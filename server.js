@@ -29,7 +29,7 @@ const s3Client = new S3Client({
 
 // Whitelist your specific frontend URL
 const corsOptions = {
-    origin: 'https://indgo-va.netlify.app/', 
+    origin: 'https://indgo-va.netlify.app', 
     optionsSuccessStatus: 200 
 };
 
