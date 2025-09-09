@@ -6,7 +6,6 @@ const express = require('express');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const { S3Client, DeleteObjectCommand } = require('@aws-sdk/client-s3');
