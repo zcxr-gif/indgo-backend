@@ -1,6 +1,7 @@
 // server.js (Updated for AWS S3)
 
 // 1. IMPORT DEPENDENCIES
+const cors = require('cors'); 
 const express = require('express');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
@@ -26,8 +27,14 @@ const s3Client = new S3Client({
 });
 
 // 3. MIDDLEWARE
-app.use(cors());
-// NOTE: express.json() is applied on a per-route basis where needed.
+
+// Whitelist your specific frontend URL
+const corsOptions = {
+    origin: 'https://indgo-va.netlify.app/', 
+    optionsSuccessStatus: 200 
+};
+
+app.use(cors(corsOptions));
 
 // --- REMOVED STATIC FILE SERVER ---
 // app.use('/uploads', express.static(path.join(__dirname, 'uploads'))); // No longer needed
