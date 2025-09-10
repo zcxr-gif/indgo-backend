@@ -10,6 +10,7 @@ const multer = require('multer');
 const path = require('path');
 const { S3Client, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const multerS3 = require('multer-s3');
+const { google } = require('googleapis');
 require('dotenv').config();
 
 // 2. INITIALIZE EXPRESS APP & AWS S3 CLIENT
@@ -34,6 +35,7 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
+app.use(express.json());
 
 // --- REMOVED STATIC FILE SERVER ---
 // app.use('/uploads', express.static(path.join(__dirname, 'uploads'))); // No longer needed
@@ -78,26 +80,31 @@ const UserSchema = new mongoose.Schema({
     name: { type: String, default: 'New Staff Member' },
     email: { type: String, required: true, unique: true },
     password: { type: String, required: true },
-    role: { 
-        type: String, 
+    role: {
+        type: String,
         enum: [
             'staff', 'pilot', 'admin',
             'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)', 'PIREP Manager (PM)',
             'Pilot Relations & Recruitment Manager (PR)', 'Technology & Design Manager (TDM)',
             'Head of Training (COT)', 'Chief Marketing Officer (CMO)', 'Route Manager (RM)',
             'Events Manager (EM)', 'Flight Instructor (FI)'
-        ], 
-        default: 'staff' 
+        ],
+        default: 'staff'
     },
+    // Pilot-specific fields
+    callsign: { type: String, default: '', unique: true, sparse: true },
+    rank: { type: String, default: 'Cadet' },
+    flightHours: { type: Number, default: 0 },
+    // General fields
     bio: { type: String, default: '' },
     imageUrl: { type: String, default: '' },
     discord: { type: String, default: '' },
     ifc: { type: String, default: '' },
     youtube: { type: String, default: '' },
-    preferredContact: { 
-        type: String, 
+    preferredContact: {
+        type: String,
         enum: ['none', 'discord', 'ifc', 'youtube'],
-        default: 'none' 
+        default: 'none'
     },
     createdAt: { type: Date, default: Date.now }
 });
@@ -152,6 +159,63 @@ const deleteS3Object = async (imageUrl) => {
         console.log(`Successfully deleted ${key} from S3.`);
     } catch (error) {
         console.error(`Failed to delete object from S3: ${imageUrl}`, error);
+    }
+};
+
+// NEW: Helper function to update Google Sheets
+const updateGoogleSheet = async (pilotData) => {
+    try {
+        const auth = new google.auth.GoogleAuth({
+            keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+            scopes: 'https://www.googleapis.com/auth/spreadsheets',
+        });
+
+        const sheets = google.sheets({ version: 'v4', auth });
+        const spreadsheetId = process.env.GOOGLE_SHEET_ID;
+        const sheetName = 'Pilots'; // Assumes the tab in your sheet is named "Pilots"
+
+        // 1. Get all callsigns to find the pilot's row
+        const getRows = await sheets.spreadsheets.values.get({
+            spreadsheetId,
+            range: `${sheetName}!A:A`,
+        });
+
+        const rows = getRows.data.values || [];
+        const pilotRowIndex = rows.findIndex(row => row[0] === pilotData.callsign);
+        const pilotRow = pilotRowIndex + 1; // Sheets are 1-indexed
+
+        // 2. Prepare the data to be written (order must match your sheet columns)
+        // Assumed Column Order: Callsign, Name, Rank, Flight Hours, Last Updated
+        const rowData = [
+            pilotData.callsign,
+            pilotData.name,
+            pilotData.rank,
+            pilotData.flightHours,
+            new Date().toISOString()
+        ];
+        
+        const resource = { values: [rowData] };
+        
+        if (pilotRow > 0) {
+            // Pilot exists, update their row
+            await sheets.spreadsheets.values.update({
+                spreadsheetId,
+                range: `${sheetName}!A${pilotRow}`,
+                valueInputOption: 'USER_ENTERED',
+                resource,
+            });
+        } else {
+            // Pilot not found, append a new row
+            await sheets.spreadsheets.values.append({
+                spreadsheetId,
+                range: `${sheetName}!A1`,
+                valueInputOption: 'USER_ENTERED',
+                resource,
+            });
+        }
+        console.log(`Successfully updated to the database for callsign ${pilotData.callsign}`);
+    } catch (error) {
+        console.error('Error updating Google Sheet:', error);
     }
 };
 
@@ -367,6 +431,49 @@ app.put('/api/me', authMiddleware, upload.single('profilePicture'), async (req, 
     } catch (error) {
         console.error('Error updating profile:', error);
         res.status(500).json({ message: 'Server error while updating profile.' });
+    }
+});
+
+// --- NEW: Pilot Routes ---
+app.post('/api/pireps', authMiddleware, async (req, res) => {
+    try {
+        const pilotId = req.user._id;
+        const { flightNumber, departure, arrival, aircraft, flightTime, remarks } = req.body;
+
+        // 1. Save the PIREP to MongoDB
+        const newPirep = new Pirep({
+            pilot: pilotId,
+            flightNumber,
+            departure,
+            arrival,
+            aircraft,
+            flightTime: parseFloat(flightTime),
+            remarks,
+            status: 'APPROVED' // Or 'PENDING' if you want staff to review it
+        });
+        await newPirep.save();
+
+        // 2. Update the pilot's total flight hours
+        const pilot = await User.findById(pilotId);
+        if (!pilot) {
+            return res.status(404).json({ message: 'Pilot profile not found.' });
+        }
+        pilot.flightHours += parseFloat(flightTime);
+        await pilot.save();
+
+        // 3. Update the Google Sheet with the new totals
+        await updateGoogleSheet({
+            callsign: pilot.callsign,
+            name: pilot.name,
+            rank: pilot.rank,
+            flightHours: pilot.flightHours,
+        });
+
+        res.status(201).json({ message: 'Flight report filed successfully!', pirep: newPirep });
+
+    } catch (error) {
+        console.error('Error filing PIREP:', error);
+        res.status(500).json({ message: 'Server error while filing flight report.' });
     }
 });
 
