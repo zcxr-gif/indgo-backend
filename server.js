@@ -1,7 +1,13 @@
-// server.js (Updated for AWS S3)
+// server.js (Fixed & Extended)
+// - callsign default changed to null (unique + sparse)
+// - added Pirep model
+// - admin create user accepts callsign and updates Google Sheets
+// - admin endpoint to assign/update callsign
+// - better duplicate-key error handling & validation
+// - safer admin self-delete check
 
 // 1. IMPORT DEPENDENCIES
-const cors = require('cors'); 
+const cors = require('cors');
 const express = require('express');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
@@ -28,36 +34,31 @@ const s3Client = new S3Client({
 
 // 3. MIDDLEWARE
 
-// Whitelist your specific frontend URL
+// Whitelist your specific frontend URL (adjust if needed)
 const corsOptions = {
-    origin: 'https://indgo-va.netlify.app', 
-    optionsSuccessStatus: 200 
+    origin: 'https://indgo-va.netlify.app',
+    optionsSuccessStatus: 200
 };
 
 app.use(cors(corsOptions));
 app.use(express.json());
-
-// --- REMOVED STATIC FILE SERVER ---
-// app.use('/uploads', express.static(path.join(__dirname, 'uploads'))); // No longer needed
 
 // Multer configuration for AWS S3 uploads
 const upload = multer({
     storage: multerS3({
         s3: s3Client,
         bucket: process.env.AWS_S3_BUCKET_NAME,
-        contentType: multerS3.AUTO_CONTENT_TYPE, // Automatically set content type
+        contentType: multerS3.AUTO_CONTENT_TYPE,
         metadata: function (req, file, cb) {
             cb(null, { fieldName: file.fieldname });
         },
         key: function (req, file, cb) {
-            let folder = 'misc/'; // Default folder
-
+            let folder = 'misc/';
             if (file.fieldname === 'profilePicture') {
                 folder = 'profiles/';
             } else if (file.fieldname === 'eventImage' || file.fieldname === 'highlightImage') {
                 folder = 'community/';
             }
-            
             const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
             const fileName = file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname);
             cb(null, folder + fileName);
@@ -72,13 +73,12 @@ mongoose.connect(process.env.MONGO_URI, {
 }).then(() => console.log('MongoDB connected successfully.'))
   .catch(err => console.error('MongoDB connection error:', err));
 
-
-// 5. DEFINE SCHEMAS AND MODELS (No changes needed here)
+// 5. DEFINE SCHEMAS AND MODELS
 
 // --- User Schema ---
 const UserSchema = new mongoose.Schema({
     name: { type: String, default: 'New Staff Member' },
-    email: { type: String, required: true, unique: true },
+    email: { type: String, required: true, unique: true, trim: true, lowercase: true },
     password: { type: String, required: true },
     role: {
         type: String,
@@ -92,7 +92,8 @@ const UserSchema = new mongoose.Schema({
         default: 'staff'
     },
     // Pilot-specific fields
-    callsign: { type: String, default: '', unique: true, sparse: true },
+    // IMPORTANT: default is null (not empty string) so sparse unique index works as intended
+    callsign: { type: String, default: null, unique: true, sparse: true, trim: true, uppercase: true },
     rank: { type: String, default: 'Cadet' },
     flightHours: { type: Number, default: 0 },
     // General fields
@@ -108,6 +109,10 @@ const UserSchema = new mongoose.Schema({
     },
     createdAt: { type: Date, default: Date.now }
 });
+
+// Ensure indexes are created (mongoose will create them on connect)
+UserSchema.index({ callsign: 1 }, { unique: true, sparse: true });
+
 const User = mongoose.model('User', UserSchema);
 
 // --- Admin Log Schema ---
@@ -119,7 +124,6 @@ const AdminLogSchema = new mongoose.Schema({
     timestamp: { type: Date, default: Date.now }
 });
 const AdminLog = mongoose.model('AdminLog', AdminLogSchema);
-
 
 // --- Event Schema ---
 const EventSchema = new mongoose.Schema({
@@ -143,9 +147,23 @@ const HighlightSchema = new mongoose.Schema({
 });
 const Highlight = mongoose.model('Highlight', HighlightSchema);
 
+// --- PIREP Schema (added because PIREP is used in routes) ---
+const PirepSchema = new mongoose.Schema({
+    pilot: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    flightNumber: { type: String, required: true },
+    departure: { type: String, required: true },
+    arrival: { type: String, required: true },
+    aircraft: { type: String, required: true },
+    flightTime: { type: Number, required: true },
+    remarks: { type: String },
+    status: { type: String, enum: ['PENDING', 'APPROVED', 'REJECTED'], default: 'PENDING' },
+    createdAt: { type: Date, default: Date.now }
+});
+const Pirep = mongoose.model('Pirep', PirepSchema);
+
 // 6. HELPER FUNCTION & AUTH MIDDLEWARE
 
-// NEW: Helper function to delete an object from S3
+// Helper function to delete an object from S3
 const deleteS3Object = async (imageUrl) => {
     if (!imageUrl) return;
     try {
@@ -162,7 +180,7 @@ const deleteS3Object = async (imageUrl) => {
     }
 };
 
-// NEW: Helper function to update Google Sheets
+// Helper function to update Google Sheets
 const updateGoogleSheet = async (pilotData) => {
     try {
         const auth = new google.auth.GoogleAuth({
@@ -193,9 +211,9 @@ const updateGoogleSheet = async (pilotData) => {
             pilotData.flightHours,
             new Date().toISOString()
         ];
-        
+
         const resource = { values: [rowData] };
-        
+
         if (pilotRow > 0) {
             // Pilot exists, update their row
             await sheets.spreadsheets.values.update({
@@ -213,12 +231,16 @@ const updateGoogleSheet = async (pilotData) => {
                 resource,
             });
         }
-        console.log(`Successfully updated to the database for callsign ${pilotData.callsign}`);
+        console.log(`Successfully updated sheet for callsign ${pilotData.callsign}`);
     } catch (error) {
         console.error('Error updating Google Sheet:', error);
     }
 };
 
+// Simple callsign validator (tweak regex to your rules)
+const isValidCallsign = cs => /^[A-Z0-9-]{2,15}$/.test(cs);
+
+// Auth middleware
 const authMiddleware = (req, res, next) => {
     const token = req.header('Authorization')?.replace('Bearer ', '');
     if (!token) {
@@ -266,7 +288,6 @@ app.post('/api/events', authMiddleware, isCommunityManager, upload.single('event
             date,
             description,
             author: req.user._id,
-            // S3 provides the full URL in `req.file.location`
             imageUrl: req.file ? req.file.location : undefined
         });
         await newEvent.save();
@@ -299,7 +320,6 @@ app.post('/api/highlights', authMiddleware, isCommunityManager, upload.single('h
             winnerName,
             description,
             author: req.user._id,
-            // S3 provides the full URL in `req.file.location`
             imageUrl: req.file.location
         });
         await newHighlight.save();
@@ -327,7 +347,6 @@ app.delete('/api/events/:id', authMiddleware, isCommunityManager, async (req, re
         if (!event) {
             return res.status(404).json({ message: 'Event not found.' });
         }
-        // If there's an image, delete it from S3
         if (event.imageUrl) {
             await deleteS3Object(event.imageUrl);
         }
@@ -346,7 +365,6 @@ app.delete('/api/highlights/:id', authMiddleware, isCommunityManager, async (req
         if (!highlight) {
             return res.status(404).json({ message: 'Highlight not found.' });
         }
-        // Delete the associated image from S3
         await deleteS3Object(highlight.imageUrl);
         await Highlight.findByIdAndDelete(req.params.id);
         res.json({ message: 'Highlight deleted successfully.' });
@@ -384,26 +402,36 @@ app.get('/api/staff', async (req, res) => {
 // PUBLIC ROUTE: Login a user
 app.post('/api/login', express.json(), async (req, res) => {
     const { email, password } = req.body;
-    const user = await User.findOne({ email });
-    if (!user) return res.status(400).json({ message: 'Invalid email or password.' });
-    const validPassword = await bcrypt.compare(password, user.password);
-    if (!validPassword) return res.status(400).json({ message: 'Invalid email or password.' });
-    const token = jwt.sign({ _id: user._id, role: user.role, name: user.name }, process.env.JWT_SECRET, { expiresIn: '3h' });
-    res.json({ token });
+    try {
+        const user = await User.findOne({ email: email?.toLowerCase().trim() });
+        if (!user) return res.status(400).json({ message: 'Invalid email or password.' });
+        const validPassword = await bcrypt.compare(password, user.password);
+        if (!validPassword) return res.status(400).json({ message: 'Invalid email or password.' });
+        const token = jwt.sign({ _id: user._id, role: user.role, name: user.name }, process.env.JWT_SECRET, { expiresIn: '3h' });
+        res.json({ token });
+    } catch (err) {
+        console.error('Login error:', err);
+        res.status(500).json({ message: 'Server error during login.' });
+    }
 });
 
 // PROTECTED ROUTE: Get current user's data
 app.get('/api/me', authMiddleware, async (req, res) => {
-    const user = await User.findById(req.user._id).select('-password');
-    if (!user) return res.status(404).json({ message: 'User not found.' });
-    res.json(user);
+    try {
+        const user = await User.findById(req.user._id).select('-password');
+        if (!user) return res.status(404).json({ message: 'User not found.' });
+        res.json(user);
+    } catch (err) {
+        console.error('Error fetching /me:', err);
+        res.status(500).json({ message: 'Server error.' });
+    }
 });
 
-// PROTECTED ROUTE: Update current user's profile
+// PROTECTED ROUTE: Update current user's profile (admins only can set callsign via admin endpoint)
 app.put('/api/me', authMiddleware, upload.single('profilePicture'), async (req, res) => {
     const { name, bio, discord, ifc, youtube, preferredContact } = req.body;
-    const updatedData = { 
-        name, 
+    const updatedData = {
+        name,
         bio,
         discord,
         ifc,
@@ -413,28 +441,36 @@ app.put('/api/me', authMiddleware, upload.single('profilePicture'), async (req, 
 
     if (req.file) {
         // If a new picture was uploaded, delete the old one from S3 first
-        const oldUser = await User.findById(req.user._id);
-        if (oldUser && oldUser.imageUrl) {
-            await deleteS3Object(oldUser.imageUrl);
+        try {
+            const oldUser = await User.findById(req.user._id);
+            if (oldUser && oldUser.imageUrl) {
+                await deleteS3Object(oldUser.imageUrl);
+            }
+        } catch (e) {
+            console.error('Error deleting old profile image:', e);
         }
-        // S3 provides the full URL in `req.file.location`
         updatedData.imageUrl = req.file.location;
     }
 
     try {
         const user = await User.findByIdAndUpdate(req.user._id, updatedData, { new: true }).select('-password');
         if (!user) return res.status(404).json({ message: 'User not found.' });
-        
+
         const token = jwt.sign({ _id: user._id, role: user.role, name: user.name }, process.env.JWT_SECRET, { expiresIn: '3h' });
         res.json({ message: 'Profile updated successfully!', user, token });
-
     } catch (error) {
+        // Handle duplicate key errors
+        if (error && error.code === 11000) {
+            const dupKey = Object.keys(error.keyValue || {})[0];
+            return res.status(400).json({ message: `Duplicate value for field: ${dupKey}.` });
+        }
         console.error('Error updating profile:', error);
         res.status(500).json({ message: 'Server error while updating profile.' });
     }
 });
 
 // --- NEW: Pilot Routes ---
+
 app.post('/api/pireps', authMiddleware, async (req, res) => {
     try {
         const pilotId = req.user._id;
@@ -461,13 +497,19 @@ app.post('/api/pireps', authMiddleware, async (req, res) => {
         pilot.flightHours += parseFloat(flightTime);
         await pilot.save();
 
-        // 3. Update the Google Sheet with the new totals
-        await updateGoogleSheet({
-            callsign: pilot.callsign,
-            name: pilot.name,
-            rank: pilot.rank,
-            flightHours: pilot.flightHours,
-        });
+        // 3. Update the Google Sheet with the new totals (only if callsign exists)
+        if (!pilot.callsign) {
+            // Decide: either allow filing without callsign but don't update sheet,
+            // or reject filing. We'll just return success but warn.
+            console.warn(`Pilot ${pilot._id} filed a PIREP without a callsign; sheet not updated.`);
+        } else {
+            await updateGoogleSheet({
+                callsign: pilot.callsign,
+                name: pilot.name,
+                rank: pilot.rank,
+                flightHours: pilot.flightHours,
+            });
+        }
 
         res.status(201).json({ message: 'Flight report filed successfully!', pirep: newPirep });
 
@@ -483,29 +525,78 @@ app.post('/api/me/password', authMiddleware, express.json(), async (req, res) =>
     if (!newPassword || newPassword.length < 6) {
         return res.status(400).json({ message: 'Password must be at least 6 characters long.' });
     }
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(newPassword, salt);
-    await User.findByIdAndUpdate(req.user._id, { password: hashedPassword });
-    res.json({ message: 'Password updated successfully!' });
+    try {
+        const salt = await bcrypt.genSalt(10);
+        const hashedPassword = await bcrypt.hash(newPassword, salt);
+        await User.findByIdAndUpdate(req.user._id, { password: hashedPassword });
+        res.json({ message: 'Password updated successfully!' });
+    } catch (err) {
+        console.error('Error updating password:', err);
+        res.status(500).json({ message: 'Server error while updating password.' });
+    }
 });
-
 
 // --- Admin-Only Routes ---
 
-// ADMIN-ONLY ROUTE: Create a new user
+// ADMIN-ONLY ROUTE: Create a new user (admin may provide callsign)
 app.post('/api/users', authMiddleware, isAdmin, express.json(), async (req, res) => {
-    const { email, password, role } = req.body;
-    let user = await User.findOne({ email });
-    if (user) return res.status(400).json({ message: 'User with this email already exists.' });
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
-    user = new User({
-        email,
-        password: hashedPassword,
-        role
-    });
-    await user.save();
-    res.status(201).json({ message: 'User created successfully.', userId: user._id });
+    const { email, password, role, callsign, name } = req.body;
+
+    try {
+        // Basic validations
+        if (!email || !password) {
+            return res.status(400).json({ message: 'Email and password are required.' });
+        }
+
+        const normalizedEmail = String(email).toLowerCase().trim();
+        let existing = await User.findOne({ email: normalizedEmail });
+        if (existing) return res.status(400).json({ message: 'User with this email already exists.' });
+
+        // if callsign provided, normalize and validate
+        const normalizedCallsign = callsign ? String(callsign).trim().toUpperCase() : null;
+        if (normalizedCallsign && !isValidCallsign(normalizedCallsign)) {
+            return res.status(400).json({ message: 'Invalid callsign format.' });
+        }
+
+        // Check callsign uniqueness if provided
+        if (normalizedCallsign) {
+            const csConflict = await User.findOne({ callsign: normalizedCallsign });
+            if (csConflict) return res.status(400).json({ message: 'This callsign is already taken.' });
+        }
+
+        const salt = await bcrypt.genSalt(10);
+        const hashedPassword = await bcrypt.hash(password, salt);
+
+        const user = new User({
+            email: normalizedEmail,
+            password: hashedPassword,
+            role,
+            name: name || 'New Staff Member',
+            callsign: normalizedCallsign
+        });
+
+        await user.save();
+
+        // If callsign exists, also update Google Sheet
+        if (normalizedCallsign) {
+            await updateGoogleSheet({
+                callsign: normalizedCallsign,
+                name: user.name,
+                rank: user.rank,
+                flightHours: user.flightHours || 0
+            });
+        }
+
+        return res.status(201).json({ message: 'User created successfully.', userId: user._id });
+    } catch (error) {
+        // Handle duplicate key (callsign or email) gracefully
+        if (error && error.code === 11000) {
+            const dupKey = Object.keys(error.keyValue || {})[0];
+            return res.status(400).json({ message: `Duplicate value for field: ${dupKey}. Please choose another ${dupKey}.` });
+        }
+        console.error('Error creating user:', error);
+        return res.status(500).json({ message: 'Server error while creating user.' });
+    }
 });
 
 // ADMIN-ONLY ROUTE: Get all users for management
@@ -514,6 +605,7 @@ app.get('/api/users', authMiddleware, isAdmin, async (req, res) => {
         const users = await User.find().select('-password');
         res.json(users);
     } catch (error) {
+        console.error('Error fetching users:', error);
         res.status(500).json({ message: 'Server error while fetching users.' });
     }
 });
@@ -541,17 +633,63 @@ app.put('/api/users/:userId/role', authMiddleware, isAdmin, express.json(), asyn
         await log.save();
         res.json({ message: `User role successfully updated to ${newRole}.` });
     } catch (error) {
+        console.error('Error updating user role:', error);
         res.status(500).json({ message: 'Server error while updating user role.' });
+    }
+});
+
+// ADMIN-ONLY ROUTE: Assign or update a user's callsign
+app.put('/api/users/:userId/callsign', authMiddleware, isAdmin, express.json(), async (req, res) => {
+    const { userId } = req.params;
+    let { callsign } = req.body;
+
+    try {
+        if (!callsign || String(callsign).trim() === '') {
+            return res.status(400).json({ message: 'A callsign (non-empty) must be provided.' });
+        }
+        callsign = String(callsign).trim().toUpperCase();
+
+        if (!isValidCallsign(callsign)) {
+            return res.status(400).json({ message: 'Invalid callsign format.' });
+        }
+
+        // Ensure callsign doesn't belong to someone else
+        const conflict = await User.findOne({ callsign, _id: { $ne: userId } });
+        if (conflict) return res.status(400).json({ message: 'This callsign is already taken by another user.' });
+
+        const user = await User.findById(userId);
+        if (!user) return res.status(404).json({ message: 'User not found.' });
+
+        user.callsign = callsign;
+        await user.save();
+
+        // Update spreadsheet as well
+        await updateGoogleSheet({
+            callsign,
+            name: user.name,
+            rank: user.rank,
+            flightHours: user.flightHours || 0
+        });
+
+        res.json({ message: `Callsign ${callsign} assigned to ${user.email}` });
+    } catch (error) {
+        if (error && error.code === 11000) {
+            return res.status(400).json({ message: 'Callsign already exists. Choose a different one.' });
+        }
+        console.error('Error assigning callsign:', error);
+        res.status(500).json({ message: 'Server error while assigning callsign.' });
     }
 });
 
 // ADMIN-ONLY ROUTE: Delete a user
 app.delete('/api/users/:userId', authMiddleware, isAdmin, async (req, res) => {
     const { userId } = req.params;
-    if (req.user._id === userId) {
-        return res.status(400).json({ message: 'You cannot delete your own admin account.' });
-    }
     try {
+        // Prevent admin deleting their own account (compare as strings)
+        if (String(req.user._id) === String(userId)) {
+            return res.status(400).json({ message: 'You cannot delete your own admin account.' });
+        }
+
         const userToDelete = await User.findById(userId);
         if (!userToDelete) return res.status(404).json({ message: 'User not found.' });
 
@@ -570,6 +708,7 @@ app.delete('/api/users/:userId', authMiddleware, isAdmin, async (req, res) => {
         await log.save();
         res.json({ message: 'User deleted successfully.' });
     } catch (error) {
+        console.error('Error deleting user:', error);
         res.status(500).json({ message: 'Server error while deleting user.' });
     }
 });
@@ -583,6 +722,7 @@ app.get('/api/logs', authMiddleware, isAdmin, async (req, res) => {
             .sort({ timestamp: -1 });
         res.json(logs);
     } catch (error) {
+        console.error('Error fetching logs:', error);
         res.status(500).json({ message: 'Server error while fetching logs.' });
     }
 });
