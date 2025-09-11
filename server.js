@@ -4,6 +4,10 @@
 // - Automatic rank promotions upon PIREP approval.
 // - New endpoints for pilots and staff to manage PIREPs.
 // - Cascade delete functionality for users and their associated data.
+// --- NEW ---
+// - Sector Ops: Roster-based duty system for realistic pilot simulation.
+// - Flight & Duty Time Limitations (FTPL) tracking.
+// - New schemas and endpoints for managing rosters and pilot duty status.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -111,7 +115,22 @@ const UserSchema = new mongoose.Schema({
         enum: ['none', 'discord', 'ifc', 'youtube'],
         default: 'none'
     },
-    createdAt: { type: Date, default: Date.now }
+    createdAt: { type: Date, default: Date.now },
+
+    // --- NEW: FIELDS FOR SECTOR OPS ---
+    dutyStatus: {
+        type: String,
+        enum: ['ON_REST', 'ON_DUTY'],
+        default: 'ON_REST'
+    },
+    currentRoster: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Roster',
+        default: null
+    },
+    lastDutyOff: { type: Date, default: null },
+    monthlyFlightHours: { type: Number, default: 0 },
+    lastHourReset: { type: Date, default: Date.now }
 });
 
 UserSchema.index({ callsign: 1 }, { unique: true, sparse: true });
@@ -120,7 +139,7 @@ const User = mongoose.model('User', UserSchema);
 // --- Admin Log Schema ---
 const AdminLogSchema = new mongoose.Schema({
     adminUser: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    action: { type: String, required: true, enum: ['ROLE_UPDATE', 'USER_DELETE'] },
+    action: { type: String, required: true, enum: ['ROLE_UPDATE', 'USER_DELETE', 'ROSTER_CREATE', 'ROSTER_DELETE'] },
     targetUser: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     details: { type: String, required: true },
     timestamp: { type: Date, default: Date.now }
@@ -162,9 +181,31 @@ const PirepSchema = new mongoose.Schema({
     reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     rejectionReason: { type: String, default: null },
     createdAt: { type: Date, default: Date.now },
-    reviewedAt: { type: Date, default: null }
+    reviewedAt: { type: Date, default: null },
+    // --- NEW: LINK PIREP TO A ROSTER ---
+    rosterLeg: {
+        rosterId: { type: mongoose.Schema.Types.ObjectId, ref: 'Roster' },
+        flightNumber: { type: String }
+    }
 });
 const Pirep = mongoose.model('Pirep', PirepSchema);
+
+// --- NEW: ROSTER SCHEMA ---
+const RosterSchema = new mongoose.Schema({
+    name: { type: String, required: true, trim: true }, // e.g., "South India Commuter"
+    hub: { type: String, required: true, uppercase: true, trim: true }, // e.g., "VOBL"
+    legs: [{
+        flightNumber: { type: String, required: true, trim: true },
+        departure: { type: String, required: true, uppercase: true, trim: true },
+        arrival: { type: String, required: true, uppercase: true, trim: true },
+    }],
+    totalFlightTime: { type: Number, required: true, min: 0 }, // Estimated total hours
+    isAvailable: { type: Boolean, default: true },
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    createdAt: { type: Date, default: Date.now }
+});
+const Roster = mongoose.model('Roster', RosterSchema);
+
 
 // 6. HELPER FUNCTION & AUTH MIDDLEWARE
 
@@ -437,6 +478,19 @@ const isPirepManager = (req, res, next) => {
     }
 };
 
+// --- NEW: Middleware for Roster Management ---
+const isRouteManager = (req, res, next) => {
+    const authorizedRoles = [
+        'admin', 'Chief Executive Officer (CEO)', 
+        'Chief Operating Officer (COO)', 'Route Manager (RM)'
+    ];
+    if (req.user && authorizedRoles.includes(req.user.role)) {
+        next();
+    } else {
+        res.status(403).json({ message: 'Access denied. You do not have permission to manage rosters.' });
+    }
+};
+
 
 // 7. API ROUTES (ENDPOINTS)
 
@@ -619,17 +673,59 @@ app.post('/api/me/password', authMiddleware, express.json(), async (req, res) =>
 // --- PIREP Workflow Routes ---
 
 // PILOT ROUTE: Submit a new PIREP for review
+// --- MODIFIED: Added Sector Ops validation ---
 app.post('/api/pireps', authMiddleware, async (req, res) => {
     try {
         const { flightNumber, departure, arrival, aircraft, flightTime, remarks } = req.body;
         if (!flightNumber || !departure || !arrival || !aircraft || !flightTime) {
             return res.status(400).json({ message: 'Please fill out all required flight details.' });
         }
-        const newPirep = new Pirep({
+        
+        const pilot = await User.findById(req.user._id);
+        if (!pilot) return res.status(404).json({ message: 'Pilot not found.' });
+
+        const newPirepData = {
             pilot: req.user._id, flightNumber, departure, arrival, aircraft, remarks,
             flightTime: parseFloat(flightTime),
             status: 'PENDING'
-        });
+        };
+
+        // Sector Ops validation logic
+        if (pilot.dutyStatus === 'ON_DUTY') {
+            if (!pilot.currentRoster) {
+                return res.status(400).json({ message: 'You are on duty but have no assigned roster. Please contact staff.' });
+            }
+            
+            await pilot.populate('currentRoster');
+            const roster = pilot.currentRoster;
+            
+            // Find the matching leg in the current roster
+            const leg = roster.legs.find(l => 
+                l.flightNumber.toUpperCase() === flightNumber.toUpperCase() &&
+                l.departure.toUpperCase() === departure.toUpperCase() &&
+                l.arrival.toUpperCase() === arrival.toUpperCase()
+            );
+
+            if (!leg) {
+                return res.status(400).json({ message: 'This flight does not match any leg in your assigned roster.' });
+            }
+
+            // Check if a PIREP for this leg has already been filed
+            const existingPirep = await Pirep.findOne({
+                pilot: req.user._id,
+                'rosterLeg.rosterId': roster._id,
+                'rosterLeg.flightNumber': flightNumber
+            });
+
+            if (existingPirep) {
+                return res.status(400).json({ message: 'You have already filed a PIREP for this roster leg.' });
+            }
+            
+            // Link the PIREP to the roster
+            newPirepData.rosterLeg = { rosterId: roster._id, flightNumber: flightNumber };
+        }
+
+        const newPirep = new Pirep(newPirepData);
         await newPirep.save();
         res.status(201).json({ message: 'Flight report submitted successfully and is pending review.', pirep: newPirep });
     } catch (error) {
@@ -637,6 +733,7 @@ app.post('/api/pireps', authMiddleware, async (req, res) => {
         res.status(500).json({ message: 'Server error while filing flight report.' });
     }
 });
+
 
 // PILOT ROUTE: Get the current user's PIREP history
 app.get('/api/me/pireps', authMiddleware, async (req, res) => {
@@ -663,6 +760,7 @@ app.get('/api/pireps/pending', authMiddleware, isPirepManager, async (req, res) 
 });
 
 // STAFF ROUTE: Approve a PIREP
+// --- MODIFIED: Update monthly flight hours ---
 app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (req, res) => {
     try {
         const pirep = await Pirep.findById(req.params.pirepId);
@@ -673,6 +771,8 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
         if (!pilot) return res.status(404).json({ message: 'Associated pilot profile not found.' });
 
         pilot.flightHours += pirep.flightTime;
+        pilot.monthlyFlightHours += pirep.flightTime; // Update monthly total
+        
         const promotionResult = checkAndApplyRankUpdate(pilot);
         
         pirep.status = 'APPROVED';
@@ -710,7 +810,7 @@ app.put('/api/pireps/:pirepId/reject', authMiddleware, isPirepManager, async (re
             rejectionReason: reason,
             reviewedBy: req.user._id,
             reviewedAt: Date.now()
-        });
+        }, { new: false }); // Set new to false to check the old status
 
         if (!pirep) return res.status(404).json({ message: 'PIREP not found.' });
         if (pirep.status !== 'PENDING') return res.status(400).json({ message: `This PIREP was already ${pirep.status.toLowerCase()}.` });
@@ -745,6 +845,128 @@ app.put('/api/users/:userId/rank', authMiddleware, isPilotManager, async (req, r
         res.status(500).json({ message: 'Server error while updating rank.' });
     }
 });
+
+
+// --- NEW: ROSTER & DUTY MANAGEMENT ROUTES ---
+
+// PUBLIC ROUTE: Get all available rosters
+app.get('/api/rosters', authMiddleware, async (req, res) => {
+    try {
+        const rosters = await Roster.find({ isAvailable: true }).sort({ createdAt: -1 });
+        res.json(rosters);
+    } catch (error) {
+        console.error('Error fetching rosters:', error);
+        res.status(500).json({ message: 'Server error while fetching rosters.' });
+    }
+});
+
+// STAFF ROUTE: Create a new roster
+app.post('/api/rosters', authMiddleware, isRouteManager, async (req, res) => {
+    try {
+        const { name, hub, legs, totalFlightTime } = req.body;
+        if (!name || !hub || !legs || legs.length === 0 || !totalFlightTime) {
+            return res.status(400).json({ message: 'All roster fields are required.' });
+        }
+        const newRoster = new Roster({
+            name, hub, legs, totalFlightTime, createdBy: req.user._id
+        });
+        await newRoster.save();
+
+        const log = new AdminLog({
+            adminUser: req.user._id, action: 'ROSTER_CREATE',
+            details: `Created new roster: "${name}"`
+        });
+        await log.save();
+        
+        res.status(201).json({ message: 'Roster created successfully!', roster: newRoster });
+    } catch (error) {
+        console.error('Error creating roster:', error);
+        res.status(500).json({ message: 'Server error while creating roster.' });
+    }
+});
+
+// STAFF ROUTE: Delete a roster
+app.delete('/api/rosters/:rosterId', authMiddleware, isRouteManager, async (req, res) => {
+    try {
+        const roster = await Roster.findByIdAndDelete(req.params.rosterId);
+        if (!roster) return res.status(404).json({ message: 'Roster not found.' });
+
+        const log = new AdminLog({
+            adminUser: req.user._id, action: 'ROSTER_DELETE',
+            details: `Deleted roster: "${roster.name}" (ID: ${roster._id})`
+        });
+        await log.save();
+
+        res.json({ message: 'Roster deleted successfully.' });
+    } catch (error) {
+        console.error('Error deleting roster:', error);
+        res.status(500).json({ message: 'Server error while deleting roster.' });
+    }
+});
+
+// PILOT ROUTE: Start a duty day
+app.post('/api/duty/start', authMiddleware, async (req, res) => {
+    const { rosterId } = req.body;
+    try {
+        const user = await User.findById(req.user._id);
+        const roster = await Roster.findById(rosterId);
+
+        if (!roster) return res.status(404).json({ message: 'Selected roster not found.' });
+        if (user.dutyStatus === 'ON_DUTY') return res.status(400).json({ message: 'You are already on duty.' });
+
+        // Check and reset monthly hours if necessary
+        const oneMonthAgo = new Date();
+        oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+        if (user.lastHourReset < oneMonthAgo) {
+            user.monthlyFlightHours = 0;
+            user.lastHourReset = Date.now();
+        }
+
+        // FTPL check (100 hours per month)
+        if ((user.monthlyFlightHours + roster.totalFlightTime) > 100) {
+            return res.status(403).json({ message: 'Starting this duty would exceed your 100-hour monthly limit.' });
+        }
+
+        user.dutyStatus = 'ON_DUTY';
+        user.currentRoster = roster._id;
+        await user.save();
+        
+        res.json({ message: `You are now on duty. Your assigned roster is "${roster.name}".`, roster });
+    } catch (error) {
+        console.error('Error starting duty:', error);
+        res.status(500).json({ message: 'Server error while starting duty.' });
+    }
+});
+
+// PILOT ROUTE: End a duty day
+app.post('/api/duty/end', authMiddleware, async (req, res) => {
+    try {
+        const user = await User.findById(req.user._id).populate('currentRoster');
+        if (user.dutyStatus !== 'ON_DUTY') return res.status(400).json({ message: 'You are not currently on duty.' });
+        if (!user.currentRoster) return res.status(400).json({ message: 'No roster assigned to end duty.' });
+
+        const rosterLegs = user.currentRoster.legs;
+        const filedPireps = await Pirep.find({
+            pilot: user._id,
+            'rosterLeg.rosterId': user.currentRoster._id
+        });
+
+        if (filedPireps.length < rosterLegs.length) {
+            return res.status(400).json({ message: `You have not filed PIREPs for all roster legs. ${filedPireps.length}/${rosterLegs.length} complete.` });
+        }
+
+        user.dutyStatus = 'ON_REST';
+        user.currentRoster = null;
+        user.lastDutyOff = Date.now();
+        await user.save();
+        
+        res.json({ message: 'Duty day completed successfully! Well flown, Captain.' });
+    } catch (error) {
+        console.error('Error ending duty:', error);
+        res.status(500).json({ message: 'Server error while ending duty.' });
+    }
+});
+
 
 // --- Admin-Only Routes ---
 
