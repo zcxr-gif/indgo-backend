@@ -95,7 +95,7 @@ const UserSchema = new mongoose.Schema({
             'Head of Training (COT)', 'Chief Marketing Officer (CMO)', 'Route Manager (RM)',
             'Events Manager (EM)', 'Flight Instructor (FI)'
         ],
-        default: 'staff'
+        default: 'pilot'
     },
     callsign: { type: String, default: null, unique: true, sparse: true, trim: true, uppercase: true },
     rank: { // NEW FIELD
@@ -543,14 +543,26 @@ app.post('/api/pireps', authMiddleware, async (req, res) => {
 
 // PROTECTED ROUTE: Change current user's password
 app.post('/api/me/password', authMiddleware, express.json(), async (req, res) => {
-    const { newPassword } = req.body;
-    if (!newPassword || newPassword.length < 6) {
-        return res.status(400).json({ message: 'Password must be at least 6 characters long.' });
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword || newPassword.length < 6) {
+        return res.status(400).json({ message: 'Current password is required, and the new password must be at least 6 characters long.' });
     }
+
     try {
+        const user = await User.findById(req.user._id);
+        if (!user) return res.status(404).json({ message: 'User not found.' });
+
+        const isMatch = await bcrypt.compare(currentPassword, user.password);
+        if (!isMatch) {
+            return res.status(400).json({ message: 'Incorrect current password.' });
+        }
+
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(newPassword, salt);
-        await User.findByIdAndUpdate(req.user._id, { password: hashedPassword });
+        user.password = hashedPassword;
+        await user.save();
+        
         res.json({ message: 'Password updated successfully!' });
     } catch (err) {
         console.error('Error updating password:', err);
