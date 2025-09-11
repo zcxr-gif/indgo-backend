@@ -3,6 +3,7 @@
 // - Advanced PIREP system with a staff review workflow.
 // - Automatic rank promotions upon PIREP approval.
 // - New endpoints for pilots and staff to manage PIREPs.
+// - Cascade delete functionality for users and their associated data.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -270,6 +271,81 @@ const updateGoogleSheet = async (pilotData) => {
         }
     } catch (error) {
         console.error('Error updating Google Sheet:', error.message);
+    }
+};
+
+// HELPER: Deletes a row from the Google Sheet based on a callsign
+const deleteRowFromGoogleSheet = async (callsign) => {
+    if (!callsign) {
+        console.warn('deleteRowFromGoogleSheet called without a callsign. Aborting.');
+        return;
+    }
+
+    try {
+        // 1. Authenticate (same as your update function)
+        const auth = new google.auth.GoogleAuth({
+            keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+            scopes: 'https://www.googleapis.com/auth/spreadsheets',
+        });
+        const sheets = google.sheets({ version: 'v4', auth });
+        const spreadsheetId = process.env.GOOGLE_SHEET_ID;
+        const sheetName = 'Pilots';
+
+        // 2. Get the sheet's metadata to find the sheetId (required for deletion)
+        const spreadsheetMeta = await sheets.spreadsheets.get({ spreadsheetId });
+        const sheet = spreadsheetMeta.data.sheets.find(s => s.properties.title === sheetName);
+        if (!sheet) {
+            throw new Error(`Sheet with name "${sheetName}" not found.`);
+        }
+        const sheetId = sheet.properties.sheetId;
+
+        // 3. Find the pilot's row index (similar to your update function)
+        const headerResponse = await sheets.spreadsheets.values.get({
+            spreadsheetId,
+            range: `${sheetName}!1:1`,
+        });
+        const headers = headerResponse.data.values ? headerResponse.data.values[0] : [];
+        const callsignColumnIndex = headers.findIndex(h => h === 'Callsign');
+        if (callsignColumnIndex === -1) {
+            throw new Error('Could not find "Callsign" column in the sheet.');
+        }
+
+        const callsignColumnLetter = String.fromCharCode(65 + callsignColumnIndex);
+        const allCallsignsResponse = await sheets.spreadsheets.values.get({
+            spreadsheetId,
+            range: `${sheetName}!${callsignColumnLetter}2:${callsignColumnLetter}`,
+        });
+
+        const allCallsigns = allCallsignsResponse.data.values ? allCallsignsResponse.data.values.flat() : [];
+        const pilotRowIndex = allCallsigns.findIndex(cs => cs === callsign); // 0-based index
+
+        // 4. If the pilot is found, execute the deletion request
+        if (pilotRowIndex !== -1) {
+            const targetRow = pilotRowIndex + 1; // The API needs the row index within the data, starting from 0 for row 2
+            
+            const request = {
+                spreadsheetId,
+                resource: {
+                    requests: [{
+                        deleteDimension: {
+                            range: {
+                                sheetId: sheetId,
+                                dimension: 'ROWS',
+                                startIndex: targetRow, // 0-based index of the row to delete
+                                endIndex: targetRow + 1
+                            }
+                        }
+                    }]
+                }
+            };
+            
+            await sheets.spreadsheets.batchUpdate(request);
+            console.log(`Successfully deleted row for callsign ${callsign} from Google Sheet.`);
+        } else {
+            console.log(`Callsign ${callsign} not found in Google Sheet. No row deleted.`);
+        }
+    } catch (error) {
+        console.error(`Error deleting row from Google Sheet for callsign ${callsign}:`, error.message);
     }
 };
 
@@ -777,24 +853,61 @@ app.put('/api/users/:userId/callsign', authMiddleware, isAdmin, express.json(), 
     }
 });
 
-// ADMIN-ONLY ROUTE: Delete a user
+// ADMIN-ONLY ROUTE: Delete a user (Updated with cascade delete)
 app.delete('/api/users/:userId', authMiddleware, isAdmin, async (req, res) => {
     const { userId } = req.params;
     try {
         if (String(req.user._id) === String(userId)) {
             return res.status(400).json({ message: 'You cannot delete your own admin account.' });
         }
-        const userToDelete = await User.findByIdAndDelete(userId);
-        if (!userToDelete) return res.status(404).json({ message: 'User not found.' });
 
-        if (userToDelete.imageUrl) await deleteS3Object(userToDelete.imageUrl);
+        // --- Find the user first, DO NOT delete yet ---
+        const userToDelete = await User.findById(userId);
+        if (!userToDelete) {
+            return res.status(404).json({ message: 'User not found.' });
+        }
+
+        // --- Perform all cleanup actions before deleting the user ---
+
+        // Step 1: Delete from Google Sheet if they have a callsign
+        if (userToDelete.callsign) {
+            await deleteRowFromGoogleSheet(userToDelete.callsign);
+        }
+
+        // Step 2: Delete S3 profile picture
+        if (userToDelete.imageUrl) {
+            await deleteS3Object(userToDelete.imageUrl);
+        }
+
+        // Step 3: Delete all PIREPs filed by this user
+        await Pirep.deleteMany({ pilot: userId });
+
+        // Step 4 (Optional but recommended): Clean up community content
+        // Find all events by the user to delete associated S3 images
+        const userEvents = await Event.find({ author: userId });
+        for (const event of userEvents) {
+            if (event.imageUrl) await deleteS3Object(event.imageUrl);
+        }
+        await Event.deleteMany({ author: userId });
+
+        // Find all highlights by the user to delete associated S3 images
+        const userHighlights = await Highlight.find({ author: userId });
+        for (const highlight of userHighlights) {
+            if (highlight.imageUrl) await deleteS3Object(highlight.imageUrl);
+        }
+        await Highlight.deleteMany({ author: userId });
+
+        // --- Final Step: Now delete the user from MongoDB ---
+        await User.findByIdAndDelete(userId);
 
         const log = new AdminLog({
-            adminUser: req.user._id, action: 'USER_DELETE',
-            details: `Deleted user with email ${userToDelete.email}.`
+            adminUser: req.user._id,
+            action: 'USER_DELETE',
+            details: `Deleted user with email ${userToDelete.email} and all associated data.`
         });
         await log.save();
-        res.json({ message: 'User deleted successfully.' });
+
+        res.json({ message: 'User and all associated data deleted successfully.' });
     } catch (error) {
         console.error('Error deleting user:', error);
         res.status(500).json({ message: 'Server error while deleting user.' });
