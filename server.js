@@ -76,6 +76,12 @@ mongoose.connect(process.env.MONGO_URI, {
 // 5. DEFINE SCHEMAS AND MODELS
 
 // --- User Schema ---
+
+const pilotRanks = [
+    'Cadet', 'Second Officer', 'First Officer', 
+    'Senior First Officer', 'Captain', 'Senior Captain'
+];
+
 const UserSchema = new mongoose.Schema({
     name: { type: String, default: 'New Staff Member' },
     email: { type: String, required: true, unique: true, trim: true, lowercase: true },
@@ -91,12 +97,13 @@ const UserSchema = new mongoose.Schema({
         ],
         default: 'staff'
     },
-    // Pilot-specific fields
-    // IMPORTANT: default is null (not empty string) so sparse unique index works as intended
     callsign: { type: String, default: null, unique: true, sparse: true, trim: true, uppercase: true },
-    rank: { type: String, default: 'Cadet' },
+    rank: { // NEW FIELD
+        type: String,
+        enum: pilotRanks,
+        default: 'Cadet'
+    },
     flightHours: { type: Number, default: 0 },
-    // General fields
     bio: { type: String, default: '' },
     imageUrl: { type: String, default: '' },
     discord: { type: String, default: '' },
@@ -109,6 +116,7 @@ const UserSchema = new mongoose.Schema({
     },
     createdAt: { type: Date, default: Date.now }
 });
+
 
 // Ensure indexes are created (mongoose will create them on connect)
 UserSchema.index({ callsign: 1 }, { unique: true, sparse: true });
@@ -272,6 +280,20 @@ const isCommunityManager = (req, res, next) => {
         next();
     } else {
         res.status(403).json({ message: 'Access denied. You do not have permission to manage community content.' });
+    }
+};
+
+const isPilotManager = (req, res, next) => {
+    const authorizedRoles = [
+        'admin',
+        'Chief Executive Officer (CEO)',
+        'Chief Operating Officer (COO)',
+        'Head of Training (COT)'
+    ];
+    if (req.user && authorizedRoles.includes(req.user.role)) {
+        next();
+    } else {
+        res.status(403).json({ message: 'Access denied. You do not have permission to manage pilots.' });
     }
 };
 
@@ -533,6 +555,40 @@ app.post('/api/me/password', authMiddleware, express.json(), async (req, res) =>
     } catch (err) {
         console.error('Error updating password:', err);
         res.status(500).json({ message: 'Server error while updating password.' });
+    }
+});
+
+app.put('/api/users/:userId/rank', authMiddleware, isPilotManager, async (req, res) => {
+    const { userId } = req.params;
+    const { newRank } = req.body;
+
+    const allowedRanks = User.schema.path('rank').enumValues;
+    if (!newRank || !allowedRanks.includes(newRank)) {
+        return res.status(400).json({ message: 'Invalid rank specified.' });
+    }
+
+    try {
+        const user = await User.findById(userId);
+        if (!user) {
+            return res.status(404).json({ message: 'User not found.' });
+        }
+
+        user.rank = newRank;
+        await user.save();
+        
+        if (user.callsign) {
+             await updateGoogleSheet({
+                callsign: user.callsign,
+                name: user.name,
+                rank: user.rank,
+                flightHours: user.flightHours
+            });
+        }
+        
+        res.json({ message: `Successfully updated ${user.name}'s rank to ${newRank}.` });
+    } catch (error) {
+        console.error('Error updating pilot rank:', error);
+        res.status(500).json({ message: 'Server error while updating rank.' });
     }
 });
 
