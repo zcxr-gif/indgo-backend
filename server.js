@@ -67,11 +67,9 @@ const upload = multer({
 });
 
 // 4. CONNECT TO MONGODB DATABASE
-mongoose.connect(process.env.MONGO_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-}).then(() => console.log('MongoDB connected successfully.'))
-  .catch(err => console.error('MongoDB connection error:', err));
+mongoose.connect(process.env.MONGO_URI) // <-- FIX: Removed deprecated options
+    .then(() => console.log('MongoDB connected successfully.'))
+    .catch(err => console.error('MongoDB connection error:', err));
 
 // 5. DEFINE SCHEMAS AND MODELS
 
@@ -97,8 +95,8 @@ const UserSchema = new mongoose.Schema({
         ],
         default: 'pilot'
     },
-    callsign: { type: String, default: null, unique: true, sparse: true, trim: true, uppercase: true },
-    rank: { // NEW FIELD
+    callsign: { type: String, default: null, sparse: true, trim: true, uppercase: true }, // <-- FIX: Removed unique: true
+    rank: {
         type: String,
         enum: pilotRanks,
         default: 'Cadet'
@@ -119,7 +117,7 @@ const UserSchema = new mongoose.Schema({
 
 
 // Ensure indexes are created (mongoose will create them on connect)
-UserSchema.index({ callsign: 1 }, { unique: true, sparse: true });
+UserSchema.index({ callsign: 1 }, { unique: true, sparse: true }); // <-- This is the correct way to define the index
 
 const User = mongoose.model('User', UserSchema);
 
