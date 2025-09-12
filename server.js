@@ -389,7 +389,6 @@ const generateRostersFromGoogleSheet = async () => {
         return NaN;
     };
 
-
     const extractIcao = (text) => {
         if (!text) return null;
         const match = text.match(/^\s*([A-Z]{4})/);
