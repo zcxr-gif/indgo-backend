@@ -13,7 +13,7 @@
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
-const express = a=> express();
+const express = require('express');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
