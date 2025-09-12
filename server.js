@@ -186,7 +186,9 @@ const RosterSchema = new mongoose.Schema({
         flightNumber: { type: String, required: true, trim: true },
         departure: { type: String, required: true, uppercase: true, trim: true },
         arrival: { type: String, required: true, uppercase: true, trim: true },
-        flightTime: { type: Number, required: true, min: 0.1 } // Estimated time for each leg
+        aircraft: { type: String, required: true, trim: true },
+        // This field stores the flight time for EACH individual leg
+        flightTime: { type: Number, required: true, min: 0.1 } 
     }],
     totalFlightTime: { type: Number, required: true, min: 0 },
     isAvailable: { type: Boolean, default: true },
@@ -341,8 +343,7 @@ const deleteRowFromGoogleSheet = async (callsign) => {
     }
 };
 
-// --- NEW: AUTOMATED ROSTER GENERATION LOGIC ---
-// --- NEW: AUTOMATED ROSTER GENERATION LOGIC (REVISED FOR COMPLEX SHEETS) ---
+// --- AUTOMATED ROSTER GENERATION LOGIC (PULLS AIRCRAFT & FLIGHT TIME PER LEG) ---
 const generateRostersFromGoogleSheet = async () => {
     console.log('Starting automated roster generation...');
     const routesSheetURL = process.env.ROUTES_SHEET_URL;
@@ -351,7 +352,6 @@ const generateRostersFromGoogleSheet = async () => {
         throw new Error('Server configuration missing for roster generation.');
     }
 
-    // Helper function to convert "2h 10m" style time to a decimal number (e.g., 2.17)
     const convertTimeToDecimal = (timeStr) => {
         if (!timeStr || typeof timeStr !== 'string') return NaN;
         let totalHours = 0;
@@ -362,7 +362,6 @@ const generateRostersFromGoogleSheet = async () => {
         return totalHours;
     };
 
-    // Helper function to extract just the ICAO code
     const extractIcao = (text) => {
         if (!text) return null;
         const match = text.match(/^\s*([A-Z]{4})/);
@@ -371,16 +370,13 @@ const generateRostersFromGoogleSheet = async () => {
 
     try {
         const response = await axios.get(routesSheetURL);
-        // 1. Parse the entire sheet as raw rows, without assuming a header row.
         const parsed = Papa.parse(response.data, { header: false });
         const allRows = parsed.data;
 
-        // 2. Dynamically find the first valid header row and map column positions.
-        const requiredHeaders = ['Callsign', 'Origin', 'Destination', 'Flight Time'];
+        const requiredHeaders = ['Callsign', 'Origin', 'Destination', 'Flight Time', 'Aircraft'];
         let columnMap = {};
         let headerRowFound = false;
 
-        // Find the first row that looks like a real header
         for (const row of allRows) {
             if (requiredHeaders.every(h => row.some(cell => cell.trim() === h))) {
                 row.forEach((header, index) => {
@@ -389,37 +385,37 @@ const generateRostersFromGoogleSheet = async () => {
                     }
                 });
                 headerRowFound = true;
-                break; // Stop after finding the first valid header
+                break;
             }
         }
 
         if (!headerRowFound) {
-            throw new Error('Could not find a valid header row containing Callsign, Origin, etc. in the Google Sheet.');
+            throw new Error('Could not find a valid header row containing Callsign, Aircraft, etc. in the Google Sheet.');
         }
 
-        // 3. Iterate over all rows and convert only valid data rows into "legs".
         const allLegs = allRows
             .map(row => {
+                // This function gets the flight time for the current row (leg)
                 const flightTimeDecimal = convertTimeToDecimal(row[columnMap['Flight Time']]);
                 
+                // The complete leg object, including its specific aircraft and flight time
                 const leg = {
                     flightNumber: row[columnMap['Callsign']]?.trim(),
                     departure: extractIcao(row[columnMap['Origin']]),
                     arrival: extractIcao(row[columnMap['Destination']]),
-                    flightTime: flightTimeDecimal
+                    aircraft: row[columnMap['Aircraft']]?.trim(),
+                    flightTime: flightTimeDecimal 
                 };
                 return leg;
             })
-            // 4. Filter out all junk rows (titles, empty lines, repeated headers).
-            .filter(leg => leg.flightNumber && leg.departure && leg.arrival && !isNaN(leg.flightTime) && leg.flightTime > 0);
+            // Filter out any rows that are missing critical data
+            .filter(leg => leg.flightNumber && leg.departure && leg.arrival && leg.aircraft && !isNaN(leg.flightTime) && leg.flightTime > 0);
 
 
         if (allLegs.length === 0) {
             console.warn('No valid legs found in the Google Sheet after filtering.');
             return { created: 0, legsFound: 0 };
         }
-
-        // --- The rest of the function remains the same ---
 
         const legsByDeparture = allLegs.reduce((acc, leg) => {
             if (!acc[leg.departure]) acc[leg.departure] = [];
@@ -431,12 +427,12 @@ const generateRostersFromGoogleSheet = async () => {
         for (const hub of ROSTER_HUBS) {
             if (!legsByDeparture[hub]) continue;
 
-            for (let i = 0; i < 5; i++) { // Attempt to create 5 rosters per hub
+            for (let i = 0; i < 5; i++) { 
                 const rosterLegs = [];
                 let currentAirport = hub;
                 let totalTime = 0;
                 const usedFlightNumbers = new Set();
-                const legCount = Math.floor(Math.random() * 3) + 2; // 2 to 4 legs
+                const legCount = Math.floor(Math.random() * 3) + 2;
 
                 for (let j = 0; j < legCount; j++) {
                     const possibleNextLegs = (legsByDeparture[currentAirport] || []).filter(
@@ -447,6 +443,7 @@ const generateRostersFromGoogleSheet = async () => {
                     const nextLeg = possibleNextLegs[Math.floor(Math.random() * possibleNextLegs.length)];
                     if ((totalTime + nextLeg.flightTime) > MAX_DAILY_FLIGHT_HOURS) break;
 
+                    // The 'nextLeg' object contains the individual flight time and is added to the roster
                     rosterLegs.push(nextLeg);
                     totalTime += nextLeg.flightTime;
                     currentAirport = nextLeg.arrival;
@@ -457,7 +454,7 @@ const generateRostersFromGoogleSheet = async () => {
                     generatedRosters.push({
                         name: `${hub} Sector Duty #${i + 1}`,
                         hub,
-                        legs: rosterLegs,
+                        legs: rosterLegs, // This array now contains legs with all their details
                         totalFlightTime: totalTime,
                         isGenerated: true,
                         isAvailable: true,
@@ -862,7 +859,6 @@ app.post('/api/rosters', authMiddleware, isRouteManager, async (req, res) => {
         const log = new AdminLog({ adminUser: req.user._id, action: 'ROSTER_CREATE', details: `Created new roster: "${name}"` });
         await log.save();
         
-        // OPTIMIZATION: Return the full new roster object
         res.status(201).json(newRoster);
     } catch (error) {
         res.status(500).json({ message: 'Server error while creating roster.' });
@@ -990,7 +986,6 @@ app.post('/api/users', authMiddleware, isAdmin, async (req, res) => {
             await updateGoogleSheet({ callsign: normalizedCallsign, name: user.name, rank: user.rank, flightHours: user.flightHours || 0 });
         }
         
-        // OPTIMIZATION: Return the full new user object, excluding the password
         const userResponse = user.toObject();
         delete userResponse.password;
         return res.status(201).json(userResponse);
