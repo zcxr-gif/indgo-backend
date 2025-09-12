@@ -1,13 +1,15 @@
 // server.js (Fully Merged & Updated)
-// - Automated Roster Generation from a separate Google Sheet.
+// - Automated Roster Generation now reads from TWO Google Sheets simultaneously:
+//   1. The primary routes sheet (for regular flights).
+//   2. The codeshare routes sheet (for partner flights).
+// - NO separate import step needed. Roster generation pulls all data in real-time.
 // - Strict Flight & Duty Time Limitations (FTPL) engine.
 // - Location-aware roster availability for pilots.
 // - Robust Google Sheets function with dynamic column mapping.
 // - Advanced PIREP system with a staff review workflow.
 // - Automatic rank promotions upon PIREP approval.
 // - Cascade delete functionality for users and their associated data.
-// - NEW: Codeshare route importer from a multi-sheet Google Sheet.
-// - NEW: Personalized roster suggestions based on pilot's last duty/flight location.
+// - Personalized roster suggestions based on pilot's last duty/flight location.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -191,7 +193,7 @@ const RosterSchema = new mongoose.Schema({
         arrival: { type: String, required: true, uppercase: true, trim: true },
         aircraft: { type: String, required: true, trim: true },
         // This field stores the flight time for EACH individual leg
-        flightTime: { type: Number, required: true, min: 0.1 } 
+        flightTime: { type: Number, required: true, min: 0.1 }
     }],
     totalFlightTime: { type: Number, required: true, min: 0 },
     isAvailable: { type: Boolean, default: true },
@@ -200,23 +202,6 @@ const RosterSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 });
 const Roster = mongoose.model('Roster', RosterSchema);
-
-// --- Codeshare Route Schema (for multi-sheet import) ---
-const CodeshareRouteSchema = new mongoose.Schema({
-    flightNumber: { type: String, required: true, trim: true },
-    operator: { type: String, required: true, trim: true },
-    rankUnlock: { type: String, required: true, trim: true },
-    departureIcao: { type: String, required: true, uppercase: true, trim: true },
-    arrivalIcao: { type: String, required: true, uppercase: true, trim: true },
-    aircraft: { type: String, required: true, trim: true },
-    flightTime: { type: Number, required: true, min: 0.1 },
-    distance: { type: Number, required: true, min: 0 }
-});
-// Add indexes for faster querying by departure or arrival
-CodeshareRouteSchema.index({ departureIcao: 1 });
-CodeshareRouteSchema.index({ arrivalIcao: 1 });
-
-const CodeshareRoute = mongoose.model('CodeshareRoute', CodeshareRouteSchema);
 
 
 // 6. HELPER FUNCTIONS & MIDDLEWARE
@@ -363,15 +348,12 @@ const deleteRowFromGoogleSheet = async (callsign) => {
     }
 };
 
-// --- AUTOMATED ROSTER GENERATION LOGIC (PULLS AIRCRAFT & FLIGHT TIME PER LEG) ---
+// --- (UPGRADED) AUTOMATED ROSTER GENERATION LOGIC ---
+// This function now reads from BOTH the primary routes sheet AND the codeshare sheet in real-time.
 const generateRostersFromGoogleSheet = async () => {
-    console.log('Starting automated roster generation...');
-    const routesSheetURL = process.env.ROUTES_SHEET_URL;
-    if (!routesSheetURL) {
-        console.error('ROUTES_SHEET_URL is not defined in .env file. Aborting roster generation.');
-        throw new Error('Server configuration missing for roster generation.');
-    }
+    console.log('Starting automated roster generation from all sources...');
 
+    // Helper functions for parsing data
     const convertTimeToDecimal = (timeStr) => {
         if (!timeStr || typeof timeStr !== 'string') return NaN;
         let totalHours = 0;
@@ -388,240 +370,175 @@ const generateRostersFromGoogleSheet = async () => {
         return match ? match[1] : null;
     };
 
+    let allPrimaryLegs = [];
+    let allCodeshareLegs = [];
+
+    // --- PART 1: FETCH PRIMARY ROUTES (FROM CSV LINK) ---
     try {
-        const response = await axios.get(routesSheetURL);
-        const parsed = Papa.parse(response.data, { header: false });
-        const allRows = parsed.data;
+        const routesSheetURL = process.env.ROUTES_SHEET_URL;
+        if (!routesSheetURL) {
+            console.warn('ROUTES_SHEET_URL is not defined. Skipping primary routes.');
+        } else {
+            console.log('Fetching primary routes from CSV URL...');
+            const response = await axios.get(routesSheetURL);
+            const parsed = Papa.parse(response.data, { header: false });
+            const allRows = parsed.data;
+            const requiredHeaders = ['Callsign', 'Origin', 'Destination', 'Flight Time', 'Aircraft'];
+            let columnMap = {};
+            let headerRowFound = false;
 
-        const requiredHeaders = ['Callsign', 'Origin', 'Destination', 'Flight Time', 'Aircraft'];
-        let columnMap = {};
-        let headerRowFound = false;
-
-        for (const row of allRows) {
-            if (requiredHeaders.every(h => row.some(cell => cell.trim() === h))) {
-                row.forEach((header, index) => {
-                    if (requiredHeaders.includes(header.trim())) {
-                        columnMap[header.trim()] = index;
-                    }
-                });
-                headerRowFound = true;
-                break;
+            for (const row of allRows) {
+                if (requiredHeaders.every(h => row.some(cell => cell.trim() === h))) {
+                    row.forEach((header, index) => { columnMap[header.trim()] = index; });
+                    headerRowFound = true;
+                    break;
+                }
             }
-        }
 
-        if (!headerRowFound) {
-            throw new Error('Could not find a valid header row containing Callsign, Aircraft, etc. in the Google Sheet.');
-        }
+            if (!headerRowFound) throw new Error('Could not find a valid header row in the primary routes sheet.');
 
-        const allLegs = allRows
-            .map(row => {
-                // This function gets the flight time for the current row (leg)
-                const flightTimeDecimal = convertTimeToDecimal(row[columnMap['Flight Time']]);
-                
-                // The complete leg object, including its specific aircraft and flight time
-                const leg = {
+            allPrimaryLegs = allRows
+                .map(row => ({
                     flightNumber: row[columnMap['Callsign']]?.trim(),
                     departure: extractIcao(row[columnMap['Origin']]),
                     arrival: extractIcao(row[columnMap['Destination']]),
                     aircraft: row[columnMap['Aircraft']]?.trim(),
-                    flightTime: flightTimeDecimal 
-                };
-                return leg;
-            })
-            // Filter out any rows that are missing critical data
-            .filter(leg => leg.flightNumber && leg.departure && leg.arrival && leg.aircraft && !isNaN(leg.flightTime) && leg.flightTime > 0);
-
-
-        if (allLegs.length === 0) {
-            console.warn('No valid legs found in the Google Sheet after filtering.');
-            return { created: 0, legsFound: 0 };
+                    flightTime: convertTimeToDecimal(row[columnMap['Flight Time']])
+                }))
+                .filter(leg => leg.flightNumber && leg.departure && leg.arrival && leg.aircraft && !isNaN(leg.flightTime) && leg.flightTime > 0);
+            console.log(`Found ${allPrimaryLegs.length} valid primary route legs.`);
         }
-
-        const legsByDeparture = allLegs.reduce((acc, leg) => {
-            if (!acc[leg.departure]) acc[leg.departure] = [];
-            acc[leg.departure].push(leg);
-            return acc;
-        }, {});
-
-        const generatedRosters = [];
-        for (const hub of ROSTER_HUBS) {
-            if (!legsByDeparture[hub]) continue;
-
-            for (let i = 0; i < 5; i++) { 
-                const rosterLegs = [];
-                let currentAirport = hub;
-                let totalTime = 0;
-                const usedFlightNumbers = new Set();
-                const legCount = Math.floor(Math.random() * 3) + 2;
-
-                for (let j = 0; j < legCount; j++) {
-                    const possibleNextLegs = (legsByDeparture[currentAirport] || []).filter(
-                        l => !usedFlightNumbers.has(l.flightNumber)
-                    );
-                    if (possibleNextLegs.length === 0) break;
-
-                    const nextLeg = possibleNextLegs[Math.floor(Math.random() * possibleNextLegs.length)];
-                    if ((totalTime + nextLeg.flightTime) > MAX_DAILY_FLIGHT_HOURS) break;
-
-                    // The 'nextLeg' object contains the individual flight time and is added to the roster
-                    rosterLegs.push(nextLeg);
-                    totalTime += nextLeg.flightTime;
-                    currentAirport = nextLeg.arrival;
-                    usedFlightNumbers.add(nextLeg.flightNumber);
-                }
-
-                if (rosterLegs.length >= 2) {
-                    generatedRosters.push({
-                        name: `${hub} Sector Duty #${i + 1}`,
-                        hub,
-                        legs: rosterLegs, // This array now contains legs with all their details
-                        totalFlightTime: totalTime,
-                        isGenerated: true,
-                        isAvailable: true,
-                    });
-                }
-            }
-        }
-
-        if (generatedRosters.length > 0) {
-            await Roster.deleteMany({ isGenerated: true });
-            await Roster.insertMany(generatedRosters);
-            console.log(`Successfully generated and saved ${generatedRosters.length} new rosters.`);
-        }
-        return { created: generatedRosters.length, legsFound: allLegs.length };
     } catch (error) {
-        console.error('Failed to generate rosters from Google Sheet:', error);
-        throw new Error('Error during automated roster generation.');
-    }
-};
-
-// --- AUTOMATED CODESHARE ROUTE IMPORT LOGIC (MULTI-SHEET) ---
-const importCodeshareRoutesFromSheet = async () => {
-    console.log('Starting codeshare route import...');
-    const spreadsheetId = process.env.CODESHARE_SHEET_ID;
-    if (!spreadsheetId) {
-        console.error('CODESHARE_SHEET_ID is not defined in .env file. Aborting import.');
-        throw new Error('Server configuration missing for codeshare route import.');
+        console.error('Failed to process primary routes sheet:', error.message);
+        // We can continue without these, so we don't throw an error for the whole process
     }
 
-    // Helper to convert time strings like "1h 30m" to a decimal (e.g., 1.5)
-    const convertTimeToDecimal = (timeStr) => {
-        if (!timeStr || typeof timeStr !== 'string') return NaN;
-        let totalHours = 0;
-        const hourMatch = timeStr.match(/(\d+)\s*h/);
-        const minMatch = timeStr.match(/(\d+)\s*m/);
-        if (hourMatch) totalHours += parseInt(hourMatch[1], 10);
-        if (minMatch) totalHours += parseInt(minMatch[1], 10) / 60;
-        return totalHours;
-    };
-
-    // Helper to extract a 4-letter ICAO code
-    const extractIcao = (text) => {
-        if (!text) return null;
-        const match = text.match(/^\s*([A-Z]{4})/);
-        return match ? match[1] : null;
-    };
-
+    // --- PART 2: FETCH CODESHARE ROUTES (FROM GOOGLE SHEETS API) ---
     try {
-        const auth = new google.auth.GoogleAuth({
-            keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
-            scopes: 'https://www.googleapis.com/auth/spreadsheets.readonly',
-        });
-        const sheets = google.sheets({ version: 'v4', auth });
-
-        // 1. Get metadata to find all sheet (tab) names
-        const metaData = await sheets.spreadsheets.get({ spreadsheetId });
-        const sheetNames = metaData.data.sheets.map(sheet => sheet.properties.title);
-        console.log(`Found sheets: ${sheetNames.join(', ')}`);
-
-        const allRoutes = [];
-        const requiredHeaders = [
-            'Flight No.', 'Operator', 'Rank Unlock', 'Departure ICAO',
-            'Arrival ICAO', 'Aircraft(s)', 'Avg. Flight Time', 'Route Distance (nm)'
-        ];
-
-        // 2. Loop through each sheet
-        for (const sheetName of sheetNames) {
-            console.log(`Processing sheet: "${sheetName}"...`);
-            const response = await sheets.spreadsheets.values.get({
-                spreadsheetId,
-                range: sheetName, // Process the entire sheet
-            });
-
-            const rows = response.data.values;
-            if (!rows || rows.length === 0) {
-                console.log(`Sheet "${sheetName}" is empty. Skipping.`);
-                continue;
-            }
-
-            // 3. Find the header row and map columns dynamically
-            let headerRowIndex = -1;
-            const columnMap = {};
-            for (let i = 0; i < rows.length; i++) {
-                const row = rows[i];
-                const foundHeaders = new Set();
-                row.forEach((cell, index) => {
-                    const trimmedCell = cell.trim();
-                    if (requiredHeaders.includes(trimmedCell)) {
-                        columnMap[trimmedCell] = index;
-                        foundHeaders.add(trimmedCell);
-                    }
-                });
-                if (foundHeaders.size === requiredHeaders.length) {
-                    headerRowIndex = i;
-                    console.log(`Header row found at index ${i} in sheet "${sheetName}".`);
-                    break;
-                }
-            }
-            
-            if (headerRowIndex === -1) {
-                console.warn(`Could not find a valid header row in sheet "${sheetName}". Skipping.`);
-                continue;
-            }
-
-            // 4. Process all rows after the header row
-            for (let i = headerRowIndex + 1; i < rows.length; i++) {
-                const row = rows[i];
-                const departureIcao = extractIcao(row[columnMap['Departure ICAO']]);
-                const arrivalIcao = extractIcao(row[columnMap['Arrival ICAO']]);
-                const flightTime = convertTimeToDecimal(row[columnMap['Avg. Flight Time']]);
-                const distance = parseFloat(String(row[columnMap['Route Distance (nm)']]).replace(/,/g, ''));
-
-                // Basic validation to skip empty/invalid rows
-                if (!departureIcao || !arrivalIcao || isNaN(flightTime) || isNaN(distance)) {
-                    continue;
-                }
-
-                allRoutes.push({
-                    flightNumber: row[columnMap['Flight No.']]?.trim(),
-                    operator: row[columnMap['Operator']]?.trim(),
-                    rankUnlock: row[columnMap['Rank Unlock']]?.trim(),
-                    departureIcao: departureIcao,
-                    arrivalIcao: arrivalIcao,
-                    aircraft: row[columnMap['Aircraft(s)']]?.trim(),
-                    flightTime: flightTime,
-                    distance: distance
-                });
-            }
-        }
-
-        // 5. Update the database
-        if (allRoutes.length > 0) {
-            console.log(`Found a total of ${allRoutes.length} valid codeshare routes. Updating database...`);
-            // Clear the existing collection and insert the fresh data
-            await CodeshareRoute.deleteMany({});
-            await CodeshareRoute.insertMany(allRoutes);
-            console.log('Successfully updated the codeshare routes in the database.');
+        const spreadsheetId = process.env.CODESHARE_SHEET_ID;
+        if (!spreadsheetId) {
+            console.warn('CODESHARE_SHEET_ID is not defined. Skipping codeshare routes.');
         } else {
-            console.log('No valid codeshare routes were found to import.');
+            console.log('Fetching codeshare routes from Google Sheet...');
+            const auth = new google.auth.GoogleAuth({
+                keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+                scopes: 'https://www.googleapis.com/auth/spreadsheets.readonly',
+            });
+            const sheets = google.sheets({ version: 'v4', auth });
+
+            const metaData = await sheets.spreadsheets.get({ spreadsheetId });
+            const sheetNames = metaData.data.sheets.map(sheet => sheet.properties.title);
+            const requiredHeaders = ['Flight No.', 'Departure ICAO', 'Arrival ICAO', 'Aircraft(s)', 'Avg. Flight Time'];
+
+            for (const sheetName of sheetNames) {
+                const response = await sheets.spreadsheets.values.get({ spreadsheetId, range: sheetName });
+                const rows = response.data.values;
+                if (!rows || rows.length === 0) continue;
+
+                let headerRowIndex = -1;
+                const columnMap = {};
+                for (let i = 0; i < rows.length; i++) {
+                    const row = rows[i];
+                    const foundHeaders = new Set();
+                    row.forEach((cell, index) => {
+                        const trimmedCell = cell.trim();
+                        if (requiredHeaders.includes(trimmedCell)) {
+                            columnMap[trimmedCell] = index;
+                            foundHeaders.add(trimmedCell);
+                        }
+                    });
+                    if (foundHeaders.size >= requiredHeaders.length) {
+                        headerRowIndex = i;
+                        break;
+                    }
+                }
+
+                if (headerRowIndex === -1) continue;
+
+                for (let i = headerRowIndex + 1; i < rows.length; i++) {
+                    const row = rows[i];
+                    const departureIcao = extractIcao(row[columnMap['Departure ICAO']]);
+                    const arrivalIcao = extractIcao(row[columnMap['Arrival ICAO']]);
+                    const flightTime = convertTimeToDecimal(row[columnMap['Avg. Flight Time']]);
+
+                    if (departureIcao && arrivalIcao && !isNaN(flightTime) && flightTime > 0) {
+                        allCodeshareLegs.push({
+                            flightNumber: row[columnMap['Flight No.']]?.trim(),
+                            departure: departureIcao,
+                            arrival: arrivalIcao,
+                            aircraft: row[columnMap['Aircraft(s)']]?.trim(),
+                            flightTime: flightTime
+                        });
+                    }
+                }
+            }
+            console.log(`Found ${allCodeshareLegs.length} valid codeshare route legs.`);
         }
-
-        return { imported: allRoutes.length, sheetsProcessed: sheetNames.length };
-
     } catch (error) {
-        console.error('Failed to import codeshare routes from Google Sheet:', error);
-        throw new Error('Error during automated codeshare route import.');
+        console.error('Failed to process codeshare routes sheet:', error.message);
+        // We can continue without these as well
     }
+
+    // --- PART 3: COMBINE ROUTES AND BUILD ROSTERS ---
+    const combinedLegs = [...allPrimaryLegs, ...allCodeshareLegs];
+    console.log(`Total available legs for roster generation: ${combinedLegs.length}`);
+
+    if (combinedLegs.length === 0) {
+        console.warn('No valid legs found from any source. No rosters will be generated.');
+        return { created: 0, legsFound: 0 };
+    }
+
+    const legsByDeparture = combinedLegs.reduce((acc, leg) => {
+        if (!acc[leg.departure]) acc[leg.departure] = [];
+        acc[leg.departure].push(leg);
+        return acc;
+    }, {});
+
+    const generatedRosters = [];
+    for (const hub of ROSTER_HUBS) {
+        if (!legsByDeparture[hub]) continue;
+
+        for (let i = 0; i < 5; i++) {
+            const rosterLegs = [];
+            let currentAirport = hub;
+            let totalTime = 0;
+            const usedFlightNumbers = new Set();
+            const legCount = Math.floor(Math.random() * 3) + 2;
+
+            for (let j = 0; j < legCount; j++) {
+                const possibleNextLegs = (legsByDeparture[currentAirport] || []).filter(
+                    l => !usedFlightNumbers.has(l.flightNumber)
+                );
+                if (possibleNextLegs.length === 0) break;
+
+                const nextLeg = possibleNextLegs[Math.floor(Math.random() * possibleNextLegs.length)];
+                if ((totalTime + nextLeg.flightTime) > MAX_DAILY_FLIGHT_HOURS) break;
+
+                rosterLegs.push(nextLeg);
+                totalTime += nextLeg.flightTime;
+                currentAirport = nextLeg.arrival;
+                usedFlightNumbers.add(nextLeg.flightNumber);
+            }
+
+            if (rosterLegs.length >= 2) {
+                generatedRosters.push({
+                    name: `${hub} Sector Duty #${i + 1}`,
+                    hub,
+                    legs: rosterLegs,
+                    totalFlightTime: totalTime,
+                    isGenerated: true,
+                    isAvailable: true,
+                });
+            }
+        }
+    }
+
+    if (generatedRosters.length > 0) {
+        await Roster.deleteMany({ isGenerated: true });
+        await Roster.insertMany(generatedRosters);
+        console.log(`Successfully generated and saved ${generatedRosters.length} new rosters.`);
+    }
+    return { created: generatedRosters.length, legsFound: combinedLegs.length };
 };
 
 // Rank Promotion Helper
@@ -1054,11 +971,12 @@ app.post('/api/rosters', authMiddleware, isRouteManager, async (req, res) => {
     }
 });
 
+// This endpoint now triggers the new, all-in-one generation function
 app.post('/api/rosters/generate', authMiddleware, isRouteManager, async (req, res) => {
     try {
         const result = await generateRostersFromGoogleSheet();
         res.status(201).json({
-            message: `Roster generation complete. Found ${result.legsFound} legs and created ${result.created} new rosters.`
+            message: `Roster generation complete. Found a total of ${result.legsFound} legs and created ${result.created} new rosters.`
         });
     } catch (error) {
         res.status(500).json({ message: error.message });
@@ -1157,28 +1075,9 @@ app.post('/api/duty/end', authMiddleware, async (req, res) => {
 });
 
 
-// --- CODESHARE ROUTE MANAGEMENT ---
-
-app.post('/api/codeshare/import', authMiddleware, isRouteManager, async (req, res) => {
-    try {
-        const result = await importCodeshareRoutesFromSheet();
-        res.status(200).json({
-            message: `Codeshare import complete. Processed ${result.sheetsProcessed} sheets and imported ${result.imported} routes.`
-        });
-    } catch (error) {
-        res.status(500).json({ message: 'Server error during codeshare import.', error: error.message });
-    }
-});
-
-app.get('/api/codeshare-routes', authMiddleware, async (req, res) => {
-    try {
-        // You can add query-based filtering here later, e.g., ?departure=VIDP
-        const routes = await CodeshareRoute.find({}).sort({ operator: 1, flightNumber: 1 });
-        res.json(routes);
-    } catch (error) {
-        res.status(500).json({ message: 'Server error while fetching codeshare routes.' });
-    }
-});
+// --- CODESHARE ROUTE MANAGEMENT (REMOVED) ---
+// The endpoints `/api/codeshare/import` and `/api/codeshare-routes` are no longer needed
+// as this logic is now handled in real-time by the roster generation function.
 
 
 // --- Admin-Only Routes ---
