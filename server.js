@@ -418,7 +418,16 @@ const generateRostersFromGoogleSheet = async () => {
         console.warn('CODESHARE_SHEET_URLS is not defined. Skipping all codeshare routes.');
     } else {
         const urls = codeshareSheetUrls.split(',');
-        const requiredHeaders = ['Flight No.', 'Departure ICAO', 'Arrival ICAO', 'Aircraft(s)', 'Avg. Flight Time'];
+        
+        // Define aliases for each required field. Case is ignored.
+        const headerAliases = {
+            flightNumber: ['Flight No.', 'Flight Number', 'Callsign'],
+            departure: ['Departure ICAO', 'Departure', 'Origin', 'From'],
+            arrival: ['Arrival ICAO', 'Arrival', 'Destination', 'To'],
+            aircraft: ['Aircraft(s)', 'Aircraft', 'Plane'],
+            flightTime: ['Avg. Flight Time', 'Flight Time', 'Duration']
+        };
+        const canonicalKeys = Object.keys(headerAliases); // ['flightNumber', 'departure', etc.]
 
         for (const url of urls) {
             try {
@@ -430,33 +439,45 @@ const generateRostersFromGoogleSheet = async () => {
 
                 let headerRowFound = false;
                 const columnMap = {};
+                
+                // More robust header detection logic
                 for (const row of rows) {
-                    const foundHeaders = new Set();
-                    row.forEach((cell, index) => {
-                        const trimmedCell = cell.trim();
-                        if (requiredHeaders.includes(trimmedCell)) {
-                            columnMap[trimmedCell] = index;
-                            foundHeaders.add(trimmedCell);
+                    const tempMap = {};
+                    
+                    row.forEach((headerCell, index) => {
+                        const trimmedHeader = headerCell.trim().toLowerCase();
+                        if (!trimmedHeader) return;
+                        
+                        for (const key of canonicalKeys) {
+                            // Find an alias that matches the current header cell
+                            if (headerAliases[key].some(alias => alias.toLowerCase() === trimmedHeader)) {
+                                tempMap[key] = index; // Map our internal key (e.g., 'departure') to the column index
+                                break; 
+                            }
                         }
                     });
-                    if (foundHeaders.size >= requiredHeaders.length) {
+
+                    // If we found all the headers we need, this is the correct header row
+                    if (Object.keys(tempMap).length === canonicalKeys.length) {
+                        Object.assign(columnMap, tempMap);
                         headerRowFound = true;
                         break;
                     }
                 }
 
                 if (!headerRowFound) {
-                    console.warn(`Could not find a valid header row in codeshare sheet: ${url}`);
+                    console.warn(`Could not find a valid header row with all required columns in codeshare sheet: ${url}`);
                     continue;
                 }
                 
                 const legsFromSheet = rows
                     .map(row => {
-                        const departureIcao = extractIcao(row[columnMap['Departure ICAO']]);
-                        const arrivalIcao = extractIcao(row[columnMap['Arrival ICAO']]);
-                        const flightTime = convertTimeToDecimal(row[columnMap['Avg. Flight Time']]);
-                        const flightNumber = row[columnMap['Flight No.']]?.trim();
-                        const aircraft = row[columnMap['Aircraft(s)']]?.trim();
+                        // Use the canonical keys to access data
+                        const departureIcao = extractIcao(row[columnMap.departure]);
+                        const arrivalIcao = extractIcao(row[columnMap.arrival]);
+                        const flightTime = convertTimeToDecimal(row[columnMap.flightTime]);
+                        const flightNumber = row[columnMap.flightNumber]?.trim();
+                        const aircraft = row[columnMap.aircraft]?.trim();
                         
                         if (departureIcao && arrivalIcao && flightNumber && aircraft && !isNaN(flightTime) && flightTime > 0) {
                             return { flightNumber, departure: departureIcao, arrival: arrivalIcao, aircraft, flightTime };
@@ -1070,12 +1091,6 @@ app.post('/api/duty/end', authMiddleware, async (req, res) => {
         res.status(500).json({ message: 'Server error while ending duty.' });
     }
 });
-
-
-// --- CODESHARE ROUTE MANAGEMENT (REMOVED) ---
-// The endpoints `/api/codeshare/import` and `/api/codeshare-routes` are no longer needed
-// as this logic is now handled in real-time by the roster generation function.
-
 
 // --- Admin-Only Routes ---
 app.post('/api/users', authMiddleware, isAdmin, async (req, res) => {
