@@ -85,10 +85,46 @@ const MAX_DAILY_FLIGHT_HOURS = 10;
 const MAX_MONTHLY_FLIGHT_HOURS = 100;
 const ROSTER_HUBS = ['VIDP', 'VABB', 'VOBL', 'VECC', 'VOMM']; // Primary hubs for roster generation
 
+
+// --- MODIFIED: NEW RANK STRUCTURE ---
+// The array defines the order of ranks from lowest to highest.
 const pilotRanks = [
-    'Cadet', 'Second Officer', 'First Officer',
-    'Senior First Officer', 'Captain', 'Senior Captain'
+    'IndGo Cadet', 'Skyline Observer', 'Route Explorer', 'Skyline Officer',
+    'Command Captain', 'Elite Captain', 'Blue Eagle', 'Line Instructor',
+    'Chief Flight Instructor', 'IndGo SkyMaster', 'Blue Legacy Commander'
 ];
+
+// The object maps each rank to its required flight hours for promotion checks.
+const rankThresholds = {
+    'IndGo Cadet': 0,
+    'Skyline Observer': 50,
+    'Route Explorer': 100,
+    'Skyline Officer': 180,
+    'Command Captain': 300,
+    'Elite Captain': 500,
+    'Blue Eagle': 750,
+    'Line Instructor': 1000,
+    'Chief Flight Instructor': 1400,
+    'IndGo SkyMaster': 1800,
+    'Blue Legacy Commander': 2300
+};
+
+// This new object stores the perks for each rank to be sent to the front-end upon promotion.
+const rankPerks = {
+    'IndGo Cadet': ['Training routes only (Q400, A320)', 'Discord pilot badge'],
+    'Skyline Observer': ['Access to A321/B738 short-haul', 'Eligible for beginner events'],
+    'Route Explorer': ['Medium-haul aircraft access (B38M/A330)', 'Written & Practical Test required'],
+    'Skyline Officer': ['Long-haul unlocks (B787-8/B77L)', 'Written & Practical Test required'],
+    'Command Captain': ['Senior group flight eligibility', 'Command aircraft: B77W, B789'],
+    'Elite Captain': ['Ultra Long Haul access (A350)', 'Written & Practical Test required'],
+    'Blue Eagle': ['A380/B744 heavy ops access', 'Exclusive Discord lounge', 'Written & Practical Test required'],
+    'Line Instructor': ['Can test cadets and mid-rank pilots', 'Route reviewing rights'],
+    'Chief Flight Instructor': ['Manage Line Instructors', 'Crew check and instructor oversight'],
+    'IndGo SkyMaster': ['Access to staff-level decisions', 'Route planning authority'],
+    'Blue Legacy Commander': ['Lifetime elite badge', 'Council-level privileges', 'Ultimate recognition']
+};
+// --- END MODIFICATION ---
+
 
 // --- User Schema (Enhanced for FTPL) ---
 const UserSchema = new mongoose.Schema({
@@ -106,7 +142,9 @@ const UserSchema = new mongoose.Schema({
         default: 'pilot'
     },
     callsign: { type: String, default: null, sparse: true, trim: true, uppercase: true },
-    rank: { type: String, enum: pilotRanks, default: 'Cadet' },
+    // --- MODIFIED: Updated rank enum and default value ---
+    rank: { type: String, enum: pilotRanks, default: 'IndGo Cadet' },
+    // --- END MODIFICATION ---
     flightHours: { type: Number, default: 0 },
     bio: { type: String, default: '' },
     imageUrl: { type: String, default: '' },
@@ -546,14 +584,11 @@ const allUrls = [...primaryUrls, ...codeshareUrls].filter(Boolean);
 };
 
 // Rank Promotion Helper
-const rankThresholds = {
-    'Cadet': 0, 'Second Officer': 10, 'First Officer': 50,
-    'Senior First Officer': 150, 'Captain': 400, 'Senior Captain': 1000
-};
 const checkAndApplyRankUpdate = (pilot) => {
     const currentHours = pilot.flightHours;
     const currentRank = pilot.rank;
     let newRank = currentRank;
+    // Iterates from the highest rank down to find the correct rank for the pilot's hours.
     for (let i = pilotRanks.length - 1; i >= 0; i--) {
         const rankName = pilotRanks[i];
         if (currentHours >= rankThresholds[rankName]) {
@@ -831,7 +866,7 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
 
         // **MERGED**: Update all flight hour counters and pilot location
         pilot.flightHours += pirep.flightTime;
-        pilot.monthlyFlightHours += pirep.flightTime;
+        pilot.monthlyFlightHours += pirep.flightT
         pilot.dailyFlightHours += pirep.flightTime;
         pilot.lastKnownAirport = pirep.arrival; // Update pilot's location
 
@@ -850,11 +885,25 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
             });
         }
         
-        let message = `PIREP approved. ${pilot.name} now has ${pilot.flightHours.toFixed(2)} hours.`;
+        // --- MODIFIED: ENHANCED API RESPONSE FOR PROMOTIONS ---
+        const responsePayload = {
+            message: `PIREP approved. ${pilot.name} now has ${pilot.flightHours.toFixed(2)} hours.`,
+            promotionDetails: null
+        };
+
         if (promotionResult.promoted) {
-            message += ` Congratulations on the promotion to ${promotionResult.rank}!`;
+            const newRank = promotionResult.rank;
+            responsePayload.message += ` Congratulations on the promotion to ${newRank}!`;
+            responsePayload.promotionDetails = {
+                newRank: newRank,
+                flightHoursRequired: rankThresholds[newRank],
+                perks: rankPerks[newRank] || []
+            };
         }
-        res.json({ message });
+        
+        res.json(responsePayload);
+        // --- END MODIFICATION ---
+
     } catch (error) {
         res.status(500).json({ message: 'Server error while approving PIREP.' });
     }
