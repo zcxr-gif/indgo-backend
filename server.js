@@ -7,6 +7,7 @@
 // - Automatic rank promotions upon PIREP approval.
 // - Cascade delete functionality for users and their associated data.
 // - NEW: Codeshare route importer from a multi-sheet Google Sheet.
+// - NEW: Personalized roster suggestions based on pilot's last duty/flight location.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -121,7 +122,8 @@ const UserSchema = new mongoose.Schema({
     dailyFlightHours: { type: Number, default: 0 }, // Resets after a duty period
     monthlyFlightHours: { type: Number, default: 0 },
     lastHourReset: { type: Date, default: Date.now }, // For monthly reset
-    lastKnownAirport: { type: String, uppercase: true, trim: true, default: 'VIDP' } // Pilot's last arrival airport
+    lastKnownAirport: { type: String, uppercase: true, trim: true, default: 'VIDP' }, // Pilot's last arrival airport (from PIREP)
+    lastDutyAirport: { type: String, uppercase: true, trim: true, default: null } // Where the last full duty roster ended
 }, { toJSON: { virtuals: true }, toObject: { virtuals: true } }); // Ensure virtuals are included
 UserSchema.index({ callsign: 1 }, { unique: true, sparse: true });
 const User = mongoose.model('User', UserSchema);
@@ -976,6 +978,8 @@ app.put('/api/users/:userId/rank', authMiddleware, isPilotManager, async (req, r
 
 
 // --- NEW/ENHANCED: ROSTER & DUTY MANAGEMENT ROUTES ---
+
+// General endpoint for browsing rosters, now less critical for individual pilots
 app.get('/api/rosters', authMiddleware, async (req, res) => {
     try {
         const user = await User.findById(req.user._id);
@@ -985,7 +989,7 @@ app.get('/api/rosters', authMiddleware, async (req, res) => {
 
         const rosters = await Roster.find({
             isAvailable: true,
-            'legs.0.departure': departureIcao // Find rosters where the first leg starts at the pilot's location
+            'legs.0.departure': departureIcao 
         }).sort({ createdAt: -1 });
 
         res.json(rosters);
@@ -993,6 +997,44 @@ app.get('/api/rosters', authMiddleware, async (req, res) => {
         res.status(500).json({ message: 'Server error while fetching available rosters.' });
     }
 });
+
+// NEW: Personalized endpoint for individual pilots
+app.get('/api/rosters/my-rosters', authMiddleware, async (req, res) => {
+    try {
+        const user = await User.findById(req.user._id);
+        if (!user) return res.status(404).json({ message: 'User not found.' });
+
+        const fromDutyLocation = user.lastDutyAirport;
+        const fromPirepLocation = user.lastKnownAirport;
+
+        // Use a Set to avoid duplicate locations if they are the same
+        const searchLocations = new Set([fromDutyLocation, fromPirepLocation].filter(Boolean));
+
+        if (searchLocations.size === 0) {
+            // Fallback to a default hub if user has no location data
+            searchLocations.add(ROSTER_HUBS[0]);
+        }
+
+        const availableRosters = await Roster.find({
+            isAvailable: true,
+            'legs.0.departure': { $in: Array.from(searchLocations) }
+        }).sort({ createdAt: -1 });
+
+        res.json({
+            rosters: availableRosters,
+            searchCriteria: {
+                fromLastDuty: fromDutyLocation,
+                fromLastPirep: fromPirepLocation,
+                searched: Array.from(searchLocations)
+            }
+        });
+
+    } catch (error) {
+        console.error("Error fetching personalized rosters:", error);
+        res.status(500).json({ message: 'Server error while fetching your personalized rosters.' });
+    }
+});
+
 
 app.post('/api/rosters', authMiddleware, isRouteManager, async (req, res) => {
     try {
@@ -1028,7 +1070,7 @@ app.delete('/api/rosters/:rosterId', authMiddleware, isRouteManager, async (req,
         const roster = await Roster.findByIdAndDelete(req.params.rosterId);
         if (!roster) return res.status(404).json({ message: 'Roster not found.' });
 
-        const log = new Adminlog({ adminUser: req.user._id, action: 'ROSTER_DELETE', details: `Deleted roster: "${roster.name}" (ID: ${roster._id})` });
+        const log = new AdminLog({ adminUser: req.user._id, action: 'ROSTER_DELETE', details: `Deleted roster: "${roster.name}" (ID: ${roster._id})` });
         await log.save();
 
         res.json({ message: 'Roster deleted successfully.' });
@@ -1082,16 +1124,24 @@ app.post('/api/duty/end', authMiddleware, async (req, res) => {
         if (user.dutyStatus !== 'ON_DUTY') return res.status(400).json({ message: 'You are not currently on duty.' });
         if (!user.currentRoster) return res.status(400).json({ message: 'No roster assigned to end duty.' });
 
-        const rosterLegs = user.currentRoster.legs;
+        const roster = user.currentRoster;
         const filedPireps = await Pirep.find({
             pilot: user._id,
-            'rosterLeg.rosterId': user.currentRoster._id,
+            'rosterLeg.rosterId': roster._id,
             status: { $in: ['APPROVED', 'PENDING'] }
         });
 
-        if (filedPireps.length < rosterLegs.length) {
-            return res.status(400).json({ message: `You must file PIREPs for all roster legs. ${filedPireps.length}/${rosterLegs.length} complete.` });
+        if (filedPireps.length < roster.legs.length) {
+            return res.status(400).json({ message: `You must file PIREPs for all roster legs. ${filedPireps.length}/${roster.legs.length} complete.` });
         }
+        
+        // --- UPDATED LOGIC ---
+        // Find the final leg of the roster to set the last duty airport
+        const finalLeg = roster.legs[roster.legs.length - 1];
+        if (finalLeg) {
+            user.lastDutyAirport = finalLeg.arrival;
+        }
+        // --- END UPDATED LOGIC ---
 
         user.dutyStatus = 'ON_REST';
         user.currentRoster = null;
