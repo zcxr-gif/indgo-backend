@@ -342,29 +342,84 @@ const deleteRowFromGoogleSheet = async (callsign) => {
 };
 
 // --- NEW: AUTOMATED ROSTER GENERATION LOGIC ---
+// --- NEW: AUTOMATED ROSTER GENERATION LOGIC (REVISED FOR COMPLEX SHEETS) ---
 const generateRostersFromGoogleSheet = async () => {
     console.log('Starting automated roster generation...');
-    const routesSheetURL = process.env.ROUTES_SHEET_URL; // e.g., https://docs.google.com/spreadsheets/d/SHEET_ID/export?format=csv
+    const routesSheetURL = process.env.ROUTES_SHEET_URL;
     if (!routesSheetURL) {
         console.error('ROUTES_SHEET_URL is not defined in .env file. Aborting roster generation.');
         throw new Error('Server configuration missing for roster generation.');
     }
 
+    // Helper function to convert "2h 10m" style time to a decimal number (e.g., 2.17)
+    const convertTimeToDecimal = (timeStr) => {
+        if (!timeStr || typeof timeStr !== 'string') return NaN;
+        let totalHours = 0;
+        const hourMatch = timeStr.match(/(\d+)\s*h/);
+        const minMatch = timeStr.match(/(\d+)\s*m/);
+        if (hourMatch) totalHours += parseInt(hourMatch[1], 10);
+        if (minMatch) totalHours += parseInt(minMatch[1], 10) / 60;
+        return totalHours;
+    };
+
+    // Helper function to extract just the ICAO code
+    const extractIcao = (text) => {
+        if (!text) return null;
+        const match = text.match(/^\s*([A-Z]{4})/);
+        return match ? match[1] : null;
+    };
+
     try {
         const response = await axios.get(routesSheetURL);
-        const parsed = Papa.parse(response.data, { header: true });
+        // 1. Parse the entire sheet as raw rows, without assuming a header row.
+        const parsed = Papa.parse(response.data, { header: false });
+        const allRows = parsed.data;
 
-        const allLegs = parsed.data.map(leg => ({
-            flightNumber: leg['Callsign']?.trim(),
-            departure: leg['Origin']?.trim().toUpperCase(),
-            arrival: leg['Destination']?.trim().toUpperCase(),
-            flightTime: parseFloat(leg['Flight Time'])
-        })).filter(leg => leg.flightNumber && leg.departure && leg.arrival && !isNaN(leg.flightTime) && leg.flightTime > 0);
+        // 2. Dynamically find the first valid header row and map column positions.
+        const requiredHeaders = ['Callsign', 'Origin', 'Destination', 'Flight Time'];
+        let columnMap = {};
+        let headerRowFound = false;
+
+        // Find the first row that looks like a real header
+        for (const row of allRows) {
+            if (requiredHeaders.every(h => row.some(cell => cell.trim() === h))) {
+                row.forEach((header, index) => {
+                    if (requiredHeaders.includes(header.trim())) {
+                        columnMap[header.trim()] = index;
+                    }
+                });
+                headerRowFound = true;
+                break; // Stop after finding the first valid header
+            }
+        }
+
+        if (!headerRowFound) {
+            throw new Error('Could not find a valid header row containing Callsign, Origin, etc. in the Google Sheet.');
+        }
+
+        // 3. Iterate over all rows and convert only valid data rows into "legs".
+        const allLegs = allRows
+            .map(row => {
+                const flightTimeDecimal = convertTimeToDecimal(row[columnMap['Flight Time']]);
+                
+                const leg = {
+                    flightNumber: row[columnMap['Callsign']]?.trim(),
+                    departure: extractIcao(row[columnMap['Origin']]),
+                    arrival: extractIcao(row[columnMap['Destination']]),
+                    flightTime: flightTimeDecimal
+                };
+                return leg;
+            })
+            // 4. Filter out all junk rows (titles, empty lines, repeated headers).
+            .filter(leg => leg.flightNumber && leg.departure && leg.arrival && !isNaN(leg.flightTime) && leg.flightTime > 0);
+
 
         if (allLegs.length === 0) {
-            console.warn('No valid legs found in the Google Sheet.');
+            console.warn('No valid legs found in the Google Sheet after filtering.');
             return { created: 0, legsFound: 0 };
         }
+
+        // --- The rest of the function remains the same ---
 
         const legsByDeparture = allLegs.reduce((acc, leg) => {
             if (!acc[leg.departure]) acc[leg.departure] = [];
