@@ -406,9 +406,10 @@ const generateRostersFromGoogleSheet = async () => {
     
     let allLegs = [];
     
-    const primaryUrl = process.env.ROUTES_SHEET_URL;
-    const codeshareUrls = process.env.CODESHARE_SHEET_URLS ? process.env.CODESHARE_SHEET_URLS.split(',') : [];
-    const allUrls = [primaryUrl, ...codeshareUrls].filter(Boolean);
+    const primaryUrls = process.env.ROUTES_SHEET_URL ? process.env.ROUTES_SHEET_URL.split(',') : [];
+const codeshareUrls = process.env.CODESHARE_SHEET_URLS ? process.env.CODESHARE_SHEET_URLS.split(',') : [];
+const allUrls = [...primaryUrls, ...codeshareUrls].filter(Boolean);
+
 
     if (allUrls.length === 0) {
         console.warn('No ROUTES_SHEET_URL or CODESHARE_SHEET_URLS defined. Aborting roster generation.');
