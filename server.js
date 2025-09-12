@@ -121,7 +121,7 @@ const UserSchema = new mongoose.Schema({
     monthlyFlightHours: { type: Number, default: 0 },
     lastHourReset: { type: Date, default: Date.now }, // For monthly reset
     lastKnownAirport: { type: String, uppercase: true, trim: true, default: 'VIDP' } // Pilot's last arrival airport
-});
+}, { toJSON: { virtuals: true }, toObject: { virtuals: true } }); // Ensure virtuals are included
 UserSchema.index({ callsign: 1 }, { unique: true, sparse: true });
 const User = mongoose.model('User', UserSchema);
 
@@ -862,7 +862,8 @@ app.post('/api/rosters', authMiddleware, isRouteManager, async (req, res) => {
         const log = new AdminLog({ adminUser: req.user._id, action: 'ROSTER_CREATE', details: `Created new roster: "${name}"` });
         await log.save();
         
-        res.status(201).json({ message: 'Roster created successfully!', roster: newRoster });
+        // OPTIMIZATION: Return the full new roster object
+        res.status(201).json(newRoster);
     } catch (error) {
         res.status(500).json({ message: 'Server error while creating roster.' });
     }
@@ -884,7 +885,7 @@ app.delete('/api/rosters/:rosterId', authMiddleware, isRouteManager, async (req,
         const roster = await Roster.findByIdAndDelete(req.params.rosterId);
         if (!roster) return res.status(404).json({ message: 'Roster not found.' });
 
-        const log = new AdminLog({ adminUser: req.user._id, action: 'ROSTER_DELETE', details: `Deleted roster: "${roster.name}" (ID: ${roster._id})` });
+        const log = new Adminlog({ adminUser: req.user._id, action: 'ROSTER_DELETE', details: `Deleted roster: "${roster.name}" (ID: ${roster._id})` });
         await log.save();
 
         res.json({ message: 'Roster deleted successfully.' });
@@ -988,7 +989,12 @@ app.post('/api/users', authMiddleware, isAdmin, async (req, res) => {
         if (normalizedCallsign) {
             await updateGoogleSheet({ callsign: normalizedCallsign, name: user.name, rank: user.rank, flightHours: user.flightHours || 0 });
         }
-        return res.status(201).json({ message: 'User created successfully.', userId: user._id });
+        
+        // OPTIMIZATION: Return the full new user object, excluding the password
+        const userResponse = user.toObject();
+        delete userResponse.password;
+        return res.status(201).json(userResponse);
+
     } catch (error) {
         if (error?.code === 11000) {
             return res.status(400).json({ message: `A user with this ${Object.keys(error.keyValue)[0]} already exists.` });
