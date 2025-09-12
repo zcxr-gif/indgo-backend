@@ -353,19 +353,21 @@ const deleteRowFromGoogleSheet = async (callsign) => {
 const generateRostersFromGoogleSheet = async () => {
     console.log('Starting automated roster generation from all sources...');
 
-    // --- KEY CHANGE: This helper function now supports "1:35" and "1h 35m" formats ---
+    // --- KEY CHANGE: This helper function now supports "H:MM", "HH:MM:SS", and "Xh Ym" formats ---
     const convertTimeToDecimal = (timeStr) => {
         if (!timeStr || typeof timeStr !== 'string') return NaN;
 
         const trimmedStr = timeStr.trim();
 
-        // Check for "H:MM" format first (e.g., "1:35")
+        // Check for "H:MM" or "HH:MM:SS" formats
         if (trimmedStr.includes(':')) {
             const parts = trimmedStr.split(':');
-            if (parts.length === 2) {
+            // Accept formats with 2 parts (H:M) or 3 parts (H:M:S)
+            if (parts.length === 2 || parts.length === 3) {
                 const hours = parseInt(parts[0], 10);
                 const minutes = parseInt(parts[1], 10);
                 if (!isNaN(hours) && !isNaN(minutes)) {
+                    // We only care about hours and minutes, so we ignore parts[2] (seconds)
                     return hours + (minutes / 60);
                 }
             }
@@ -383,9 +385,10 @@ const generateRostersFromGoogleSheet = async () => {
             return totalHours;
         }
 
-        // If neither format matches, return NaN to indicate an invalid format
+        // If no format matches, return NaN
         return NaN;
     };
+
 
     const extractIcao = (text) => {
         if (!text) return null;
