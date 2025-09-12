@@ -6,6 +6,7 @@
 // - Advanced PIREP system with a staff review workflow.
 // - Automatic rank promotions upon PIREP approval.
 // - Cascade delete functionality for users and their associated data.
+// - NEW: Codeshare route importer from a multi-sheet Google Sheet.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -197,6 +198,23 @@ const RosterSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 });
 const Roster = mongoose.model('Roster', RosterSchema);
+
+// --- Codeshare Route Schema (for multi-sheet import) ---
+const CodeshareRouteSchema = new mongoose.Schema({
+    flightNumber: { type: String, required: true, trim: true },
+    operator: { type: String, required: true, trim: true },
+    rankUnlock: { type: String, required: true, trim: true },
+    departureIcao: { type: String, required: true, uppercase: true, trim: true },
+    arrivalIcao: { type: String, required: true, uppercase: true, trim: true },
+    aircraft: { type: String, required: true, trim: true },
+    flightTime: { type: Number, required: true, min: 0.1 },
+    distance: { type: Number, required: true, min: 0 }
+});
+// Add indexes for faster querying by departure or arrival
+CodeshareRouteSchema.index({ departureIcao: 1 });
+CodeshareRouteSchema.index({ arrivalIcao: 1 });
+
+const CodeshareRoute = mongoose.model('CodeshareRoute', CodeshareRouteSchema);
 
 
 // 6. HELPER FUNCTIONS & MIDDLEWARE
@@ -472,6 +490,135 @@ const generateRostersFromGoogleSheet = async () => {
     } catch (error) {
         console.error('Failed to generate rosters from Google Sheet:', error);
         throw new Error('Error during automated roster generation.');
+    }
+};
+
+// --- AUTOMATED CODESHARE ROUTE IMPORT LOGIC (MULTI-SHEET) ---
+const importCodeshareRoutesFromSheet = async () => {
+    console.log('Starting codeshare route import...');
+    const spreadsheetId = process.env.CODESHARE_SHEET_ID;
+    if (!spreadsheetId) {
+        console.error('CODESHARE_SHEET_ID is not defined in .env file. Aborting import.');
+        throw new Error('Server configuration missing for codeshare route import.');
+    }
+
+    // Helper to convert time strings like "1h 30m" to a decimal (e.g., 1.5)
+    const convertTimeToDecimal = (timeStr) => {
+        if (!timeStr || typeof timeStr !== 'string') return NaN;
+        let totalHours = 0;
+        const hourMatch = timeStr.match(/(\d+)\s*h/);
+        const minMatch = timeStr.match(/(\d+)\s*m/);
+        if (hourMatch) totalHours += parseInt(hourMatch[1], 10);
+        if (minMatch) totalHours += parseInt(minMatch[1], 10) / 60;
+        return totalHours;
+    };
+
+    // Helper to extract a 4-letter ICAO code
+    const extractIcao = (text) => {
+        if (!text) return null;
+        const match = text.match(/^\s*([A-Z]{4})/);
+        return match ? match[1] : null;
+    };
+
+    try {
+        const auth = new google.auth.GoogleAuth({
+            keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+            scopes: 'https://www.googleapis.com/auth/spreadsheets.readonly',
+        });
+        const sheets = google.sheets({ version: 'v4', auth });
+
+        // 1. Get metadata to find all sheet (tab) names
+        const metaData = await sheets.spreadsheets.get({ spreadsheetId });
+        const sheetNames = metaData.data.sheets.map(sheet => sheet.properties.title);
+        console.log(`Found sheets: ${sheetNames.join(', ')}`);
+
+        const allRoutes = [];
+        const requiredHeaders = [
+            'Flight No.', 'Operator', 'Rank Unlock', 'Departure ICAO',
+            'Arrival ICAO', 'Aircraft(s)', 'Avg. Flight Time', 'Route Distance (nm)'
+        ];
+
+        // 2. Loop through each sheet
+        for (const sheetName of sheetNames) {
+            console.log(`Processing sheet: "${sheetName}"...`);
+            const response = await sheets.spreadsheets.values.get({
+                spreadsheetId,
+                range: sheetName, // Process the entire sheet
+            });
+
+            const rows = response.data.values;
+            if (!rows || rows.length === 0) {
+                console.log(`Sheet "${sheetName}" is empty. Skipping.`);
+                continue;
+            }
+
+            // 3. Find the header row and map columns dynamically
+            let headerRowIndex = -1;
+            const columnMap = {};
+            for (let i = 0; i < rows.length; i++) {
+                const row = rows[i];
+                const foundHeaders = new Set();
+                row.forEach((cell, index) => {
+                    const trimmedCell = cell.trim();
+                    if (requiredHeaders.includes(trimmedCell)) {
+                        columnMap[trimmedCell] = index;
+                        foundHeaders.add(trimmedCell);
+                    }
+                });
+                if (foundHeaders.size === requiredHeaders.length) {
+                    headerRowIndex = i;
+                    console.log(`Header row found at index ${i} in sheet "${sheetName}".`);
+                    break;
+                }
+            }
+            
+            if (headerRowIndex === -1) {
+                console.warn(`Could not find a valid header row in sheet "${sheetName}". Skipping.`);
+                continue;
+            }
+
+            // 4. Process all rows after the header row
+            for (let i = headerRowIndex + 1; i < rows.length; i++) {
+                const row = rows[i];
+                const departureIcao = extractIcao(row[columnMap['Departure ICAO']]);
+                const arrivalIcao = extractIcao(row[columnMap['Arrival ICAO']]);
+                const flightTime = convertTimeToDecimal(row[columnMap['Avg. Flight Time']]);
+                const distance = parseFloat(String(row[columnMap['Route Distance (nm)']]).replace(/,/g, ''));
+
+                // Basic validation to skip empty/invalid rows
+                if (!departureIcao || !arrivalIcao || isNaN(flightTime) || isNaN(distance)) {
+                    continue;
+                }
+
+                allRoutes.push({
+                    flightNumber: row[columnMap['Flight No.']]?.trim(),
+                    operator: row[columnMap['Operator']]?.trim(),
+                    rankUnlock: row[columnMap['Rank Unlock']]?.trim(),
+                    departureIcao: departureIcao,
+                    arrivalIcao: arrivalIcao,
+                    aircraft: row[columnMap['Aircraft(s)']]?.trim(),
+                    flightTime: flightTime,
+                    distance: distance
+                });
+            }
+        }
+
+        // 5. Update the database
+        if (allRoutes.length > 0) {
+            console.log(`Found a total of ${allRoutes.length} valid codeshare routes. Updating database...`);
+            // Clear the existing collection and insert the fresh data
+            await CodeshareRoute.deleteMany({});
+            await CodeshareRoute.insertMany(allRoutes);
+            console.log('Successfully updated the codeshare routes in the database.');
+        } else {
+            console.log('No valid codeshare routes were found to import.');
+        }
+
+        return { imported: allRoutes.length, sheetsProcessed: sheetNames.length };
+
+    } catch (error) {
+        console.error('Failed to import codeshare routes from Google Sheet:', error);
+        throw new Error('Error during automated codeshare route import.');
     }
 };
 
@@ -956,6 +1103,30 @@ app.post('/api/duty/end', authMiddleware, async (req, res) => {
         res.json({ message: 'Duty day completed successfully! You are now on crew rest.' });
     } catch (error) {
         res.status(500).json({ message: 'Server error while ending duty.' });
+    }
+});
+
+
+// --- CODESHARE ROUTE MANAGEMENT ---
+
+app.post('/api/codeshare/import', authMiddleware, isRouteManager, async (req, res) => {
+    try {
+        const result = await importCodeshareRoutesFromSheet();
+        res.status(200).json({
+            message: `Codeshare import complete. Processed ${result.sheetsProcessed} sheets and imported ${result.imported} routes.`
+        });
+    } catch (error) {
+        res.status(500).json({ message: 'Server error during codeshare import.', error: error.message });
+    }
+});
+
+app.get('/api/codeshare-routes', authMiddleware, async (req, res) => {
+    try {
+        // You can add query-based filtering here later, e.g., ?departure=VIDP
+        const routes = await CodeshareRoute.find({}).sort({ operator: 1, flightNumber: 1 });
+        res.json(routes);
+    } catch (error) {
+        res.status(500).json({ message: 'Server error while fetching codeshare routes.' });
     }
 });
 
