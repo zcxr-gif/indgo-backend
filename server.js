@@ -353,15 +353,38 @@ const deleteRowFromGoogleSheet = async (callsign) => {
 const generateRostersFromGoogleSheet = async () => {
     console.log('Starting automated roster generation from all sources...');
 
-    // Helper functions for parsing data remain the same
+    // --- KEY CHANGE: This helper function now supports "1:35" and "1h 35m" formats ---
     const convertTimeToDecimal = (timeStr) => {
         if (!timeStr || typeof timeStr !== 'string') return NaN;
-        let totalHours = 0;
-        const hourMatch = timeStr.match(/(\d+)\s*h/);
-        const minMatch = timeStr.match(/(\d+)\s*m/);
-        if (hourMatch) totalHours += parseInt(hourMatch[1], 10);
-        if (minMatch) totalHours += parseInt(minMatch[1], 10) / 60;
-        return totalHours;
+
+        const trimmedStr = timeStr.trim();
+
+        // Check for "H:MM" format first (e.g., "1:35")
+        if (trimmedStr.includes(':')) {
+            const parts = trimmedStr.split(':');
+            if (parts.length === 2) {
+                const hours = parseInt(parts[0], 10);
+                const minutes = parseInt(parts[1], 10);
+                if (!isNaN(hours) && !isNaN(minutes)) {
+                    return hours + (minutes / 60);
+                }
+            }
+        }
+
+        // Fallback to check for "Xh Ym" format (e.g., "1h 35m")
+        const hourMatch = trimmedStr.match(/(\d+)\s*h/);
+        const minMatch = trimmedStr.match(/(\d+)\s*m/);
+
+        // Only proceed if at least one of the parts is found
+        if (hourMatch || minMatch) {
+            let totalHours = 0;
+            if (hourMatch) totalHours += parseInt(hourMatch[1], 10);
+            if (minMatch) totalHours += parseInt(minMatch[1], 10) / 60;
+            return totalHours;
+        }
+
+        // If neither format matches, return NaN to indicate an invalid format
+        return NaN;
     };
 
     const extractIcao = (text) => {
@@ -370,8 +393,6 @@ const generateRostersFromGoogleSheet = async () => {
         return match ? match[1] : null;
     };
 
-    // --- KEY CHANGE: Define aliases for ALL route types, not just codeshare ---
-    // This makes the parsing logic universal and more robust.
     const headerAliases = {
         flightNumber: ['Flight No.', 'Flight Number', 'Callsign'],
         departure: ['Departure ICAO', 'Departure', 'Origin', 'From'],
@@ -379,21 +400,19 @@ const generateRostersFromGoogleSheet = async () => {
         aircraft: ['Aircraft(s)', 'Aircraft', 'Plane'],
         flightTime: ['Avg. Flight Time', 'Flight Time', 'Duration']
     };
-    const canonicalKeys = Object.keys(headerAliases); // ['flightNumber', 'departure', etc.]
+    const canonicalKeys = Object.keys(headerAliases);
     
     let allLegs = [];
     
-    // --- KEY CHANGE: Combine all sheet URLs into a single list for processing ---
     const primaryUrl = process.env.ROUTES_SHEET_URL;
     const codeshareUrls = process.env.CODESHARE_SHEET_URLS ? process.env.CODESHARE_SHEET_URLS.split(',') : [];
-    const allUrls = [primaryUrl, ...codeshareUrls].filter(Boolean); // Filter out any empty/undefined URLs
+    const allUrls = [primaryUrl, ...codeshareUrls].filter(Boolean);
 
     if (allUrls.length === 0) {
         console.warn('No ROUTES_SHEET_URL or CODESHARE_SHEET_URLS defined. Aborting roster generation.');
         return { created: 0, legsFound: 0 };
     }
 
-    // Loop through every provided sheet URL
     for (const url of allUrls) {
         try {
             console.log(`Fetching routes from: ${url.substring(0, 80)}...`);
@@ -406,7 +425,6 @@ const generateRostersFromGoogleSheet = async () => {
                 continue;
             }
 
-            // --- KEY CHANGE: Intelligently find the header row and its index ---
             let headerRowIndex = -1;
             let columnMap = {};
 
@@ -430,7 +448,7 @@ const generateRostersFromGoogleSheet = async () => {
                     columnMap = tempMap;
                     headerRowIndex = i;
                     console.log(`- Found valid header row at index ${i}.`);
-                    break; // Stop searching once we find a valid header
+                    break;
                 }
             }
 
@@ -439,7 +457,6 @@ const generateRostersFromGoogleSheet = async () => {
                 continue;
             }
 
-            // --- KEY CHANGE: Slice the array to get ONLY the data rows ---
             const dataRows = allRows.slice(headerRowIndex + 1);
 
             const legsFromSheet = dataRows
@@ -465,7 +482,6 @@ const generateRostersFromGoogleSheet = async () => {
         }
     }
 
-    // --- PART 3: BUILD ROSTERS (This logic remains the same) ---
     console.log(`Total available legs for roster generation from all sources: ${allLegs.length}`);
 
     if (allLegs.length === 0) {
