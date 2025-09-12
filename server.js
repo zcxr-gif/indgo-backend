@@ -349,11 +349,11 @@ const deleteRowFromGoogleSheet = async (callsign) => {
 };
 
 // --- (UPGRADED) AUTOMATED ROSTER GENERATION LOGIC ---
-// This function now fetches both primary and codeshare routes from published CSV URLs.
+// This function now robustly finds the header row in each sheet, ignoring initial junk rows.
 const generateRostersFromGoogleSheet = async () => {
     console.log('Starting automated roster generation from all sources...');
 
-    // Helper functions for parsing data
+    // Helper functions for parsing data remain the same
     const convertTimeToDecimal = (timeStr) => {
         if (!timeStr || typeof timeStr !== 'string') return NaN;
         let totalHours = 0;
@@ -370,142 +370,110 @@ const generateRostersFromGoogleSheet = async () => {
         return match ? match[1] : null;
     };
 
-    let allPrimaryLegs = [];
-    let allCodeshareLegs = [];
+    // --- KEY CHANGE: Define aliases for ALL route types, not just codeshare ---
+    // This makes the parsing logic universal and more robust.
+    const headerAliases = {
+        flightNumber: ['Flight No.', 'Flight Number', 'Callsign'],
+        departure: ['Departure ICAO', 'Departure', 'Origin', 'From'],
+        arrival: ['Arrival ICAO', 'Arrival', 'Destination', 'To'],
+        aircraft: ['Aircraft(s)', 'Aircraft', 'Plane'],
+        flightTime: ['Avg. Flight Time', 'Flight Time', 'Duration']
+    };
+    const canonicalKeys = Object.keys(headerAliases); // ['flightNumber', 'departure', etc.]
+    
+    let allLegs = [];
+    
+    // --- KEY CHANGE: Combine all sheet URLs into a single list for processing ---
+    const primaryUrl = process.env.ROUTES_SHEET_URL;
+    const codeshareUrls = process.env.CODESHARE_SHEET_URLS ? process.env.CODESHARE_SHEET_URLS.split(',') : [];
+    const allUrls = [primaryUrl, ...codeshareUrls].filter(Boolean); // Filter out any empty/undefined URLs
 
-    // --- PART 1: FETCH PRIMARY ROUTES (FROM CSV LINK) ---
-    try {
-        const routesSheetURL = process.env.ROUTES_SHEET_URL;
-        if (!routesSheetURL) {
-            console.warn('ROUTES_SHEET_URL is not defined. Skipping primary routes.');
-        } else {
-            console.log('Fetching primary routes from CSV URL...');
-            const response = await axios.get(routesSheetURL);
-            const parsed = Papa.parse(response.data, { header: false });
-            const allRows = parsed.data;
-            const requiredHeaders = ['Callsign', 'Origin', 'Destination', 'Flight Time', 'Aircraft'];
-            let columnMap = {};
-            let headerRowFound = false;
-
-            for (const row of allRows) {
-                if (requiredHeaders.every(h => row.some(cell => cell.trim() === h))) {
-                    row.forEach((header, index) => { columnMap[header.trim()] = index; });
-                    headerRowFound = true;
-                    break;
-                }
-            }
-
-            if (!headerRowFound) throw new Error('Could not find a valid header row in the primary routes sheet.');
-
-            allPrimaryLegs = allRows
-                .map(row => ({
-                    flightNumber: row[columnMap['Callsign']]?.trim(),
-                    departure: extractIcao(row[columnMap['Origin']]),
-                    arrival: extractIcao(row[columnMap['Destination']]),
-                    aircraft: row[columnMap['Aircraft']]?.trim(),
-                    flightTime: convertTimeToDecimal(row[columnMap['Flight Time']])
-                }))
-                .filter(leg => leg.flightNumber && leg.departure && leg.arrival && leg.aircraft && !isNaN(leg.flightTime) && leg.flightTime > 0);
-            console.log(`Found ${allPrimaryLegs.length} valid primary route legs.`);
-        }
-    } catch (error) {
-        console.error('Failed to process primary routes sheet:', error.message);
-    }
-
-    // --- PART 2: FETCH CODESHARE ROUTES (FROM CSV LINKS) ---
-    const codeshareSheetUrls = process.env.CODESHARE_SHEET_URLS;
-    if (!codeshareSheetUrls) {
-        console.warn('CODESHARE_SHEET_URLS is not defined. Skipping all codeshare routes.');
-    } else {
-        const urls = codeshareSheetUrls.split(',');
-        
-        // Define aliases for each required field. Case is ignored.
-        const headerAliases = {
-            flightNumber: ['Flight No.', 'Flight Number', 'Callsign'],
-            departure: ['Departure ICAO', 'Departure', 'Origin', 'From'],
-            arrival: ['Arrival ICAO', 'Arrival', 'Destination', 'To'],
-            aircraft: ['Aircraft(s)', 'Aircraft', 'Plane'],
-            flightTime: ['Avg. Flight Time', 'Flight Time', 'Duration']
-        };
-        const canonicalKeys = Object.keys(headerAliases); // ['flightNumber', 'departure', etc.]
-
-        for (const url of urls) {
-            try {
-                console.log(`Fetching codeshare routes from: ${url.substring(0, 80)}...`);
-                const response = await axios.get(url.trim());
-                const parsed = Papa.parse(response.data, { header: false });
-                const rows = parsed.data;
-                if (!rows || rows.length === 0) continue;
-
-                let headerRowFound = false;
-                const columnMap = {};
-                
-                // More robust header detection logic
-                for (const row of rows) {
-                    const tempMap = {};
-                    
-                    row.forEach((headerCell, index) => {
-                        const trimmedHeader = headerCell.trim().toLowerCase();
-                        if (!trimmedHeader) return;
-                        
-                        for (const key of canonicalKeys) {
-                            // Find an alias that matches the current header cell
-                            if (headerAliases[key].some(alias => alias.toLowerCase() === trimmedHeader)) {
-                                tempMap[key] = index; // Map our internal key (e.g., 'departure') to the column index
-                                break; 
-                            }
-                        }
-                    });
-
-                    // If we found all the headers we need, this is the correct header row
-                    if (Object.keys(tempMap).length === canonicalKeys.length) {
-                        Object.assign(columnMap, tempMap);
-                        headerRowFound = true;
-                        break;
-                    }
-                }
-
-                if (!headerRowFound) {
-                    console.warn(`Could not find a valid header row with all required columns in codeshare sheet: ${url}`);
-                    continue;
-                }
-                
-                const legsFromSheet = rows
-                    .map(row => {
-                        // Use the canonical keys to access data
-                        const departureIcao = extractIcao(row[columnMap.departure]);
-                        const arrivalIcao = extractIcao(row[columnMap.arrival]);
-                        const flightTime = convertTimeToDecimal(row[columnMap.flightTime]);
-                        const flightNumber = row[columnMap.flightNumber]?.trim();
-                        const aircraft = row[columnMap.aircraft]?.trim();
-                        
-                        if (departureIcao && arrivalIcao && flightNumber && aircraft && !isNaN(flightTime) && flightTime > 0) {
-                            return { flightNumber, departure: departureIcao, arrival: arrivalIcao, aircraft, flightTime };
-                        }
-                        return null;
-                    })
-                    .filter(leg => leg !== null);
-                
-                allCodeshareLegs.push(...legsFromSheet);
-                console.log(`- Found ${legsFromSheet.length} valid codeshare legs from this sheet.`);
-
-            } catch (error) {
-                console.error(`Failed to process codeshare URL ${url}:`, error.message);
-            }
-        }
-        console.log(`Found a total of ${allCodeshareLegs.length} valid codeshare route legs from all sources.`);
-    }
-
-    // --- PART 3: COMBINE ROUTES AND BUILD ROSTERS ---
-    const combinedLegs = [...allPrimaryLegs, ...allCodeshareLegs];
-    console.log(`Total available legs for roster generation: ${combinedLegs.length}`);
-
-    if (combinedLegs.length === 0) {
-        console.warn('No valid legs found from any source. No rosters will be generated.');
+    if (allUrls.length === 0) {
+        console.warn('No ROUTES_SHEET_URL or CODESHARE_SHEET_URLS defined. Aborting roster generation.');
         return { created: 0, legsFound: 0 };
     }
 
-    const legsByDeparture = combinedLegs.reduce((acc, leg) => {
+    // Loop through every provided sheet URL
+    for (const url of allUrls) {
+        try {
+            console.log(`Fetching routes from: ${url.substring(0, 80)}...`);
+            const response = await axios.get(url.trim());
+            const parsed = Papa.parse(response.data, { header: false, skipEmptyLines: true });
+            const allRows = parsed.data;
+
+            if (!allRows || allRows.length === 0) {
+                console.log('- Sheet is empty or could not be parsed.');
+                continue;
+            }
+
+            // --- KEY CHANGE: Intelligently find the header row and its index ---
+            let headerRowIndex = -1;
+            let columnMap = {};
+
+            for (let i = 0; i < allRows.length; i++) {
+                const row = allRows[i];
+                const tempMap = {};
+                
+                row.forEach((headerCell, index) => {
+                    const trimmedHeader = headerCell.trim().toLowerCase();
+                    if (!trimmedHeader) return;
+                    
+                    for (const key of canonicalKeys) {
+                        if (headerAliases[key].some(alias => alias.toLowerCase() === trimmedHeader)) {
+                            tempMap[key] = index;
+                            break;
+                        }
+                    }
+                });
+
+                if (Object.keys(tempMap).length === canonicalKeys.length) {
+                    columnMap = tempMap;
+                    headerRowIndex = i;
+                    console.log(`- Found valid header row at index ${i}.`);
+                    break; // Stop searching once we find a valid header
+                }
+            }
+
+            if (headerRowIndex === -1) {
+                console.warn(`- Could not find a valid header row in sheet: ${url}`);
+                continue;
+            }
+
+            // --- KEY CHANGE: Slice the array to get ONLY the data rows ---
+            const dataRows = allRows.slice(headerRowIndex + 1);
+
+            const legsFromSheet = dataRows
+                .map(row => {
+                    const departureIcao = extractIcao(row[columnMap.departure]);
+                    const arrivalIcao = extractIcao(row[columnMap.arrival]);
+                    const flightTime = convertTimeToDecimal(row[columnMap.flightTime]);
+                    const flightNumber = row[columnMap.flightNumber]?.trim();
+                    const aircraft = row[columnMap.aircraft]?.trim();
+                    
+                    if (departureIcao && arrivalIcao && flightNumber && aircraft && !isNaN(flightTime) && flightTime > 0) {
+                        return { flightNumber, departure: departureIcao, arrival: arrivalIcao, aircraft, flightTime };
+                    }
+                    return null;
+                })
+                .filter(leg => leg !== null);
+            
+            allLegs.push(...legsFromSheet);
+            console.log(`- Found ${legsFromSheet.length} valid legs from this sheet.`);
+
+        } catch (error) {
+            console.error(`Failed to process URL ${url}:`, error.message);
+        }
+    }
+
+    // --- PART 3: BUILD ROSTERS (This logic remains the same) ---
+    console.log(`Total available legs for roster generation from all sources: ${allLegs.length}`);
+
+    if (allLegs.length === 0) {
+        console.warn('No valid legs found from any source. No rosters will be generated.');
+        return { created: 0, legsFound: allLegs.length };
+    }
+
+    const legsByDeparture = allLegs.reduce((acc, leg) => {
         if (!acc[leg.departure]) acc[leg.departure] = [];
         acc[leg.departure].push(leg);
         return acc;
@@ -555,9 +523,8 @@ const generateRostersFromGoogleSheet = async () => {
         await Roster.insertMany(generatedRosters);
         console.log(`Successfully generated and saved ${generatedRosters.length} new rosters.`);
     }
-    return { created: generatedRosters.length, legsFound: combinedLegs.length };
+    return { created: generatedRosters.length, legsFound: allLegs.length };
 };
-
 
 // Rank Promotion Helper
 const rankThresholds = {
