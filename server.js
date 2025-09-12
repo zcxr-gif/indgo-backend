@@ -1,13 +1,11 @@
-// server.js (Fully Updated)
+// server.js (Fully Merged & Updated)
+// - Automated Roster Generation from a separate Google Sheet.
+// - Strict Flight & Duty Time Limitations (FTPL) engine.
+// - Location-aware roster availability for pilots.
 // - Robust Google Sheets function with dynamic column mapping.
 // - Advanced PIREP system with a staff review workflow.
 // - Automatic rank promotions upon PIREP approval.
-// - New endpoints for pilots and staff to manage PIREPs.
 // - Cascade delete functionality for users and their associated data.
-// --- NEW ---
-// - Sector Ops: Roster-based duty system for realistic pilot simulation.
-// - Flight & Duty Time Limitations (FTPL) tracking.
-// - New schemas and endpoints for managing rosters and pilot duty status.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -20,6 +18,8 @@ const path = require('path');
 const { S3Client, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const multerS3 = require('multer-s3');
 const { google } = require('googleapis');
+const Papa = require('papaparse'); // For parsing CSV data from Google Sheets
+const axios = require('axios'); // For fetching the sheet
 require('dotenv').config();
 
 // 2. INITIALIZE EXPRESS APP & AWS S3 CLIENT
@@ -28,7 +28,7 @@ const PORT = process.env.PORT || 5000;
 
 // Configure the AWS S3 client
 const s3Client = new S3Client({
-    region: process.env.AWS_REGION, // e.g., 'us-east-2'
+    region: process.env.AWS_REGION,
     credentials: {
         accessKeyId: process.env.AWS_ACCESS_KEY_ID,
         secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
@@ -36,8 +36,6 @@ const s3Client = new S3Client({
 });
 
 // 3. MIDDLEWARE
-
-// Whitelist your specific frontend URL (adjust if needed)
 const corsOptions = {
     origin: 'https://indgo-va.netlify.app',
     optionsSuccessStatus: 200
@@ -59,12 +57,12 @@ const upload = multer({
             let folder = 'misc/';
             if (file.fieldname === 'profilePicture') {
                 folder = 'profiles/';
-            } else if (file.fieldname === 'eventImage' || file.fieldname === 'highlightImage') {
+            } else if (['eventImage', 'highlightImage'].includes(file.fieldname)) {
                 folder = 'community/';
             }
             const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-            const fileName = file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname);
-            cb(null, folder + fileName);
+            const fileName = `${file.fieldname}-${uniqueSuffix}${path.extname(file.originalname)}`;
+            cb(null, `${folder}${fileName}`);
         }
     })
 });
@@ -76,13 +74,19 @@ mongoose.connect(process.env.MONGO_URI)
 
 // 5. DEFINE SCHEMAS AND MODELS
 
-// --- User Schema ---
+// --- Constants for FTPL ---
+const MIN_REST_PERIOD = 8 * 60 * 60 * 1000; // 8 hours in ms
+const MAX_DUTY_PERIOD = 14 * 60 * 60 * 1000; // 14 hours in ms
+const MAX_DAILY_FLIGHT_HOURS = 10;
+const MAX_MONTHLY_FLIGHT_HOURS = 100;
+const ROSTER_HUBS = ['VIDP', 'VABB', 'VOBL', 'VECC', 'VOMM']; // Primary hubs for roster generation
 
 const pilotRanks = [
-    'Cadet', 'Second Officer', 'First Officer', 
+    'Cadet', 'Second Officer', 'First Officer',
     'Senior First Officer', 'Captain', 'Senior Captain'
 ];
 
+// --- User Schema (Enhanced for FTPL) ---
 const UserSchema = new mongoose.Schema({
     name: { type: String, default: 'New Staff Member' },
     email: { type: String, required: true, unique: true, trim: true, lowercase: true },
@@ -90,49 +94,34 @@ const UserSchema = new mongoose.Schema({
     role: {
         type: String,
         enum: [
-            'staff', 'pilot', 'admin',
-            'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)', 'PIREP Manager (PM)',
-            'Pilot Relations & Recruitment Manager (PR)', 'Technology & Design Manager (TDM)',
+            'staff', 'pilot', 'admin', 'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)',
+            'PIREP Manager (PM)', 'Pilot Relations & Recruitment Manager (PR)', 'Technology & Design Manager (TDM)',
             'Head of Training (COT)', 'Chief Marketing Officer (CMO)', 'Route Manager (RM)',
             'Events Manager (EM)', 'Flight Instructor (FI)'
         ],
         default: 'pilot'
     },
     callsign: { type: String, default: null, sparse: true, trim: true, uppercase: true },
-    rank: {
-        type: String,
-        enum: pilotRanks,
-        default: 'Cadet'
-    },
+    rank: { type: String, enum: pilotRanks, default: 'Cadet' },
     flightHours: { type: Number, default: 0 },
     bio: { type: String, default: '' },
     imageUrl: { type: String, default: '' },
     discord: { type: String, default: '' },
     ifc: { type: String, default: '' },
     youtube: { type: String, default: '' },
-    preferredContact: {
-        type: String,
-        enum: ['none', 'discord', 'ifc', 'youtube'],
-        default: 'none'
-    },
+    preferredContact: { type: String, enum: ['none', 'discord', 'ifc', 'youtube'], default: 'none' },
     createdAt: { type: Date, default: Date.now },
 
-    // --- NEW: FIELDS FOR SECTOR OPS ---
-    dutyStatus: {
-        type: String,
-        enum: ['ON_REST', 'ON_DUTY'],
-        default: 'ON_REST'
-    },
-    currentRoster: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'Roster',
-        default: null
-    },
-    lastDutyOff: { type: Date, default: null },
+    // --- ENHANCED FIELDS FOR SECTOR OPS & FTPL ---
+    dutyStatus: { type: String, enum: ['ON_REST', 'ON_DUTY'], default: 'ON_REST' },
+    currentRoster: { type: mongoose.Schema.Types.ObjectId, ref: 'Roster', default: null },
+    lastDutyStart: { type: Date, default: null }, // Tracks when the current duty began
+    lastDutyOff: { type: Date, default: null },   // Tracks when the last duty ended for rest calculation
+    dailyFlightHours: { type: Number, default: 0 }, // Resets after a duty period
     monthlyFlightHours: { type: Number, default: 0 },
-    lastHourReset: { type: Date, default: Date.now }
+    lastHourReset: { type: Date, default: Date.now }, // For monthly reset
+    lastKnownAirport: { type: String, uppercase: true, trim: true, default: 'VIDP' } // Pilot's last arrival airport
 });
-
 UserSchema.index({ callsign: 1 }, { unique: true, sparse: true });
 const User = mongoose.model('User', UserSchema);
 
@@ -168,21 +157,20 @@ const HighlightSchema = new mongoose.Schema({
 });
 const Highlight = mongoose.model('Highlight', HighlightSchema);
 
-// --- PIREP Schema (Enhanced for Review Workflow) ---
+// --- PIREP Schema ---
 const PirepSchema = new mongoose.Schema({
     pilot: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     flightNumber: { type: String, required: true },
     departure: { type: String, required: true, uppercase: true, trim: true },
     arrival: { type: String, required: true, uppercase: true, trim: true },
     aircraft: { type: String, required: true },
-    flightTime: { type: Number, required: true, min: 0.1 }, // In hours
+    flightTime: { type: Number, required: true, min: 0.1 },
     remarks: { type: String, trim: true },
     status: { type: String, enum: ['PENDING', 'APPROVED', 'REJECTED'], default: 'PENDING' },
     reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     rejectionReason: { type: String, default: null },
     createdAt: { type: Date, default: Date.now },
     reviewedAt: { type: Date, default: null },
-    // --- NEW: LINK PIREP TO A ROSTER ---
     rosterLeg: {
         rosterId: { type: mongoose.Schema.Types.ObjectId, ref: 'Roster' },
         flightNumber: { type: String }
@@ -190,31 +178,33 @@ const PirepSchema = new mongoose.Schema({
 });
 const Pirep = mongoose.model('Pirep', PirepSchema);
 
-// --- NEW: ROSTER SCHEMA ---
+// --- Roster Schema (Enhanced for Automation) ---
 const RosterSchema = new mongoose.Schema({
-    name: { type: String, required: true, trim: true }, // e.g., "South India Commuter"
-    hub: { type: String, required: true, uppercase: true, trim: true }, // e.g., "VOBL"
+    name: { type: String, required: true, trim: true },
+    hub: { type: String, required: true, uppercase: true, trim: true },
     legs: [{
         flightNumber: { type: String, required: true, trim: true },
         departure: { type: String, required: true, uppercase: true, trim: true },
         arrival: { type: String, required: true, uppercase: true, trim: true },
+        flightTime: { type: Number, required: true, min: 0.1 } // Estimated time for each leg
     }],
-    totalFlightTime: { type: Number, required: true, min: 0 }, // Estimated total hours
+    totalFlightTime: { type: Number, required: true, min: 0 },
     isAvailable: { type: Boolean, default: true },
+    isGenerated: { type: Boolean, default: false }, // To distinguish auto-generated from manual
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     createdAt: { type: Date, default: Date.now }
 });
 const Roster = mongoose.model('Roster', RosterSchema);
 
 
-// 6. HELPER FUNCTION & AUTH MIDDLEWARE
+// 6. HELPER FUNCTIONS & MIDDLEWARE
 
 // Helper function to delete an object from S3
 const deleteS3Object = async (imageUrl) => {
     if (!imageUrl) return;
     try {
         const url = new URL(imageUrl);
-        const key = url.pathname.substring(1); // Remove leading '/'
+        const key = url.pathname.substring(1);
         const command = new DeleteObjectCommand({
             Bucket: process.env.AWS_S3_BUCKET_NAME,
             Key: key,
@@ -226,72 +216,53 @@ const deleteS3Object = async (imageUrl) => {
     }
 };
 
-// HELPER: Improved Google Sheets update function
+// Improved Google Sheets update function
 const updateGoogleSheet = async (pilotData) => {
-    // Ensure we have a callsign to work with, otherwise we can't update the sheet.
     if (!pilotData || !pilotData.callsign) {
         console.warn('updateGoogleSheet called without pilot data or callsign. Aborting sheet update.');
         return;
     }
-
     try {
-        // 1. Authenticate with Google Sheets API
         const auth = new google.auth.GoogleAuth({
             keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
             scopes: 'https://www.googleapis.com/auth/spreadsheets',
         });
         const sheets = google.sheets({ version: 'v4', auth });
         const spreadsheetId = process.env.GOOGLE_SHEET_ID;
-        const sheetName = 'Pilots'; // The name of the tab in your spreadsheet
+        const sheetName = 'Pilots';
 
-        // 2. Get the header row to dynamically find column indexes
         const headerResponse = await sheets.spreadsheets.values.get({
             spreadsheetId,
-            range: `${sheetName}!1:1`, // Get the first row
+            range: `${sheetName}!1:1`,
         });
-
         const headers = headerResponse.data.values ? headerResponse.data.values[0] : [];
-        
-        // Map headers to their column index. This makes the code flexible.
         const columnMap = {};
-        headers.forEach((header, index) => {
-            columnMap[header] = index;
-        });
+        headers.forEach((header, index) => { columnMap[header] = index; });
 
-        // Check if essential columns exist in the sheet
         const requiredColumns = ['Callsign', 'Name', 'Rank', 'Flight Hours'];
         for (const col of requiredColumns) {
-            if (columnMap[col] === undefined) {
-                throw new Error(`Missing required column in Google Sheet: "${col}"`);
-            }
+            if (columnMap[col] === undefined) throw new Error(`Missing required column in Google Sheet: "${col}"`);
         }
-        
-        // 3. Find the pilot's row by searching the "Callsign" column
-        const callsignColumnIndex = columnMap['Callsign'];
-        const callsignColumnLetter = String.fromCharCode(65 + callsignColumnIndex); // A, B, C...
 
+        const callsignColumnIndex = columnMap['Callsign'];
+        const callsignColumnLetter = String.fromCharCode(65 + callsignColumnIndex);
         const allCallsignsResponse = await sheets.spreadsheets.values.get({
             spreadsheetId,
-            range: `${sheetName}!${callsignColumnLetter}2:${callsignColumnLetter}`, // Start from row 2
+            range: `${sheetName}!${callsignColumnLetter}2:${callsignColumnLetter}`,
         });
-
         const allCallsigns = allCallsignsResponse.data.values ? allCallsignsResponse.data.values.flat() : [];
         const pilotRowIndex = allCallsigns.findIndex(cs => cs === pilotData.callsign);
-        
-        // 4. Prepare the data row in the correct order based on headers
+
         const fullRowData = new Array(headers.length).fill(null);
         fullRowData[columnMap['Callsign']] = pilotData.callsign;
         fullRowData[columnMap['Name']] = pilotData.name;
         fullRowData[columnMap['Rank']] = pilotData.rank;
         fullRowData[columnMap['Flight Hours']] = pilotData.flightHours;
-        
         if (columnMap['Last Updated'] !== undefined) {
             fullRowData[columnMap['Last Updated']] = new Date().toISOString();
         }
-
         const resource = { values: [fullRowData] };
 
-        // 5. Update the row if the pilot was found, or append a new row if not
         if (pilotRowIndex !== -1) {
             const targetRow = pilotRowIndex + 2;
             await sheets.spreadsheets.values.update({
@@ -315,15 +286,13 @@ const updateGoogleSheet = async (pilotData) => {
     }
 };
 
-// HELPER: Deletes a row from the Google Sheet based on a callsign
+// Deletes a row from the Google Sheet based on a callsign
 const deleteRowFromGoogleSheet = async (callsign) => {
     if (!callsign) {
         console.warn('deleteRowFromGoogleSheet called without a callsign. Aborting.');
         return;
     }
-
     try {
-        // 1. Authenticate (same as your update function)
         const auth = new google.auth.GoogleAuth({
             keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
             scopes: 'https://www.googleapis.com/auth/spreadsheets',
@@ -332,54 +301,36 @@ const deleteRowFromGoogleSheet = async (callsign) => {
         const spreadsheetId = process.env.GOOGLE_SHEET_ID;
         const sheetName = 'Pilots';
 
-        // 2. Get the sheet's metadata to find the sheetId (required for deletion)
         const spreadsheetMeta = await sheets.spreadsheets.get({ spreadsheetId });
         const sheet = spreadsheetMeta.data.sheets.find(s => s.properties.title === sheetName);
-        if (!sheet) {
-            throw new Error(`Sheet with name "${sheetName}" not found.`);
-        }
+        if (!sheet) throw new Error(`Sheet with name "${sheetName}" not found.`);
         const sheetId = sheet.properties.sheetId;
 
-        // 3. Find the pilot's row index (similar to your update function)
-        const headerResponse = await sheets.spreadsheets.values.get({
-            spreadsheetId,
-            range: `${sheetName}!1:1`,
-        });
+        const headerResponse = await sheets.spreadsheets.values.get({ spreadsheetId, range: `${sheetName}!1:1` });
         const headers = headerResponse.data.values ? headerResponse.data.values[0] : [];
         const callsignColumnIndex = headers.findIndex(h => h === 'Callsign');
-        if (callsignColumnIndex === -1) {
-            throw new Error('Could not find "Callsign" column in the sheet.');
-        }
+        if (callsignColumnIndex === -1) throw new Error('Could not find "Callsign" column in the sheet.');
 
         const callsignColumnLetter = String.fromCharCode(65 + callsignColumnIndex);
         const allCallsignsResponse = await sheets.spreadsheets.values.get({
             spreadsheetId,
             range: `${sheetName}!${callsignColumnLetter}2:${callsignColumnLetter}`,
         });
-
         const allCallsigns = allCallsignsResponse.data.values ? allCallsignsResponse.data.values.flat() : [];
-        const pilotRowIndex = allCallsigns.findIndex(cs => cs === callsign); // 0-based index
+        const pilotRowIndex = allCallsigns.findIndex(cs => cs === callsign);
 
-        // 4. If the pilot is found, execute the deletion request
         if (pilotRowIndex !== -1) {
-            const targetRow = pilotRowIndex + 1; // The API needs the row index within the data, starting from 0 for row 2
-            
+            const targetRow = pilotRowIndex + 1;
             const request = {
                 spreadsheetId,
                 resource: {
                     requests: [{
                         deleteDimension: {
-                            range: {
-                                sheetId: sheetId,
-                                dimension: 'ROWS',
-                                startIndex: targetRow, // 0-based index of the row to delete
-                                endIndex: targetRow + 1
-                            }
+                            range: { sheetId, dimension: 'ROWS', startIndex: targetRow, endIndex: targetRow + 1 }
                         }
                     }]
                 }
             };
-            
             await sheets.spreadsheets.batchUpdate(request);
             console.log(`Successfully deleted row for callsign ${callsign} from Google Sheet.`);
         } else {
@@ -390,17 +341,97 @@ const deleteRowFromGoogleSheet = async (callsign) => {
     }
 };
 
-// --- Rank Promotion Helper ---
+// --- NEW: AUTOMATED ROSTER GENERATION LOGIC ---
+const generateRostersFromGoogleSheet = async () => {
+    console.log('Starting automated roster generation...');
+    const routesSheetURL = process.env.ROUTES_SHEET_URL; // e.g., https://docs.google.com/spreadsheets/d/SHEET_ID/export?format=csv
+    if (!routesSheetURL) {
+        console.error('ROUTES_SHEET_URL is not defined in .env file. Aborting roster generation.');
+        throw new Error('Server configuration missing for roster generation.');
+    }
+
+    try {
+        const response = await axios.get(routesSheetURL);
+        const parsed = Papa.parse(response.data, { header: true });
+
+        const allLegs = parsed.data.map(leg => ({
+            flightNumber: leg['Callsign']?.trim(),
+            departure: leg['Origin']?.trim().toUpperCase(),
+            arrival: leg['Destination']?.trim().toUpperCase(),
+            flightTime: parseFloat(leg['Flight Time'])
+        })).filter(leg => leg.flightNumber && leg.departure && leg.arrival && !isNaN(leg.flightTime) && leg.flightTime > 0);
+
+        if (allLegs.length === 0) {
+            console.warn('No valid legs found in the Google Sheet.');
+            return { created: 0, legsFound: 0 };
+        }
+
+        const legsByDeparture = allLegs.reduce((acc, leg) => {
+            if (!acc[leg.departure]) acc[leg.departure] = [];
+            acc[leg.departure].push(leg);
+            return acc;
+        }, {});
+
+        const generatedRosters = [];
+        for (const hub of ROSTER_HUBS) {
+            if (!legsByDeparture[hub]) continue;
+
+            for (let i = 0; i < 5; i++) { // Attempt to create 5 rosters per hub
+                const rosterLegs = [];
+                let currentAirport = hub;
+                let totalTime = 0;
+                const usedFlightNumbers = new Set();
+                const legCount = Math.floor(Math.random() * 3) + 2; // 2 to 4 legs
+
+                for (let j = 0; j < legCount; j++) {
+                    const possibleNextLegs = (legsByDeparture[currentAirport] || []).filter(
+                        l => !usedFlightNumbers.has(l.flightNumber)
+                    );
+                    if (possibleNextLegs.length === 0) break;
+
+                    const nextLeg = possibleNextLegs[Math.floor(Math.random() * possibleNextLegs.length)];
+                    if ((totalTime + nextLeg.flightTime) > MAX_DAILY_FLIGHT_HOURS) break;
+
+                    rosterLegs.push(nextLeg);
+                    totalTime += nextLeg.flightTime;
+                    currentAirport = nextLeg.arrival;
+                    usedFlightNumbers.add(nextLeg.flightNumber);
+                }
+
+                if (rosterLegs.length >= 2) {
+                    generatedRosters.push({
+                        name: `${hub} Sector Duty #${i + 1}`,
+                        hub,
+                        legs: rosterLegs,
+                        totalFlightTime: totalTime,
+                        isGenerated: true,
+                        isAvailable: true,
+                    });
+                }
+            }
+        }
+
+        if (generatedRosters.length > 0) {
+            await Roster.deleteMany({ isGenerated: true });
+            await Roster.insertMany(generatedRosters);
+            console.log(`Successfully generated and saved ${generatedRosters.length} new rosters.`);
+        }
+        return { created: generatedRosters.length, legsFound: allLegs.length };
+    } catch (error) {
+        console.error('Failed to generate rosters from Google Sheet:', error);
+        throw new Error('Error during automated roster generation.');
+    }
+};
+
+// Rank Promotion Helper
 const rankThresholds = {
     'Cadet': 0, 'Second Officer': 10, 'First Officer': 50,
     'Senior First Officer': 150, 'Captain': 400, 'Senior Captain': 1000
 };
-
 const checkAndApplyRankUpdate = (pilot) => {
     const currentHours = pilot.flightHours;
     const currentRank = pilot.rank;
     let newRank = currentRank;
-    // Iterate from highest rank to lowest to find the best fit
     for (let i = pilotRanks.length - 1; i >= 0; i--) {
         const rankName = pilotRanks[i];
         if (currentHours >= rankThresholds[rankName]) {
@@ -418,102 +449,50 @@ const checkAndApplyRankUpdate = (pilot) => {
 // Simple callsign validator
 const isValidCallsign = cs => /^[A-Z0-9-]{2,15}$/.test(cs);
 
-// Auth middleware
+// Auth & Role Middlewares
 const authMiddleware = (req, res, next) => {
     const token = req.header('Authorization')?.replace('Bearer ', '');
-    if (!token) {
-        return res.status(401).json({ message: 'Access denied. No token provided.' });
-    }
+    if (!token) return res.status(401).json({ message: 'Access denied. No token provided.' });
     try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        req.user = decoded;
+        req.user = jwt.verify(token, process.env.JWT_SECRET);
         next();
     } catch (ex) {
         res.status(400).json({ message: 'Invalid token.' });
     }
 };
 
-// Role-based middlewares
-const isAdmin = (req, res, next) => {
-    if (req.user && req.user.role === 'admin') {
+const hasRole = (allowedRoles) => (req, res, next) => {
+    if (req.user && allowedRoles.includes(req.user.role)) {
         next();
     } else {
-        res.status(403).json({ message: 'Access denied. Administrator privileges required.' });
+        res.status(403).json({ message: 'Access denied. You do not have the required permissions.' });
     }
 };
 
-const isCommunityManager = (req, res, next) => {
-    const authorizedRoles = [
-        'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)', 'admin',
-        'Chief Marketing Officer (CMO)', 'Events Manager (EM)'
-    ];
-    if (req.user && authorizedRoles.includes(req.user.role)) {
-        next();
-    } else {
-        res.status(403).json({ message: 'Access denied. You do not have permission to manage community content.' });
-    }
-};
-
-const isPilotManager = (req, res, next) => {
-    const authorizedRoles = [
-        'admin', 'Chief Executive Officer (CEO)',
-        'Chief Operating Officer (COO)', 'Head of Training (COT)'
-    ];
-    if (req.user && authorizedRoles.includes(req.user.role)) {
-        next();
-    } else {
-        res.status(403).json({ message: 'Access denied. You do not have permission to manage pilots.' });
-    }
-};
-
-const isPirepManager = (req, res, next) => {
-    const authorizedRoles = [
-        'admin', 'Chief Executive Officer (CEO)',
-        'Chief Operating Officer (COO)', 'PIREP Manager (PM)'
-    ];
-    if (req.user && authorizedRoles.includes(req.user.role)) {
-        next();
-    } else {
-        res.status(403).json({ message: 'Access denied. You do not have permission to manage PIREPs.' });
-    }
-};
-
-// --- NEW: Middleware for Roster Management ---
-const isRouteManager = (req, res, next) => {
-    const authorizedRoles = [
-        'admin', 'Chief Executive Officer (CEO)', 
-        'Chief Operating Officer (COO)', 'Route Manager (RM)'
-    ];
-    if (req.user && authorizedRoles.includes(req.user.role)) {
-        next();
-    } else {
-        res.status(403).json({ message: 'Access denied. You do not have permission to manage rosters.' });
-    }
-};
+const isAdmin = hasRole(['admin']);
+const isCommunityManager = hasRole(['admin', 'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)', 'Chief Marketing Officer (CMO)', 'Events Manager (EM)']);
+const isPilotManager = hasRole(['admin', 'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)', 'Head of Training (COT)']);
+const isPirepManager = hasRole(['admin', 'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)', 'PIREP Manager (PM)']);
+const isRouteManager = hasRole(['admin', 'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)', 'Route Manager (RM)']);
 
 
 // 7. API ROUTES (ENDPOINTS)
 
 // --- Community Content Routes ---
-
-// POST a new event
 app.post('/api/events', authMiddleware, isCommunityManager, upload.single('eventImage'), async (req, res) => {
     try {
         const { title, date, description } = req.body;
         const newEvent = new Event({
-            title, date, description,
-            author: req.user._id,
+            title, date, description, author: req.user._id,
             imageUrl: req.file ? req.file.location : undefined
         });
         await newEvent.save();
         res.status(201).json({ message: 'Event created successfully!', event: newEvent });
     } catch (error) {
-        console.error("Error creating event:", error);
         res.status(500).json({ message: 'Server error while creating event.' });
     }
 });
 
-// GET all events (public)
 app.get('/api/events', async (req, res) => {
     try {
         const events = await Event.find().sort({ date: -1 });
@@ -523,27 +502,20 @@ app.get('/api/events', async (req, res) => {
     }
 });
 
-// POST a new highlight
 app.post('/api/highlights', authMiddleware, isCommunityManager, upload.single('highlightImage'), async (req, res) => {
     try {
         const { title, winnerName, description } = req.body;
-        if (!req.file) {
-            return res.status(400).json({ message: 'An image is required for a highlight.' });
-        }
+        if (!req.file) return res.status(400).json({ message: 'An image is required for a highlight.' });
         const newHighlight = new Highlight({
-            title, winnerName, description,
-            author: req.user._id,
-            imageUrl: req.file.location
+            title, winnerName, description, author: req.user._id, imageUrl: req.file.location
         });
         await newHighlight.save();
         res.status(201).json({ message: 'Highlight created successfully!', highlight: newHighlight });
     } catch (error) {
-        console.error("Error creating highlight:", error);
         res.status(500).json({ message: 'Server error while creating highlight.' });
     }
 });
 
-// GET all highlights (public)
 app.get('/api/highlights', async (req, res) => {
     try {
         const highlights = await Highlight.find().sort({ createdAt: -1 });
@@ -553,7 +525,6 @@ app.get('/api/highlights', async (req, res) => {
     }
 });
 
-// DELETE an event
 app.delete('/api/events/:id', authMiddleware, isCommunityManager, async (req, res) => {
     try {
         const event = await Event.findById(req.params.id);
@@ -562,12 +533,10 @@ app.delete('/api/events/:id', authMiddleware, isCommunityManager, async (req, re
         await Event.findByIdAndDelete(req.params.id);
         res.json({ message: 'Event deleted successfully.' });
     } catch (error) {
-        console.error('Error deleting event:', error);
         res.status(500).json({ message: 'Server error while deleting event.' });
     }
 });
 
-// DELETE a highlight
 app.delete('/api/highlights/:id', authMiddleware, isCommunityManager, async (req, res) => {
     try {
         const highlight = await Highlight.findById(req.params.id);
@@ -576,30 +545,25 @@ app.delete('/api/highlights/:id', authMiddleware, isCommunityManager, async (req
         await Highlight.findByIdAndDelete(req.params.id);
         res.json({ message: 'Highlight deleted successfully.' });
     } catch (error) {
-        console.error('Error deleting highlight:', error);
         res.status(500).json({ message: 'Server error while deleting highlight.' });
     }
 });
 
-// --- User and Staff Routes ---
 
-// PUBLIC ROUTE: Get all staff members
+// --- User and Staff Routes ---
 app.get('/api/staff', async (req, res) => {
     try {
         const staffRoles = User.schema.path('role').enumValues.filter(r => r !== 'pilot');
-        const staffMembers = await User.find({ role: { $in: staffRoles } })
-            .select('-password').sort({ createdAt: -1 });
+        const staffMembers = await User.find({ role: { $in: staffRoles } }).select('-password').sort({ createdAt: -1 });
         res.json(staffMembers);
     } catch (error) {
-        console.error('Error fetching staff:', error);
         res.status(500).json({ message: 'Server error while fetching staff members.' });
     }
 });
 
-// PUBLIC ROUTE: Login a user
-app.post('/api/login', express.json(), async (req, res) => {
-    const { email, password } = req.body;
+app.post('/api/login', async (req, res) => {
     try {
+        const { email, password } = req.body;
         const user = await User.findOne({ email: email?.toLowerCase().trim() });
         if (!user) return res.status(400).json({ message: 'Invalid email or password.' });
         const validPassword = await bcrypt.compare(password, user.password);
@@ -607,53 +571,47 @@ app.post('/api/login', express.json(), async (req, res) => {
         const token = jwt.sign({ _id: user._id, role: user.role, name: user.name }, process.env.JWT_SECRET, { expiresIn: '3h' });
         res.json({ token });
     } catch (err) {
-        console.error('Login error:', err);
         res.status(500).json({ message: 'Server error during login.' });
     }
 });
 
-// PROTECTED ROUTE: Get current user's data
 app.get('/api/me', authMiddleware, async (req, res) => {
     try {
         const user = await User.findById(req.user._id).select('-password');
         if (!user) return res.status(404).json({ message: 'User not found.' });
         res.json(user);
     } catch (err) {
-        console.error('Error fetching /me:', err);
         res.status(500).json({ message: 'Server error.' });
     }
 });
 
-// PROTECTED ROUTE: Update current user's profile
 app.put('/api/me', authMiddleware, upload.single('profilePicture'), async (req, res) => {
-    const { name, bio, discord, ifc, youtube, preferredContact } = req.body;
-    const updatedData = { name, bio, discord, ifc, youtube, preferredContact };
-
-    if (req.file) {
-        const oldUser = await User.findById(req.user._id);
-        if (oldUser?.imageUrl) await deleteS3Object(oldUser.imageUrl);
-        updatedData.imageUrl = req.file.location;
-    }
-
     try {
+        const { name, bio, discord, ifc, youtube, preferredContact } = req.body;
+        const updatedData = { name, bio, discord, ifc, youtube, preferredContact };
+
+        if (req.file) {
+            const oldUser = await User.findById(req.user._id);
+            if (oldUser?.imageUrl) await deleteS3Object(oldUser.imageUrl);
+            updatedData.imageUrl = req.file.location;
+        }
+
         const user = await User.findByIdAndUpdate(req.user._id, updatedData, { new: true }).select('-password');
         if (!user) return res.status(404).json({ message: 'User not found.' });
         const token = jwt.sign({ _id: user._id, role: user.role, name: user.name }, process.env.JWT_SECRET, { expiresIn: '3h' });
         res.json({ message: 'Profile updated successfully!', user, token });
     } catch (error) {
         if (error?.code === 11000) return res.status(400).json({ message: `A user with that ${Object.keys(error.keyValue)[0]} already exists.` });
-        console.error('Error updating profile:', error);
         res.status(500).json({ message: 'Server error while updating profile.' });
     }
 });
 
-// PROTECTED ROUTE: Change current user's password
-app.post('/api/me/password', authMiddleware, express.json(), async (req, res) => {
-    const { currentPassword, newPassword } = req.body;
-    if (!currentPassword || !newPassword || newPassword.length < 6) {
-        return res.status(400).json({ message: 'Current password is required, and the new password must be at least 6 characters long.' });
-    }
+app.post('/api/me/password', authMiddleware, async (req, res) => {
     try {
+        const { currentPassword, newPassword } = req.body;
+        if (!currentPassword || !newPassword || newPassword.length < 6) {
+            return res.status(400).json({ message: 'Current password is required, and the new password must be at least 6 characters long.' });
+        }
         const user = await User.findById(req.user._id);
         if (!user) return res.status(404).json({ message: 'User not found.' });
 
@@ -665,15 +623,12 @@ app.post('/api/me/password', authMiddleware, express.json(), async (req, res) =>
         await user.save();
         res.json({ message: 'Password updated successfully!' });
     } catch (err) {
-        console.error('Error updating password:', err);
         res.status(500).json({ message: 'Server error while updating password.' });
     }
 });
 
-// --- PIREP Workflow Routes ---
 
-// PILOT ROUTE: Submit a new PIREP for review
-// --- MODIFIED: Added Sector Ops validation ---
+// --- PIREP Workflow Routes ---
 app.post('/api/pireps', authMiddleware, async (req, res) => {
     try {
         const { flightNumber, departure, arrival, aircraft, flightTime, remarks } = req.body;
@@ -690,38 +645,28 @@ app.post('/api/pireps', authMiddleware, async (req, res) => {
             status: 'PENDING'
         };
 
-        // Sector Ops validation logic
         if (pilot.dutyStatus === 'ON_DUTY') {
-            if (!pilot.currentRoster) {
-                return res.status(400).json({ message: 'You are on duty but have no assigned roster. Please contact staff.' });
-            }
+            if (!pilot.currentRoster) return res.status(400).json({ message: 'You are on duty but have no assigned roster. Please contact staff.' });
             
             await pilot.populate('currentRoster');
             const roster = pilot.currentRoster;
             
-            // Find the matching leg in the current roster
-            const leg = roster.legs.find(l => 
+            const leg = roster.legs.find(l =>
                 l.flightNumber.toUpperCase() === flightNumber.toUpperCase() &&
                 l.departure.toUpperCase() === departure.toUpperCase() &&
                 l.arrival.toUpperCase() === arrival.toUpperCase()
             );
 
-            if (!leg) {
-                return res.status(400).json({ message: 'This flight does not match any leg in your assigned roster.' });
-            }
+            if (!leg) return res.status(400).json({ message: 'This flight does not match any leg in your assigned roster.' });
 
-            // Check if a PIREP for this leg has already been filed
             const existingPirep = await Pirep.findOne({
                 pilot: req.user._id,
                 'rosterLeg.rosterId': roster._id,
                 'rosterLeg.flightNumber': flightNumber
             });
 
-            if (existingPirep) {
-                return res.status(400).json({ message: 'You have already filed a PIREP for this roster leg.' });
-            }
+            if (existingPirep) return res.status(400).json({ message: 'You have already filed a PIREP for this roster leg.' });
             
-            // Link the PIREP to the roster
             newPirepData.rosterLeg = { rosterId: roster._id, flightNumber: flightNumber };
         }
 
@@ -729,24 +674,19 @@ app.post('/api/pireps', authMiddleware, async (req, res) => {
         await newPirep.save();
         res.status(201).json({ message: 'Flight report submitted successfully and is pending review.', pirep: newPirep });
     } catch (error) {
-        console.error('Error filing PIREP:', error);
         res.status(500).json({ message: 'Server error while filing flight report.' });
     }
 });
 
-
-// PILOT ROUTE: Get the current user's PIREP history
 app.get('/api/me/pireps', authMiddleware, async (req, res) => {
     try {
         const pireps = await Pirep.find({ pilot: req.user._id }).sort({ createdAt: -1 });
         res.json(pireps);
     } catch (error) {
-        console.error("Error fetching user's PIREPs:", error);
         res.status(500).json({ message: 'Server error while fetching your flight reports.' });
     }
 });
 
-// STAFF ROUTE: Get all PIREPs that are pending review
 app.get('/api/pireps/pending', authMiddleware, isPirepManager, async (req, res) => {
     try {
         const pendingPireps = await Pirep.find({ status: 'PENDING' })
@@ -754,13 +694,10 @@ app.get('/api/pireps/pending', authMiddleware, isPirepManager, async (req, res) 
             .sort({ createdAt: 'asc' });
         res.json(pendingPireps);
     } catch (error) {
-        console.error('Error fetching pending PIREPs:', error);
         res.status(500).json({ message: 'Server error while fetching pending PIREPs.' });
     }
 });
 
-// STAFF ROUTE: Approve a PIREP
-// --- MODIFIED: Update monthly flight hours ---
 app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (req, res) => {
     try {
         const pirep = await Pirep.findById(req.params.pirepId);
@@ -770,9 +707,12 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
         const pilot = await User.findById(pirep.pilot);
         if (!pilot) return res.status(404).json({ message: 'Associated pilot profile not found.' });
 
+        // **MERGED**: Update all flight hour counters and pilot location
         pilot.flightHours += pirep.flightTime;
-        pilot.monthlyFlightHours += pirep.flightTime; // Update monthly total
-        
+        pilot.monthlyFlightHours += pirep.flightTime;
+        pilot.dailyFlightHours += pirep.flightTime;
+        pilot.lastKnownAirport = pirep.arrival; // Update pilot's location
+
         const promotionResult = checkAndApplyRankUpdate(pilot);
         
         pirep.status = 'APPROVED';
@@ -794,117 +734,110 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
         }
         res.json({ message });
     } catch (error) {
-        console.error('Error approving PIREP:', error);
         res.status(500).json({ message: 'Server error while approving PIREP.' });
     }
 });
 
-// STAFF ROUTE: Reject a PIREP
 app.put('/api/pireps/:pirepId/reject', authMiddleware, isPirepManager, async (req, res) => {
     try {
         const { reason } = req.body;
         if (!reason) return res.status(400).json({ message: 'A reason for rejection is required.' });
 
         const pirep = await Pirep.findByIdAndUpdate(req.params.pirepId, {
-            status: 'REJECTED',
-            rejectionReason: reason,
-            reviewedBy: req.user._id,
-            reviewedAt: Date.now()
-        }, { new: false }); // Set new to false to check the old status
+            status: 'REJECTED', rejectionReason: reason, reviewedBy: req.user._id, reviewedAt: Date.now()
+        }, { new: false });
 
         if (!pirep) return res.status(404).json({ message: 'PIREP not found.' });
         if (pirep.status !== 'PENDING') return res.status(400).json({ message: `This PIREP was already ${pirep.status.toLowerCase()}.` });
         
         res.json({ message: 'PIREP has been successfully rejected.' });
     } catch (error) {
-        console.error('Error rejecting PIREP:', error);
         res.status(500).json({ message: 'Server error while rejecting PIREP.' });
     }
 });
 
-// STAFF ROUTE: Update a pilot's rank
 app.put('/api/users/:userId/rank', authMiddleware, isPilotManager, async (req, res) => {
-    const { userId } = req.params;
-    const { newRank } = req.body;
-    if (!newRank || !pilotRanks.includes(newRank)) {
-        return res.status(400).json({ message: 'Invalid rank specified.' });
-    }
     try {
+        const { userId } = req.params;
+        const { newRank } = req.body;
+        if (!newRank || !pilotRanks.includes(newRank)) return res.status(400).json({ message: 'Invalid rank specified.' });
+
         const user = await User.findById(userId);
         if (!user) return res.status(404).json({ message: 'User not found.' });
         user.rank = newRank;
         await user.save();
         if (user.callsign) {
-             await updateGoogleSheet({
-                callsign: user.callsign, name: user.name, rank: user.rank, flightHours: user.flightHours
-            });
+             await updateGoogleSheet({ callsign: user.callsign, name: user.name, rank: user.rank, flightHours: user.flightHours });
         }
         res.json({ message: `Successfully updated ${user.name}'s rank to ${newRank}.` });
     } catch (error) {
-        console.error('Error updating pilot rank:', error);
         res.status(500).json({ message: 'Server error while updating rank.' });
     }
 });
 
 
-// --- NEW: ROSTER & DUTY MANAGEMENT ROUTES ---
-
-// PUBLIC ROUTE: Get all available rosters
+// --- NEW/ENHANCED: ROSTER & DUTY MANAGEMENT ROUTES ---
 app.get('/api/rosters', authMiddleware, async (req, res) => {
     try {
-        const rosters = await Roster.find({ isAvailable: true }).sort({ createdAt: -1 });
+        const user = await User.findById(req.user._id);
+        if (!user) return res.status(404).json({ message: 'User not found.' });
+        
+        const departureIcao = user.lastKnownAirport || ROSTER_HUBS[0];
+
+        const rosters = await Roster.find({
+            isAvailable: true,
+            'legs.0.departure': departureIcao // Find rosters where the first leg starts at the pilot's location
+        }).sort({ createdAt: -1 });
+
         res.json(rosters);
     } catch (error) {
-        console.error('Error fetching rosters:', error);
-        res.status(500).json({ message: 'Server error while fetching rosters.' });
+        res.status(500).json({ message: 'Server error while fetching available rosters.' });
     }
 });
 
-// STAFF ROUTE: Create a new roster
 app.post('/api/rosters', authMiddleware, isRouteManager, async (req, res) => {
     try {
         const { name, hub, legs, totalFlightTime } = req.body;
         if (!name || !hub || !legs || legs.length === 0 || !totalFlightTime) {
             return res.status(400).json({ message: 'All roster fields are required.' });
         }
-        const newRoster = new Roster({
-            name, hub, legs, totalFlightTime, createdBy: req.user._id
-        });
+        const newRoster = new Roster({ name, hub, legs, totalFlightTime, createdBy: req.user._id });
         await newRoster.save();
 
-        const log = new AdminLog({
-            adminUser: req.user._id, action: 'ROSTER_CREATE',
-            details: `Created new roster: "${name}"`
-        });
+        const log = new AdminLog({ adminUser: req.user._id, action: 'ROSTER_CREATE', details: `Created new roster: "${name}"` });
         await log.save();
         
         res.status(201).json({ message: 'Roster created successfully!', roster: newRoster });
     } catch (error) {
-        console.error('Error creating roster:', error);
         res.status(500).json({ message: 'Server error while creating roster.' });
     }
 });
 
-// STAFF ROUTE: Delete a roster
+app.post('/api/rosters/generate', authMiddleware, isRouteManager, async (req, res) => {
+    try {
+        const result = await generateRostersFromGoogleSheet();
+        res.status(201).json({
+            message: `Roster generation complete. Found ${result.legsFound} legs and created ${result.created} new rosters.`
+        });
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+});
+
 app.delete('/api/rosters/:rosterId', authMiddleware, isRouteManager, async (req, res) => {
     try {
         const roster = await Roster.findByIdAndDelete(req.params.rosterId);
         if (!roster) return res.status(404).json({ message: 'Roster not found.' });
 
-        const log = new AdminLog({
-            adminUser: req.user._id, action: 'ROSTER_DELETE',
-            details: `Deleted roster: "${roster.name}" (ID: ${roster._id})`
-        });
+        const log = new AdminLog({ adminUser: req.user._id, action: 'ROSTER_DELETE', details: `Deleted roster: "${roster.name}" (ID: ${roster._id})` });
         await log.save();
 
         res.json({ message: 'Roster deleted successfully.' });
     } catch (error) {
-        console.error('Error deleting roster:', error);
         res.status(500).json({ message: 'Server error while deleting roster.' });
     }
 });
 
-// PILOT ROUTE: Start a duty day
 app.post('/api/duty/start', authMiddleware, async (req, res) => {
     const { rosterId } = req.body;
     try {
@@ -914,31 +847,36 @@ app.post('/api/duty/start', authMiddleware, async (req, res) => {
         if (!roster) return res.status(404).json({ message: 'Selected roster not found.' });
         if (user.dutyStatus === 'ON_DUTY') return res.status(400).json({ message: 'You are already on duty.' });
 
-        // Check and reset monthly hours if necessary
+        // --- FTPL CHECKS ---
+        if (user.lastDutyOff && (Date.now() - user.lastDutyOff) < MIN_REST_PERIOD) {
+            const timeToRest = Math.ceil((MIN_REST_PERIOD - (Date.now() - user.lastDutyOff)) / (60 * 1000));
+            return res.status(403).json({ message: `Crew rest required. You can go on duty in ${timeToRest} minutes.` });
+        }
+        
         const oneMonthAgo = new Date();
         oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
         if (user.lastHourReset < oneMonthAgo) {
             user.monthlyFlightHours = 0;
             user.lastHourReset = Date.now();
         }
-
-        // FTPL check (100 hours per month)
-        if ((user.monthlyFlightHours + roster.totalFlightTime) > 100) {
-            return res.status(403).json({ message: 'Starting this duty would exceed your 100-hour monthly limit.' });
+        if ((user.monthlyFlightHours + roster.totalFlightTime) > MAX_MONTHLY_FLIGHT_HOURS) {
+            return res.status(403).json({ message: `This duty would exceed your ${MAX_MONTHLY_FLIGHT_HOURS}-hour monthly limit.` });
+        }
+        if ((user.dailyFlightHours + roster.totalFlightTime) > MAX_DAILY_FLIGHT_HOURS) {
+            return res.status(403).json({ message: `This duty would exceed your ${MAX_DAILY_FLIGHT_HOURS}-hour daily flight limit.` });
         }
 
         user.dutyStatus = 'ON_DUTY';
         user.currentRoster = roster._id;
+        user.lastDutyStart = Date.now();
         await user.save();
         
-        res.json({ message: `You are now on duty. Your assigned roster is "${roster.name}".`, roster });
+        res.json({ message: `You are now on duty for roster "${roster.name}".`, roster });
     } catch (error) {
-        console.error('Error starting duty:', error);
         res.status(500).json({ message: 'Server error while starting duty.' });
     }
 });
 
-// PILOT ROUTE: End a duty day
 app.post('/api/duty/end', authMiddleware, async (req, res) => {
     try {
         const user = await User.findById(req.user._id).populate('currentRoster');
@@ -948,32 +886,32 @@ app.post('/api/duty/end', authMiddleware, async (req, res) => {
         const rosterLegs = user.currentRoster.legs;
         const filedPireps = await Pirep.find({
             pilot: user._id,
-            'rosterLeg.rosterId': user.currentRoster._id
+            'rosterLeg.rosterId': user.currentRoster._id,
+            status: { $in: ['APPROVED', 'PENDING'] }
         });
 
         if (filedPireps.length < rosterLegs.length) {
-            return res.status(400).json({ message: `You have not filed PIREPs for all roster legs. ${filedPireps.length}/${rosterLegs.length} complete.` });
+            return res.status(400).json({ message: `You must file PIREPs for all roster legs. ${filedPireps.length}/${rosterLegs.length} complete.` });
         }
 
         user.dutyStatus = 'ON_REST';
         user.currentRoster = null;
         user.lastDutyOff = Date.now();
+        user.lastDutyStart = null;
+        user.dailyFlightHours = 0; // Reset daily flight hours
         await user.save();
         
-        res.json({ message: 'Duty day completed successfully! Well flown, Captain.' });
+        res.json({ message: 'Duty day completed successfully! You are now on crew rest.' });
     } catch (error) {
-        console.error('Error ending duty:', error);
         res.status(500).json({ message: 'Server error while ending duty.' });
     }
 });
 
 
 // --- Admin-Only Routes ---
-
-// ADMIN-ONLY ROUTE: Create a new user
-app.post('/api/users', authMiddleware, isAdmin, express.json(), async (req, res) => {
-    const { email, password, role, callsign, name } = req.body;
+app.post('/api/users', authMiddleware, isAdmin, async (req, res) => {
     try {
+        const { email, password, role, callsign, name } = req.body;
         if (!email || !password) return res.status(400).json({ message: 'Email and password are required.' });
         const normalizedEmail = String(email).toLowerCase().trim();
         const normalizedCallsign = callsign ? String(callsign).trim().toUpperCase() : null;
@@ -993,40 +931,33 @@ app.post('/api/users', authMiddleware, isAdmin, express.json(), async (req, res)
         await user.save();
         
         if (normalizedCallsign) {
-            await updateGoogleSheet({
-                callsign: normalizedCallsign, name: user.name, rank: user.rank, flightHours: user.flightHours || 0
-            });
+            await updateGoogleSheet({ callsign: normalizedCallsign, name: user.name, rank: user.rank, flightHours: user.flightHours || 0 });
         }
         return res.status(201).json({ message: 'User created successfully.', userId: user._id });
     } catch (error) {
         if (error?.code === 11000) {
-            const dupKey = Object.keys(error.keyValue)[0];
-            return res.status(400).json({ message: `A user with this ${dupKey} already exists.` });
+            return res.status(400).json({ message: `A user with this ${Object.keys(error.keyValue)[0]} already exists.` });
         }
-        console.error('Error creating user:', error);
         return res.status(500).json({ message: 'Server error while creating user.' });
     }
 });
 
-// ADMIN-ONLY ROUTE: Get all users for management
 app.get('/api/users', authMiddleware, isAdmin, async (req, res) => {
     try {
         const users = await User.find().select('-password');
         res.json(users);
     } catch (error) {
-        console.error('Error fetching users:', error);
         res.status(500).json({ message: 'Server error while fetching users.' });
     }
 });
 
-// ADMIN-ONLY ROUTE: Update a user's role
-app.put('/api/users/:userId/role', authMiddleware, isAdmin, express.json(), async (req, res) => {
-    const { userId } = req.params;
-    const { newRole } = req.body;
-    if (!User.schema.path('role').enumValues.includes(newRole)) {
-        return res.status(400).json({ message: 'Invalid role specified.' });
-    }
+app.put('/api/users/:userId/role', authMiddleware, isAdmin, async (req, res) => {
     try {
+        const { userId } = req.params;
+        const { newRole } = req.body;
+        if (!User.schema.path('role').enumValues.includes(newRole)) {
+            return res.status(400).json({ message: 'Invalid role specified.' });
+        }
         const targetUser = await User.findById(userId);
         if (!targetUser) return res.status(404).json({ message: 'User not found.' });
         const oldRole = targetUser.role;
@@ -1040,16 +971,14 @@ app.put('/api/users/:userId/role', authMiddleware, isAdmin, express.json(), asyn
         await log.save();
         res.json({ message: `User role successfully updated to ${newRole}.` });
     } catch (error) {
-        console.error('Error updating user role:', error);
         res.status(500).json({ message: 'Server error while updating user role.' });
     }
 });
 
-// ADMIN-ONLY ROUTE: Assign or update a user's callsign
-app.put('/api/users/:userId/callsign', authMiddleware, isAdmin, express.json(), async (req, res) => {
-    const { userId } = req.params;
-    let { callsign } = req.body;
+app.put('/api/users/:userId/callsign', authMiddleware, isAdmin, async (req, res) => {
     try {
+        const { userId } = req.params;
+        let { callsign } = req.body;
         if (!callsign || String(callsign).trim() === '') {
             return res.status(400).json({ message: 'A non-empty callsign must be provided.' });
         }
@@ -1062,20 +991,16 @@ app.put('/api/users/:userId/callsign', authMiddleware, isAdmin, express.json(), 
         user.callsign = callsign;
         await user.save();
 
-        await updateGoogleSheet({
-            callsign, name: user.name, rank: user.rank, flightHours: user.flightHours || 0
-        });
+        await updateGoogleSheet({ callsign, name: user.name, rank: user.rank, flightHours: user.flightHours || 0 });
         res.json({ message: `Callsign ${callsign} assigned to ${user.email}` });
     } catch (error) {
         if (error?.code === 11000) {
             return res.status(400).json({ message: 'This callsign is already taken by another user.' });
         }
-        console.error('Error assigning callsign:', error);
         res.status(500).json({ message: 'Server error while assigning callsign.' });
     }
 });
 
-// ADMIN-ONLY ROUTE: Delete a user (Updated with cascade delete)
 app.delete('/api/users/:userId', authMiddleware, isAdmin, async (req, res) => {
     const { userId } = req.params;
     try {
@@ -1083,43 +1008,26 @@ app.delete('/api/users/:userId', authMiddleware, isAdmin, async (req, res) => {
             return res.status(400).json({ message: 'You cannot delete your own admin account.' });
         }
 
-        // --- Find the user first, DO NOT delete yet ---
         const userToDelete = await User.findById(userId);
-        if (!userToDelete) {
-            return res.status(404).json({ message: 'User not found.' });
-        }
+        if (!userToDelete) return res.status(404).json({ message: 'User not found.' });
 
-        // --- Perform all cleanup actions before deleting the user ---
+        if (userToDelete.callsign) await deleteRowFromGoogleSheet(userToDelete.callsign);
+        if (userToDelete.imageUrl) await deleteS3Object(userToDelete.imageUrl);
 
-        // Step 1: Delete from Google Sheet if they have a callsign
-        if (userToDelete.callsign) {
-            await deleteRowFromGoogleSheet(userToDelete.callsign);
-        }
-
-        // Step 2: Delete S3 profile picture
-        if (userToDelete.imageUrl) {
-            await deleteS3Object(userToDelete.imageUrl);
-        }
-
-        // Step 3: Delete all PIREPs filed by this user
         await Pirep.deleteMany({ pilot: userId });
 
-        // Step 4 (Optional but recommended): Clean up community content
-        // Find all events by the user to delete associated S3 images
         const userEvents = await Event.find({ author: userId });
         for (const event of userEvents) {
             if (event.imageUrl) await deleteS3Object(event.imageUrl);
         }
         await Event.deleteMany({ author: userId });
 
-        // Find all highlights by the user to delete associated S3 images
         const userHighlights = await Highlight.find({ author: userId });
         for (const highlight of userHighlights) {
             if (highlight.imageUrl) await deleteS3Object(highlight.imageUrl);
         }
         await Highlight.deleteMany({ author: userId });
 
-        // --- Final Step: Now delete the user from MongoDB ---
         await User.findByIdAndDelete(userId);
 
         const log = new AdminLog({
@@ -1131,12 +1039,10 @@ app.delete('/api/users/:userId', authMiddleware, isAdmin, async (req, res) => {
 
         res.json({ message: 'User and all associated data deleted successfully.' });
     } catch (error) {
-        console.error('Error deleting user:', error);
         res.status(500).json({ message: 'Server error while deleting user.' });
     }
 });
 
-// ADMIN-ONLY ROUTE: View activity logs
 app.get('/api/logs', authMiddleware, isAdmin, async (req, res) => {
     try {
         const logs = await AdminLog.find()
@@ -1145,7 +1051,6 @@ app.get('/api/logs', authMiddleware, isAdmin, async (req, res) => {
             .sort({ timestamp: -1 });
         res.json(logs);
     } catch (error) {
-        console.error('Error fetching logs:', error);
         res.status(500).json({ message: 'Server error while fetching logs.' });
     }
 });
