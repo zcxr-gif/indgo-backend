@@ -13,7 +13,7 @@
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
-const express = require('express');
+const express = a=> express();
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -349,7 +349,7 @@ const deleteRowFromGoogleSheet = async (callsign) => {
 };
 
 // --- (UPGRADED) AUTOMATED ROSTER GENERATION LOGIC ---
-// This function now reads from BOTH the primary routes sheet AND the codeshare sheet in real-time.
+// This function now fetches both primary and codeshare routes from published CSV URLs.
 const generateRostersFromGoogleSheet = async () => {
     console.log('Starting automated roster generation from all sources...');
 
@@ -410,35 +410,27 @@ const generateRostersFromGoogleSheet = async () => {
         }
     } catch (error) {
         console.error('Failed to process primary routes sheet:', error.message);
-        // We can continue without these, so we don't throw an error for the whole process
     }
 
-    // --- PART 2: FETCH CODESHARE ROUTES (FROM GOOGLE SHEETS API) ---
-    try {
-        const spreadsheetId = process.env.CODESHARE_SHEET_ID;
-        if (!spreadsheetId) {
-            console.warn('CODESHARE_SHEET_ID is not defined. Skipping codeshare routes.');
-        } else {
-            console.log('Fetching codeshare routes from Google Sheet...');
-            const auth = new google.auth.GoogleAuth({
-                keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
-                scopes: 'https://www.googleapis.com/auth/spreadsheets.readonly',
-            });
-            const sheets = google.sheets({ version: 'v4', auth });
+    // --- PART 2: FETCH CODESHARE ROUTES (FROM CSV LINKS) ---
+    const codeshareSheetUrls = process.env.CODESHARE_SHEET_URLS;
+    if (!codeshareSheetUrls) {
+        console.warn('CODESHARE_SHEET_URLS is not defined. Skipping all codeshare routes.');
+    } else {
+        const urls = codeshareSheetUrls.split(',');
+        const requiredHeaders = ['Flight No.', 'Departure ICAO', 'Arrival ICAO', 'Aircraft(s)', 'Avg. Flight Time'];
 
-            const metaData = await sheets.spreadsheets.get({ spreadsheetId });
-            const sheetNames = metaData.data.sheets.map(sheet => sheet.properties.title);
-            const requiredHeaders = ['Flight No.', 'Departure ICAO', 'Arrival ICAO', 'Aircraft(s)', 'Avg. Flight Time'];
-
-            for (const sheetName of sheetNames) {
-                const response = await sheets.spreadsheets.values.get({ spreadsheetId, range: sheetName });
-                const rows = response.data.values;
+        for (const url of urls) {
+            try {
+                console.log(`Fetching codeshare routes from: ${url.substring(0, 80)}...`);
+                const response = await axios.get(url.trim());
+                const parsed = Papa.parse(response.data, { header: false });
+                const rows = parsed.data;
                 if (!rows || rows.length === 0) continue;
 
-                let headerRowIndex = -1;
+                let headerRowFound = false;
                 const columnMap = {};
-                for (let i = 0; i < rows.length; i++) {
-                    const row = rows[i];
+                for (const row of rows) {
                     const foundHeaders = new Set();
                     row.forEach((cell, index) => {
                         const trimmedCell = cell.trim();
@@ -448,35 +440,39 @@ const generateRostersFromGoogleSheet = async () => {
                         }
                     });
                     if (foundHeaders.size >= requiredHeaders.length) {
-                        headerRowIndex = i;
+                        headerRowFound = true;
                         break;
                     }
                 }
 
-                if (headerRowIndex === -1) continue;
-
-                for (let i = headerRowIndex + 1; i < rows.length; i++) {
-                    const row = rows[i];
-                    const departureIcao = extractIcao(row[columnMap['Departure ICAO']]);
-                    const arrivalIcao = extractIcao(row[columnMap['Arrival ICAO']]);
-                    const flightTime = convertTimeToDecimal(row[columnMap['Avg. Flight Time']]);
-
-                    if (departureIcao && arrivalIcao && !isNaN(flightTime) && flightTime > 0) {
-                        allCodeshareLegs.push({
-                            flightNumber: row[columnMap['Flight No.']]?.trim(),
-                            departure: departureIcao,
-                            arrival: arrivalIcao,
-                            aircraft: row[columnMap['Aircraft(s)']]?.trim(),
-                            flightTime: flightTime
-                        });
-                    }
+                if (!headerRowFound) {
+                    console.warn(`Could not find a valid header row in codeshare sheet: ${url}`);
+                    continue;
                 }
+                
+                const legsFromSheet = rows
+                    .map(row => {
+                        const departureIcao = extractIcao(row[columnMap['Departure ICAO']]);
+                        const arrivalIcao = extractIcao(row[columnMap['Arrival ICAO']]);
+                        const flightTime = convertTimeToDecimal(row[columnMap['Avg. Flight Time']]);
+                        const flightNumber = row[columnMap['Flight No.']]?.trim();
+                        const aircraft = row[columnMap['Aircraft(s)']]?.trim();
+                        
+                        if (departureIcao && arrivalIcao && flightNumber && aircraft && !isNaN(flightTime) && flightTime > 0) {
+                            return { flightNumber, departure: departureIcao, arrival: arrivalIcao, aircraft, flightTime };
+                        }
+                        return null;
+                    })
+                    .filter(leg => leg !== null);
+                
+                allCodeshareLegs.push(...legsFromSheet);
+                console.log(`- Found ${legsFromSheet.length} valid codeshare legs from this sheet.`);
+
+            } catch (error) {
+                console.error(`Failed to process codeshare URL ${url}:`, error.message);
             }
-            console.log(`Found ${allCodeshareLegs.length} valid codeshare route legs.`);
         }
-    } catch (error) {
-        console.error('Failed to process codeshare routes sheet:', error.message);
-        // We can continue without these as well
+        console.log(`Found a total of ${allCodeshareLegs.length} valid codeshare route legs from all sources.`);
     }
 
     // --- PART 3: COMBINE ROUTES AND BUILD ROSTERS ---
@@ -540,6 +536,7 @@ const generateRostersFromGoogleSheet = async () => {
     }
     return { created: generatedRosters.length, legsFound: combinedLegs.length };
 };
+
 
 // Rank Promotion Helper
 const rankThresholds = {
