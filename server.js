@@ -10,6 +10,8 @@
 // - Automatic rank promotions upon PIREP approval.
 // - Cascade delete functionality for users and their associated data.
 // - Personalized roster suggestions based on pilot's last duty/flight location.
+// - NEW: Roster multipliers for bonus flight hours on final legs.
+// - NEW: Image verification required for all PIREP submissions.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -63,6 +65,8 @@ const upload = multer({
                 folder = 'profiles/';
             } else if (['eventImage', 'highlightImage'].includes(file.fieldname)) {
                 folder = 'community/';
+            } else if (file.fieldname === 'verificationImage') {
+                folder = 'pirep-verification/';
             }
             const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
             const fileName = `${file.fieldname}-${uniqueSuffix}${path.extname(file.originalname)}`;
@@ -123,7 +127,6 @@ const rankPerks = {
     'IndGo SkyMaster': ['Access to staff-level decisions', 'Route planning authority'],
     'Blue Legacy Commander': ['Lifetime elite badge', 'Council-level privileges', 'Ultimate recognition']
 };
-// --- END MODIFICATION ---
 
 
 // --- User Schema (Enhanced for FTPL) ---
@@ -253,6 +256,8 @@ const PirepSchema = new mongoose.Schema({
     rejectionReason: { type: String, default: null },
     createdAt: { type: Date, default: Date.now },
     reviewedAt: { type: Date, default: null },
+    verificationImageUrl: { type: String, default: null }, // Temporary URL for staff review
+    isMultiplierEligible: { type: Boolean, default: false }, // True if this is the last leg of a roster
     rosterLeg: {
         rosterId: { type: mongoose.Schema.Types.ObjectId, ref: 'Roster' },
         flightNumber: { type: String }
@@ -278,6 +283,7 @@ const RosterSchema = new mongoose.Schema({
         flightTime: { type: Number, required: true, min: 0.1 }
     }],
     totalFlightTime: { type: Number, required: true, min: 0 },
+    multiplier: { type: Number, default: 1, min: 1, max: 2 }, // Random multiplier for the final leg
     isAvailable: { type: Boolean, default: true },
     isGenerated: { type: Boolean, default: false }, 
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
@@ -596,11 +602,15 @@ const generateRostersFromGoogleSheet = async () => {
             }
 
             if (rosterLegs.length >= 2) {
+                // Generates a random multiplier between 1.10 and 1.50
+                const randomMultiplier = parseFloat((1.1 + Math.random() * 0.4).toFixed(2));
+                
                 generatedRosters.push({
                     name: `${hub} Sector Duty #${i + 1}`,
                     hub,
                     legs: rosterLegs,
                     totalFlightTime: totalTime,
+                    multiplier: randomMultiplier, // Assign the multiplier here
                     isGenerated: true,
                     isAvailable: true,
                 });
@@ -829,9 +839,14 @@ app.post('/api/me/password', authMiddleware, async (req, res) => {
 
 
 // --- PIREP Workflow Routes ---
-app.post('/api/pireps', authMiddleware, async (req, res) => {
+app.post('/api/pireps', authMiddleware, upload.single('verificationImage'), async (req, res) => {
     try {
         const { flightNumber, departure, arrival, aircraft, flightTime, remarks } = req.body;
+
+        if (!req.file) {
+            return res.status(400).json({ message: 'A verification image of the flight is required.' });
+        }
+
         if (!flightNumber || !departure || !arrival || !aircraft || !flightTime) {
             return res.status(400).json({ message: 'Please fill out all required flight details.' });
         }
@@ -842,7 +857,9 @@ app.post('/api/pireps', authMiddleware, async (req, res) => {
         const newPirepData = {
             pilot: req.user._id, flightNumber, departure, arrival, aircraft, remarks,
             flightTime: parseFloat(flightTime),
-            status: 'PENDING'
+            status: 'PENDING',
+            verificationImageUrl: req.file.location, // Store the S3 image URL
+            isMultiplierEligible: false // Default to false
         };
 
         if (pilot.dutyStatus === 'ON_DUTY') {
@@ -868,6 +885,12 @@ app.post('/api/pireps', authMiddleware, async (req, res) => {
             if (existingPirep) return res.status(400).json({ message: 'You have already filed a PIREP for this roster leg.' });
             
             newPirepData.rosterLeg = { rosterId: roster._id, flightNumber: flightNumber };
+            
+            const lastLegInRoster = roster.legs[roster.legs.length - 1];
+            if (lastLegInRoster.flightNumber.toUpperCase() === flightNumber.toUpperCase()) {
+                newPirepData.isMultiplierEligible = true;
+                console.log(`PIREP for ${flightNumber} by ${pilot.email} is eligible for a multiplier.`);
+            }
         }
 
         const newPirep = new Pirep(newPirepData);
@@ -907,12 +930,28 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
         if (!pirep) return res.status(404).json({ message: 'PIREP not found.' });
         if (pirep.status !== 'PENDING') return res.status(400).json({ message: `This PIREP has already been ${pirep.status.toLowerCase()}.` });
 
+        if (pirep.verificationImageUrl) {
+            deleteS3Object(pirep.verificationImageUrl);
+        }
+
         const pilot = await User.findById(pirep.pilot);
         if (!pilot) return res.status(404).json({ message: 'Associated pilot profile not found.' });
 
-        pilot.flightHours += pirep.flightTime;
-        pilot.monthlyFlightHours += pirep.flightTime;
-        pilot.dailyFlightHours += pirep.flightTime;
+        let hoursToAdd = pirep.flightTime;
+        let multiplierApplied = 1;
+
+        if (pirep.isMultiplierEligible && pirep.rosterLeg && pirep.rosterLeg.rosterId) {
+            const roster = await Roster.findById(pirep.rosterLeg.rosterId);
+            if (roster && roster.multiplier > 1) {
+                hoursToAdd *= roster.multiplier;
+                multiplierApplied = roster.multiplier;
+                console.log(`Applied ${roster.multiplier}x multiplier to PIREP ${pirep._id}. Original: ${pirep.flightTime}, Awarded: ${hoursToAdd}`);
+            }
+        }
+
+        pilot.flightHours += hoursToAdd;
+        pilot.monthlyFlightHours += hoursToAdd;
+        pilot.dailyFlightHours += hoursToAdd;
         pilot.lastKnownAirport = pirep.arrival; 
 
         const promotionResult = checkAndApplyRankUpdate(pilot);
@@ -920,20 +959,24 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
         pirep.status = 'APPROVED';
         pirep.reviewedBy = req.user._id;
         pirep.reviewedAt = Date.now();
+        pirep.verificationImageUrl = null; // Clear the URL from the database
         
         await pilot.save();
         await pirep.save();
 
-        // --- PERFORMANCE UPDATE: DECOUPLED GOOGLE SHEET UPDATE ---
-        // This is now a "fire-and-forget" operation and won't block the API response.
         if (pilot.callsign) {
             updateGoogleSheet({
                 callsign: pilot.callsign, name: pilot.name, rank: pilot.rank, flightHours: pilot.flightHours,
             });
         }
         
+        let message = `PIREP approved. ${pilot.name} now has ${pilot.flightHours.toFixed(2)} hours.`;
+        if (multiplierApplied > 1) {
+            message += ` A ${multiplierApplied}x multiplier was applied!`;
+        }
+
         const responsePayload = {
-            message: `PIREP approved. ${pilot.name} now has ${pilot.flightHours.toFixed(2)} hours.`,
+            message: message,
             promotionDetails: null
         };
 
@@ -960,12 +1003,20 @@ app.put('/api/pireps/:pirepId/reject', authMiddleware, isPirepManager, async (re
         const { reason } = req.body;
         if (!reason) return res.status(400).json({ message: 'A reason for rejection is required.' });
 
-        const pirep = await Pirep.findByIdAndUpdate(req.params.pirepId, {
-            status: 'REJECTED', rejectionReason: reason, reviewedBy: req.user._id, reviewedAt: Date.now()
-        }, { new: false });
-
+        const pirep = await Pirep.findById(req.params.pirepId);
         if (!pirep) return res.status(404).json({ message: 'PIREP not found.' });
         if (pirep.status !== 'PENDING') return res.status(400).json({ message: `This PIREP was already ${pirep.status.toLowerCase()}.` });
+
+        if (pirep.verificationImageUrl) {
+            await deleteS3Object(pirep.verificationImageUrl);
+        }
+        
+        pirep.status = 'REJECTED';
+        pirep.rejectionReason = reason;
+        pirep.reviewedBy = req.user._id;
+        pirep.reviewedAt = Date.now();
+        pirep.verificationImageUrl = null; // Clear the URL
+        await pirep.save();
         
         res.json({ message: 'PIREP has been successfully rejected.' });
     } catch (error) {
@@ -985,7 +1036,6 @@ app.put('/api/users/:userId/rank', authMiddleware, isPilotManager, async (req, r
         user.rank = newRank;
         await user.save();
         
-        // --- PERFORMANCE UPDATE: DECOUPLED GOOGLE SHEET UPDATE ---
         if (user.callsign) {
              updateGoogleSheet({ callsign: user.callsign, name: user.name, rank: user.rank, flightHours: user.flightHours });
         }
@@ -1058,7 +1108,16 @@ app.post('/api/rosters', authMiddleware, isRouteManager, async (req, res) => {
         if (!name || !hub || !legs || legs.length === 0 || !totalFlightTime) {
             return res.status(400).json({ message: 'All roster fields are required.' });
         }
-        const newRoster = new Roster({ name, hub, legs, totalFlightTime, createdBy: req.user._id });
+        // Generates a random multiplier between 1.10 and 1.50 for manually created rosters
+        const randomMultiplier = parseFloat((1.1 + Math.random() * 0.4).toFixed(2));
+        const newRoster = new Roster({ 
+            name, 
+            hub, 
+            legs, 
+            totalFlightTime, 
+            multiplier: randomMultiplier,
+            createdBy: req.user._id 
+        });
         await newRoster.save();
 
         const log = new AdminLog({ adminUser: req.user._id, action: 'ROSTER_CREATE', details: `Created new roster: "${name}"` });
@@ -1195,7 +1254,6 @@ app.post('/api/users', authMiddleware, isAdmin, async (req, res) => {
         });
         await user.save();
         
-        // --- PERFORMANCE UPDATE: DECOUPLED GOOGLE SHEET UPDATE ---
         if (normalizedCallsign) {
             updateGoogleSheet({ callsign: normalizedCallsign, name: user.name, rank: user.rank, flightHours: user.flightHours || 0 });
         }
@@ -1215,7 +1273,6 @@ app.post('/api/users', authMiddleware, isAdmin, async (req, res) => {
 
 app.get('/api/users', authMiddleware, isAdmin, async (req, res) => {
     try {
-        // --- PERFORMANCE UPDATE: USE .select() and .lean() FOR FASTER, LIGHTER QUERIES ---
         const users = await User.find()
             .select('name email callsign rank flightHours role createdAt')
             .lean();
@@ -1267,7 +1324,6 @@ app.put('/api/users/:userId/callsign', authMiddleware, isAdmin, async (req, res)
         user.callsign = callsign;
         await user.save();
 
-        // --- PERFORMANCE UPDATE: DECOUPLED GOOGLE SHEET UPDATE ---
         updateGoogleSheet({ callsign, name: user.name, rank: user.rank, flightHours: user.flightHours || 0 });
         res.json({ message: `Callsign ${callsign} assigned to ${user.email}` });
     } catch (error) {
@@ -1279,7 +1335,6 @@ app.put('/api/users/:userId/callsign', authMiddleware, isAdmin, async (req, res)
     }
 });
 
-// --- PERFORMANCE UPDATE: SIMPLIFIED DELETE ROUTE USING MONGOOSE MIDDLEWARE ---
 app.delete('/api/users/:userId', authMiddleware, isAdmin, async (req, res) => {
     const { userId } = req.params;
     try {
@@ -1290,12 +1345,10 @@ app.delete('/api/users/:userId', authMiddleware, isAdmin, async (req, res) => {
         const userToDelete = await User.findById(userId);
         if (!userToDelete) return res.status(404).json({ message: 'User not found.' });
 
-        // The Google Sheet row is deleted in the background (fire-and-forget)
         if (userToDelete.callsign) {
             deleteRowFromGoogleSheet(userToDelete.callsign);
         }
 
-        // This single line triggers all the cascade logic from the middleware
         await User.findByIdAndDelete(userId);
 
         const log = new AdminLog({
