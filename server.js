@@ -12,6 +12,7 @@
 // - Personalized roster suggestions based on pilot's last duty/flight location.
 // - NEW: Roster multipliers for bonus flight hours on final legs.
 // - NEW: Image verification required for all PIREP submissions.
+// - NEW: Rank Unlock requirement is now read from Google Sheets and stored with each roster leg.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -88,9 +89,6 @@ const MIN_REST_PERIOD = 8 * 60 * 60 * 1000; // 8 hours in ms
 const MAX_DUTY_PERIOD = 14 * 60 * 60 * 1000; // 14 hours in ms
 const MAX_DAILY_FLIGHT_HOURS = 10;
 const MAX_MONTHLY_FLIGHT_HOURS = 100;
-// REMOVED ROSTER_HUBS as it's no longer the primary logic driver for generation
-// const ROSTER_HUBS = ['VIDP', 'VABB', 'VOBL', 'VECC', 'VOMM'];
-
 
 // --- MODIFIED: NEW RANK STRUCTURE ---
 // The array defines the order of ranks from lowest to highest.
@@ -282,7 +280,8 @@ const RosterSchema = new mongoose.Schema({
         departure: { type: String, required: true, uppercase: true, trim: true },
         arrival: { type: String, required: true, uppercase: true, trim: true },
         aircraft: { type: String, required: true, trim: true },
-        flightTime: { type: Number, required: true, min: 0.1 }
+        flightTime: { type: Number, required: true, min: 0.1 },
+        requiredRank: { type: String, enum: pilotRanks, default: 'IndGo Cadet' } // MODIFIED TO INCLUDE RANK
     }],
     totalFlightTime: { type: Number, required: true, min: 0 },
     multiplier: { type: Number, default: 1, min: 1, max: 2 }, // Random multiplier for the final leg
@@ -475,13 +474,16 @@ const generateRostersFromGoogleSheet = async () => {
         return match ? match[1] : null;
     };
 
+    // --- MODIFICATION START: Added 'requiredRank' to header aliases ---
     const headerAliases = {
         flightNumber: ['Flight No.', 'Flight Number', 'Callsign'],
         departure: ['Departure ICAO', 'Departure', 'Origin', 'From'],
         arrival: ['Arrival ICAO', 'Arrival', 'Destination', 'To'],
         aircraft: ['Aircraft(s)', 'Aircraft', 'Plane'],
-        flightTime: ['Avg. Flight Time', 'Flight Time', 'Duration']
+        flightTime: ['Avg. Flight Time', 'Flight Time', 'Duration'],
+        requiredRank: ['Rank Unlock', 'Rank', 'Min Rank'] // ADDED THIS LINE
     };
+    // --- MODIFICATION END ---
     const canonicalKeys = Object.keys(headerAliases);
     
     let allLegs = [];
@@ -525,13 +527,17 @@ const generateRostersFromGoogleSheet = async () => {
                         }
                     }
                 });
-
-                if (Object.keys(tempMap).length === canonicalKeys.length) {
+                
+                // --- MODIFICATION START: Check if required keys are present ---
+                // We now check for 5 main keys, rank is optional for backward compatibility.
+                const requiredKeys = ['flightNumber', 'departure', 'arrival', 'aircraft', 'flightTime'];
+                if (requiredKeys.every(key => tempMap[key] !== undefined)) {
                     columnMap = tempMap;
                     headerRowIndex = i;
                     console.log(`- Found valid header row at index ${i}.`);
                     break;
                 }
+                // --- MODIFICATION END ---
             }
 
             if (headerRowIndex === -1) {
@@ -549,8 +555,21 @@ const generateRostersFromGoogleSheet = async () => {
                     const flightNumber = row[columnMap.flightNumber]?.trim();
                     const aircraft = row[columnMap.aircraft]?.trim();
                     
+                    // --- MODIFICATION START: Extract rank and validate it ---
+                    let requiredRank = 'IndGo Cadet'; // Default rank
+                    if (columnMap.requiredRank !== undefined) {
+                        const rankFromSheet = row[columnMap.requiredRank]?.trim();
+                        // Check if the rank from the sheet is a valid rank defined in pilotRanks
+                        if (rankFromSheet && pilotRanks.includes(rankFromSheet)) {
+                            requiredRank = rankFromSheet;
+                        }
+                    }
+                    // --- MODIFICATION END ---
+                    
                     if (departureIcao && arrivalIcao && flightNumber && aircraft && !isNaN(flightTime) && flightTime > 0) {
-                        return { flightNumber, departure: departureIcao, arrival: arrivalIcao, aircraft, flightTime };
+                        // --- MODIFICATION START: Add requiredRank to the returned leg object ---
+                        return { flightNumber, departure: departureIcao, arrival: arrivalIcao, aircraft, flightTime, requiredRank };
+                        // --- MODIFICATION END ---
                     }
                     return null;
                 })
@@ -579,24 +598,19 @@ const generateRostersFromGoogleSheet = async () => {
 
     const generatedRosters = [];
     
-    // --- START OF MODIFICATION ---
-    // Get a list of all unique departure airports found in the spreadsheets.
     const allDepartureAirports = Object.keys(legsByDeparture);
     console.log(`Found ${allDepartureAirports.length} unique departure airports for roster generation.`);
 
-    // Loop through every airport that has outgoing flights, not just the hubs.
     for (const departureAirport of allDepartureAirports) {
         if (!legsByDeparture[departureAirport]) continue;
 
-        // To avoid creating too many rosters, let's generate up to 3 for each location.
-        // You can adjust this number.
         const rosterCountPerAirport = 3; 
         for (let i = 0; i < rosterCountPerAirport; i++) {
             const rosterLegs = [];
-            let currentAirport = departureAirport; // Start the roster from the current airport in the loop
+            let currentAirport = departureAirport; 
             let totalTime = 0;
             const usedFlightNumbers = new Set();
-            const legCount = Math.floor(Math.random() * 3) + 2; // Create rosters with 2 to 4 legs
+            const legCount = Math.floor(Math.random() * 3) + 2; 
 
             for (let j = 0; j < legCount; j++) {
                 const possibleNextLegs = (legsByDeparture[currentAirport] || []).filter(
@@ -614,12 +628,11 @@ const generateRostersFromGoogleSheet = async () => {
             }
 
             if (rosterLegs.length >= 2) {
-                // Generates a random multiplier between 1.10 and 1.50
                 const randomMultiplier = parseFloat((1.1 + Math.random() * 0.4).toFixed(2));
                 
                 generatedRosters.push({
-                    name: `${departureAirport} Sector Duty #${i + 1}`, // Roster name now reflects the starting airport
-                    hub: departureAirport, // The 'hub' is now the starting airport
+                    name: `${departureAirport} Sector Duty #${i + 1}`,
+                    hub: departureAirport,
                     legs: rosterLegs,
                     totalFlightTime: totalTime,
                     multiplier: randomMultiplier,
@@ -629,8 +642,6 @@ const generateRostersFromGoogleSheet = async () => {
             }
         }
     }
-    // --- END OF MODIFICATION ---
-
 
     if (generatedRosters.length > 0) {
         await Roster.deleteMany({ isGenerated: true });
