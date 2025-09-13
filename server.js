@@ -12,6 +12,7 @@
 // - Personalized roster suggestions based on pilot's last duty/flight location.
 // - NEW: Roster multipliers for bonus flight hours on final legs.
 // - NEW: Image verification required for all PIREP submissions.
+// - NEW: Map feature support via airports data endpoint.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -26,6 +27,7 @@ const multerS3 = require('multer-s3');
 const { google } = require('googleapis');
 const Papa = require('papaparse'); // For parsing CSV data from Google Sheets
 const axios = require('axios'); // For fetching the sheet
+const fs = require('fs').promises; // For reading local JSON files
 require('dotenv').config();
 
 // 2. INITIALIZE EXPRESS APP & AWS S3 CLIENT
@@ -87,19 +89,14 @@ const MIN_REST_PERIOD = 8 * 60 * 60 * 1000; // 8 hours in ms
 const MAX_DUTY_PERIOD = 14 * 60 * 60 * 1000; // 14 hours in ms
 const MAX_DAILY_FLIGHT_HOURS = 10;
 const MAX_MONTHLY_FLIGHT_HOURS = 100;
-// REMOVED ROSTER_HUBS as it's no longer the primary logic driver for generation
-// const ROSTER_HUBS = ['VIDP', 'VABB', 'VOBL', 'VECC', 'VOMM'];
-
 
 // --- MODIFIED: NEW RANK STRUCTURE ---
-// The array defines the order of ranks from lowest to highest.
 const pilotRanks = [
     'IndGo Cadet', 'Skyline Observer', 'Route Explorer', 'Skyline Officer',
     'Command Captain', 'Elite Captain', 'Blue Eagle', 'Line Instructor',
     'Chief Flight Instructor', 'IndGo SkyMaster', 'Blue Legacy Commander'
 ];
 
-// The object maps each rank to its required flight hours for promotion checks.
 const rankThresholds = {
     'IndGo Cadet': 0,
     'Skyline Observer': 50,
@@ -114,7 +111,6 @@ const rankThresholds = {
     'Blue Legacy Commander': 2300
 };
 
-// This new object stores the perks for each rank to be sent to the front-end upon promotion.
 const rankPerks = {
     'IndGo Cadet': ['Training routes only (Q400, A320)', 'Discord pilot badge'],
     'Skyline Observer': ['Access to A321/B738 short-haul', 'Eligible for beginner events'],
@@ -128,7 +124,6 @@ const rankPerks = {
     'IndGo SkyMaster': ['Access to staff-level decisions', 'Route planning authority'],
     'Blue Legacy Commander': ['Lifetime elite badge', 'Council-level privileges', 'Ultimate recognition']
 };
-
 
 // --- User Schema (Enhanced for FTPL) ---
 const UserSchema = new mongoose.Schema({
@@ -578,7 +573,6 @@ const generateRostersFromGoogleSheet = async () => {
 
     const generatedRosters = [];
     
-    // --- START OF MODIFICATION ---
     // Get a list of all unique departure airports found in the spreadsheets.
     const allDepartureAirports = Object.keys(legsByDeparture);
     console.log(`Found ${allDepartureAirports.length} unique departure airports for roster generation.`);
@@ -587,12 +581,11 @@ const generateRostersFromGoogleSheet = async () => {
     for (const departureAirport of allDepartureAirports) {
         if (!legsByDeparture[departureAirport]) continue;
 
-        // To avoid creating too many rosters, let's generate up to 3 for each location.
-        // You can adjust this number.
+        // Generate up to 3 rosters for each location to avoid over-generation.
         const rosterCountPerAirport = 3; 
         for (let i = 0; i < rosterCountPerAirport; i++) {
             const rosterLegs = [];
-            let currentAirport = departureAirport; // Start the roster from the current airport in the loop
+            let currentAirport = departureAirport;
             let totalTime = 0;
             const usedFlightNumbers = new Set();
             const legCount = Math.floor(Math.random() * 3) + 2; // Create rosters with 2 to 4 legs
@@ -617,8 +610,8 @@ const generateRostersFromGoogleSheet = async () => {
                 const randomMultiplier = parseFloat((1.1 + Math.random() * 0.4).toFixed(2));
                 
                 generatedRosters.push({
-                    name: `${departureAirport} Sector Duty #${i + 1}`, // Roster name now reflects the starting airport
-                    hub: departureAirport, // The 'hub' is now the starting airport
+                    name: `${departureAirport} Sector Duty #${i + 1}`,
+                    hub: departureAirport,
                     legs: rosterLegs,
                     totalFlightTime: totalTime,
                     multiplier: randomMultiplier,
@@ -628,8 +621,6 @@ const generateRostersFromGoogleSheet = async () => {
             }
         }
     }
-    // --- END OF MODIFICATION ---
-
 
     if (generatedRosters.length > 0) {
         await Roster.deleteMany({ isGenerated: true });
@@ -689,6 +680,18 @@ const isRouteManager = hasRole(['admin', 'Chief Executive Officer (CEO)', 'Chief
 
 
 // 7. API ROUTES (ENDPOINTS)
+
+// --- NEW: Airport Data Route for Map Feature ---
+app.get('/api/airports', async (req, res) => {
+    try {
+        const filePath = path.join(__dirname, 'airports.json');
+        const data = await fs.readFile(filePath, 'utf8');
+        res.json(JSON.parse(data));
+    } catch (error) {
+        console.error('Error reading airports.json:', error);
+        res.status(500).json({ message: 'Could not load airport data.' });
+    }
+});
 
 // --- Community Content Routes ---
 app.post('/api/events', authMiddleware, isCommunityManager, upload.single('eventImage'), async (req, res) => {
