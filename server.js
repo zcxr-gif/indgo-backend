@@ -474,16 +474,15 @@ const generateRostersFromGoogleSheet = async () => {
         return match ? match[1] : null;
     };
 
-    // --- MODIFICATION START: Added 'requiredRank' to header aliases ---
     const headerAliases = {
         flightNumber: ['Flight No.', 'Flight Number', 'Callsign'],
         departure: ['Departure ICAO', 'Departure', 'Origin', 'From'],
         arrival: ['Arrival ICAO', 'Arrival', 'Destination', 'To'],
         aircraft: ['Aircraft(s)', 'Aircraft', 'Plane'],
         flightTime: ['Avg. Flight Time', 'Flight Time', 'Duration'],
-        requiredRank: ['Rank Unlock', 'Rank', 'Min Rank'] // ADDED THIS LINE
+        requiredRank: ['Rank Unlock', 'Rank', 'Min Rank']
     };
-    // --- MODIFICATION END ---
+
     const canonicalKeys = Object.keys(headerAliases);
     
     let allLegs = [];
@@ -528,16 +527,15 @@ const generateRostersFromGoogleSheet = async () => {
                     }
                 });
                 
-                // --- MODIFICATION START: Check if required keys are present ---
-                // We now check for 5 main keys, rank is optional for backward compatibility.
-                const requiredKeys = ['flightNumber', 'departure', 'arrival', 'aircraft', 'flightTime'];
+                // --- MODIFICATION #1: 'requiredRank' is now a mandatory column ---
+                const requiredKeys = ['flightNumber', 'departure', 'arrival', 'aircraft', 'flightTime', 'requiredRank'];
                 if (requiredKeys.every(key => tempMap[key] !== undefined)) {
                     columnMap = tempMap;
                     headerRowIndex = i;
                     console.log(`- Found valid header row at index ${i}.`);
                     break;
                 }
-                // --- MODIFICATION END ---
+                // --- END MODIFICATION #1 ---
             }
 
             if (headerRowIndex === -1) {
@@ -555,21 +553,15 @@ const generateRostersFromGoogleSheet = async () => {
                     const flightNumber = row[columnMap.flightNumber]?.trim();
                     const aircraft = row[columnMap.aircraft]?.trim();
                     
-                    // --- MODIFICATION START: Extract rank and validate it ---
-                    let requiredRank = 'IndGo Cadet'; // Default rank
-                    if (columnMap.requiredRank !== undefined) {
-                        const rankFromSheet = row[columnMap.requiredRank]?.trim();
-                        // Check if the rank from the sheet is a valid rank defined in pilotRanks
-                        if (rankFromSheet && pilotRanks.includes(rankFromSheet)) {
-                            requiredRank = rankFromSheet;
-                        }
-                    }
-                    // --- MODIFICATION END ---
+                    // --- MODIFICATION #2: Extract and validate rank as a mandatory field ---
+                    const rankFromSheet = row[columnMap.requiredRank]?.trim();
+                    const isValidRank = rankFromSheet && pilotRanks.includes(rankFromSheet);
+                    // --- END MODIFICATION #2 ---
                     
-                    if (departureIcao && arrivalIcao && flightNumber && aircraft && !isNaN(flightTime) && flightTime > 0) {
-                        // --- MODIFICATION START: Add requiredRank to the returned leg object ---
-                        return { flightNumber, departure: departureIcao, arrival: arrivalIcao, aircraft, flightTime, requiredRank };
-                        // --- MODIFICATION END ---
+                    if (departureIcao && arrivalIcao && flightNumber && aircraft && !isNaN(flightTime) && flightTime > 0 && isValidRank) {
+                        // --- MODIFICATION #2: Use the validated rank directly from the sheet ---
+                        return { flightNumber, departure: departureIcao, arrival: arrivalIcao, aircraft, flightTime, requiredRank: rankFromSheet };
+                        // --- END MODIFICATION #2 ---
                     }
                     return null;
                 })
