@@ -87,7 +87,8 @@ const MIN_REST_PERIOD = 8 * 60 * 60 * 1000; // 8 hours in ms
 const MAX_DUTY_PERIOD = 14 * 60 * 60 * 1000; // 14 hours in ms
 const MAX_DAILY_FLIGHT_HOURS = 10;
 const MAX_MONTHLY_FLIGHT_HOURS = 100;
-const ROSTER_HUBS = ['VIDP', 'VABB', 'VOBL', 'VECC', 'VOMM']; // Primary hubs for roster generation
+// REMOVED ROSTER_HUBS as it's no longer the primary logic driver for generation
+// const ROSTER_HUBS = ['VIDP', 'VABB', 'VOBL', 'VECC', 'VOMM'];
 
 
 // --- MODIFIED: NEW RANK STRUCTURE ---
@@ -576,15 +577,25 @@ const generateRostersFromGoogleSheet = async () => {
     }, {});
 
     const generatedRosters = [];
-    for (const hub of ROSTER_HUBS) {
-        if (!legsByDeparture[hub]) continue;
+    
+    // --- START OF MODIFICATION ---
+    // Get a list of all unique departure airports found in the spreadsheets.
+    const allDepartureAirports = Object.keys(legsByDeparture);
+    console.log(`Found ${allDepartureAirports.length} unique departure airports for roster generation.`);
 
-        for (let i = 0; i < 5; i++) {
+    // Loop through every airport that has outgoing flights, not just the hubs.
+    for (const departureAirport of allDepartureAirports) {
+        if (!legsByDeparture[departureAirport]) continue;
+
+        // To avoid creating too many rosters, let's generate up to 3 for each location.
+        // You can adjust this number.
+        const rosterCountPerAirport = 3; 
+        for (let i = 0; i < rosterCountPerAirport; i++) {
             const rosterLegs = [];
-            let currentAirport = hub;
+            let currentAirport = departureAirport; // Start the roster from the current airport in the loop
             let totalTime = 0;
             const usedFlightNumbers = new Set();
-            const legCount = Math.floor(Math.random() * 3) + 2;
+            const legCount = Math.floor(Math.random() * 3) + 2; // Create rosters with 2 to 4 legs
 
             for (let j = 0; j < legCount; j++) {
                 const possibleNextLegs = (legsByDeparture[currentAirport] || []).filter(
@@ -606,17 +617,19 @@ const generateRostersFromGoogleSheet = async () => {
                 const randomMultiplier = parseFloat((1.1 + Math.random() * 0.4).toFixed(2));
                 
                 generatedRosters.push({
-                    name: `${hub} Sector Duty #${i + 1}`,
-                    hub,
+                    name: `${departureAirport} Sector Duty #${i + 1}`, // Roster name now reflects the starting airport
+                    hub: departureAirport, // The 'hub' is now the starting airport
                     legs: rosterLegs,
                     totalFlightTime: totalTime,
-                    multiplier: randomMultiplier, // Assign the multiplier here
+                    multiplier: randomMultiplier,
                     isGenerated: true,
                     isAvailable: true,
                 });
             }
         }
     }
+    // --- END OF MODIFICATION ---
+
 
     if (generatedRosters.length > 0) {
         await Roster.deleteMany({ isGenerated: true });
@@ -1066,7 +1079,7 @@ app.get('/api/rosters', authMiddleware, async (req, res) => {
         const user = await User.findById(req.user._id).lean();
         if (!user) return res.status(404).json({ message: 'User not found.' });
         
-        const departureIcao = user.lastKnownAirport || ROSTER_HUBS[0];
+        const departureIcao = user.lastKnownAirport || 'VIDP';
 
         const rosters = await Roster.find({
             isAvailable: true,
@@ -1092,7 +1105,7 @@ app.get('/api/rosters/my-rosters', authMiddleware, async (req, res) => {
 
         const searchLocations = new Set([fromDutyLocation, fromPirepLocation].filter(Boolean));
         if (searchLocations.size === 0) {
-            searchLocations.add(ROSTER_HUBS[0]);
+            searchLocations.add('VIDP'); // Default fallback if no location is known
         }
 
         const availableRosters = await Roster.find({
@@ -1150,7 +1163,7 @@ app.post('/api/rosters/generate', authMiddleware, isRouteManager, async (req, re
         res.status(201).json({
             message: `Roster generation complete. Found a total of ${result.legsFound} legs and created ${result.created} new rosters.`
         });
-    } catch (error) {
+    } catch (error)
         console.error(error);
         res.status(500).json({ message: error.message });
     }
