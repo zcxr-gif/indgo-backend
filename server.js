@@ -246,6 +246,9 @@ const PirepSchema = new mongoose.Schema({
     arrival: { type: String, required: true, uppercase: true, trim: true },
     aircraft: { type: String, required: true },
     flightTime: { type: Number, required: true, min: 0.1 },
+        // Required metadata for routes
+        rankUnlock: { type: String, required: true, trim: true },
+        operator:   { type: String, required: true, trim: true },
     remarks: { type: String, trim: true },
     status: { type: String, enum: ['PENDING', 'APPROVED', 'REJECTED'], default: 'PENDING' },
     reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
@@ -436,7 +439,26 @@ const deleteRowFromGoogleSheet = async (callsign) => {
 };
 
 // --- (UPGRADED) AUTOMATED ROSTER GENERATION LOGIC ---
-const generateRostersFromGoogleSheet = async () => {
+const 
+// Deduce a rank from the aircraft string (mirrors the sheet's ARRAYFORMULA mapping)
+const deduceRankFromAircraft = (acStr) => {
+    const s = String(acStr || '').toUpperCase();
+    if (!s) return 'Unknown';
+    const has = (pat) => new RegExp(pat, 'i').test(s);
+    if (has('(Q400|A320|B738)')) return 'IndGo Cadet';
+    if (has('(A321|B737)')) return 'Skyline Observer';
+    if (has('(A330|B38M)')) return 'Route Explorer';
+    if (has('(787-8|777-200LR)')) return 'Skyline Officer';
+    if (has('(787-9|777-300ER)')) return 'Command Captain';
+    if (has('A350')) return 'Elite Captain';
+    if (has('(A380|747|744)')) return 'Blue Eagle';
+    if (has('INSTRUCTOR')) return 'Line Instructor';
+    if (has('CHIEF')) return 'Chief Flight Instructor';
+    if (has('SKYMASTER')) return 'IndGo SkyMaster';
+    if (has('COMMANDER')) return 'Blue Legacy Commander';
+    return 'Unknown';
+};
+generateRostersFromGoogleSheet = async () => {
     console.log('Starting automated roster generation from all sources...');
 
     const convertTimeToDecimal = (timeStr) => {
@@ -469,14 +491,19 @@ const generateRostersFromGoogleSheet = async () => {
         return match ? match[1] : null;
     };
 
-    const headerAliases = {
+    const headerAliasesBase = {
         flightNumber: ['Flight No.', 'Flight Number', 'Callsign'],
         departure: ['Departure ICAO', 'Departure', 'Origin', 'From'],
         arrival: ['Arrival ICAO', 'Arrival', 'Destination', 'To'],
         aircraft: ['Aircraft(s)', 'Aircraft', 'Plane'],
         flightTime: ['Avg. Flight Time', 'Flight Time', 'Duration']
     };
-    const canonicalKeys = Object.keys(headerAliases);
+    const headerAliasesCodeshare = {
+        ...headerAliasesBase,
+        rankUnlock: ['Rank Unlock', 'Rank', 'Rank Required', 'Unlock Rank'],
+        operator:   ['Operator', 'Airline', 'Carrier', 'Virtual Airline']
+    };
+
     
     let allLegs = [];
     
@@ -490,6 +517,9 @@ const generateRostersFromGoogleSheet = async () => {
     }
 
     for (const url of allUrls) {
+        const isCodeshare = (process.env.CODESHARE_SHEET_URLS ? process.env.CODESHARE_SHEET_URLS.split(',').map(s=>s.trim()) : []).includes(url.trim());
+        const headerAliases = isCodeshare ? headerAliasesCodeshare : headerAliasesBase;
+        const canonicalKeys = Object.keys(headerAliases);
         try {
             console.log(`Fetching routes from: ${url.substring(0, 80)}...`);
             const response = await axios.get(url.trim());
@@ -535,20 +565,36 @@ const generateRostersFromGoogleSheet = async () => {
 
             const dataRows = allRows.slice(headerRowIndex + 1);
 
+            
             const legsFromSheet = dataRows
                 .map(row => {
                     const departureIcao = extractIcao(row[columnMap.departure]);
-                    const arrivalIcao = extractIcao(row[columnMap.arrival]);
-                    const flightTime = convertTimeToDecimal(row[columnMap.flightTime]);
-                    const flightNumber = row[columnMap.flightNumber]?.trim();
-                    const aircraft = row[columnMap.aircraft]?.trim();
-                    
-                    if (departureIcao && arrivalIcao && flightNumber && aircraft && !isNaN(flightTime) && flightTime > 0) {
-                        return { flightNumber, departure: departureIcao, arrival: arrivalIcao, aircraft, flightTime };
+                    const arrivalIcao   = extractIcao(row[columnMap.arrival]);
+                    const flightTime    = convertTimeToDecimal(row[columnMap.flightTime]);
+                    const flightNumber  = row[columnMap.flightNumber]?.trim();
+                    const aircraft      = row[columnMap.aircraft]?.trim();
+
+                    // Determine operator/rank per sheet type
+                    let rankUnlock = null;
+                    let operator = null;
+
+                    if (isCodeshare) {
+                        rankUnlock = row[columnMap.rankUnlock]?.trim();
+                        operator   = row[columnMap.operator]?.trim();
+                        if (!rankUnlock || !operator) return null; // enforce for codeshare
+                    } else {
+                        // Primary: compute defaults if not explicitly present
+                        rankUnlock = (columnMap.rankUnlock !== undefined) ? String(row[columnMap.rankUnlock] || '').trim() : deduceRankFromAircraft(aircraft);
+                        operator   = (columnMap.operator !== undefined) ? String(row[columnMap.operator] || '').trim() : 'IndGo Air Virtual';
+                    }
+
+                    if (departureIcao && arrivalIcao && flightNumber && aircraft && !isNaN(flightTime) && flightTime > 0 && rankUnlock && operator) {
+                        return { flightNumber, departure: departureIcao, arrival: arrivalIcao, aircraft, flightTime, rankUnlock, operator };
                     }
                     return null;
                 })
                 .filter(leg => leg !== null);
+
             
             allLegs.push(...legsFromSheet);
             console.log(`- Found ${legsFromSheet.length} valid legs from this sheet.`);
@@ -1134,21 +1180,33 @@ app.get('/api/rosters/my-rosters', authMiddleware, async (req, res) => {
 
 app.post('/api/rosters', authMiddleware, isRouteManager, async (req, res) => {
     try {
+        
         const { name, hub, legs, totalFlightTime } = req.body;
-        if (!name || !hub || !legs || legs.length === 0 || !totalFlightTime) {
-            return res.status(400).json({ message: 'All roster fields are required.' });
+        if (!name || !hub || !Array.isArray(legs) || legs.length === 0) {
+            return res.status(400).json({ message: 'Name, hub and at least one leg are required.' });
         }
+        // Ensure each leg has operator and rankUnlock (defaults for primary IndGo rosters)
+        const finishedLegs = legs.map(l => {
+            const aircraft = l.aircraft || '';
+            const operator = (l.operator && String(l.operator).trim()) || 'IndGo Air Virtual';
+            const rankUnlock = (l.rankUnlock && String(l.rankUnlock).trim()) || deduceRankFromAircraft(aircraft);
+            return { ...l, operator, rankUnlock };
+        });
+        const computedTFT = typeof totalFlightTime === 'number' && totalFlightTime > 0
+            ? totalFlightTime
+            : finishedLegs.reduce((s, L) => s + (Number(L.flightTime) || 0), 0);
+
         // Generates a random multiplier between 1.10 and 1.50 for manually created rosters
         const randomMultiplier = parseFloat((1.1 + Math.random() * 0.4).toFixed(2));
         const newRoster = new Roster({ 
             name, 
             hub, 
-            legs, 
-            totalFlightTime, 
+            legs: finishedLegs, 
+            totalFlightTime: computedTFT, 
             multiplier: randomMultiplier,
             createdBy: req.user._id 
         });
-        await newRoster.save();
+await newRoster.save();
 
         const log = new AdminLog({ adminUser: req.user._id, action: 'ROSTER_CREATE', details: `Created new roster: "${name}"` });
         await log.save();
