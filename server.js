@@ -1051,6 +1051,18 @@ app.put('/api/users/:userId/rank', authMiddleware, isPilotManager, async (req, r
 
 app.get('/api/rosters', authMiddleware, async (req, res) => {
     try {
+        const { all } = req.query;
+        // Define manager roles that can view all rosters
+        const managerRoles = ['admin', 'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)', 'Route Manager (RM)'];
+        const isManager = managerRoles.includes(req.user.role);
+
+        // If a manager requests 'all', return everything
+        if (all === 'true' && isManager) {
+            const allRosters = await Roster.find({}).sort({ hub: 1, name: 1 }).lean();
+            return res.json(allRosters);
+        }
+
+        // --- Existing logic for personalized pilot view ---
         const user = await User.findById(req.user._id).lean();
         if (!user) return res.status(404).json({ message: 'User not found.' });
         
@@ -1067,6 +1079,8 @@ app.get('/api/rosters', authMiddleware, async (req, res) => {
         res.status(500).json({ message: 'Server error while fetching available rosters.' });
     }
 });
+
+
 
 app.get('/api/rosters/my-rosters', authMiddleware, async (req, res) => {
     try {
