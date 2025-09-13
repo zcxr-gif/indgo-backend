@@ -97,6 +97,22 @@ const pilotRanks = [
     'Chief Flight Instructor', 'IndGo SkyMaster', 'Blue Legacy Commander'
 ];
 
+// --- Rank helpers (allow flights at or below the pilot's rank) ---
+const rankIndex = (r) => {
+    const i = pilotRanks.indexOf(String(r || '').trim());
+    return i >= 0 ? i : -1;
+};
+const canFlyLeg = (userRank, legRank) => {
+    const ui = rankIndex(userRank);
+    const li = rankIndex(legRank);
+    return ui >= 0 && li >= 0 && li <= ui;
+};
+const getLegRequiredRank = (leg) => {
+    if (leg?.rankUnlock && pilotRanks.includes(leg.rankUnlock)) return leg.rankUnlock;
+    return deduceRankFromAircraft(leg?.aircraft);
+};
+
+
 const rankThresholds = {
     'IndGo Cadet': 0,
     'Skyline Observer': 50,
@@ -439,6 +455,7 @@ const deleteRowFromGoogleSheet = async (callsign) => {
 };
 
 // --- (UPGRADED) AUTOMATED ROSTER GENERATION LOGIC ---
+
 // Deduce a rank from the aircraft string (mirrors the sheet's ARRAYFORMULA mapping)
 const deduceRankFromAircraft = (acStr) => {
     const s = String(acStr || '').toUpperCase();
@@ -457,7 +474,7 @@ const deduceRankFromAircraft = (acStr) => {
     if (has('COMMANDER')) return 'Blue Legacy Commander';
     return 'Unknown';
 };
-generateRostersFromGoogleSheet = async () => {
+const generateRostersFromGoogleSheet = async () => {
     console.log('Starting automated roster generation from all sources...');
 
     const convertTimeToDecimal = (timeStr) => {
@@ -937,7 +954,15 @@ app.post('/api/pireps', authMiddleware, upload.single('verificationImage'), asyn
 
             if (!leg) return res.status(400).json({ message: 'This flight does not match any leg in your assigned roster.' });
 
-            const existingPirep = await Pirep.findOne({
+            
+            // Rank enforcement on roster leg
+            const requiredRank = getLegRequiredRank(leg);
+            if (!canFlyLeg(pilot.rank, requiredRank)) {
+                return res.status(403).json({
+                    message: `This roster leg requires ${requiredRank}, which is above your rank (${pilot.rank}).`
+                });
+            }
+const existingPirep = await Pirep.findOne({
                 pilot: req.user._id,
                 'rosterLeg.rosterId': roster._id,
                 'rosterLeg.flightNumber': flightNumber
@@ -952,6 +977,17 @@ app.post('/api/pireps', authMiddleware, upload.single('verificationImage'), asyn
                 newPirepData.isMultiplierEligible = true;
                 console.log(`PIREP for ${flightNumber} by ${pilot.email} is eligible for a multiplier.`);
             }
+        } else {
+            // Ad-hoc (off-roster) PIREP: enforce rank by aircraft
+            const neededRank = deduceRankFromAircraft(aircraft);
+            if (!canFlyLeg(pilot.rank, neededRank)) {
+                return res.status(403).json({
+                    message: `This aircraft/route requires ${neededRank}, which is above your rank (${pilot.rank}).`
+                });
+            }
+            // Optionally record inferred rank for staff reference
+            newPirepData.rankUnlock = neededRank;
+            newPirepData.operator = newPirepData.operator || 'IndGo Air Virtual';
         }
 
         const newPirep = new Pirep(newPirepData);
@@ -1134,7 +1170,12 @@ app.get('/api/rosters', authMiddleware, async (req, res) => {
             'legs.0.departure': departureIcao 
         }).sort({ createdAt: -1 }).lean();
 
-        res.json(rosters);
+        // Rank filter: only include rosters whose legs are all at/below user's rank
+        const filtered = rosters.filter(r =>
+            Array.isArray(r.legs) && r.legs.length > 0 &&
+            r.legs.every(l => canFlyLeg(user.rank, getLegRequiredRank(l)))
+        );
+        res.json(filtered);
     } catch (error) {
         console.error(error);
         res.status(500).json({ message: 'Server error while fetching available rosters.' });
@@ -1162,7 +1203,10 @@ app.get('/api/rosters/my-rosters', authMiddleware, async (req, res) => {
         }).sort({ createdAt: -1 }).lean();
 
         res.json({
-            rosters: availableRosters,
+            rosters: availableRosters.filter(r =>
+                Array.isArray(r.legs) && r.legs.length > 0 &&
+                r.legs.every(l => canFlyLeg(user.rank, getLegRequiredRank(l)))
+            ),
             searchCriteria: {
                 fromLastDuty: fromDutyLocation,
                 fromLastPirep: fromPirepLocation,
@@ -1271,7 +1315,15 @@ app.post('/api/duty/start', authMiddleware, async (req, res) => {
             return res.status(403).json({ message: `This duty would exceed your ${MAX_DAILY_FLIGHT_HOURS}-hour daily flight limit.` });
         }
 
-        user.dutyStatus = 'ON_DUTY';
+        
+        // Rank enforcement: block roster if any leg requires a rank above the pilot's rank
+        const overRankLeg = roster.legs.find(l => !canFlyLeg(user.rank, getLegRequiredRank(l)));
+        if (overRankLeg) {
+            return res.status(403).json({
+                message: `This roster includes leg ${overRankLeg.flightNumber} (${overRankLeg.aircraft}) requiring ${getLegRequiredRank(overRankLeg)}, which is above your rank (${user.rank}).`
+            });
+        }
+user.dutyStatus = 'ON_DUTY';
         user.currentRoster = roster._id;
         user.lastDutyStart = Date.now();
         await user.save();
