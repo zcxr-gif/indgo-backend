@@ -1163,7 +1163,7 @@ app.post('/api/rosters/generate', authMiddleware, isRouteManager, async (req, re
         res.status(201).json({
             message: `Roster generation complete. Found a total of ${result.legsFound} legs and created ${result.created} new rosters.`
         });
-    } catch (error)
+    } catch (error) {
         console.error(error);
         res.status(500).json({ message: error.message });
     }
