@@ -439,7 +439,6 @@ const deleteRowFromGoogleSheet = async (callsign) => {
 };
 
 // --- (UPGRADED) AUTOMATED ROSTER GENERATION LOGIC ---
-const 
 // Deduce a rank from the aircraft string (mirrors the sheet's ARRAYFORMULA mapping)
 const deduceRankFromAircraft = (acStr) => {
     const s = String(acStr || '').toUpperCase();
