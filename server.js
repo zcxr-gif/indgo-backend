@@ -26,6 +26,7 @@ const multerS3 = require('multer-s3');
 const { google } = require('googleapis');
 const Papa = require('papaparse'); // For parsing CSV data from Google Sheets
 const axios = require('axios'); // For fetching the sheet
+const fs = require('fs').promises; // Import the fs module with promises
 require('dotenv').config();
 
 // 2. INITIALIZE EXPRESS APP & AWS S3 CLIENT
@@ -689,6 +690,18 @@ const isRouteManager = hasRole(['admin', 'Chief Executive Officer (CEO)', 'Chief
 
 
 // 7. API ROUTES (ENDPOINTS)
+// --- NEW: Airport Data Route ---
+app.get('/api/airports', async (req, res) => {
+    try {
+        const filePath = path.join(__dirname, 'airports.json');
+        const data = await fs.readFile(filePath, 'utf8');
+        res.json(JSON.parse(data));
+    } catch (error) {
+        console.error('Error reading airports.json:', error);
+        res.status(500).json({ message: 'Could not load airport data.' });
+    }
+});
+
 
 // --- Community Content Routes ---
 app.post('/api/events', authMiddleware, isCommunityManager, upload.single('eventImage'), async (req, res) => {
@@ -1163,7 +1176,7 @@ app.post('/api/rosters/generate', authMiddleware, isRouteManager, async (req, re
         res.status(201).json({
             message: `Roster generation complete. Found a total of ${result.legsFound} legs and created ${result.created} new rosters.`
         });
-    } catch (error) {}
+    } catch (error) {
         console.error(error);
         res.status(500).json({ message: error.message });
     }
