@@ -1276,11 +1276,14 @@ app.get('/api/rosters', authMiddleware, async (req, res) => {
         const user = await User.findById(req.user._id).lean();
         if (!user) return res.status(404).json({ message: 'User not found.' });
         
-        const departureIcao = user.lastKnownAirport || 'VIDP';
+        const departureIcao = String(user.lastKnownAirport || 'VIDP').toUpperCase().trim();
 
         const rosters = await Roster.find({
             isAvailable: true,
-            'legs.0.departure': departureIcao 
+            $or: [
+            { 'legs.0.departure': departureIcao },
+            { hub: departureIcao }
+        ] 
         }).sort({ createdAt: -1 }).lean();
 
         // Rank filter: only include rosters whose legs are all at/below user's rank
@@ -1305,14 +1308,21 @@ app.get('/api/rosters/my-rosters', authMiddleware, async (req, res) => {
         const fromDutyLocation = user.lastDutyAirport;
         const fromPirepLocation = user.lastKnownAirport;
 
-        const searchLocations = new Set([fromDutyLocation, fromPirepLocation].filter(Boolean));
+        const searchLocations = new Set(
+            [fromDutyLocation, fromPirepLocation]
+                .filter(Boolean)
+                .map(s => String(s).toUpperCase().trim())
+        );
         if (searchLocations.size === 0) {
             searchLocations.add('VIDP'); // Default fallback if no location is known
         }
 
         const availableRosters = await Roster.find({
             isAvailable: true,
-            'legs.0.departure': { $in: Array.from(searchLocations) }
+            $or: [
+                { 'legs.0.departure': { $in: Array.from(searchLocations) } },
+                { hub: { $in: Array.from(searchLocations) } }
+            ]
         }).sort({ createdAt: -1 }).lean();
 
         res.json({
@@ -1342,11 +1352,19 @@ app.post('/api/rosters', authMiddleware, isRouteManager, async (req, res) => {
             return res.status(400).json({ message: 'Name, hub and at least one leg are required.' });
         }
         // Ensure each leg has operator and rankUnlock (defaults for primary IndGo rosters)
+        const normalizeICAO = s => String(s || '').toUpperCase().trim();
+
         const finishedLegs = legs.map(l => {
             const aircraft = l.aircraft || '';
             const operator = (l.operator && String(l.operator).trim()) || 'IndGo Air Virtual';
             const rankUnlock = (l.rankUnlock && String(l.rankUnlock).trim()) || deduceRankFromAircraft(aircraft);
-            return { ...l, operator, rankUnlock };
+            return { 
+                ...l, 
+                operator, 
+                rankUnlock,
+                departure: normalizeICAO(l.departure),
+                arrival: normalizeICAO(l.arrival)
+            };
         });
         const computedTFT = typeof totalFlightTime === 'number' && totalFlightTime > 0
             ? totalFlightTime
@@ -1356,7 +1374,7 @@ app.post('/api/rosters', authMiddleware, isRouteManager, async (req, res) => {
         const randomMultiplier = parseFloat((1.1 + Math.random() * 0.4).toFixed(2));
         const newRoster = new Roster({ 
             name, 
-            hub, 
+            hub: normalizeICAO(hub || finishedLegs[0]?.departure), 
             legs: finishedLegs, 
             totalFlightTime: computedTFT, 
             multiplier: randomMultiplier,
