@@ -208,7 +208,7 @@ const UserSchema = new mongoose.Schema({
         read: { type: Boolean, default: false },
         createdAt: { type: Date, default: Date.now }
     }],
-    default:
+    default: []
 }, { toJSON: { virtuals: true }, toObject: { virtuals: true } });
 UserSchema.index({ callsign: 1 }, { unique: true, sparse: true });
 
@@ -1024,7 +1024,7 @@ app.get('/api/me', authMiddleware, async (req, res) => {
         }
 
         // Add unread notifications to the response
-        user.unreadNotifications = user.notifications.filter(n => !n.read);
+        user.unreadNotifications = (user.notifications || []).filter(n => !n.read);
 
         res.json(user);
     } catch (err) {
