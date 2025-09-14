@@ -1053,7 +1053,7 @@ app.post('/api/login', async (req, res) => {
 // --- MODIFIED /api/me to deliver notifications ---
 app.get('/api/me', authMiddleware, async (req, res) => {
     try {
-        const user = await User.findById(req.user._id).select('-password').lean();
+        const user = await User.findById(req.user._id).select('-password').populate('currentFlightPlan').lean();
         if (!user) return res.status(404).json({ message: 'User not found.' });
 
         user.timeUntilNextDutyMs = 0;
