@@ -22,7 +22,6 @@
 // - FIXED: Off-roster (non-duty) PIREPs no longer affect FTPL counters.
 // - MODIFIED: Roster generation now creates a mix of single-rank and mixed-rank duties.
 // - MODIFIED: PIREP filing is now automated via the flight plan completion process.
-// - MODIFIED: Infinite Flight Tracker now uses the pilot's unique 'infiniteFlightUsername' for reliability.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -183,8 +182,7 @@ const UserSchema = new mongoose.Schema({
     discord: { type: String, default: '' },
     ifc: { type: String, default: '' },
     youtube: { type: String, default: '' },
-    // NEW FIELD FOR INFINITE FLIGHT TRACKING
-    infiniteFlightUsername: { type: String, default: '', trim: true },
+    infiniteFlightUsername: { type: String, default: '', trim: true }, // ADDED FROM MERGE
     preferredContact: { type: String, enum: ['none', 'discord', 'ifc', 'youtube'], default: 'none' },
     createdAt: { type: Date, default: Date.now },
     // FTPL Fields
@@ -333,7 +331,7 @@ const PirepSchema = new mongoose.Schema({
     rankUnlock: { type: String, trim: true },
     operator: { type: String, trim: true },
     remarks: { type: String, trim: true },
-    status: { type: String, enum: ['PENDING', 'APPROVED', 'REJEC'TED'], default: 'PENDING' },
+    status: { type: String, enum: ['PENDING', 'APPROVED', 'REJECTED'], default: 'PENDING' },
     reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     rejectionReason: { type: String, default: null },
     createdAt: { type: Date, default: Date.now },
@@ -969,7 +967,7 @@ const finalizeFlightAndCreatePirep = async (flightPlan, remarks = null, verifica
 
 
 /**
- * MODIFIED: Checks the Infinite Flight Live API using pilot's unique username for reliability.
+ * Checks the Infinite Flight Live API for active flights and compares against our database.
  */
 const checkFlights = async () => {
     console.log('[IF Tracker] Checking Infinite Flight API for active flights...');
@@ -979,36 +977,27 @@ const checkFlights = async () => {
             headers: { 'Authorization': `Bearer ${process.env.IF_API_KEY}` }
         });
         const liveFlights = response.data.result;
-        // Create a Set of active usernames from the API for fast lookups
-        const liveUsernames = new Set(liveFlights.map(f => f.username));
+        const liveCallsigns = new Set(liveFlights.map(f => f.callsign));
 
         // 2. Get all our flight plans that are currently 'FLYING'
-        // Populate the pilot's 'infiniteFlightUsername' field
-        const activePlans = await FlightPlan.find({ status: 'FLYING' }).populate('pilot', 'callsign infiniteFlightUsername');
-        
+        const activePlans = await FlightPlan.find({ status: 'FLYING' }).populate('pilot', 'callsign');
         if (activePlans.length === 0) {
             console.log('[IF Tracker] No active flight plans to track.');
             return;
         }
 
-        console.log(`[IF Tracker] Tracking ${activePlans.length} flights. Found ${liveUsernames.size} live users on IF.`);
+        console.log(`[IF Tracker] Tracking ${activePlans.length} flights. Found ${liveCallsigns.size} live flights on IF.`);
 
-        // 3. Compare our active plans with the live flights by username
+        // 3. Compare our active plans with the live flights
         for (const plan of activePlans) {
-            // Get the pilot's registered Infinite Flight username from their profile
-            const pilotUsername = plan.pilot?.infiniteFlightUsername;
+            const pilotCallsign = plan.pilot?.callsign;
+            if (!pilotCallsign) continue; // Skip if pilot has no callsign
 
-            // Skip tracking if the pilot hasn't set their IF username in their profile
-            if (!pilotUsername) {
-                console.warn(`[IF Tracker] Skipping plan for ${plan.pilot?.callsign} because they have no IF username set.`);
-                continue;
-            }
-
-            // If the pilot's username is NOT in the live flight list, they have landed.
-            if (!liveUsernames.has(pilotUsername)) {
-                console.log(`[IF Tracker] Pilot ${pilotUsername} (Flight ${plan.flightNumber}) is no longer live. Finalizing flight...`);
+            // If the pilot's callsign is NOT in the live flight list, they have landed.
+            if (!liveCallsigns.has(pilotCallsign)) {
+                console.log(`[IF Tracker] Pilot ${pilotCallsign} (Flight ${plan.flightNumber}) is no longer live. Finalizing flight...`);
                 
-                // Use the reusable helper function to finalize the flight
+                // Use the new reusable helper function to finalize the flight
                 await finalizeFlightAndCreatePirep(
                     plan,
                     "Flight automatically finalized by the Infinite Flight Live Tracker.",
@@ -1026,7 +1015,6 @@ const checkFlights = async () => {
         }
     }
 };
-
 
 /**
  * Initializes the flight tracker to run on a schedule.
@@ -1217,9 +1205,10 @@ app.get('/api/me', authMiddleware, async (req, res) => {
     }
 });
 
-// MODIFIED: Endpoint to handle 'infiniteFlightUsername'
+
 app.put('/api/me', authMiddleware, upload.single('profilePicture'), async (req, res) => {
     try {
+        // MODIFIED: Added infiniteFlightUsername from the second file
         const { name, bio, discord, ifc, youtube, preferredContact, infiniteFlightUsername } = req.body;
         const updatedData = { name, bio, discord, ifc, youtube, preferredContact, infiniteFlightUsername };
 
