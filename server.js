@@ -208,6 +208,7 @@ const UserSchema = new mongoose.Schema({
         read: { type: Boolean, default: false },
         createdAt: { type: Date, default: Date.now }
     }],
+    default:
 }, { toJSON: { virtuals: true }, toObject: { virtuals: true } });
 UserSchema.index({ callsign: 1 }, { unique: true, sparse: true });
 
