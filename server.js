@@ -17,6 +17,7 @@
 // - FIXED: Daily flight hour counter now resets intelligently when starting a new duty.
 // - ADDED: Endpoint for user profile now includes time remaining on crew rest.
 // - FIXED: Off-roster (non-duty) PIREPs no longer affect FTPL counters.
+// - MODIFIED: Roster generation now creates a mix of single-rank and mixed-rank duties.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -643,31 +644,91 @@ const generateRostersFromGoogleSheet = async () => {
         console.warn('No valid legs found from any source. No rosters will be generated.');
         return { created: 0, legsFound: allLegs.length };
     }
+    
+    const generatedRosters = [];
+    const rosterCountPerType = 2; // Generate up to 2 of each type per location to control volume
 
+    // --- NEW: Step 1 - Generate SINGLE-RANK Rosters ---
+    console.log('--- Generating Single-Rank Rosters ---');
+    const legsByRank = allLegs.reduce((acc, leg) => {
+        const rank = leg.rankUnlock; 
+        if (!acc[rank]) acc[rank] = [];
+        acc[rank].push(leg);
+        return acc;
+    }, {});
+
+    for (const rank in legsByRank) {
+        if (!pilotRanks.includes(rank)) continue; // Skip unknown or invalid ranks
+
+        const legsForThisRank = legsByRank[rank];
+        const legsByDepartureForRank = legsForThisRank.reduce((acc, leg) => {
+            if (!acc[leg.departure]) acc[leg.departure] = [];
+            acc[leg.departure].push(leg);
+            return acc;
+        }, {});
+
+        const departureAirportsForRank = Object.keys(legsByDepartureForRank);
+        console.log(`Found ${departureAirportsForRank.length} departure airports for rank: ${rank}`);
+
+        for (const departureAirport of departureAirportsForRank) {
+            for (let i = 0; i < rosterCountPerType; i++) {
+                const rosterLegs = [];
+                let currentAirport = departureAirport;
+                let totalTime = 0;
+                const usedFlightNumbers = new Set();
+                const legCount = Math.floor(Math.random() * 3) + 2; // 2 to 4 legs
+
+                for (let j = 0; j < legCount; j++) {
+                    const possibleNextLegs = (legsByDepartureForRank[currentAirport] || []).filter(
+                        l => !usedFlightNumbers.has(l.flightNumber)
+                    );
+                    if (possibleNextLegs.length === 0) break;
+
+                    const nextLeg = possibleNextLegs[Math.floor(Math.random() * possibleNextLegs.length)];
+                    if ((totalTime + nextLeg.flightTime) > MAX_DAILY_FLIGHT_HOURS) break;
+
+                    rosterLegs.push(nextLeg);
+                    totalTime += nextLeg.flightTime;
+                    currentAirport = nextLeg.arrival;
+                    usedFlightNumbers.add(nextLeg.flightNumber);
+                }
+
+                if (rosterLegs.length >= 2) {
+                    const randomMultiplier = parseFloat((1.1 + Math.random() * 0.4).toFixed(2));
+                    generatedRosters.push({
+                        name: `${departureAirport} ${rank} Duty #${i + 1}`, // Descriptive name
+                        hub: departureAirport,
+                        legs: rosterLegs,
+                        totalFlightTime: totalTime,
+                        multiplier: randomMultiplier,
+                        isGenerated: true,
+                        isAvailable: true,
+                    });
+                }
+            }
+        }
+    }
+    
+    // --- NEW: Step 2 - Generate MIXED-RANK Rosters ---
+    console.log('--- Generating Mixed-Rank Rosters ---');
     const legsByDeparture = allLegs.reduce((acc, leg) => {
         if (!acc[leg.departure]) acc[leg.departure] = [];
         acc[leg.departure].push(leg);
         return acc;
     }, {});
 
-    const generatedRosters = [];
-    
-    // Get a list of all unique departure airports found in the spreadsheets.
     const allDepartureAirports = Object.keys(legsByDeparture);
-    console.log(`Found ${allDepartureAirports.length} unique departure airports for roster generation.`);
+    console.log(`Found ${allDepartureAirports.length} unique departure airports for mixed roster generation.`);
 
-    // Loop through every airport that has outgoing flights, not just the hubs.
     for (const departureAirport of allDepartureAirports) {
         if (!legsByDeparture[departureAirport]) continue;
 
-        // Generate up to 3 rosters for each location to avoid over-generation.
-        const rosterCountPerAirport = 3; 
-        for (let i = 0; i < rosterCountPerAirport; i++) {
+        for (let i = 0; i < rosterCountPerType; i++) { 
             const rosterLegs = [];
             let currentAirport = departureAirport;
             let totalTime = 0;
             const usedFlightNumbers = new Set();
-            const legCount = Math.floor(Math.random() * 3) + 2; // Create rosters with 2 to 4 legs
+            const legCount = Math.floor(Math.random() * 3) + 2; // 2 to 4 legs
 
             for (let j = 0; j < legCount; j++) {
                 const possibleNextLegs = (legsByDeparture[currentAirport] || []).filter(
@@ -685,11 +746,9 @@ const generateRostersFromGoogleSheet = async () => {
             }
 
             if (rosterLegs.length >= 2) {
-                // Generates a random multiplier between 1.10 and 1.50
                 const randomMultiplier = parseFloat((1.1 + Math.random() * 0.4).toFixed(2));
-                
                 generatedRosters.push({
-                    name: `${departureAirport} Sector Duty #${i + 1}`,
+                    name: `${departureAirport} Sector Duty #${i + 1}`, // Original naming
                     hub: departureAirport,
                     legs: rosterLegs,
                     totalFlightTime: totalTime,
@@ -703,8 +762,10 @@ const generateRostersFromGoogleSheet = async () => {
 
     if (generatedRosters.length > 0) {
         await Roster.deleteMany({ isGenerated: true });
+        // Shuffle the combined list of rosters for better presentation
+        generatedRosters.sort(() => Math.random() - 0.5); 
         await Roster.insertMany(generatedRosters);
-        console.log(`Successfully generated and saved ${generatedRosters.length} new rosters.`);
+        console.log(`Successfully generated and saved ${generatedRosters.length} new mixed and single-rank rosters.`);
     }
     return { created: generatedRosters.length, legsFound: allLegs.length };
 };
