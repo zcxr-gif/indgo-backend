@@ -1,4 +1,4 @@
-// server.js (Fully Merged, Updated & Performance Tuned)
+// server.js (Fully Merged, Updated & Performance Tuned with Leaderboards)
 // - Automated Roster Generation now reads from TWO Google Sheets simultaneously:
 //   1. The primary routes sheet (for regular flights).
 //   2. The codeshare routes sheet (for partner flights).
@@ -13,6 +13,7 @@
 // - NEW: Roster multipliers for bonus flight hours on final legs.
 // - NEW: Image verification required for all PIREP submissions.
 // - NEW: Map feature support via airports data endpoint.
+// - NEW: Weekly and Monthly pilot leaderboards for hours and sectors.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -141,7 +142,7 @@ const rankPerks = {
     'Blue Legacy Commander': ['Lifetime elite badge', 'Council-level privileges', 'Ultimate recognition']
 };
 
-// --- User Schema (Enhanced for FTPL) ---
+// --- User Schema (Enhanced for FTPL & LEADERBOARDS) ---
 const UserSchema = new mongoose.Schema({
     name: { type: String, default: 'New Staff Member' },
     email: { type: String, required: true, unique: true, trim: true, lowercase: true },
@@ -166,15 +167,23 @@ const UserSchema = new mongoose.Schema({
     youtube: { type: String, default: '' },
     preferredContact: { type: String, enum: ['none', 'discord', 'ifc', 'youtube'], default: 'none' },
     createdAt: { type: Date, default: Date.now },
+    // FTPL Fields
     dutyStatus: { type: String, enum: ['ON_REST', 'ON_DUTY'], default: 'ON_REST' },
     currentRoster: { type: mongoose.Schema.Types.ObjectId, ref: 'Roster', default: null },
     lastDutyStart: { type: Date, default: null }, 
     lastDutyOff: { type: Date, default: null },   
     dailyFlightHours: { type: Number, default: 0 }, 
-    monthlyFlightHours: { type: Number, default: 0 },
+    monthlyFlightHours: { type: Number, default: 0 }, // For FTPL (rolling 30 days)
     lastHourReset: { type: Date, default: Date.now }, 
     lastKnownAirport: { type: String, uppercase: true, trim: true, default: 'VIDP' }, 
-    lastDutyAirport: { type: String, uppercase: true, trim: true, default: null } 
+    lastDutyAirport: { type: String, uppercase: true, trim: true, default: null },
+    // NEW: Leaderboard Fields
+    weeklyFlightHours: { type: Number, default: 0 },
+    leaderboardMonthlyFlightHours: { type: Number, default: 0 }, // By calendar month
+    weeklySectors: { type: Number, default: 0 },
+    monthlySectors: { type: Number, default: 0 },
+    lastWeeklyReset: { type: Date, default: Date.now },
+    lastMonthlyReset: { type: Date, default: Date.now }
 }, { toJSON: { virtuals: true }, toObject: { virtuals: true } }); 
 UserSchema.index({ callsign: 1 }, { unique: true, sparse: true });
 
@@ -220,6 +229,11 @@ const User = mongoose.model('User', UserSchema);
 // --- PERFORMANCE UPDATE: ADDED INDEXES FOR FASTER QUERIES ---
 UserSchema.index({ role: 1 }); // For fetching staff members quickly
 UserSchema.index({ lastKnownAirport: 1, lastDutyAirport: 1 }); // Speeds up personalized roster lookups
+// NEW: Indexes for Leaderboards
+UserSchema.index({ weeklyFlightHours: -1 });
+UserSchema.index({ weeklySectors: -1 });
+UserSchema.index({ leaderboardMonthlyFlightHours: -1 });
+UserSchema.index({ monthlySectors: -1 });
 
 
 // --- Admin Log Schema ---
@@ -249,7 +263,7 @@ const HighlightSchema = new mongoose.Schema({
     winnerName: { type: String, required: true },
     description: { type: String },
     imageUrl: { type: String, required: true },
-    author: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    author: { type: mongoose.schema.Types.ObjectId, ref: 'User' },
     createdAt: { type: Date, default: Date.now }
 });
 const Highlight = mongoose.model('Highlight', HighlightSchema);
@@ -262,9 +276,9 @@ const PirepSchema = new mongoose.Schema({
     arrival: { type: String, required: true, uppercase: true, trim: true },
     aircraft: { type: String, required: true },
     flightTime: { type: Number, required: true, min: 0.1 },
-        // Required metadata for routes
-        rankUnlock: { type: String, required: true, trim: true },
-        operator:   { type: String, required: true, trim: true },
+    // Required metadata for routes
+    rankUnlock: { type: String, required: true, trim: true },
+    operator:   { type: String, required: true, trim: true },
     remarks: { type: String, trim: true },
     status: { type: String, enum: ['PENDING', 'APPROVED', 'REJECTED'], default: 'PENDING' },
     reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
@@ -711,6 +725,29 @@ const checkAndApplyRankUpdate = (pilot) => {
     return { promoted: false };
 };
 
+// NEW: Leaderboard Stats Reset Helper
+const checkAndResetLeaderboardStats = (pilot) => {
+    const now = new Date();
+    const oneWeekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+    // Check for weekly reset (if last reset was more than 7 days ago)
+    if (pilot.lastWeeklyReset < oneWeekAgo) {
+        pilot.weeklyFlightHours = 0;
+        pilot.weeklySectors = 0;
+        pilot.lastWeeklyReset = now;
+        console.log(`Weekly leaderboard stats reset for pilot ${pilot.email}`);
+    }
+
+    // Check for monthly reset (if the month of the last reset is different from the current month)
+    if (pilot.lastMonthlyReset.getUTCMonth() !== now.getUTCMonth() || pilot.lastMonthlyReset.getUTCFullYear() !== now.getUTCFullYear()) {
+        pilot.leaderboardMonthlyFlightHours = 0;
+        pilot.monthlySectors = 0;
+        pilot.lastMonthlyReset = now;
+        console.log(`Monthly leaderboard stats reset for pilot ${pilot.email}`);
+    }
+};
+
+
 // Simple callsign validator
 const isValidCallsign = cs => /^[A-Z0-9-]{2,15}$/.test(cs);
 
@@ -754,6 +791,46 @@ app.get('/api/airports', async (req, res) => {
         res.status(500).json({ message: 'Could not load airport data.' });
     }
 });
+
+// --- NEW: Leaderboard Routes ---
+app.get('/api/leaderboard/weekly', async (req, res) => {
+    try {
+        const topByHours = await User.find({ role: 'pilot', weeklyFlightHours: { $gt: 0 } })
+            .sort({ weeklyFlightHours: -1 })
+            .limit(10)
+            .select('name callsign weeklyFlightHours');
+            
+        const topBySectors = await User.find({ role: 'pilot', weeklySectors: { $gt: 0 } })
+            .sort({ weeklySectors: -1 })
+            .limit(10)
+            .select('name callsign weeklySectors');
+
+        res.json({ topByHours, topBySectors });
+    } catch (error) {
+        console.error('Error fetching weekly leaderboard:', error);
+        res.status(500).json({ message: 'Server error while fetching weekly leaderboard.' });
+    }
+});
+
+app.get('/api/leaderboard/monthly', async (req, res) => {
+    try {
+        const topByHours = await User.find({ role: 'pilot', leaderboardMonthlyFlightHours: { $gt: 0 } })
+            .sort({ leaderboardMonthlyFlightHours: -1 })
+            .limit(10)
+            .select('name callsign leaderboardMonthlyFlightHours');
+
+        const topBySectors = await User.find({ role: 'pilot', monthlySectors: { $gt: 0 } })
+            .sort({ monthlySectors: -1 })
+            .limit(10)
+            .select('name callsign monthlySectors');
+            
+        res.json({ topByHours, topBySectors });
+    } catch (error) {
+        console.error('Error fetching monthly leaderboard:', error);
+        res.status(500).json({ message: 'Server error while fetching monthly leaderboard.' });
+    }
+});
+
 
 // --- Community Content Routes ---
 app.post('/api/events', authMiddleware, isCommunityManager, upload.single('eventImage'), async (req, res) => {
@@ -962,7 +1039,7 @@ app.post('/api/pireps', authMiddleware, upload.single('verificationImage'), asyn
                     message: `This roster leg requires ${requiredRank}, which is above your rank (${pilot.rank}).`
                 });
             }
-const existingPirep = await Pirep.findOne({
+            const existingPirep = await Pirep.findOne({
                 pilot: req.user._id,
                 'rosterLeg.rosterId': roster._id,
                 'rosterLeg.flightNumber': flightNumber
@@ -1046,9 +1123,20 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
             }
         }
 
-        pilot.flightHours += hoursToAdd;
-        pilot.monthlyFlightHours += hoursToAdd;
-        pilot.dailyFlightHours += hoursToAdd;
+        // --- LEADERBOARD LOGIC ---
+        // 1. Check if pilot's leaderboard stats need resetting before adding new hours/sectors
+        checkAndResetLeaderboardStats(pilot);
+
+        // 2. Add hours and sectors to all relevant counters
+        pilot.flightHours += hoursToAdd; // Total lifetime hours
+        pilot.monthlyFlightHours += hoursToAdd; // For FTPL
+        pilot.dailyFlightHours += hoursToAdd; // For FTPL
+        pilot.weeklyFlightHours += hoursToAdd; // Leaderboard
+        pilot.leaderboardMonthlyFlightHours += hoursToAdd; // Leaderboard
+        pilot.weeklySectors += 1; // Leaderboard
+        pilot.monthlySectors += 1; // Leaderboard
+        // --- END LEADERBOARD LOGIC ---
+
         pilot.lastKnownAirport = pirep.arrival; 
 
         const promotionResult = checkAndApplyRankUpdate(pilot);
@@ -1249,7 +1337,7 @@ app.post('/api/rosters', authMiddleware, isRouteManager, async (req, res) => {
             multiplier: randomMultiplier,
             createdBy: req.user._id 
         });
-await newRoster.save();
+        await newRoster.save();
 
         const log = new AdminLog({ adminUser: req.user._id, action: 'ROSTER_CREATE', details: `Created new roster: "${name}"` });
         await log.save();
@@ -1323,7 +1411,7 @@ app.post('/api/duty/start', authMiddleware, async (req, res) => {
                 message: `This roster includes leg ${overRankLeg.flightNumber} (${overRankLeg.aircraft}) requiring ${getLegRequiredRank(overRankLeg)}, which is above your rank (${user.rank}).`
             });
         }
-user.dutyStatus = 'ON_DUTY';
+        user.dutyStatus = 'ON_DUTY';
         user.currentRoster = roster._id;
         user.lastDutyStart = Date.now();
         await user.save();
