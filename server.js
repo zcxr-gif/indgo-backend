@@ -14,8 +14,9 @@
 // - NEW: Image verification required for all PIREP submissions.
 // - NEW: Map feature support via airports data endpoint.
 // - NEW: Weekly and Monthly pilot leaderboards for hours and sectors.
+// - NEW: Test & Practical based promotion system for specific ranks.
 // - FIXED: Daily flight hour counter now resets intelligently when starting a new duty.
-// - ADDED: Endpoint for user profile now includes time remaining on crew rest.
+// - ADDED: Endpoint for user profile now includes time remaining on crew rest and notifications.
 // - FIXED: Off-roster (non-duty) PIREPs no longer affect FTPL counters.
 // - MODIFIED: Roster generation now creates a mix of single-rank and mixed-rank duties.
 
@@ -89,34 +90,25 @@ mongoose.connect(process.env.MONGO_URI)
 
 // 5. DEFINE SCHEMAS AND MODELS
 
-// --- Constants for FTPL ---
+// --- Constants for FTPL & Ranks ---
 const MIN_REST_PERIOD = 8 * 60 * 60 * 1000; // 8 hours in ms
 const MAX_DUTY_PERIOD = 14 * 60 * 60 * 1000; // 14 hours in ms
 const MAX_DAILY_FLIGHT_HOURS = 10;
 const MAX_MONTHLY_FLIGHT_HOURS = 100;
 
-// --- MODIFIED: NEW RANK STRUCTURE ---
 const pilotRanks = [
     'IndGo Cadet', 'Skyline Observer', 'Route Explorer', 'Skyline Officer',
     'Command Captain', 'Elite Captain', 'Blue Eagle', 'Line Instructor',
     'Chief Flight Instructor', 'IndGo SkyMaster', 'Blue Legacy Commander'
 ];
 
-// --- Rank helpers (allow flights at or below the pilot's rank) ---
-const rankIndex = (r) => {
-    const i = pilotRanks.indexOf(String(r || '').trim());
-    return i >= 0 ? i : -1;
-};
-const canFlyLeg = (userRank, legRank) => {
-    const ui = rankIndex(userRank);
-    const li = rankIndex(legRank);
-    return ui >= 0 && li >= 0 && li <= ui;
-};
-const getLegRequiredRank = (leg) => {
-    if (leg?.rankUnlock && pilotRanks.includes(leg.rankUnlock)) return leg.rankUnlock;
-    return deduceRankFromAircraft(leg?.aircraft);
-};
-
+// NEW: Define ranks that require manual testing and promotion
+const testGatedRanks = [
+    'Route Explorer',
+    'Skyline Officer',
+    'Elite Captain',
+    'Blue Eagle'
+];
 
 const rankThresholds = {
     'IndGo Cadet': 0,
@@ -146,7 +138,24 @@ const rankPerks = {
     'Blue Legacy Commander': ['Lifetime elite badge', 'Council-level privileges', 'Ultimate recognition']
 };
 
-// --- User Schema (Enhanced for FTPL & LEADERBOARDS) ---
+
+// --- Rank helpers ---
+const rankIndex = (r) => {
+    const i = pilotRanks.indexOf(String(r || '').trim());
+    return i >= 0 ? i : -1;
+};
+const canFlyLeg = (userRank, legRank) => {
+    const ui = rankIndex(userRank);
+    const li = rankIndex(legRank);
+    return ui >= 0 && li >= 0 && li <= ui;
+};
+const getLegRequiredRank = (leg) => {
+    if (leg?.rankUnlock && pilotRanks.includes(leg.rankUnlock)) return leg.rankUnlock;
+    return deduceRankFromAircraft(leg?.aircraft);
+};
+
+
+// --- User Schema (Enhanced for Test-Based Promotions) ---
 const UserSchema = new mongoose.Schema({
     name: { type: String, default: 'New Staff Member' },
     email: { type: String, required: true, unique: true, trim: true, lowercase: true },
@@ -174,53 +183,52 @@ const UserSchema = new mongoose.Schema({
     // FTPL Fields
     dutyStatus: { type: String, enum: ['ON_REST', 'ON_DUTY'], default: 'ON_REST' },
     currentRoster: { type: mongoose.Schema.Types.ObjectId, ref: 'Roster', default: null },
-    lastDutyStart: { type: Date, default: null }, 
-    lastDutyOff: { type: Date, default: null },   
-    dailyFlightHours: { type: Number, default: 0 }, 
+    lastDutyStart: { type: Date, default: null },
+    lastDutyOff: { type: Date, default: null },
+    dailyFlightHours: { type: Number, default: 0 },
     monthlyFlightHours: { type: Number, default: 0 }, // For FTPL (rolling 30 days)
-    lastHourReset: { type: Date, default: Date.now }, 
-    lastKnownAirport: { type: String, uppercase: true, trim: true, default: 'VIDP' }, 
+    lastHourReset: { type: Date, default: Date.now },
+    lastKnownAirport: { type: String, uppercase: true, trim: true, default: 'VIDP' },
     lastDutyAirport: { type: String, uppercase: true, trim: true, default: null },
-    // NEW: Leaderboard Fields
+    // Leaderboard Fields
     weeklyFlightHours: { type: Number, default: 0 },
     leaderboardMonthlyFlightHours: { type: Number, default: 0 }, // By calendar month
     weeklySectors: { type: Number, default: 0 },
     monthlySectors: { type: Number, default: 0 },
     lastWeeklyReset: { type: Date, default: Date.now },
-    lastMonthlyReset: { type: Date, default: Date.now }
-}, { toJSON: { virtuals: true }, toObject: { virtuals: true } }); 
+    lastMonthlyReset: { type: Date, default: Date.now },
+    // NEW FIELDS FOR MANUAL PROMOTION
+    promotionStatus: {
+        type: String,
+        enum: ['ACTIVE', 'PENDING_TEST'],
+        default: 'ACTIVE'
+    },
+    notifications: [{
+        message: { type: String, required: true },
+        read: { type: Boolean, default: false },
+        createdAt: { type: Date, default: Date.now }
+    }],
+}, { toJSON: { virtuals: true }, toObject: { virtuals: true } });
 UserSchema.index({ callsign: 1 }, { unique: true, sparse: true });
 
-// --- PERFORMANCE UPDATE: ADDED MIDDLEWARE FOR EFFICIENT CASCADE DELETES ---
-UserSchema.pre('findOneAndDelete', { document: true, query: true }, async function(next) {
+UserSchema.pre('findOneAndDelete', { document: true, query: true }, async function (next) {
     try {
         const user = await this.model.findOne(this.getFilter());
         if (!user) return next();
 
         console.log(`Performing cascade delete for user: ${user.email}`);
-
-        // 1. Delete user's S3 profile picture (no need to await)
-        if (user.imageUrl) {
-            deleteS3Object(user.imageUrl);
-        }
-
-        // 2. Delete all PIREPs filed by the user
+        if (user.imageUrl) { deleteS3Object(user.imageUrl); }
         await mongoose.model('Pirep').deleteMany({ pilot: user._id });
-
-        // 3. Find and delete user-created events and their S3 images
         const events = await mongoose.model('Event').find({ author: user._id }).lean();
         for (const event of events) {
             if (event.imageUrl) deleteS3Object(event.imageUrl);
         }
         await mongoose.model('Event').deleteMany({ author: user._id });
-        
-        // 4. Do the same for highlights
         const highlights = await mongoose.model('Highlight').find({ author: user._id }).lean();
         for (const highlight of highlights) {
             if (highlight.imageUrl) deleteS3Object(highlight.imageUrl);
         }
         await mongoose.model('Highlight').deleteMany({ author: user._id });
-
         next();
     } catch (error) {
         console.error("Error in user cascade delete middleware:", error);
@@ -230,10 +238,8 @@ UserSchema.pre('findOneAndDelete', { document: true, query: true }, async functi
 
 const User = mongoose.model('User', UserSchema);
 
-// --- PERFORMANCE UPDATE: ADDED INDEXES FOR FASTER QUERIES ---
-UserSchema.index({ role: 1 }); // For fetching staff members quickly
-UserSchema.index({ lastKnownAirport: 1, lastDutyAirport: 1 }); // Speeds up personalized roster lookups
-// NEW: Indexes for Leaderboards
+UserSchema.index({ role: 1 });
+UserSchema.index({ lastKnownAirport: 1, lastDutyAirport: 1 });
 UserSchema.index({ weeklyFlightHours: -1 });
 UserSchema.index({ weeklySectors: -1 });
 UserSchema.index({ leaderboardMonthlyFlightHours: -1 });
@@ -243,7 +249,7 @@ UserSchema.index({ monthlySectors: -1 });
 // --- Admin Log Schema ---
 const AdminLogSchema = new mongoose.Schema({
     adminUser: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    action: { type: String, required: true, enum: ['ROLE_UPDATE', 'USER_DELETE', 'ROSTER_CREATE', 'ROSTER_DELETE'] },
+    action: { type: String, required: true, enum: ['ROLE_UPDATE', 'USER_DELETE', 'ROSTER_CREATE', 'ROSTER_DELETE', 'PROMOTION_TEST_REQUIRED'] }, // ADDED NEW ACTION
     targetUser: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     details: { type: String, required: true },
     timestamp: { type: Date, default: Date.now }
@@ -280,31 +286,27 @@ const PirepSchema = new mongoose.Schema({
     arrival: { type: String, required: true, uppercase: true, trim: true },
     aircraft: { type: String, required: true },
     flightTime: { type: Number, required: true, min: 0.1 },
-    // Required metadata for routes
-    rankUnlock: { type: String, required: true, trim: true },
-    operator:   { type: String, required: true, trim: true },
+    rankUnlock: { type: String, trim: true },
+    operator: { type: String, trim: true },
     remarks: { type: String, trim: true },
     status: { type: String, enum: ['PENDING', 'APPROVED', 'REJECTED'], default: 'PENDING' },
     reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     rejectionReason: { type: String, default: null },
     createdAt: { type: Date, default: Date.now },
     reviewedAt: { type: Date, default: null },
-    verificationImageUrl: { type: String, default: null }, // Temporary URL for staff review
-    isMultiplierEligible: { type: Boolean, default: false }, // True if this is the last leg of a roster
+    verificationImageUrl: { type: String, default: null },
+    isMultiplierEligible: { type: Boolean, default: false },
     rosterLeg: {
         rosterId: { type: mongoose.Schema.Types.ObjectId, ref: 'Roster' },
         flightNumber: { type: String }
     }
 });
 const Pirep = mongoose.model('Pirep', PirepSchema);
+PirepSchema.index({ pilot: 1 });
+PirepSchema.index({ status: 1 });
+PirepSchema.index({ 'rosterLeg.rosterId': 1, 'rosterLeg.flightNumber': 1 });
 
-// --- PERFORMANCE UPDATE: ADDED INDEXES FOR FASTER QUERIES ---
-PirepSchema.index({ pilot: 1 }); // Speeds up fetching a user's PIREPs
-PirepSchema.index({ status: 1 }); // Speeds up finding 'PENDING' PIREPs
-PirepSchema.index({ 'rosterLeg.rosterId': 1, 'rosterLeg.flightNumber': 1 }); // Speeds up checking for duplicate PIREPs on a roster
-
-
-// --- Roster Schema (Enhanced for Automation) ---
+// --- Roster Schema ---
 const RosterSchema = new mongoose.Schema({
     name: { type: String, required: true, trim: true },
     hub: { type: String, required: true, uppercase: true, trim: true },
@@ -313,24 +315,23 @@ const RosterSchema = new mongoose.Schema({
         departure: { type: String, required: true, uppercase: true, trim: true },
         arrival: { type: String, required: true, uppercase: true, trim: true },
         aircraft: { type: String, required: true, trim: true },
-        flightTime: { type: Number, required: true, min: 0.1 }
+        flightTime: { type: Number, required: true, min: 0.1 },
+        rankUnlock: { type: String },
+        operator: { type: String }
     }],
     totalFlightTime: { type: Number, required: true, min: 0 },
-    multiplier: { type: Number, default: 1, min: 1, max: 2 }, // Random multiplier for the final leg
+    multiplier: { type: Number, default: 1, min: 1, max: 2 },
     isAvailable: { type: Boolean, default: true },
-    isGenerated: { type: Boolean, default: false }, 
+    isGenerated: { type: Boolean, default: false },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     createdAt: { type: Date, default: Date.now }
 });
 const Roster = mongoose.model('Roster', RosterSchema);
-
-// --- PERFORMANCE UPDATE: ADDED INDEXES FOR FASTER QUERIES ---
-RosterSchema.index({ isAvailable: 1, 'legs.0.departure': 1 }); // Speeds up finding available rosters by location
+RosterSchema.index({ isAvailable: 1, 'legs.0.departure': 1 });
 
 
 // 6. HELPER FUNCTIONS & MIDDLEWARE
 
-// Helper function to delete an object from S3
 const deleteS3Object = async (imageUrl) => {
     if (!imageUrl) return;
     try {
@@ -347,7 +348,6 @@ const deleteS3Object = async (imageUrl) => {
     }
 };
 
-// Improved Google Sheets update function
 const updateGoogleSheet = async (pilotData) => {
     if (!pilotData || !pilotData.callsign) {
         console.warn('updateGoogleSheet called without pilot data or callsign. Aborting sheet update.');
@@ -417,7 +417,6 @@ const updateGoogleSheet = async (pilotData) => {
     }
 };
 
-// Deletes a row from the Google Sheet based on a callsign
 const deleteRowFromGoogleSheet = async (callsign) => {
     if (!callsign) {
         console.warn('deleteRowFromGoogleSheet called without a callsign. Aborting.');
@@ -472,9 +471,6 @@ const deleteRowFromGoogleSheet = async (callsign) => {
     }
 };
 
-// --- (UPGRADED) AUTOMATED ROSTER GENERATION LOGIC ---
-
-// Deduce a rank from the aircraft string (mirrors the sheet's ARRAYFORMULA mapping)
 const deduceRankFromAircraft = (acStr) => {
     const s = String(acStr || '').toUpperCase();
     if (!s) return 'Unknown';
@@ -492,6 +488,7 @@ const deduceRankFromAircraft = (acStr) => {
     if (has('COMMANDER')) return 'Blue Legacy Commander';
     return 'Unknown';
 };
+
 const generateRostersFromGoogleSheet = async () => {
     console.log('Starting automated roster generation from all sources...');
 
@@ -770,31 +767,50 @@ const generateRostersFromGoogleSheet = async () => {
     return { created: generatedRosters.length, legsFound: allLegs.length };
 };
 
-// Rank Promotion Helper
+
+// Rank Promotion Helper (OVERHAULED for Manual Promotion)
 const checkAndApplyRankUpdate = (pilot) => {
     const currentHours = pilot.flightHours;
     const currentRank = pilot.rank;
-    let newRank = currentRank;
+    let prospectiveRank = currentRank;
+
+    // Find the highest rank the pilot qualifies for based on hours
     for (let i = pilotRanks.length - 1; i >= 0; i--) {
         const rankName = pilotRanks[i];
         if (currentHours >= rankThresholds[rankName]) {
-            newRank = rankName;
+            prospectiveRank = rankName;
             break;
         }
     }
-    if (newRank !== currentRank) {
-        pilot.rank = newRank;
-        return { promoted: true, rank: newRank };
+
+    // If the prospective rank is the same as the current one, do nothing.
+    if (prospectiveRank === currentRank) {
+        return { promoted: false, pendingTest: false };
     }
-    return { promoted: false };
+
+    // --- NEW LOGIC ---
+    // Check if the prospective rank is a "test-gated" rank
+    if (testGatedRanks.includes(prospectiveRank)) {
+        // If the pilot is currently ACTIVE and qualifies for a test, put them in PENDING_TEST state.
+        if (pilot.promotionStatus === 'ACTIVE') {
+            pilot.promotionStatus = 'PENDING_TEST';
+            // Return a special status to signal that staff needs to be notified.
+            return { promoted: false, pendingTest: true, prospectiveRank: prospectiveRank };
+        }
+        // If they are already pending a test, do nothing further automatically.
+        return { promoted: false, pendingTest: false };
+
+    } else {
+        // This is an automatic promotion for a non-test-gated rank.
+        pilot.rank = prospectiveRank;
+        return { promoted: true, rank: prospectiveRank };
+    }
 };
 
-// NEW: Leaderboard Stats Reset Helper
 const checkAndResetLeaderboardStats = (pilot) => {
     const now = new Date();
     const oneWeekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
-    // Check for weekly reset (if last reset was more than 7 days ago)
     if (pilot.lastWeeklyReset < oneWeekAgo) {
         pilot.weeklyFlightHours = 0;
         pilot.weeklySectors = 0;
@@ -802,7 +818,6 @@ const checkAndResetLeaderboardStats = (pilot) => {
         console.log(`Weekly leaderboard stats reset for pilot ${pilot.email}`);
     }
 
-    // Check for monthly reset (if the month of the last reset is different from the current month)
     if (pilot.lastMonthlyReset.getUTCMonth() !== now.getUTCMonth() || pilot.lastMonthlyReset.getUTCFullYear() !== now.getUTCFullYear()) {
         pilot.leaderboardMonthlyFlightHours = 0;
         pilot.monthlySectors = 0;
@@ -811,11 +826,8 @@ const checkAndResetLeaderboardStats = (pilot) => {
     }
 };
 
-
-// Simple callsign validator
 const isValidCallsign = cs => /^[A-Z0-9-]{2,15}$/.test(cs);
 
-// Auth & Role Middlewares
 const authMiddleware = (req, res, next) => {
     const token = req.header('Authorization')?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ message: 'Access denied. No token provided.' });
@@ -844,7 +856,6 @@ const isRouteManager = hasRole(['admin', 'Chief Executive Officer (CEO)', 'Chief
 
 // 7. API ROUTES (ENDPOINTS)
 
-// --- NEW: Airport Data Route for Map Feature ---
 app.get('/api/airports', async (req, res) => {
     try {
         const filePath = path.join(__dirname, 'airports.json');
@@ -856,7 +867,6 @@ app.get('/api/airports', async (req, res) => {
     }
 });
 
-// --- NEW: Leaderboard Routes ---
 app.get('/api/leaderboard/weekly', async (req, res) => {
     try {
         const topByHours = await User.find({ role: 'pilot', weeklyFlightHours: { $gt: 0 } })
@@ -895,8 +905,6 @@ app.get('/api/leaderboard/monthly', async (req, res) => {
     }
 });
 
-
-// --- Community Content Routes ---
 app.post('/api/events', authMiddleware, isCommunityManager, upload.single('eventImage'), async (req, res) => {
     try {
         const { title, date, description } = req.body;
@@ -973,8 +981,6 @@ app.delete('/api/highlights/:id', authMiddleware, isCommunityManager, async (req
     }
 });
 
-
-// --- User and Staff Routes ---
 app.get('/api/staff', async (req, res) => {
     try {
         const staffRoles = User.schema.path('role').enumValues.filter(r => r !== 'pilot');
@@ -1001,14 +1007,13 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
+// --- MODIFIED /api/me to deliver notifications ---
 app.get('/api/me', authMiddleware, async (req, res) => {
     try {
         const user = await User.findById(req.user._id).select('-password').lean();
         if (!user) return res.status(404).json({ message: 'User not found.' });
-        
-        // +++ ADDED: Time until next duty counter logic +++
-        // This will be used on the front-end for a countdown timer.
-        user.timeUntilNextDutyMs = 0; // Default to 0 (ready for duty)
+
+        user.timeUntilNextDutyMs = 0;
         if (user.dutyStatus === 'ON_REST' && user.lastDutyOff) {
             const restEndsAt = user.lastDutyOff.getTime() + MIN_REST_PERIOD;
             const now = Date.now();
@@ -1016,7 +1021,9 @@ app.get('/api/me', authMiddleware, async (req, res) => {
                 user.timeUntilNextDutyMs = restEndsAt - now;
             }
         }
-        // --- End of new logic ---
+
+        // Add unread notifications to the response
+        user.unreadNotifications = user.notifications.filter(n => !n.read);
 
         res.json(user);
     } catch (err) {
@@ -1024,6 +1031,7 @@ app.get('/api/me', authMiddleware, async (req, res) => {
         res.status(500).json({ message: 'Server error.' });
     }
 });
+
 
 app.put('/api/me', authMiddleware, upload.single('profilePicture'), async (req, res) => {
     try {
@@ -1069,37 +1077,64 @@ app.post('/api/me/password', authMiddleware, async (req, res) => {
     }
 });
 
+// --- NEW Route to mark notifications as read ---
+app.post('/api/me/notifications/read', authMiddleware, async (req, res) => {
+    try {
+        const { notificationIds } = req.body; // Expect an array of IDs from the frontend
+        if (!Array.isArray(notificationIds)) {
+            return res.status(400).json({ message: 'Expected an array of notification IDs.' });
+        }
 
-// --- PIREP Workflow Routes ---
+        await User.updateOne(
+            { _id: req.user._id },
+            { $set: { "notifications.$[elem].read": true } },
+            { arrayFilters: [{ "elem._id": { $in: notificationIds } }] }
+        );
+
+        res.json({ message: 'Notifications marked as read.' });
+    } catch (err) {
+        console.error('Error marking notifications as read:', err);
+        res.status(500).json({ message: 'Server error.' });
+    }
+});
+
+
+// --- MODIFIED PIREP Filing to block users pending tests ---
 app.post('/api/pireps', authMiddleware, upload.single('verificationImage'), async (req, res) => {
     try {
-        const { flightNumber, departure, arrival, aircraft, flightTime, remarks } = req.body;
+        const { flightNumber, departure, arrival, aircraft, flightTime, remarks, operator } = req.body;
 
         if (!req.file) {
             return res.status(400).json({ message: 'A verification image of the flight is required.' });
         }
-
         if (!flightNumber || !departure || !arrival || !aircraft || !flightTime) {
             return res.status(400).json({ message: 'Please fill out all required flight details.' });
         }
-        
+
         const pilot = await User.findById(req.user._id);
         if (!pilot) return res.status(404).json({ message: 'Pilot not found.' });
+
+        // NEW: Add restriction check
+        if (pilot.promotionStatus === 'PENDING_TEST') {
+            return res.status(403).json({
+                message: 'You are currently in an observation period awaiting promotion tests. You cannot file new PIREPs until your tests are complete and you have been promoted by a staff member.'
+            });
+        }
 
         const newPirepData = {
             pilot: req.user._id, flightNumber, departure, arrival, aircraft, remarks,
             flightTime: parseFloat(flightTime),
             status: 'PENDING',
-            verificationImageUrl: req.file.location, // Store the S3 image URL
-            isMultiplierEligible: false // Default to false
+            verificationImageUrl: req.file.location,
+            isMultiplierEligible: false
         };
 
         if (pilot.dutyStatus === 'ON_DUTY') {
             if (!pilot.currentRoster) return res.status(400).json({ message: 'You are on duty but have no assigned roster. Please contact staff.' });
-            
+
             await pilot.populate('currentRoster');
             const roster = pilot.currentRoster;
-            
+
             const leg = roster.legs.find(l =>
                 l.flightNumber.toUpperCase() === flightNumber.toUpperCase() &&
                 l.departure.toUpperCase() === departure.toUpperCase() &&
@@ -1108,8 +1143,6 @@ app.post('/api/pireps', authMiddleware, upload.single('verificationImage'), asyn
 
             if (!leg) return res.status(400).json({ message: 'This flight does not match any leg in your assigned roster.' });
 
-            
-            // Rank enforcement on roster leg
             const requiredRank = getLegRequiredRank(leg);
             if (!canFlyLeg(pilot.rank, requiredRank)) {
                 return res.status(403).json({
@@ -1121,27 +1154,25 @@ app.post('/api/pireps', authMiddleware, upload.single('verificationImage'), asyn
                 'rosterLeg.rosterId': roster._id,
                 'rosterLeg.flightNumber': flightNumber
             });
-
             if (existingPirep) return res.status(400).json({ message: 'You have already filed a PIREP for this roster leg.' });
-            
+
             newPirepData.rosterLeg = { rosterId: roster._id, flightNumber: flightNumber };
-            
+            newPirepData.rankUnlock = leg.rankUnlock;
+            newPirepData.operator = leg.operator;
+
             const lastLegInRoster = roster.legs[roster.legs.length - 1];
             if (lastLegInRoster.flightNumber.toUpperCase() === flightNumber.toUpperCase()) {
                 newPirepData.isMultiplierEligible = true;
-                console.log(`PIREP for ${flightNumber} by ${pilot.email} is eligible for a multiplier.`);
             }
         } else {
-            // Ad-hoc (off-roster) PIREP: enforce rank by aircraft
             const neededRank = deduceRankFromAircraft(aircraft);
             if (!canFlyLeg(pilot.rank, neededRank)) {
                 return res.status(403).json({
                     message: `This aircraft/route requires ${neededRank}, which is above your rank (${pilot.rank}).`
                 });
             }
-            // Optionally record inferred rank for staff reference
             newPirepData.rankUnlock = neededRank;
-            newPirepData.operator = newPirepData.operator || 'IndGo Air Virtual';
+            newPirepData.operator = operator || 'IndGo Air Virtual';
         }
 
         const newPirep = new Pirep(newPirepData);
@@ -1152,6 +1183,7 @@ app.post('/api/pireps', authMiddleware, upload.single('verificationImage'), asyn
         res.status(500).json({ message: 'Server error while filing flight report.' });
     }
 });
+
 
 app.get('/api/me/pireps', authMiddleware, async (req, res) => {
     try {
@@ -1175,90 +1207,75 @@ app.get('/api/pireps/pending', authMiddleware, isPirepManager, async (req, res) 
     }
 });
 
+// --- MODIFIED PIREP Approval to handle test-based promotions ---
 app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (req, res) => {
     try {
         const pirep = await Pirep.findById(req.params.pirepId);
         if (!pirep) return res.status(404).json({ message: 'PIREP not found.' });
         if (pirep.status !== 'PENDING') return res.status(400).json({ message: `This PIREP has already been ${pirep.status.toLowerCase()}.` });
-
-        if (pirep.verificationImageUrl) {
-            deleteS3Object(pirep.verificationImageUrl);
-        }
+        if (pirep.verificationImageUrl) { deleteS3Object(pirep.verificationImageUrl); }
 
         const pilot = await User.findById(pirep.pilot);
         if (!pilot) return res.status(404).json({ message: 'Associated pilot profile not found.' });
 
         let hoursToAdd = pirep.flightTime;
         let multiplierApplied = 1;
-
-        if (pirep.isMultiplierEligible && pirep.rosterLeg && pirep.rosterLeg.rosterId) {
+        if (pirep.isMultiplierEligible && pirep.rosterLeg?.rosterId) {
             const roster = await Roster.findById(pirep.rosterLeg.rosterId);
             if (roster && roster.multiplier > 1) {
                 hoursToAdd *= roster.multiplier;
                 multiplierApplied = roster.multiplier;
-                console.log(`Applied ${roster.multiplier}x multiplier to PIREP ${pirep._id}. Original: ${pirep.flightTime}, Awarded: ${hoursToAdd}`);
             }
         }
 
-        // --- LOGIC FOR HOUR & SECTOR ATTRIBUTION ---
-
-        // 1. Check if pilot's leaderboard stats need resetting before adding new hours/sectors.
         checkAndResetLeaderboardStats(pilot);
+        pilot.flightHours += hoursToAdd;
+        pilot.weeklyFlightHours += hoursToAdd;
+        pilot.leaderboardMonthlyFlightHours += hoursToAdd;
+        pilot.weeklySectors += 1;
+        pilot.monthlySectors += 1;
 
-        // 2. Update lifetime totals and leaderboard stats for ALL flights (rostered or not).
-        pilot.flightHours += hoursToAdd;                   // Total lifetime hours
-        pilot.weeklyFlightHours += hoursToAdd;             // Leaderboard
-        pilot.leaderboardMonthlyFlightHours += hoursToAdd; // Leaderboard
-        pilot.weeklySectors += 1;                          // Leaderboard
-        pilot.monthlySectors += 1;                         // Leaderboard
-
-        // 3. Conditionally update FTPL counters ONLY for rostered flights.
-        //    A PIREP is considered 'rostered' if it has a rosterLeg associated with it.
         if (pirep.rosterLeg && pirep.rosterLeg.rosterId) {
-            pilot.monthlyFlightHours += hoursToAdd; // For FTPL
-            pilot.dailyFlightHours += hoursToAdd;   // For FTPL
-            console.log(`PIREP ${pirep._id} is a rostered flight. Applied ${hoursToAdd.toFixed(2)} hours to FTPL counters.`);
-        } else {
-            console.log(`PIREP ${pirep._id} is a non-rostered flight. FTPL counters were not affected.`);
+            pilot.monthlyFlightHours += hoursToAdd;
+            pilot.dailyFlightHours += hoursToAdd;
         }
-        // --- END OF MODIFIED LOGIC ---
+        pilot.lastKnownAirport = pirep.arrival;
 
-        pilot.lastKnownAirport = pirep.arrival; 
-
+        // MODIFIED SECTION
         const promotionResult = checkAndApplyRankUpdate(pilot);
         
         pirep.status = 'APPROVED';
         pirep.reviewedBy = req.user._id;
         pirep.reviewedAt = Date.now();
-        pirep.verificationImageUrl = null; // Clear the URL from the database
+        pirep.verificationImageUrl = null;
         
-        await pilot.save();
+        await pilot.save(); // Save pilot's new hours and potential status change
         await pirep.save();
 
         if (pilot.callsign) {
-            updateGoogleSheet({
-                callsign: pilot.callsign, name: pilot.name, rank: pilot.rank, flightHours: pilot.flightHours,
-            });
+            updateGoogleSheet({ callsign: pilot.callsign, name: pilot.name, rank: pilot.rank, flightHours: pilot.flightHours });
         }
         
         let message = `PIREP approved. ${pilot.name} now has ${pilot.flightHours.toFixed(2)} hours.`;
-        if (multiplierApplied > 1) {
-            message += ` A ${multiplierApplied}x multiplier was applied!`;
-        }
+        if (multiplierApplied > 1) { message += ` A ${multiplierApplied}x multiplier was applied!`; }
 
-        const responsePayload = {
-            message: message,
-            promotionDetails: null
-        };
+        const responsePayload = { message, promotionDetails: null };
 
+        // If a standard promotion occurred
         if (promotionResult.promoted) {
-            const newRank = promotionResult.rank;
-            responsePayload.message += ` Congratulations on the promotion to ${newRank}!`;
-            responsePayload.promotionDetails = {
-                newRank: newRank,
-                flightHoursRequired: rankThresholds[newRank],
-                perks: rankPerks[newRank] || []
-            };
+            responsePayload.message += ` Congratulations on the promotion to ${promotionResult.rank}!`;
+        }
+        
+        // NEW: If the pilot is now pending a test, create an admin log and inform user
+        if (promotionResult.pendingTest) {
+            const log = new AdminLog({
+                adminUser: req.user._id,
+                action: 'PROMOTION_TEST_REQUIRED',
+                targetUser: pilot._id,
+                details: `${pilot.name} (${pilot.email}) has reached the required hours for ${promotionResult.prospectiveRank} and requires testing.`
+            });
+            await log.save();
+            responsePayload.message += ` You have reached the flight hour requirement for the next rank! Staff has been notified to schedule your practical and written tests. Your account is now in an observation period.`;
         }
         
         res.json(responsePayload);
@@ -1268,6 +1285,7 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
         res.status(500).json({ message: 'Server error while approving PIREP.' });
     }
 });
+
 
 app.put('/api/pireps/:pirepId/reject', authMiddleware, isPirepManager, async (req, res) => {
     try {
@@ -1286,7 +1304,7 @@ app.put('/api/pireps/:pirepId/reject', authMiddleware, isPirepManager, async (re
         pirep.rejectionReason = reason;
         pirep.reviewedBy = req.user._id;
         pirep.reviewedAt = Date.now();
-        pirep.verificationImageUrl = null; // Clear the URL
+        pirep.verificationImageUrl = null;
         await pirep.save();
         
         res.json({ message: 'PIREP has been successfully rejected.' });
@@ -1296,6 +1314,7 @@ app.put('/api/pireps/:pirepId/reject', authMiddleware, isPirepManager, async (re
     }
 });
 
+// --- MODIFIED Manual Rank Update to handle promotion completion ---
 app.put('/api/users/:userId/rank', authMiddleware, isPilotManager, async (req, res) => {
     try {
         const { userId } = req.params;
@@ -1304,11 +1323,24 @@ app.put('/api/users/:userId/rank', authMiddleware, isPilotManager, async (req, r
 
         const user = await User.findById(userId);
         if (!user) return res.status(404).json({ message: 'User not found.' });
+
+        const oldRank = user.rank;
         user.rank = newRank;
+
+        // --- NEW LOGIC ---
+        // If the user was pending a test, reset their status and add a notification
+        if (user.promotionStatus === 'PENDING_TEST') {
+            user.promotionStatus = 'ACTIVE';
+            user.notifications.push({
+                message: `Congratulations! You have passed your tests and have been promoted from ${oldRank} to ${newRank}. You are now cleared for normal flight operations.`
+            });
+        }
+        // --- END OF NEW LOGIC ---
+
         await user.save();
-        
+
         if (user.callsign) {
-             updateGoogleSheet({ callsign: user.callsign, name: user.name, rank: user.rank, flightHours: user.flightHours });
+            updateGoogleSheet({ callsign: user.callsign, name: user.name, rank: user.rank, flightHours: user.flightHours });
         }
         res.json({ message: `Successfully updated ${user.name}'s rank to ${newRank}.` });
     } catch (error) {
@@ -1318,22 +1350,18 @@ app.put('/api/users/:userId/rank', authMiddleware, isPilotManager, async (req, r
 });
 
 
-// --- NEW/ENHANCED: ROSTER & DUTY MANAGEMENT ROUTES ---
 
 app.get('/api/rosters', authMiddleware, async (req, res) => {
     try {
         const { all } = req.query;
-        // Define manager roles that can view all rosters
         const managerRoles = ['admin', 'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)', 'Route Manager (RM)'];
         const isManager = managerRoles.includes(req.user.role);
 
-        // If a manager requests 'all', return everything
         if (all === 'true' && isManager) {
             const allRosters = await Roster.find({}).sort({ hub: 1, name: 1 }).lean();
             return res.json(allRosters);
         }
 
-        // --- Existing logic for personalized pilot view ---
         const user = await User.findById(req.user._id).lean();
         if (!user) return res.status(404).json({ message: 'User not found.' });
         
@@ -1347,7 +1375,6 @@ app.get('/api/rosters', authMiddleware, async (req, res) => {
         ] 
         }).sort({ createdAt: -1 }).lean();
 
-        // Rank filter: only include rosters whose legs are all at/below user's rank
         const filtered = rosters.filter(r =>
             Array.isArray(r.legs) && r.legs.length > 0 &&
             r.legs.every(l => canFlyLeg(user.rank, getLegRequiredRank(l)))
@@ -1358,8 +1385,6 @@ app.get('/api/rosters', authMiddleware, async (req, res) => {
         res.status(500).json({ message: 'Server error while fetching available rosters.' });
     }
 });
-
-
 
 app.get('/api/rosters/my-rosters', authMiddleware, async (req, res) => {
     try {
@@ -1375,7 +1400,7 @@ app.get('/api/rosters/my-rosters', authMiddleware, async (req, res) => {
                 .map(s => String(s).toUpperCase().trim())
         );
         if (searchLocations.size === 0) {
-            searchLocations.add('VIDP'); // Default fallback if no location is known
+            searchLocations.add('VIDP');
         }
 
         const availableRosters = await Roster.find({
@@ -1404,7 +1429,6 @@ app.get('/api/rosters/my-rosters', authMiddleware, async (req, res) => {
     }
 });
 
-
 app.post('/api/rosters', authMiddleware, isRouteManager, async (req, res) => {
     try {
         
@@ -1412,7 +1436,6 @@ app.post('/api/rosters', authMiddleware, isRouteManager, async (req, res) => {
         if (!name || !hub || !Array.isArray(legs) || legs.length === 0) {
             return res.status(400).json({ message: 'Name, hub and at least one leg are required.' });
         }
-        // Ensure each leg has operator and rankUnlock (defaults for primary IndGo rosters)
         const normalizeICAO = s => String(s || '').toUpperCase().trim();
 
         const finishedLegs = legs.map(l => {
@@ -1431,7 +1454,6 @@ app.post('/api/rosters', authMiddleware, isRouteManager, async (req, res) => {
             ? totalFlightTime
             : finishedLegs.reduce((s, L) => s + (Number(L.flightTime) || 0), 0);
 
-        // Generates a random multiplier between 1.10 and 1.50 for manually created rosters
         const randomMultiplier = parseFloat((1.1 + Math.random() * 0.4).toFixed(2));
         const newRoster = new Roster({ 
             name, 
@@ -1480,6 +1502,7 @@ app.delete('/api/rosters/:rosterId', authMiddleware, isRouteManager, async (req,
     }
 });
 
+// --- MODIFIED Duty Start to block users pending tests ---
 app.post('/api/duty/start', authMiddleware, async (req, res) => {
     const { rosterId } = req.body;
     try {
@@ -1489,13 +1512,17 @@ app.post('/api/duty/start', authMiddleware, async (req, res) => {
         if (!roster) return res.status(404).json({ message: 'Selected roster not found.' });
         if (user.dutyStatus === 'ON_DUTY') return res.status(400).json({ message: 'You are already on duty.' });
 
-        // +++ (FTPL FIX) SMARTER RESET LOGIC +++
-        // If the pilot has completed the minimum rest, it's a new duty day, so we reset their daily flight hours.
+        // NEW: Add restriction check
+        if (user.promotionStatus === 'PENDING_TEST') {
+            return res.status(403).json({
+                message: 'You are currently in an observation period awaiting promotion tests. You cannot start a new duty until your tests are complete and you have been promoted by a staff member.'
+            });
+        }
+
         if (user.lastDutyOff && (Date.now() - user.lastDutyOff.getTime()) >= MIN_REST_PERIOD) {
             user.dailyFlightHours = 0;
             console.log(`Daily flight hours for ${user.email} reset due to starting a new duty period.`);
         }
-        // --- End of new logic ---
 
         if (user.lastDutyOff && (Date.now() - user.lastDutyOff) < MIN_REST_PERIOD) {
             const timeToRest = Math.ceil((MIN_REST_PERIOD - (Date.now() - user.lastDutyOff)) / (60 * 1000));
@@ -1511,12 +1538,10 @@ app.post('/api/duty/start', authMiddleware, async (req, res) => {
         if ((user.monthlyFlightHours + roster.totalFlightTime) > MAX_MONTHLY_FLIGHT_HOURS) {
             return res.status(403).json({ message: `This duty would exceed your ${MAX_MONTHLY_FLIGHT_HOURS}-hour monthly limit.` });
         }
-        // This check now correctly uses the potentially reset dailyFlightHours value
         if ((user.dailyFlightHours + roster.totalFlightTime) > MAX_DAILY_FLIGHT_HOURS) {
             return res.status(403).json({ message: `This duty would exceed your ${MAX_DAILY_FLIGHT_HOURS}-hour daily flight limit.` });
         }
         
-        // Rank enforcement: block roster if any leg requires a rank above the pilot's rank
         const overRankLeg = roster.legs.find(l => !canFlyLeg(user.rank, getLegRequiredRank(l)));
         if (overRankLeg) {
             return res.status(403).json({
@@ -1534,6 +1559,7 @@ app.post('/api/duty/start', authMiddleware, async (req, res) => {
         res.status(500).json({ message: 'Server error while starting duty.' });
     }
 });
+
 
 app.post('/api/duty/end', authMiddleware, async (req, res) => {
     try {
@@ -1561,8 +1587,6 @@ app.post('/api/duty/end', authMiddleware, async (req, res) => {
         user.currentRoster = null;
         user.lastDutyOff = Date.now();
         user.lastDutyStart = null;
-        // --- (REMOVED as part of FTPL FIX) --- The following line is now handled by duty/start
-        // user.dailyFlightHours = 0; 
         await user.save();
         
         res.json({ message: 'Duty day completed successfully! You are now on crew rest.' });
@@ -1572,7 +1596,6 @@ app.post('/api/duty/end', authMiddleware, async (req, res) => {
     }
 });
 
-// --- Admin-Only Routes ---
 app.post('/api/users', authMiddleware, isAdmin, async (req, res) => {
     try {
         const { email, password, role, callsign, name } = req.body;
