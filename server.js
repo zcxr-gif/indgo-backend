@@ -14,6 +14,8 @@
 // - NEW: Image verification required for all PIREP submissions.
 // - NEW: Map feature support via airports data endpoint.
 // - NEW: Weekly and Monthly pilot leaderboards for hours and sectors.
+// - FIXED: Daily flight hour counter now resets intelligently when starting a new duty.
+// - ADDED: Endpoint for user profile now includes time remaining on crew rest.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -939,8 +941,21 @@ app.post('/api/login', async (req, res) => {
 
 app.get('/api/me', authMiddleware, async (req, res) => {
     try {
-        const user = await User.findById(req.user._id).select('-password');
+        const user = await User.findById(req.user._id).select('-password').lean();
         if (!user) return res.status(404).json({ message: 'User not found.' });
+        
+        // +++ ADDED: Time until next duty counter logic +++
+        // This will be used on the front-end for a countdown timer.
+        user.timeUntilNextDutyMs = 0; // Default to 0 (ready for duty)
+        if (user.dutyStatus === 'ON_REST' && user.lastDutyOff) {
+            const restEndsAt = user.lastDutyOff.getTime() + MIN_REST_PERIOD;
+            const now = Date.now();
+            if (restEndsAt > now) {
+                user.timeUntilNextDutyMs = restEndsAt - now;
+            }
+        }
+        // --- End of new logic ---
+
         res.json(user);
     } catch (err) {
         console.error(err);
@@ -1385,6 +1400,14 @@ app.post('/api/duty/start', authMiddleware, async (req, res) => {
         if (!roster) return res.status(404).json({ message: 'Selected roster not found.' });
         if (user.dutyStatus === 'ON_DUTY') return res.status(400).json({ message: 'You are already on duty.' });
 
+        // +++ (FTPL FIX) SMARTER RESET LOGIC +++
+        // If the pilot has completed the minimum rest, it's a new duty day, so we reset their daily flight hours.
+        if (user.lastDutyOff && (Date.now() - user.lastDutyOff.getTime()) >= MIN_REST_PERIOD) {
+            user.dailyFlightHours = 0;
+            console.log(`Daily flight hours for ${user.email} reset due to starting a new duty period.`);
+        }
+        // --- End of new logic ---
+
         if (user.lastDutyOff && (Date.now() - user.lastDutyOff) < MIN_REST_PERIOD) {
             const timeToRest = Math.ceil((MIN_REST_PERIOD - (Date.now() - user.lastDutyOff)) / (60 * 1000));
             return res.status(403).json({ message: `Crew rest required. You can go on duty in ${timeToRest} minutes.` });
@@ -1399,10 +1422,10 @@ app.post('/api/duty/start', authMiddleware, async (req, res) => {
         if ((user.monthlyFlightHours + roster.totalFlightTime) > MAX_MONTHLY_FLIGHT_HOURS) {
             return res.status(403).json({ message: `This duty would exceed your ${MAX_MONTHLY_FLIGHT_HOURS}-hour monthly limit.` });
         }
+        // This check now correctly uses the potentially reset dailyFlightHours value
         if ((user.dailyFlightHours + roster.totalFlightTime) > MAX_DAILY_FLIGHT_HOURS) {
             return res.status(403).json({ message: `This duty would exceed your ${MAX_DAILY_FLIGHT_HOURS}-hour daily flight limit.` });
         }
-
         
         // Rank enforcement: block roster if any leg requires a rank above the pilot's rank
         const overRankLeg = roster.legs.find(l => !canFlyLeg(user.rank, getLegRequiredRank(l)));
@@ -1449,7 +1472,8 @@ app.post('/api/duty/end', authMiddleware, async (req, res) => {
         user.currentRoster = null;
         user.lastDutyOff = Date.now();
         user.lastDutyStart = null;
-        user.dailyFlightHours = 0;
+        // --- (REMOVED as part of FTPL FIX) --- The following line is now handled by duty/start
+        // user.dailyFlightHours = 0; 
         await user.save();
         
         res.json({ message: 'Duty day completed successfully! You are now on crew rest.' });
