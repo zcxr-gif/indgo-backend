@@ -15,10 +15,12 @@
 // - NEW: Map feature support via airports data endpoint.
 // - NEW: Weekly and Monthly pilot leaderboards for hours and sectors.
 // - NEW: Test & Practical based promotion system for specific ranks.
+// - NEW: Flight Planning system with FIC/ADC codes and automated PIREP generation.
 // - FIXED: Daily flight hour counter now resets intelligently when starting a new duty.
 // - ADDED: Endpoint for user profile now includes time remaining on crew rest and notifications.
 // - FIXED: Off-roster (non-duty) PIREPs no longer affect FTPL counters.
 // - MODIFIED: Roster generation now creates a mix of single-rank and mixed-rank duties.
+// - MODIFIED: PIREP filing is now automated via the flight plan completion process.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -34,6 +36,7 @@ const { google } = require('googleapis');
 const Papa = require('papaparse'); // For parsing CSV data from Google Sheets
 const axios = require('axios'); // For fetching the sheet
 const fs = require('fs').promises; // For reading local JSON files
+const crypto = require('crypto'); // For Flight Plan code generation
 require('dotenv').config();
 
 // 2. INITIALIZE EXPRESS APP & AWS S3 CLIENT
@@ -203,6 +206,8 @@ const UserSchema = new mongoose.Schema({
         enum: ['ACTIVE', 'PENDING_TEST'],
         default: 'ACTIVE'
     },
+    // NEW: Link to active flight plan
+    currentFlightPlan: { type: mongoose.Schema.Types.ObjectId, ref: 'FlightPlan', default: null },
     notifications: [{
         message: { type: String, required: true },
         read: { type: Boolean, default: false },
@@ -220,6 +225,7 @@ UserSchema.pre('findOneAndDelete', { document: true, query: true }, async functi
         console.log(`Performing cascade delete for user: ${user.email}`);
         if (user.imageUrl) { deleteS3Object(user.imageUrl); }
         await mongoose.model('Pirep').deleteMany({ pilot: user._id });
+        await mongoose.model('FlightPlan').deleteMany({ pilot: user._id }); // Cascade delete flight plans
         const events = await mongoose.model('Event').find({ author: user._id }).lean();
         for (const event of events) {
             if (event.imageUrl) deleteS3Object(event.imageUrl);
@@ -279,6 +285,39 @@ const HighlightSchema = new mongoose.Schema({
 });
 const Highlight = mongoose.model('Highlight', HighlightSchema);
 
+// --- NEW: Flight Plan Schema ---
+const FlightPlanSchema = new mongoose.Schema({
+    pilot: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    flightNumber: { type: String, required: true, trim: true },
+    departure: { type: String, required: true, uppercase: true, trim: true },
+    arrival: { type: String, required: true, uppercase: true, trim: true },
+    aircraft: { type: String, required: true },
+    etd: { type: Date, required: true }, // Estimated Time of Departure
+    eet: { type: Number, required: true }, // Estimated Elapsed Time in hours
+    eta: { type: Date, required: true }, // Estimated Time of Arrival
+    alternate: { type: String, required: true, uppercase: true, trim: true },
+    pob: { type: Number, required: true }, // Persons on Board
+    route: { type: String, required: true },
+    ficNumber: { type: String, required: true, unique: true }, // Flight Information Code
+    adcNumber: { type: String, required: true, unique: true }, // Air Defence Clearance
+    status: {
+        type: String,
+        enum: ['PLANNED', 'FLYING', 'COMPLETED', 'CANCELLED'],
+        default: 'PLANNED'
+    },
+    // For roster flights
+    rosterLeg: {
+        rosterId: { type: mongoose.Schema.Types.ObjectId, ref: 'Roster' },
+        flightNumber: { type: String }
+    },
+    // Actual times
+    actualDepartureTime: { type: Date },
+    actualArrivalTime: { type: Date },
+}, { timestamps: true });
+FlightPlanSchema.index({ pilot: 1, status: 1 });
+const FlightPlan = mongoose.model('FlightPlan', FlightPlanSchema);
+
+
 // --- PIREP Schema ---
 const PirepSchema = new mongoose.Schema({
     pilot: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
@@ -332,6 +371,9 @@ RosterSchema.index({ isAvailable: 1, 'legs.0.departure': 1 });
 
 
 // 6. HELPER FUNCTIONS & MIDDLEWARE
+
+const generateFicNumber = () => `FIC/${new Date().getFullYear()}/${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+const generateAdcNumber = () => `ADC/${crypto.randomBytes(5).toString('hex').toUpperCase()}`;
 
 const deleteS3Object = async (imageUrl) => {
     if (!imageUrl) return;
@@ -1100,91 +1142,196 @@ app.post('/api/me/notifications/read', authMiddleware, async (req, res) => {
 });
 
 
-// --- MODIFIED PIREP Filing to block users pending tests ---
-app.post('/api/pireps', authMiddleware, upload.single('verificationImage'), async (req, res) => {
-    try {
-        const { flightNumber, departure, arrival, aircraft, flightTime, remarks, operator } = req.body;
+// --- NEW: FLIGHT PLANNING & PIREP AUTOMATION ROUTES ---
 
-        if (!req.file) {
-            return res.status(400).json({ message: 'A verification image of the flight is required.' });
-        }
-        if (!flightNumber || !departure || !arrival || !aircraft || !flightTime) {
-            return res.status(400).json({ message: 'Please fill out all required flight details.' });
+app.post('/api/flightplans', authMiddleware, async (req, res) => {
+    try {
+        const { flightNumber, departure, arrival, aircraft, etd, eet, alternate, pob, route } = req.body;
+        if (!flightNumber || !departure || !arrival || !aircraft || !etd || !eet || !alternate || !pob || !route) {
+            return res.status(400).json({ message: 'Please provide all required flight plan details.' });
         }
 
         const pilot = await User.findById(req.user._id);
         if (!pilot) return res.status(404).json({ message: 'Pilot not found.' });
 
-        // NEW: Add restriction check
         if (pilot.promotionStatus === 'PENDING_TEST') {
-            return res.status(403).json({
-                message: 'You are currently in an observation period awaiting promotion tests. You cannot file new PIREPs until your tests are complete and you have been promoted by a staff member.'
-            });
+            return res.status(403).json({ message: 'You are awaiting promotion tests and cannot file new flight plans.' });
+        }
+        if (pilot.currentFlightPlan) {
+            return res.status(400).json({ message: 'You already have an active flight plan. Please complete or cancel it first.' });
         }
 
-        const newPirepData = {
-            pilot: req.user._id, flightNumber, departure, arrival, aircraft, remarks,
-            flightTime: parseFloat(flightTime),
-            status: 'PENDING',
-            verificationImageUrl: req.file.location,
-            isMultiplierEligible: false
-        };
+        const planData = { departure, arrival, aircraft };
+        const rosterLegData = {};
 
         if (pilot.dutyStatus === 'ON_DUTY') {
-            if (!pilot.currentRoster) return res.status(400).json({ message: 'You are on duty but have no assigned roster. Please contact staff.' });
-
+            if (!pilot.currentRoster) return res.status(400).json({ message: 'You are on duty but have no assigned roster.' });
             await pilot.populate('currentRoster');
-            const roster = pilot.currentRoster;
 
-            const leg = roster.legs.find(l =>
-                l.flightNumber.toUpperCase() === flightNumber.toUpperCase() &&
-                l.departure.toUpperCase() === departure.toUpperCase() &&
-                l.arrival.toUpperCase() === arrival.toUpperCase()
-            );
+            const leg = pilot.currentRoster.legs.find(l => l.flightNumber.toUpperCase() === flightNumber.toUpperCase());
+            if (!leg) return res.status(400).json({ message: 'This flight number does not match any leg in your assigned roster.' });
 
-            if (!leg) return res.status(400).json({ message: 'This flight does not match any leg in your assigned roster.' });
-
-            const requiredRank = getLegRequiredRank(leg);
-            if (!canFlyLeg(pilot.rank, requiredRank)) {
-                return res.status(403).json({
-                    message: `This roster leg requires ${requiredRank}, which is above your rank (${pilot.rank}).`
-                });
-            }
-            const existingPirep = await Pirep.findOne({
-                pilot: req.user._id,
-                'rosterLeg.rosterId': roster._id,
-                'rosterLeg.flightNumber': flightNumber
+            const existingPlanForLeg = await FlightPlan.findOne({
+                pilot: pilot._id,
+                'rosterLeg.rosterId': pilot.currentRoster._id,
+                'rosterLeg.flightNumber': flightNumber,
+                status: { $in: ['PLANNED', 'FLYING', 'COMPLETED'] }
             });
-            if (existingPirep) return res.status(400).json({ message: 'You have already filed a PIREP for this roster leg.' });
+            if (existingPlanForLeg) return res.status(400).json({ message: 'You have already filed a flight plan for this roster leg.' });
 
-            newPirepData.rosterLeg = { rosterId: roster._id, flightNumber: flightNumber };
-            newPirepData.rankUnlock = leg.rankUnlock;
-            newPirepData.operator = leg.operator;
+            planData.departure = leg.departure;
+            planData.arrival = leg.arrival;
+            planData.aircraft = leg.aircraft;
+            rosterLegData.rosterId = pilot.currentRoster._id;
+            rosterLegData.flightNumber = leg.flightNumber;
+        }
 
-            const lastLegInRoster = roster.legs[roster.legs.length - 1];
-            if (lastLegInRoster.flightNumber.toUpperCase() === flightNumber.toUpperCase()) {
-                newPirepData.isMultiplierEligible = true;
+        const requiredRank = deduceRankFromAircraft(planData.aircraft);
+        if (!canFlyLeg(pilot.rank, requiredRank)) {
+            return res.status(403).json({ message: `This aircraft/route requires ${requiredRank}, which is above your rank (${pilot.rank}).` });
+        }
+
+        const eetHours = parseFloat(eet);
+        const etdDate = new Date(etd);
+        const etaDate = new Date(etdDate.getTime() + eetHours * 60 * 60 * 1000);
+
+        const newFlightPlan = new FlightPlan({
+            pilot: pilot._id,
+            flightNumber,
+            departure: planData.departure,
+            arrival: planData.arrival,
+            aircraft: planData.aircraft,
+            alternate,
+            pob,
+            route,
+            etd: etdDate,
+            eet: eetHours,
+            eta: etaDate,
+            ficNumber: generateFicNumber(),
+            adcNumber: generateAdcNumber(),
+            rosterLeg: pilot.dutyStatus === 'ON_DUTY' ? rosterLegData : undefined
+        });
+
+        await newFlightPlan.save();
+        pilot.currentFlightPlan = newFlightPlan._id;
+        await pilot.save();
+
+        res.status(201).json({ message: 'Flight plan filed successfully. You are cleared to depart at your ETD.', flightPlan: newFlightPlan });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error while filing flight plan.' });
+    }
+});
+
+app.get('/api/flightplans/my-active', authMiddleware, async (req, res) => {
+    try {
+        const pilot = await User.findById(req.user._id).populate('currentFlightPlan');
+        if (!pilot) return res.status(404).json({ message: 'Pilot not found.' });
+        if (!pilot.currentFlightPlan) return res.json(null); // No active plan is a valid state
+
+        res.json(pilot.currentFlightPlan);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error fetching active flight plan.' });
+    }
+});
+
+app.post('/api/flightplans/:id/depart', authMiddleware, async (req, res) => {
+    try {
+        const flightPlan = await FlightPlan.findById(req.params.id);
+        if (!flightPlan) return res.status(404).json({ message: 'Flight plan not found.' });
+        if (flightPlan.pilot.toString() !== req.user._id) return res.status(403).json({ message: 'This is not your flight plan.' });
+        if (flightPlan.status !== 'PLANNED') return res.status(400).json({ message: `Cannot depart. Flight status is already '${flightPlan.status}'.` });
+
+        flightPlan.status = 'FLYING';
+        flightPlan.actualDepartureTime = Date.now();
+        await flightPlan.save();
+
+        res.json({ message: 'Departure confirmed. Your flight is now active.', flightPlan });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error during departure.' });
+    }
+});
+
+app.post('/api/flightplans/:id/arrive', authMiddleware, upload.single('verificationImage'), async (req, res) => {
+    try {
+        const { remarks } = req.body;
+        if (!req.file) return res.status(400).json({ message: 'A verification image of the flight is required to generate a PIREP.' });
+
+        const flightPlan = await FlightPlan.findById(req.params.id);
+        if (!flightPlan) return res.status(404).json({ message: 'Flight plan not found.' });
+        if (flightPlan.pilot.toString() !== req.user._id) return res.status(403).json({ message: 'This is not your flight plan.' });
+        if (flightPlan.status !== 'FLYING') return res.status(400).json({ message: `Cannot arrive. Flight status must be 'FLYING'.` });
+
+        flightPlan.status = 'COMPLETED';
+        flightPlan.actualArrivalTime = Date.now();
+        const flightTimeHours = (flightPlan.actualArrivalTime - flightPlan.actualDepartureTime) / (1000 * 60 * 60);
+
+        const newPirepData = {
+            pilot: flightPlan.pilot,
+            flightNumber: flightPlan.flightNumber,
+            departure: flightPlan.departure,
+            arrival: flightPlan.arrival,
+            aircraft: flightPlan.aircraft,
+            flightTime: parseFloat(flightTimeHours.toFixed(2)),
+            remarks,
+            verificationImageUrl: req.file.location,
+            status: 'PENDING',
+            isMultiplierEligible: false,
+        };
+
+        if (flightPlan.rosterLeg && flightPlan.rosterLeg.rosterId) {
+            const roster = await Roster.findById(flightPlan.rosterLeg.rosterId);
+            if (roster) {
+                const leg = roster.legs.find(l => l.flightNumber === flightPlan.flightNumber);
+                if (leg) {
+                    newPirepData.rankUnlock = leg.rankUnlock;
+                    newPirepData.operator = leg.operator;
+                    newPirepData.rosterLeg = flightPlan.rosterLeg;
+                    const lastLegInRoster = roster.legs[roster.legs.length - 1];
+                    if (lastLegInRoster.flightNumber.toUpperCase() === flightPlan.flightNumber.toUpperCase()) {
+                        newPirepData.isMultiplierEligible = true;
+                    }
+                }
             }
         } else {
-            const neededRank = deduceRankFromAircraft(aircraft);
-            if (!canFlyLeg(pilot.rank, neededRank)) {
-                return res.status(403).json({
-                    message: `This aircraft/route requires ${neededRank}, which is above your rank (${pilot.rank}).`
-                });
-            }
-            newPirepData.rankUnlock = neededRank;
-            newPirepData.operator = operator || 'IndGo Air Virtual';
+            newPirepData.rankUnlock = deduceRankFromAircraft(flightPlan.aircraft);
+            newPirepData.operator = 'IndGo Air Virtual';
         }
 
         const newPirep = new Pirep(newPirepData);
         await newPirep.save();
-        res.status(201).json({ message: 'Flight report submitted successfully and is pending review.', pirep: newPirep });
+
+        await User.updateOne({ _id: flightPlan.pilot }, { $set: { currentFlightPlan: null } });
+        await flightPlan.save();
+
+        res.status(201).json({ message: 'Flight completed successfully! Your PIREP has been automatically generated and is pending review.', pirep: newPirep });
+
     } catch (error) {
         console.error(error);
-        res.status(500).json({ message: 'Server error while filing flight report.' });
+        res.status(500).json({ message: 'Server error while completing flight.' });
     }
 });
 
+app.post('/api/flightplans/:id/cancel', authMiddleware, async (req, res) => {
+    try {
+        const flightPlan = await FlightPlan.findById(req.params.id);
+        if (!flightPlan) return res.status(404).json({ message: 'Flight plan not found.' });
+        if (flightPlan.pilot.toString() !== req.user._id) return res.status(403).json({ message: 'This is not your flight plan.' });
+        if (flightPlan.status !== 'PLANNED') return res.status(400).json({ message: `Cannot cancel a flight that is already '${flightPlan.status}'.` });
+
+        flightPlan.status = 'CANCELLED';
+        await flightPlan.save();
+        await User.updateOne({ _id: flightPlan.pilot }, { $set: { currentFlightPlan: null } });
+
+        res.json({ message: 'Flight plan has been successfully cancelled.' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error while cancelling flight plan.' });
+    }
+});
 
 app.get('/api/me/pireps', authMiddleware, async (req, res) => {
     try {
