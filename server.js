@@ -16,6 +16,7 @@
 // - NEW: Weekly and Monthly pilot leaderboards for hours and sectors.
 // - FIXED: Daily flight hour counter now resets intelligently when starting a new duty.
 // - ADDED: Endpoint for user profile now includes time remaining on crew rest.
+// - FIXED: Off-roster (non-duty) PIREPs no longer affect FTPL counters.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -1138,19 +1139,28 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
             }
         }
 
-        // --- LEADERBOARD LOGIC ---
-        // 1. Check if pilot's leaderboard stats need resetting before adding new hours/sectors
+        // --- LOGIC FOR HOUR & SECTOR ATTRIBUTION ---
+
+        // 1. Check if pilot's leaderboard stats need resetting before adding new hours/sectors.
         checkAndResetLeaderboardStats(pilot);
 
-        // 2. Add hours and sectors to all relevant counters
-        pilot.flightHours += hoursToAdd; // Total lifetime hours
-        pilot.monthlyFlightHours += hoursToAdd; // For FTPL
-        pilot.dailyFlightHours += hoursToAdd; // For FTPL
-        pilot.weeklyFlightHours += hoursToAdd; // Leaderboard
+        // 2. Update lifetime totals and leaderboard stats for ALL flights (rostered or not).
+        pilot.flightHours += hoursToAdd;                   // Total lifetime hours
+        pilot.weeklyFlightHours += hoursToAdd;             // Leaderboard
         pilot.leaderboardMonthlyFlightHours += hoursToAdd; // Leaderboard
-        pilot.weeklySectors += 1; // Leaderboard
-        pilot.monthlySectors += 1; // Leaderboard
-        // --- END LEADERBOARD LOGIC ---
+        pilot.weeklySectors += 1;                          // Leaderboard
+        pilot.monthlySectors += 1;                         // Leaderboard
+
+        // 3. Conditionally update FTPL counters ONLY for rostered flights.
+        //    A PIREP is considered 'rostered' if it has a rosterLeg associated with it.
+        if (pirep.rosterLeg && pirep.rosterLeg.rosterId) {
+            pilot.monthlyFlightHours += hoursToAdd; // For FTPL
+            pilot.dailyFlightHours += hoursToAdd;   // For FTPL
+            console.log(`PIREP ${pirep._id} is a rostered flight. Applied ${hoursToAdd.toFixed(2)} hours to FTPL counters.`);
+        } else {
+            console.log(`PIREP ${pirep._id} is a non-rostered flight. FTPL counters were not affected.`);
+        }
+        // --- END OF MODIFIED LOGIC ---
 
         pilot.lastKnownAirport = pirep.arrival; 
 
