@@ -263,7 +263,7 @@ const HighlightSchema = new mongoose.Schema({
     winnerName: { type: String, required: true },
     description: { type: String },
     imageUrl: { type: String, required: true },
-    author: { type: mongoose.schema.Types.ObjectId, ref: 'User' },
+    author: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     createdAt: { type: Date, default: Date.now }
 });
 const Highlight = mongoose.model('Highlight', HighlightSchema);
