@@ -1,27 +1,4 @@
 // server.js (Fully Merged, Updated & Performance Tuned with Leaderboards & IF Tracker)
-// - Automated Roster Generation now reads from TWO Google Sheets simultaneously:
-//   1. The primary routes sheet (for regular flights).
-//   2. The codeshare routes sheet (for partner flights).
-// - NO separate import step needed. Roster generation pulls all data in real-time.
-// - Strict Flight & Duty Time Limitations (FTPL) engine.
-// - Location-aware roster availability for pilots.
-// - Robust Google Sheets function with dynamic column mapping.
-// - Advanced PIREP system with a staff review workflow.
-// - Automatic rank promotions upon PIREP approval.
-// - Cascade delete functionality for users and their associated data.
-// - Personalized roster suggestions based on pilot's last duty/flight location.
-// - NEW: Roster multipliers for bonus flight hours on final legs.
-// - NEW: Image verification required for all PIREP submissions.
-// - NEW: Map feature support via airports data endpoint.
-// - NEW: Weekly and Monthly pilot leaderboards for hours and sectors.
-// - NEW: Test & Practical based promotion system for specific ranks.
-// - NEW: Flight Planning system with FIC/ADC codes and automated PIREP generation.
-// - NEW: Integrated Infinite Flight Live API tracker for automatic flight finalization.
-// - FIXED: Daily flight hour counter now resets intelligently when starting a new duty.
-// - ADDED: Endpoint for user profile now includes time remaining on crew rest and notifications.
-// - FIXED: Off-roster (non-duty) PIREPs no longer affect FTPL counters.
-// - MODIFIED: Roster generation now creates a mix of single-rank and mixed-rank duties.
-// - MODIFIED: PIREP filing is now automated via the flight plan completion process.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -34,11 +11,16 @@ const path = require('path');
 const { S3Client, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const multerS3 = require('multer-s3');
 const { google } = require('googleapis');
-const Papa = require('papaparse'); // For parsing CSV data from Google Sheets
-const axios = require('axios'); // For fetching the sheet AND for the IF Tracker
-const fs = require('fs').promises; // For reading local JSON files
-const crypto = require('crypto'); // For Flight Plan code generation
+const Papa = require('papaparse');
+const axios = require('axios');
+const fs = require('fs').promises;
+const crypto = require('crypto');
 require('dotenv').config();
+
+// IMPORT FROM PROJECT MODULES
+const { startFlightTracker } = require('./if-tracker');
+const { finalizeFlightAndCreatePirep } = require('./flightUtils');
+const { deduceRankFromAircraft } = require('./flightUtils'); // Replaces local version
 
 // 2. INITIALIZE EXPRESS APP & AWS S3 CLIENT
 const app = express();
@@ -106,7 +88,6 @@ const pilotRanks = [
     'Chief Flight Instructor', 'IndGo SkyMaster', 'Blue Legacy Commander'
 ];
 
-// NEW: Define ranks that require manual testing and promotion
 const testGatedRanks = [
     'Route Explorer',
     'Skyline Officer',
@@ -142,8 +123,18 @@ const rankPerks = {
     'Blue Legacy Commander': ['Lifetime elite badge', 'Council-level privileges', 'Ultimate recognition']
 };
 
+// --- Models (Assuming they are defined in separate files as per best practice) ---
+const User = require('./models/User');
+const AdminLog = require('./models/AdminLog');
+const Event = require('./models/Event');
+const Highlight = require('./models/Highlight');
+const FlightPlan = require('./models/FlightPlan');
+const Pirep = require('./models/Pirep');
+const Roster = require('./models/Roster');
 
-// --- Rank helpers ---
+
+// 6. HELPER FUNCTIONS & MIDDLEWARE
+
 const rankIndex = (r) => {
     const i = pilotRanks.indexOf(String(r || '').trim());
     return i >= 0 ? i : -1;
@@ -155,224 +146,10 @@ const canFlyLeg = (userRank, legRank) => {
 };
 const getLegRequiredRank = (leg) => {
     if (leg?.rankUnlock && pilotRanks.includes(leg.rankUnlock)) return leg.rankUnlock;
+    // Using the imported helper function from flightUtils.js
     return deduceRankFromAircraft(leg?.aircraft);
 };
 
-
-// --- User Schema (Enhanced for Test-Based Promotions) ---
-const UserSchema = new mongoose.Schema({
-    name: { type: String, default: 'New Staff Member' },
-    email: { type: String, required: true, unique: true, trim: true, lowercase: true },
-    password: { type: String, required: true },
-    role: {
-        type: String,
-        enum: [
-            'staff', 'pilot', 'admin', 'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)',
-            'PIREP Manager (PM)', 'Pilot Relations & Recruitment Manager (PR)', 'Technology & Design Manager (TDM)',
-            'Head of Training (COT)', 'Chief Marketing Officer (CMO)', 'Route Manager (RM)',
-            'Events Manager (EM)', 'Flight Instructor (FI)'
-        ],
-        default: 'pilot'
-    },
-    callsign: { type: String, default: null, sparse: true, trim: true, uppercase: true },
-    rank: { type: String, enum: pilotRanks, default: 'IndGo Cadet' },
-    flightHours: { type: Number, default: 0 },
-    bio: { type: String, default: '' },
-    imageUrl: { type: String, default: '' },
-    discord: { type: String, default: '' },
-    ifc: { type: String, default: '' },
-    youtube: { type: String, default: '' },
-    infiniteFlightUsername: { type: String, default: '', trim: true }, // ADDED FROM MERGE
-    preferredContact: { type: String, enum: ['none', 'discord', 'ifc', 'youtube'], default: 'none' },
-    createdAt: { type: Date, default: Date.now },
-    // FTPL Fields
-    dutyStatus: { type: String, enum: ['ON_REST', 'ON_DUTY'], default: 'ON_REST' },
-    currentRoster: { type: mongoose.Schema.Types.ObjectId, ref: 'Roster', default: null },
-    lastDutyStart: { type: Date, default: null },
-    lastDutyOff: { type: Date, default: null },
-    dailyFlightHours: { type: Number, default: 0 },
-    monthlyFlightHours: { type: Number, default: 0 }, // For FTPL (rolling 30 days)
-    lastHourReset: { type: Date, default: Date.now },
-    lastKnownAirport: { type: String, uppercase: true, trim: true, default: 'VIDP' },
-    lastDutyAirport: { type: String, uppercase: true, trim: true, default: null },
-    // Leaderboard Fields
-    weeklyFlightHours: { type: Number, default: 0 },
-    leaderboardMonthlyFlightHours: { type: Number, default: 0 }, // By calendar month
-    weeklySectors: { type: Number, default: 0 },
-    monthlySectors: { type: Number, default: 0 },
-    lastWeeklyReset: { type: Date, default: Date.now },
-    lastMonthlyReset: { type: Date, default: Date.now },
-    // NEW FIELDS FOR MANUAL PROMOTION
-    promotionStatus: {
-        type: String,
-        enum: ['ACTIVE', 'PENDING_TEST'],
-        default: 'ACTIVE'
-    },
-    // NEW: Link to active flight plan
-    currentFlightPlan: { type: mongoose.Schema.Types.ObjectId, ref: 'FlightPlan', default: null },
-    notifications: [{
-        message: { type: String, required: true },
-        read: { type: Boolean, default: false },
-        createdAt: { type: Date, default: Date.now }
-    }],
-    default: []
-}, { toJSON: { virtuals: true }, toObject: { virtuals: true } });
-UserSchema.index({ callsign: 1 }, { unique: true, sparse: true });
-
-UserSchema.pre('findOneAndDelete', { document: true, query: true }, async function (next) {
-    try {
-        const user = await this.model.findOne(this.getFilter());
-        if (!user) return next();
-
-        console.log(`Performing cascade delete for user: ${user.email}`);
-        if (user.imageUrl) { deleteS3Object(user.imageUrl); }
-        await mongoose.model('Pirep').deleteMany({ pilot: user._id });
-        await mongoose.model('FlightPlan').deleteMany({ pilot: user._id }); // Cascade delete flight plans
-        const events = await mongoose.model('Event').find({ author: user._id }).lean();
-        for (const event of events) {
-            if (event.imageUrl) deleteS3Object(event.imageUrl);
-        }
-        await mongoose.model('Event').deleteMany({ author: user._id });
-        const highlights = await mongoose.model('Highlight').find({ author: user._id }).lean();
-        for (const highlight of highlights) {
-            if (highlight.imageUrl) deleteS3Object(highlight.imageUrl);
-        }
-        await mongoose.model('Highlight').deleteMany({ author: user._id });
-        next();
-    } catch (error) {
-        console.error("Error in user cascade delete middleware:", error);
-        next(error);
-    }
-});
-
-const User = mongoose.model('User', UserSchema);
-
-UserSchema.index({ role: 1 });
-UserSchema.index({ lastKnownAirport: 1, lastDutyAirport: 1 });
-UserSchema.index({ weeklyFlightHours: -1 });
-UserSchema.index({ weeklySectors: -1 });
-UserSchema.index({ leaderboardMonthlyFlightHours: -1 });
-UserSchema.index({ monthlySectors: -1 });
-
-
-// --- Admin Log Schema ---
-const AdminLogSchema = new mongoose.Schema({
-    adminUser: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    action: { type: String, required: true, enum: ['ROLE_UPDATE', 'USER_DELETE', 'ROSTER_CREATE', 'ROSTER_DELETE', 'PROMOTION_TEST_REQUIRED'] }, // ADDED NEW ACTION
-    targetUser: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-    details: { type: String, required: true },
-    timestamp: { type: Date, default: Date.now }
-});
-const AdminLog = mongoose.model('AdminLog', AdminLogSchema);
-
-// --- Event Schema ---
-const EventSchema = new mongoose.Schema({
-    title: { type: String, required: true },
-    date: { type: Date, required: true },
-    description: { type: String, required: true },
-    imageUrl: { type: String },
-    author: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-    createdAt: { type: Date, default: Date.now }
-});
-const Event = mongoose.model('Event', EventSchema);
-
-// --- Highlight Schema ---
-const HighlightSchema = new mongoose.Schema({
-    title: { type: String, required: true },
-    winnerName: { type: String, required: true },
-    description: { type: String },
-    imageUrl: { type: String, required: true },
-    author: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-    createdAt: { type: Date, default: Date.now }
-});
-const Highlight = mongoose.model('Highlight', HighlightSchema);
-
-// --- NEW: Flight Plan Schema ---
-const FlightPlanSchema = new mongoose.Schema({
-    pilot: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    flightNumber: { type: String, required: true, trim: true },
-    departure: { type: String, required: true, uppercase: true, trim: true },
-    arrival: { type: String, required: true, uppercase: true, trim: true },
-    aircraft: { type: String, required: true },
-    etd: { type: Date, required: true }, // Estimated Time of Departure
-    eet: { type: Number, required: true }, // Estimated Elapsed Time in hours
-    eta: { type: Date, required: true }, // Estimated Time of Arrival
-    alternate: { type: String, required: true, uppercase: true, trim: true },
-    pob: { type: Number, required: true }, // Persons on Board
-    route: { type: String, required: true },
-    ficNumber: { type: String, required: true, unique: true }, // Flight Information Code
-    adcNumber: { type: String, required: true, unique: true }, // Air Defence Clearance
-    status: {
-        type: String,
-        enum: ['PLANNED', 'FLYING', 'COMPLETED', 'CANCELLED'],
-        default: 'PLANNED'
-    },
-    // For roster flights
-    rosterLeg: {
-        rosterId: { type: mongoose.Schema.Types.ObjectId, ref: 'Roster' },
-        flightNumber: { type: String }
-    },
-    // Actual times
-    actualDepartureTime: { type: Date },
-    actualArrivalTime: { type: Date },
-}, { timestamps: true });
-FlightPlanSchema.index({ pilot: 1, status: 1 });
-const FlightPlan = mongoose.model('FlightPlan', FlightPlanSchema);
-
-
-// --- PIREP Schema ---
-const PirepSchema = new mongoose.Schema({
-    pilot: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    flightNumber: { type: String, required: true },
-    departure: { type: String, required: true, uppercase: true, trim: true },
-    arrival: { type: String, required: true, uppercase: true, trim: true },
-    aircraft: { type: String, required: true },
-    flightTime: { type: Number, required: true, min: 0.1 },
-    rankUnlock: { type: String, trim: true },
-    operator: { type: String, trim: true },
-    remarks: { type: String, trim: true },
-    status: { type: String, enum: ['PENDING', 'APPROVED', 'REJECTED'], default: 'PENDING' },
-    reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
-    rejectionReason: { type: String, default: null },
-    createdAt: { type: Date, default: Date.now },
-    reviewedAt: { type: Date, default: null },
-    verificationImageUrl: { type: String, default: null },
-    isMultiplierEligible: { type: Boolean, default: false },
-    rosterLeg: {
-        rosterId: { type: mongoose.Schema.Types.ObjectId, ref: 'Roster' },
-        flightNumber: { type: String }
-    }
-});
-const Pirep = mongoose.model('Pirep', PirepSchema);
-PirepSchema.index({ pilot: 1 });
-PirepSchema.index({ status: 1 });
-PirepSchema.index({ 'rosterLeg.rosterId': 1, 'rosterLeg.flightNumber': 1 });
-
-// --- Roster Schema ---
-const RosterSchema = new mongoose.Schema({
-    name: { type: String, required: true, trim: true },
-    hub: { type: String, required: true, uppercase: true, trim: true },
-    legs: [{
-        flightNumber: { type: String, required: true, trim: true },
-        departure: { type: String, required: true, uppercase: true, trim: true },
-        arrival: { type: String, required: true, uppercase: true, trim: true },
-        aircraft: { type: String, required: true, trim: true },
-        flightTime: { type: Number, required: true, min: 0.1 },
-        rankUnlock: { type: String },
-        operator: { type: String }
-    }],
-    totalFlightTime: { type: Number, required: true, min: 0 },
-    multiplier: { type: Number, default: 1, min: 1, max: 2 },
-    isAvailable: { type: Boolean, default: true },
-    isGenerated: { type: Boolean, default: false },
-    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-    createdAt: { type: Date, default: Date.now }
-});
-const Roster = mongoose.model('Roster', RosterSchema);
-RosterSchema.index({ isAvailable: 1, 'legs.0.departure': 1 });
-
-
-// 6. HELPER FUNCTIONS & MIDDLEWARE
 
 const generateFicNumber = () => `FIC/${new Date().getFullYear()}/${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 const generateAdcNumber = () => `ADC/${crypto.randomBytes(5).toString('hex').toUpperCase()}`;
@@ -514,24 +291,6 @@ const deleteRowFromGoogleSheet = async (callsign) => {
     } catch (error) {
         console.error(`Error deleting row from Google Sheet for callsign ${callsign}:`, error.message);
     }
-};
-
-const deduceRankFromAircraft = (acStr) => {
-    const s = String(acStr || '').toUpperCase();
-    if (!s) return 'Unknown';
-    const has = (pat) => new RegExp(pat, 'i').test(s);
-    if (has('(Q400|A320|B738)')) return 'IndGo Cadet';
-    if (has('(A321|B737)')) return 'Skyline Observer';
-    if (has('(A330|B38M)')) return 'Route Explorer';
-    if (has('(787-8|777-200LR)')) return 'Skyline Officer';
-    if (has('(787-9|777-300ER)')) return 'Command Captain';
-    if (has('A350')) return 'Elite Captain';
-    if (has('(A380|747|744)')) return 'Blue Eagle';
-    if (has('INSTRUCTOR')) return 'Line Instructor';
-    if (has('CHIEF')) return 'Chief Flight Instructor';
-    if (has('SKYMASTER')) return 'IndGo SkyMaster';
-    if (has('COMMANDER')) return 'Blue Legacy Commander';
-    return 'Unknown';
 };
 
 const generateRostersFromGoogleSheet = async () => {
@@ -688,9 +447,8 @@ const generateRostersFromGoogleSheet = async () => {
     }
     
     const generatedRosters = [];
-    const rosterCountPerType = 2; // Generate up to 2 of each type per location to control volume
+    const rosterCountPerType = 2;
 
-    // --- NEW: Step 1 - Generate SINGLE-RANK Rosters ---
     console.log('--- Generating Single-Rank Rosters ---');
     const legsByRank = allLegs.reduce((acc, leg) => {
         const rank = leg.rankUnlock; 
@@ -700,7 +458,7 @@ const generateRostersFromGoogleSheet = async () => {
     }, {});
 
     for (const rank in legsByRank) {
-        if (!pilotRanks.includes(rank)) continue; // Skip unknown or invalid ranks
+        if (!pilotRanks.includes(rank)) continue;
 
         const legsForThisRank = legsByRank[rank];
         const legsByDepartureForRank = legsForThisRank.reduce((acc, leg) => {
@@ -718,7 +476,7 @@ const generateRostersFromGoogleSheet = async () => {
                 let currentAirport = departureAirport;
                 let totalTime = 0;
                 const usedFlightNumbers = new Set();
-                const legCount = Math.floor(Math.random() * 3) + 2; // 2 to 4 legs
+                const legCount = Math.floor(Math.random() * 3) + 2;
 
                 for (let j = 0; j < legCount; j++) {
                     const possibleNextLegs = (legsByDepartureForRank[currentAirport] || []).filter(
@@ -738,7 +496,7 @@ const generateRostersFromGoogleSheet = async () => {
                 if (rosterLegs.length >= 2) {
                     const randomMultiplier = parseFloat((1.1 + Math.random() * 0.4).toFixed(2));
                     generatedRosters.push({
-                        name: `${departureAirport} ${rank} Duty #${i + 1}`, // Descriptive name
+                        name: `${departureAirport} ${rank} Duty #${i + 1}`,
                         hub: departureAirport,
                         legs: rosterLegs,
                         totalFlightTime: totalTime,
@@ -751,7 +509,6 @@ const generateRostersFromGoogleSheet = async () => {
         }
     }
     
-    // --- NEW: Step 2 - Generate MIXED-RANK Rosters ---
     console.log('--- Generating Mixed-Rank Rosters ---');
     const legsByDeparture = allLegs.reduce((acc, leg) => {
         if (!acc[leg.departure]) acc[leg.departure] = [];
@@ -770,7 +527,7 @@ const generateRostersFromGoogleSheet = async () => {
             let currentAirport = departureAirport;
             let totalTime = 0;
             const usedFlightNumbers = new Set();
-            const legCount = Math.floor(Math.random() * 3) + 2; // 2 to 4 legs
+            const legCount = Math.floor(Math.random() * 3) + 2;
 
             for (let j = 0; j < legCount; j++) {
                 const possibleNextLegs = (legsByDeparture[currentAirport] || []).filter(
@@ -790,7 +547,7 @@ const generateRostersFromGoogleSheet = async () => {
             if (rosterLegs.length >= 2) {
                 const randomMultiplier = parseFloat((1.1 + Math.random() * 0.4).toFixed(2));
                 generatedRosters.push({
-                    name: `${departureAirport} Sector Duty #${i + 1}`, // Original naming
+                    name: `${departureAirport} Sector Duty #${i + 1}`,
                     hub: departureAirport,
                     legs: rosterLegs,
                     totalFlightTime: totalTime,
@@ -804,7 +561,6 @@ const generateRostersFromGoogleSheet = async () => {
 
     if (generatedRosters.length > 0) {
         await Roster.deleteMany({ isGenerated: true });
-        // Shuffle the combined list of rosters for better presentation
         generatedRosters.sort(() => Math.random() - 0.5); 
         await Roster.insertMany(generatedRosters);
         console.log(`Successfully generated and saved ${generatedRosters.length} new mixed and single-rank rosters.`);
@@ -812,14 +568,11 @@ const generateRostersFromGoogleSheet = async () => {
     return { created: generatedRosters.length, legsFound: allLegs.length };
 };
 
-
-// Rank Promotion Helper (OVERHAULED for Manual Promotion)
 const checkAndApplyRankUpdate = (pilot) => {
     const currentHours = pilot.flightHours;
     const currentRank = pilot.rank;
     let prospectiveRank = currentRank;
 
-    // Find the highest rank the pilot qualifies for based on hours
     for (let i = pilotRanks.length - 1; i >= 0; i--) {
         const rankName = pilotRanks[i];
         if (currentHours >= rankThresholds[rankName]) {
@@ -828,25 +581,18 @@ const checkAndApplyRankUpdate = (pilot) => {
         }
     }
 
-    // If the prospective rank is the same as the current one, do nothing.
     if (prospectiveRank === currentRank) {
         return { promoted: false, pendingTest: false };
     }
 
-    // --- NEW LOGIC ---
-    // Check if the prospective rank is a "test-gated" rank
     if (testGatedRanks.includes(prospectiveRank)) {
-        // If the pilot is currently ACTIVE and qualifies for a test, put them in PENDING_TEST state.
         if (pilot.promotionStatus === 'ACTIVE') {
             pilot.promotionStatus = 'PENDING_TEST';
-            // Return a special status to signal that staff needs to be notified.
             return { promoted: false, pendingTest: true, prospectiveRank: prospectiveRank };
         }
-        // If they are already pending a test, do nothing further automatically.
         return { promoted: false, pendingTest: false };
 
     } else {
-        // This is an automatic promotion for a non-test-gated rank.
         pilot.rank = prospectiveRank;
         return { promoted: true, rank: prospectiveRank };
     }
@@ -897,134 +643,6 @@ const isCommunityManager = hasRole(['admin', 'Chief Executive Officer (CEO)', 'C
 const isPilotManager = hasRole(['admin', 'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)', 'Head of Training (COT)']);
 const isPirepManager = hasRole(['admin', 'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)', 'PIREP Manager (PM)']);
 const isRouteManager = hasRole(['admin', 'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)', 'Route Manager (RM)']);
-
-
-// //////////////////////////////////////////////////////////////
-// --- SECTION 6.5: AUTOMATED FLIGHT FINALIZATION & TRACKING ---
-// //////////////////////////////////////////////////////////////
-
-/**
- * Reusable logic to finalize a flight, create a PIREP, and update user.
- * Can be called by the manual /arrive endpoint or the automated tracker.
- * @param {mongoose.Document} flightPlan - The flight plan document to finalize.
- * @param {string} [remarks=null] - Optional remarks for the PIREP.
- * @param {string} [verificationImageUrl=null] - Optional image URL.
- * @returns {Promise<mongoose.Document>} The newly created PIREP document.
- */
-const finalizeFlightAndCreatePirep = async (flightPlan, remarks = null, verificationImageUrl = null) => {
-    // 1. Update Flight Plan status and times
-    flightPlan.status = 'COMPLETED';
-    flightPlan.actualArrivalTime = Date.now();
-    const flightTimeHours = (flightPlan.actualArrivalTime - flightPlan.actualDepartureTime) / (1000 * 60 * 60);
-
-    // 2. Prepare PIREP data
-    const newPirepData = {
-        pilot: flightPlan.pilot,
-        flightNumber: flightPlan.flightNumber,
-        departure: flightPlan.departure,
-        arrival: flightPlan.arrival,
-        aircraft: flightPlan.aircraft,
-        flightTime: parseFloat(flightTimeHours.toFixed(2)),
-        remarks,
-        verificationImageUrl, // Will be null for automated PIREPs
-        status: 'PENDING',
-        isMultiplierEligible: false,
-    };
-
-    // 3. Check for roster details and multipliers
-    if (flightPlan.rosterLeg && flightPlan.rosterLeg.rosterId) {
-        const roster = await Roster.findById(flightPlan.rosterLeg.rosterId);
-        if (roster) {
-            const leg = roster.legs.find(l => l.flightNumber === flightPlan.flightNumber);
-            if (leg) {
-                newPirepData.rankUnlock = leg.rankUnlock;
-                newPirepData.operator = leg.operator;
-                newPirepData.rosterLeg = flightPlan.rosterLeg;
-                const lastLegInRoster = roster.legs[roster.legs.length - 1];
-                if (lastLegInRoster.flightNumber.toUpperCase() === flightPlan.flightNumber.toUpperCase()) {
-                    newPirepData.isMultiplierEligible = true;
-                }
-            }
-        }
-    } else {
-        // For non-roster flights
-        newPirepData.rankUnlock = deduceRankFromAircraft(flightPlan.aircraft);
-        newPirepData.operator = 'IndGo Air Virtual';
-    }
-
-    // 4. Create and save the PIREP
-    const newPirep = new Pirep(newPirepData);
-    await newPirep.save();
-
-    // 5. Update the user to remove the current flight plan link
-    await User.updateOne({ _id: flightPlan.pilot }, { $set: { currentFlightPlan: null } });
-    await flightPlan.save();
-
-    console.log(`PIREP automatically generated for flight ${flightPlan.flightNumber} for pilot ${flightPlan.pilot}.`);
-    
-    return newPirep;
-};
-
-
-/**
- * Checks the Infinite Flight Live API for active flights and compares against our database.
- */
-const checkFlights = async () => {
-    console.log('[IF Tracker] Checking Infinite Flight API for active flights...');
-    try {
-        // 1. Fetch live flights from the IF API
-        const response = await axios.get('https://api.infiniteflight.com/v2/flights', {
-            headers: { 'Authorization': `Bearer ${process.env.IF_API_KEY}` }
-        });
-        const liveFlights = response.data.result;
-        const liveCallsigns = new Set(liveFlights.map(f => f.callsign));
-
-        // 2. Get all our flight plans that are currently 'FLYING'
-        const activePlans = await FlightPlan.find({ status: 'FLYING' }).populate('pilot', 'callsign');
-        if (activePlans.length === 0) {
-            console.log('[IF Tracker] No active flight plans to track.');
-            return;
-        }
-
-        console.log(`[IF Tracker] Tracking ${activePlans.length} flights. Found ${liveCallsigns.size} live flights on IF.`);
-
-        // 3. Compare our active plans with the live flights
-        for (const plan of activePlans) {
-            const pilotCallsign = plan.pilot?.callsign;
-            if (!pilotCallsign) continue; // Skip if pilot has no callsign
-
-            // If the pilot's callsign is NOT in the live flight list, they have landed.
-            if (!liveCallsigns.has(pilotCallsign)) {
-                console.log(`[IF Tracker] Pilot ${pilotCallsign} (Flight ${plan.flightNumber}) is no longer live. Finalizing flight...`);
-                
-                // Use the new reusable helper function to finalize the flight
-                await finalizeFlightAndCreatePirep(
-                    plan,
-                    "Flight automatically finalized by the Infinite Flight Live Tracker.",
-                    null // No verification image for automated finalization
-                );
-            }
-        }
-
-    } catch (error) {
-        // Handle API rate limits or other errors gracefully
-        if (error.response) {
-            console.error(`[IF Tracker] Error checking flights: ${error.response.status} - ${error.response.statusText}`);
-        } else {
-            console.error('[IF Tracker] Error checking flights:', error.message);
-        }
-    }
-};
-
-/**
- * Initializes the flight tracker to run on a schedule.
- */
-const startFlightTracker = () => {
-    console.log('🚀 Infinite Flight Tracker has been initialized.');
-    // Run the check immediately, then run it every 2 minutes (120,000 milliseconds)
-    checkFlights();
-    setInterval(checkFlights, 120000); 
-};
 
 
 // 7. API ROUTES (ENDPOINTS)
@@ -1180,7 +798,6 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-// --- MODIFIED /api/me to deliver notifications ---
 app.get('/api/me', authMiddleware, async (req, res) => {
     try {
         const user = await User.findById(req.user._id).select('-password').populate('currentFlightPlan').lean();
@@ -1188,16 +805,14 @@ app.get('/api/me', authMiddleware, async (req, res) => {
 
         user.timeUntilNextDutyMs = 0;
         if (user.dutyStatus === 'ON_REST' && user.lastDutyOff) {
-            const restEndsAt = user.lastDutyOff.getTime() + MIN_REST_PERIOD;
+            const restEndsAt = new Date(user.lastDutyOff).getTime() + MIN_REST_PERIOD;
             const now = Date.now();
             if (restEndsAt > now) {
                 user.timeUntilNextDutyMs = restEndsAt - now;
             }
         }
 
-        // Add unread notifications to the response
         user.unreadNotifications = (user.notifications || []).filter(n => !n.read);
-
         res.json(user);
     } catch (err) {
         console.error(err);
@@ -1205,10 +820,8 @@ app.get('/api/me', authMiddleware, async (req, res) => {
     }
 });
 
-
 app.put('/api/me', authMiddleware, upload.single('profilePicture'), async (req, res) => {
     try {
-        // MODIFIED: Added infiniteFlightUsername from the second file
         const { name, bio, discord, ifc, youtube, preferredContact, infiniteFlightUsername } = req.body;
         const updatedData = { name, bio, discord, ifc, youtube, preferredContact, infiniteFlightUsername };
 
@@ -1251,10 +864,9 @@ app.post('/api/me/password', authMiddleware, async (req, res) => {
     }
 });
 
-// --- NEW Route to mark notifications as read ---
 app.post('/api/me/notifications/read', authMiddleware, async (req, res) => {
     try {
-        const { notificationIds } = req.body; // Expect an array of IDs from the frontend
+        const { notificationIds } = req.body;
         if (!Array.isArray(notificationIds)) {
             return res.status(400).json({ message: 'Expected an array of notification IDs.' });
         }
@@ -1272,8 +884,7 @@ app.post('/api/me/notifications/read', authMiddleware, async (req, res) => {
     }
 });
 
-
-// --- NEW: FLIGHT PLANNING & PIREP AUTOMATION ROUTES ---
+// --- FLIGHT PLANNING & PIREP AUTOMATION ROUTES ---
 
 app.post('/api/flightplans', authMiddleware, async (req, res) => {
     try {
@@ -1359,7 +970,7 @@ app.get('/api/flightplans/my-active', authMiddleware, async (req, res) => {
     try {
         const pilot = await User.findById(req.user._id).populate('currentFlightPlan');
         if (!pilot) return res.status(404).json({ message: 'Pilot not found.' });
-        if (!pilot.currentFlightPlan) return res.json(null); // No active plan is a valid state
+        if (!pilot.currentFlightPlan) return res.json(null);
 
         res.json(pilot.currentFlightPlan);
     } catch (error) {
@@ -1386,9 +997,6 @@ app.post('/api/flightplans/:id/depart', authMiddleware, async (req, res) => {
     }
 });
 
-// //////////////////////////////////////////////////
-// --- MODIFIED: /arrive ENDPOINT NOW USES HELPER ---
-// //////////////////////////////////////////////////
 app.post('/api/flightplans/:id/arrive', authMiddleware, upload.single('verificationImage'), async (req, res) => {
     try {
         const { remarks } = req.body;
@@ -1399,11 +1007,11 @@ app.post('/api/flightplans/:id/arrive', authMiddleware, upload.single('verificat
         if (flightPlan.pilot.toString() !== req.user._id) return res.status(403).json({ message: 'This is not your flight plan.' });
         if (flightPlan.status !== 'FLYING') return res.status(400).json({ message: `Cannot arrive. Flight status must be 'FLYING'.` });
 
-        // Call the reusable helper function
+        // Using the imported helper function from flightUtils.js
         const newPirep = await finalizeFlightAndCreatePirep(
             flightPlan,
             remarks,
-            req.file.location // Pass the image URL
+            req.file.location
         );
 
         res.status(201).json({ message: 'Flight completed successfully! Your PIREP has been automatically generated and is pending review.', pirep: newPirep });
@@ -1454,7 +1062,6 @@ app.get('/api/pireps/pending', authMiddleware, isPirepManager, async (req, res) 
     }
 });
 
-// --- MODIFIED PIREP Approval to handle test-based promotions ---
 app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (req, res) => {
     try {
         const pirep = await Pirep.findById(req.params.pirepId);
@@ -1488,7 +1095,6 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
         }
         pilot.lastKnownAirport = pirep.arrival;
 
-        // MODIFIED SECTION
         const promotionResult = checkAndApplyRankUpdate(pilot);
         
         pirep.status = 'APPROVED';
@@ -1496,7 +1102,7 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
         pirep.reviewedAt = Date.now();
         pirep.verificationImageUrl = null;
         
-        await pilot.save(); // Save pilot's new hours and potential status change
+        await pilot.save();
         await pirep.save();
 
         if (pilot.callsign) {
@@ -1508,12 +1114,10 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
 
         const responsePayload = { message, promotionDetails: null };
 
-        // If a standard promotion occurred
         if (promotionResult.promoted) {
             responsePayload.message += ` Congratulations on the promotion to ${promotionResult.rank}!`;
         }
         
-        // NEW: If the pilot is now pending a test, create an admin log and inform user
         if (promotionResult.pendingTest) {
             const log = new AdminLog({
                 adminUser: req.user._id,
@@ -1532,7 +1136,6 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
         res.status(500).json({ message: 'Server error while approving PIREP.' });
     }
 });
-
 
 app.put('/api/pireps/:pirepId/reject', authMiddleware, isPirepManager, async (req, res) => {
     try {
@@ -1561,7 +1164,6 @@ app.put('/api/pireps/:pirepId/reject', authMiddleware, isPirepManager, async (re
     }
 });
 
-// --- MODIFIED Manual Rank Update to handle promotion completion ---
 app.put('/api/users/:userId/rank', authMiddleware, isPilotManager, async (req, res) => {
     try {
         const { userId } = req.params;
@@ -1574,15 +1176,12 @@ app.put('/api/users/:userId/rank', authMiddleware, isPilotManager, async (req, r
         const oldRank = user.rank;
         user.rank = newRank;
 
-        // --- NEW LOGIC ---
-        // If the user was pending a test, reset their status and add a notification
         if (user.promotionStatus === 'PENDING_TEST') {
             user.promotionStatus = 'ACTIVE';
             user.notifications.push({
                 message: `Congratulations! You have passed your tests and have been promoted from ${oldRank} to ${newRank}. You are now cleared for normal flight operations.`
             });
         }
-        // --- END OF NEW LOGIC ---
 
         await user.save();
 
@@ -1595,8 +1194,6 @@ app.put('/api/users/:userId/rank', authMiddleware, isPilotManager, async (req, r
         res.status(500).json({ message: 'Server error while updating rank.' });
     }
 });
-
-
 
 app.get('/api/rosters', authMiddleware, async (req, res) => {
     try {
@@ -1617,9 +1214,9 @@ app.get('/api/rosters', authMiddleware, async (req, res) => {
         const rosters = await Roster.find({
             isAvailable: true,
             $or: [
-            { 'legs.0.departure': departureIcao },
-            { hub: departureIcao }
-        ] 
+                { 'legs.0.departure': departureIcao },
+                { hub: departureIcao }
+            ] 
         }).sort({ createdAt: -1 }).lean();
 
         const filtered = rosters.filter(r =>
@@ -1678,7 +1275,6 @@ app.get('/api/rosters/my-rosters', authMiddleware, async (req, res) => {
 
 app.post('/api/rosters', authMiddleware, isRouteManager, async (req, res) => {
     try {
-        
         const { name, hub, legs, totalFlightTime } = req.body;
         if (!name || !hub || !Array.isArray(legs) || legs.length === 0) {
             return res.status(400).json({ message: 'Name, hub and at least one leg are required.' });
@@ -1749,7 +1345,6 @@ app.delete('/api/rosters/:rosterId', authMiddleware, isRouteManager, async (req,
     }
 });
 
-// --- MODIFIED Duty Start to block users pending tests ---
 app.post('/api/duty/start', authMiddleware, async (req, res) => {
     const { rosterId } = req.body;
     try {
@@ -1759,20 +1354,19 @@ app.post('/api/duty/start', authMiddleware, async (req, res) => {
         if (!roster) return res.status(404).json({ message: 'Selected roster not found.' });
         if (user.dutyStatus === 'ON_DUTY') return res.status(400).json({ message: 'You are already on duty.' });
 
-        // NEW: Add restriction check
         if (user.promotionStatus === 'PENDING_TEST') {
             return res.status(403).json({
                 message: 'You are currently in an observation period awaiting promotion tests. You cannot start a new duty until your tests are complete and you have been promoted by a staff member.'
             });
         }
 
-        if (user.lastDutyOff && (Date.now() - user.lastDutyOff.getTime()) >= MIN_REST_PERIOD) {
+        if (user.lastDutyOff && (Date.now() - new Date(user.lastDutyOff).getTime()) >= MIN_REST_PERIOD) {
             user.dailyFlightHours = 0;
             console.log(`Daily flight hours for ${user.email} reset due to starting a new duty period.`);
         }
 
-        if (user.lastDutyOff && (Date.now() - user.lastDutyOff) < MIN_REST_PERIOD) {
-            const timeToRest = Math.ceil((MIN_REST_PERIOD - (Date.now() - user.lastDutyOff)) / (60 * 1000));
+        if (user.lastDutyOff && (Date.now() - new Date(user.lastDutyOff).getTime()) < MIN_REST_PERIOD) {
+            const timeToRest = Math.ceil((MIN_REST_PERIOD - (Date.now() - new Date(user.lastDutyOff).getTime())) / (60 * 1000));
             return res.status(403).json({ message: `Crew rest required. You can go on duty in ${timeToRest} minutes.` });
         }
         
@@ -1806,7 +1400,6 @@ app.post('/api/duty/start', authMiddleware, async (req, res) => {
         res.status(500).json({ message: 'Server error while starting duty.' });
     }
 });
-
 
 app.post('/api/duty/end', authMiddleware, async (req, res) => {
     try {
@@ -1992,9 +1585,8 @@ app.get('/api/logs', authMiddleware, isAdmin, async (req, res) => {
 // 8. START THE SERVER
 app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
-    // /////////////////////////////////////////
-    // --- NEW: INITIALIZE THE IF TRACKER ---
-    // /////////////////////////////////////////
+    
+    // Initialize the Infinite Flight Tracker using the modularized code
     if (process.env.IF_API_KEY) {
         startFlightTracker();
     } else {

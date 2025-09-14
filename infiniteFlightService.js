@@ -1,7 +1,7 @@
 // infiniteFlightService.js
 const axios = require('axios');
 
-const apiKey = process.env.INFINITE_FLIGHT_API_KEY;
+const apiKey = process.env.IF_API_KEY;
 const api = axios.create({
     baseURL: 'https://api.infiniteflight.com/public/v2',
     headers: {
