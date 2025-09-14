@@ -1,4 +1,4 @@
-// server.js (Fully Merged, Updated & Performance Tuned with Leaderboards)
+// server.js (Fully Merged, Updated & Performance Tuned with Leaderboards & IF Tracker)
 // - Automated Roster Generation now reads from TWO Google Sheets simultaneously:
 //   1. The primary routes sheet (for regular flights).
 //   2. The codeshare routes sheet (for partner flights).
@@ -16,11 +16,13 @@
 // - NEW: Weekly and Monthly pilot leaderboards for hours and sectors.
 // - NEW: Test & Practical based promotion system for specific ranks.
 // - NEW: Flight Planning system with FIC/ADC codes and automated PIREP generation.
+// - NEW: Integrated Infinite Flight Live API tracker for automatic flight finalization.
 // - FIXED: Daily flight hour counter now resets intelligently when starting a new duty.
 // - ADDED: Endpoint for user profile now includes time remaining on crew rest and notifications.
 // - FIXED: Off-roster (non-duty) PIREPs no longer affect FTPL counters.
 // - MODIFIED: Roster generation now creates a mix of single-rank and mixed-rank duties.
 // - MODIFIED: PIREP filing is now automated via the flight plan completion process.
+// - MODIFIED: Infinite Flight Tracker now uses the pilot's unique 'infiniteFlightUsername' for reliability.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -34,7 +36,7 @@ const { S3Client, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const multerS3 = require('multer-s3');
 const { google } = require('googleapis');
 const Papa = require('papaparse'); // For parsing CSV data from Google Sheets
-const axios = require('axios'); // For fetching the sheet
+const axios = require('axios'); // For fetching the sheet AND for the IF Tracker
 const fs = require('fs').promises; // For reading local JSON files
 const crypto = require('crypto'); // For Flight Plan code generation
 require('dotenv').config();
@@ -181,6 +183,8 @@ const UserSchema = new mongoose.Schema({
     discord: { type: String, default: '' },
     ifc: { type: String, default: '' },
     youtube: { type: String, default: '' },
+    // NEW FIELD FOR INFINITE FLIGHT TRACKING
+    infiniteFlightUsername: { type: String, default: '', trim: true },
     preferredContact: { type: String, enum: ['none', 'discord', 'ifc', 'youtube'], default: 'none' },
     createdAt: { type: Date, default: Date.now },
     // FTPL Fields
@@ -329,7 +333,7 @@ const PirepSchema = new mongoose.Schema({
     rankUnlock: { type: String, trim: true },
     operator: { type: String, trim: true },
     remarks: { type: String, trim: true },
-    status: { type: String, enum: ['PENDING', 'APPROVED', 'REJECTED'], default: 'PENDING' },
+    status: { type: String, enum: ['PENDING', 'APPROVED', 'REJEC'TED'], default: 'PENDING' },
     reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     rejectionReason: { type: String, default: null },
     createdAt: { type: Date, default: Date.now },
@@ -897,6 +901,144 @@ const isPirepManager = hasRole(['admin', 'Chief Executive Officer (CEO)', 'Chief
 const isRouteManager = hasRole(['admin', 'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)', 'Route Manager (RM)']);
 
 
+// //////////////////////////////////////////////////////////////
+// --- SECTION 6.5: AUTOMATED FLIGHT FINALIZATION & TRACKING ---
+// //////////////////////////////////////////////////////////////
+
+/**
+ * Reusable logic to finalize a flight, create a PIREP, and update user.
+ * Can be called by the manual /arrive endpoint or the automated tracker.
+ * @param {mongoose.Document} flightPlan - The flight plan document to finalize.
+ * @param {string} [remarks=null] - Optional remarks for the PIREP.
+ * @param {string} [verificationImageUrl=null] - Optional image URL.
+ * @returns {Promise<mongoose.Document>} The newly created PIREP document.
+ */
+const finalizeFlightAndCreatePirep = async (flightPlan, remarks = null, verificationImageUrl = null) => {
+    // 1. Update Flight Plan status and times
+    flightPlan.status = 'COMPLETED';
+    flightPlan.actualArrivalTime = Date.now();
+    const flightTimeHours = (flightPlan.actualArrivalTime - flightPlan.actualDepartureTime) / (1000 * 60 * 60);
+
+    // 2. Prepare PIREP data
+    const newPirepData = {
+        pilot: flightPlan.pilot,
+        flightNumber: flightPlan.flightNumber,
+        departure: flightPlan.departure,
+        arrival: flightPlan.arrival,
+        aircraft: flightPlan.aircraft,
+        flightTime: parseFloat(flightTimeHours.toFixed(2)),
+        remarks,
+        verificationImageUrl, // Will be null for automated PIREPs
+        status: 'PENDING',
+        isMultiplierEligible: false,
+    };
+
+    // 3. Check for roster details and multipliers
+    if (flightPlan.rosterLeg && flightPlan.rosterLeg.rosterId) {
+        const roster = await Roster.findById(flightPlan.rosterLeg.rosterId);
+        if (roster) {
+            const leg = roster.legs.find(l => l.flightNumber === flightPlan.flightNumber);
+            if (leg) {
+                newPirepData.rankUnlock = leg.rankUnlock;
+                newPirepData.operator = leg.operator;
+                newPirepData.rosterLeg = flightPlan.rosterLeg;
+                const lastLegInRoster = roster.legs[roster.legs.length - 1];
+                if (lastLegInRoster.flightNumber.toUpperCase() === flightPlan.flightNumber.toUpperCase()) {
+                    newPirepData.isMultiplierEligible = true;
+                }
+            }
+        }
+    } else {
+        // For non-roster flights
+        newPirepData.rankUnlock = deduceRankFromAircraft(flightPlan.aircraft);
+        newPirepData.operator = 'IndGo Air Virtual';
+    }
+
+    // 4. Create and save the PIREP
+    const newPirep = new Pirep(newPirepData);
+    await newPirep.save();
+
+    // 5. Update the user to remove the current flight plan link
+    await User.updateOne({ _id: flightPlan.pilot }, { $set: { currentFlightPlan: null } });
+    await flightPlan.save();
+
+    console.log(`PIREP automatically generated for flight ${flightPlan.flightNumber} for pilot ${flightPlan.pilot}.`);
+    
+    return newPirep;
+};
+
+
+/**
+ * MODIFIED: Checks the Infinite Flight Live API using pilot's unique username for reliability.
+ */
+const checkFlights = async () => {
+    console.log('[IF Tracker] Checking Infinite Flight API for active flights...');
+    try {
+        // 1. Fetch live flights from the IF API
+        const response = await axios.get('https://api.infiniteflight.com/v2/flights', {
+            headers: { 'Authorization': `Bearer ${process.env.IF_API_KEY}` }
+        });
+        const liveFlights = response.data.result;
+        // Create a Set of active usernames from the API for fast lookups
+        const liveUsernames = new Set(liveFlights.map(f => f.username));
+
+        // 2. Get all our flight plans that are currently 'FLYING'
+        // Populate the pilot's 'infiniteFlightUsername' field
+        const activePlans = await FlightPlan.find({ status: 'FLYING' }).populate('pilot', 'callsign infiniteFlightUsername');
+        
+        if (activePlans.length === 0) {
+            console.log('[IF Tracker] No active flight plans to track.');
+            return;
+        }
+
+        console.log(`[IF Tracker] Tracking ${activePlans.length} flights. Found ${liveUsernames.size} live users on IF.`);
+
+        // 3. Compare our active plans with the live flights by username
+        for (const plan of activePlans) {
+            // Get the pilot's registered Infinite Flight username from their profile
+            const pilotUsername = plan.pilot?.infiniteFlightUsername;
+
+            // Skip tracking if the pilot hasn't set their IF username in their profile
+            if (!pilotUsername) {
+                console.warn(`[IF Tracker] Skipping plan for ${plan.pilot?.callsign} because they have no IF username set.`);
+                continue;
+            }
+
+            // If the pilot's username is NOT in the live flight list, they have landed.
+            if (!liveUsernames.has(pilotUsername)) {
+                console.log(`[IF Tracker] Pilot ${pilotUsername} (Flight ${plan.flightNumber}) is no longer live. Finalizing flight...`);
+                
+                // Use the reusable helper function to finalize the flight
+                await finalizeFlightAndCreatePirep(
+                    plan,
+                    "Flight automatically finalized by the Infinite Flight Live Tracker.",
+                    null // No verification image for automated finalization
+                );
+            }
+        }
+
+    } catch (error) {
+        // Handle API rate limits or other errors gracefully
+        if (error.response) {
+            console.error(`[IF Tracker] Error checking flights: ${error.response.status} - ${error.response.statusText}`);
+        } else {
+            console.error('[IF Tracker] Error checking flights:', error.message);
+        }
+    }
+};
+
+
+/**
+ * Initializes the flight tracker to run on a schedule.
+ */
+const startFlightTracker = () => {
+    console.log('🚀 Infinite Flight Tracker has been initialized.');
+    // Run the check immediately, then run it every 2 minutes (120,000 milliseconds)
+    checkFlights();
+    setInterval(checkFlights, 120000); 
+};
+
+
 // 7. API ROUTES (ENDPOINTS)
 
 app.get('/api/airports', async (req, res) => {
@@ -1075,11 +1217,11 @@ app.get('/api/me', authMiddleware, async (req, res) => {
     }
 });
 
-
+// MODIFIED: Endpoint to handle 'infiniteFlightUsername'
 app.put('/api/me', authMiddleware, upload.single('profilePicture'), async (req, res) => {
     try {
-        const { name, bio, discord, ifc, youtube, preferredContact } = req.body;
-        const updatedData = { name, bio, discord, ifc, youtube, preferredContact };
+        const { name, bio, discord, ifc, youtube, preferredContact, infiniteFlightUsername } = req.body;
+        const updatedData = { name, bio, discord, ifc, youtube, preferredContact, infiniteFlightUsername };
 
         if (req.file) {
             const oldUser = await User.findById(req.user._id);
@@ -1255,6 +1397,9 @@ app.post('/api/flightplans/:id/depart', authMiddleware, async (req, res) => {
     }
 });
 
+// //////////////////////////////////////////////////
+// --- MODIFIED: /arrive ENDPOINT NOW USES HELPER ---
+// //////////////////////////////////////////////////
 app.post('/api/flightplans/:id/arrive', authMiddleware, upload.single('verificationImage'), async (req, res) => {
     try {
         const { remarks } = req.body;
@@ -1265,47 +1410,12 @@ app.post('/api/flightplans/:id/arrive', authMiddleware, upload.single('verificat
         if (flightPlan.pilot.toString() !== req.user._id) return res.status(403).json({ message: 'This is not your flight plan.' });
         if (flightPlan.status !== 'FLYING') return res.status(400).json({ message: `Cannot arrive. Flight status must be 'FLYING'.` });
 
-        flightPlan.status = 'COMPLETED';
-        flightPlan.actualArrivalTime = Date.now();
-        const flightTimeHours = (flightPlan.actualArrivalTime - flightPlan.actualDepartureTime) / (1000 * 60 * 60);
-
-        const newPirepData = {
-            pilot: flightPlan.pilot,
-            flightNumber: flightPlan.flightNumber,
-            departure: flightPlan.departure,
-            arrival: flightPlan.arrival,
-            aircraft: flightPlan.aircraft,
-            flightTime: parseFloat(flightTimeHours.toFixed(2)),
+        // Call the reusable helper function
+        const newPirep = await finalizeFlightAndCreatePirep(
+            flightPlan,
             remarks,
-            verificationImageUrl: req.file.location,
-            status: 'PENDING',
-            isMultiplierEligible: false,
-        };
-
-        if (flightPlan.rosterLeg && flightPlan.rosterLeg.rosterId) {
-            const roster = await Roster.findById(flightPlan.rosterLeg.rosterId);
-            if (roster) {
-                const leg = roster.legs.find(l => l.flightNumber === flightPlan.flightNumber);
-                if (leg) {
-                    newPirepData.rankUnlock = leg.rankUnlock;
-                    newPirepData.operator = leg.operator;
-                    newPirepData.rosterLeg = flightPlan.rosterLeg;
-                    const lastLegInRoster = roster.legs[roster.legs.length - 1];
-                    if (lastLegInRoster.flightNumber.toUpperCase() === flightPlan.flightNumber.toUpperCase()) {
-                        newPirepData.isMultiplierEligible = true;
-                    }
-                }
-            }
-        } else {
-            newPirepData.rankUnlock = deduceRankFromAircraft(flightPlan.aircraft);
-            newPirepData.operator = 'IndGo Air Virtual';
-        }
-
-        const newPirep = new Pirep(newPirepData);
-        await newPirep.save();
-
-        await User.updateOne({ _id: flightPlan.pilot }, { $set: { currentFlightPlan: null } });
-        await flightPlan.save();
+            req.file.location // Pass the image URL
+        );
 
         res.status(201).json({ message: 'Flight completed successfully! Your PIREP has been automatically generated and is pending review.', pirep: newPirep });
 
@@ -1893,4 +2003,15 @@ app.get('/api/logs', authMiddleware, isAdmin, async (req, res) => {
 // 8. START THE SERVER
 app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
+    // /////////////////////////////////////////
+    // --- NEW: INITIALIZE THE IF TRACKER ---
+    // /////////////////////////////////////////
+    if (process.env.IF_API_KEY) {
+        startFlightTracker();
+    } else {
+        console.warn("******************************************************************");
+        console.warn("WARNING: IF_API_KEY is not defined in your .env file.");
+        console.warn("The automated Infinite Flight tracker will not be started.");
+        console.warn("******************************************************************");
+    }
 });
