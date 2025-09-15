@@ -1,4 +1,4 @@
-// server.js (Fully Merged, Updated & Performance Tuned with Leaderboards)
+// server.js (Fully Merged, Updated & Performance Tuned with Leaderboards & Invites)
 // - Automated Roster Generation now reads from TWO Google Sheets simultaneously:
 //   1. The primary routes sheet (for regular flights).
 //   2. The codeshare routes sheet (for partner flights).
@@ -17,6 +17,7 @@
 // - NEW: Weekly and Monthly pilot leaderboards for hours and sectors.
 // - NEW: Test & Practical based promotion system for specific ranks.
 // - NEW: Flight Planning system with FIC/ADC codes and automated PIREP generation.
+// - NEW: Invite-based registration system for new pilots.
 // - FIXED: Daily flight hour counter now resets intelligently when starting a new duty.
 // - ADDED: Endpoint for user profile now includes time remaining on crew rest and notifications.
 // - FIXED: Off-roster (non-duty) PIREPs no longer affect FTPL counters.
@@ -38,7 +39,7 @@ const { google } = require('googleapis');
 const Papa = require('papaparse'); // For parsing CSV data from Google Sheets
 const axios = require('axios'); // For fetching the sheet
 const fs = require('fs').promises; // For reading local JSON files
-const crypto = require('crypto'); // For Flight Plan code generation
+const crypto = require('crypto'); // For Flight Plan code generation & Invites
 require('dotenv').config();
 
 // 2. INITIALIZE EXPRESS APP & AWS S3 CLIENT
@@ -254,6 +255,35 @@ UserSchema.index({ weeklyFlightHours: -1 });
 UserSchema.index({ weeklySectors: -1 });
 UserSchema.index({ leaderboardMonthlyFlightHours: -1 });
 UserSchema.index({ monthlySectors: -1 });
+
+// --- Invite Schema (NEW) ---
+const InviteSchema = new mongoose.Schema({
+    code: {
+        type: String,
+        required: true,
+        unique: true,
+    },
+    expiresAt: {
+        type: Date,
+        required: true,
+    },
+    status: {
+        type: String,
+        enum: ['PENDING', 'ACCEPTED', 'EXPIRED'],
+        default: 'PENDING',
+    },
+    createdBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+        required: true,
+    },
+    usedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+        default: null,
+    },
+}, { timestamps: true });
+const Invite = mongoose.model('Invite', InviteSchema);
 
 
 // --- Admin Log Schema ---
@@ -1053,6 +1083,119 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
+// --- NEW: USER REGISTRATION & INVITE SYSTEM ROUTES ---
+
+// Public-facing registration route
+app.post('/api/register', async (req, res) => {
+    try {
+        const { name, email, password, callsign, inviteCode } = req.body;
+
+        // 1. Validate input
+        if (!name || !email || !password || !callsign || !inviteCode) {
+            return res.status(400).json({ message: 'All fields, including an invite code, are required.' });
+        }
+        if (password.length < 6) {
+            return res.status(400).json({ message: 'Password must be at least 6 characters long.' });
+        }
+        const normalizedCallsign = String(callsign).trim().toUpperCase();
+        if (!isValidCallsign(normalizedCallsign)) {
+            return res.status(400).json({ message: 'Invalid callsign format. Use letters, numbers, and hyphens (2-15 chars).' });
+        }
+
+        // 2. Validate invite code
+        const invite = await Invite.findOne({ code: inviteCode, status: 'PENDING' });
+        if (!invite) {
+            return res.status(400).json({ message: 'This invite code is invalid or has already been used.' });
+        }
+        if (invite.expiresAt < new Date()) {
+            invite.status = 'EXPIRED';
+            await invite.save();
+            return res.status(400).json({ message: 'This invite code has expired.' });
+        }
+
+        // 3. Create the new user
+        const salt = await bcrypt.genSalt(10);
+        const newUser = new User({
+            name,
+            email: String(email).toLowerCase().trim(),
+            password: await bcrypt.hash(password, salt),
+            callsign: normalizedCallsign,
+            role: 'pilot' // All registrations via this route are pilots
+        });
+        await newUser.save();
+
+        // 4. Invalidate the invite code
+        invite.status = 'ACCEPTED';
+        invite.usedBy = newUser._id;
+        await invite.save();
+
+        // 5. Update Google Sheet
+        updateGoogleSheet({
+            callsign: newUser.callsign,
+            name: newUser.name,
+            rank: newUser.rank,
+            flightHours: newUser.flightHours
+        });
+
+        // 6. Log the user in by sending a token
+        const token = jwt.sign({ _id: newUser._id, role: newUser.role, name: newUser.name }, process.env.JWT_SECRET, { expiresIn: '3h' });
+        res.status(201).json({ token });
+
+    } catch (error) {
+        console.error(error);
+        if (error?.code === 11000) {
+            return res.status(400).json({ message: `A user with that ${Object.keys(error.keyValue)[0]} already exists.` });
+        }
+        res.status(500).json({ message: 'Server error during registration.' });
+    }
+});
+
+// Admin-only: Create a new invite code
+app.post('/api/invites', authMiddleware, isAdmin, async (req, res) => {
+    try {
+        const sevenDaysFromNow = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+        const newInvite = new Invite({
+            code: crypto.randomBytes(16).toString('hex'),
+            expiresAt: sevenDaysFromNow,
+            createdBy: req.user._id,
+        });
+        await newInvite.save();
+        res.status(201).json({ message: 'Invite code created successfully.', invite: newInvite });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error creating invite code.' });
+    }
+});
+
+// Admin-only: Get all invite codes
+app.get('/api/invites', authMiddleware, isAdmin, async (req, res) => {
+    try {
+        const invites = await Invite.find()
+            .populate('createdBy', 'name email')
+            .populate('usedBy', 'name email')
+            .sort({ createdAt: -1 });
+        res.json(invites);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error fetching invites.' });
+    }
+});
+
+// Admin-only: Delete an invite code
+app.delete('/api/invites/:inviteId', authMiddleware, isAdmin, async (req, res) => {
+    try {
+        const invite = await Invite.findByIdAndDelete(req.params.inviteId);
+        if (!invite) {
+            return res.status(404).json({ message: 'Invite not found.' });
+        }
+        res.json({ message: 'Invite code deleted successfully.' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error deleting invite.' });
+    }
+});
+
+
 // --- MODIFIED /api/me to deliver notifications ---
 app.get('/api/me', authMiddleware, async (req, res) => {
     try {
@@ -1766,6 +1909,8 @@ app.post('/api/duty/end', authMiddleware, async (req, res) => {
     }
 });
 
+// This route is now intended for creating STAFF/ADMIN accounts manually.
+// Pilots should register using the public /api/register route with an invite code.
 app.post('/api/users', authMiddleware, isAdmin, async (req, res) => {
     try {
         const { email, password, role, callsign, name } = req.body;
@@ -1787,7 +1932,7 @@ app.post('/api/users', authMiddleware, isAdmin, async (req, res) => {
         });
         await user.save();
         
-        if (normalizedCallsign) {
+        if (normalizedCallsign && user.role === 'pilot') {
             updateGoogleSheet({ callsign: normalizedCallsign, name: user.name, rank: user.rank, flightHours: user.flightHours || 0 });
         }
         
