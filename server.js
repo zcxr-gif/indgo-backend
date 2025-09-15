@@ -4,6 +4,7 @@
 //   2. The codeshare routes sheet (for partner flights).
 // - NO separate import step needed. Roster generation pulls all data in real-time.
 // - Strict Flight & Duty Time Limitations (FTPL) engine.
+// - ADDED: Staff-controlled switch to disable FTPL for individual users.
 // - Location-aware roster availability for pilots.
 // - Robust Google Sheets function with dynamic column mapping.
 // - Advanced PIREP system with a staff review workflow.
@@ -192,6 +193,7 @@ const UserSchema = new mongoose.Schema({
     dailyFlightHours: { type: Number, default: 0 },
     monthlyFlightHours: { type: Number, default: 0 }, // For FTPL (rolling 30 days)
     lastHourReset: { type: Date, default: Date.now },
+    isFtplExempt: { type: Boolean, default: false }, // NEW: Staff-controlled switch to bypass FTPL
     lastKnownAirport: { type: String, uppercase: true, trim: true, default: 'VIDP' },
     lastDutyAirport: { type: String, uppercase: true, trim: true, default: null },
     // Leaderboard Fields
@@ -257,7 +259,7 @@ UserSchema.index({ monthlySectors: -1 });
 // --- Admin Log Schema ---
 const AdminLogSchema = new mongoose.Schema({
     adminUser: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    action: { type: String, required: true, enum: ['ROLE_UPDATE', 'USER_DELETE', 'ROSTER_CREATE', 'ROSTER_DELETE', 'PROMOTION_TEST_REQUIRED'] }, // ADDED NEW ACTION
+    action: { type: String, required: true, enum: ['ROLE_UPDATE', 'USER_DELETE', 'ROSTER_CREATE', 'ROSTER_DELETE', 'PROMOTION_TEST_REQUIRED', 'FTPL_STATUS_UPDATE'] }, // ADDED NEW ACTION
     targetUser: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     details: { type: String, required: true },
     timestamp: { type: Date, default: Date.now }
@@ -1356,7 +1358,7 @@ app.get('/api/pireps/pending', authMiddleware, isPirepManager, async (req, res) 
     }
 });
 
-// --- ***MODIFIED*** PIREP Approval to allow time correction ---
+// --- ***MODIFIED*** PIREP Approval to allow time correction and handle FTPL exemption ---
 app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (req, res) => {
     try {
         const { correctedFlightTime } = req.body; // Staff can optionally send a corrected time
@@ -1396,7 +1398,8 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
         pilot.weeklySectors += 1;
         pilot.monthlySectors += 1;
 
-        if (pirep.rosterLeg && pirep.rosterLeg.rosterId) {
+        // MODIFIED: Only update FTPL counters for non-exempt pilots on roster flights
+        if (pirep.rosterLeg && pirep.rosterLeg.rosterId && !pilot.isFtplExempt) {
             pilot.monthlyFlightHours += hoursToAdd;
             pilot.dailyFlightHours += hoursToAdd;
         }
@@ -1665,7 +1668,7 @@ app.delete('/api/rosters/:rosterId', authMiddleware, isRouteManager, async (req,
     }
 });
 
-// --- MODIFIED Duty Start to block users pending tests ---
+// --- MODIFIED Duty Start to handle FTPL exemption ---
 app.post('/api/duty/start', authMiddleware, async (req, res) => {
     const { rosterId } = req.body;
     try {
@@ -1675,34 +1678,38 @@ app.post('/api/duty/start', authMiddleware, async (req, res) => {
         if (!roster) return res.status(404).json({ message: 'Selected roster not found.' });
         if (user.dutyStatus === 'ON_DUTY') return res.status(400).json({ message: 'You are already on duty.' });
 
-        // NEW: Add restriction check
         if (user.promotionStatus === 'PENDING_TEST') {
             return res.status(403).json({
                 message: 'You are currently in an observation period awaiting promotion tests. You cannot start a new duty until your tests are complete and you have been promoted by a staff member.'
             });
         }
 
+        // This intelligent reset should happen for all users when starting a new duty after rest.
         if (user.lastDutyOff && (Date.now() - user.lastDutyOff.getTime()) >= MIN_REST_PERIOD) {
             user.dailyFlightHours = 0;
             console.log(`Daily flight hours for ${user.email} reset due to starting a new duty period.`);
         }
 
-        if (user.lastDutyOff && (Date.now() - user.lastDutyOff) < MIN_REST_PERIOD) {
-            const timeToRest = Math.ceil((MIN_REST_PERIOD - (Date.now() - user.lastDutyOff)) / (60 * 1000));
-            return res.status(403).json({ message: `Crew rest required. You can go on duty in ${timeToRest} minutes.` });
-        }
-        
-        const oneMonthAgo = new Date();
-        oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
-        if (user.lastHourReset < oneMonthAgo) {
-            user.monthlyFlightHours = 0;
-            user.lastHourReset = Date.now();
-        }
-        if ((user.monthlyFlightHours + roster.totalFlightTime) > MAX_MONTHLY_FLIGHT_HOURS) {
-            return res.status(403).json({ message: `This duty would exceed your ${MAX_MONTHLY_FLIGHT_HOURS}-hour monthly limit.` });
-        }
-        if ((user.dailyFlightHours + roster.totalFlightTime) > MAX_DAILY_FLIGHT_HOURS) {
-            return res.status(403).json({ message: `This duty would exceed your ${MAX_DAILY_FLIGHT_HOURS}-hour daily flight limit.` });
+        // --- FTPL Checks ---
+        // These checks are bypassed if the user is exempt.
+        if (!user.isFtplExempt) {
+            if (user.lastDutyOff && (Date.now() - user.lastDutyOff) < MIN_REST_PERIOD) {
+                const timeToRest = Math.ceil((MIN_REST_PERIOD - (Date.now() - user.lastDutyOff)) / (60 * 1000));
+                return res.status(403).json({ message: `Crew rest required. You can go on duty in ${timeToRest} minutes.` });
+            }
+            
+            const oneMonthAgo = new Date();
+            oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+            if (user.lastHourReset < oneMonthAgo) {
+                user.monthlyFlightHours = 0;
+                user.lastHourReset = Date.now();
+            }
+            if ((user.monthlyFlightHours + roster.totalFlightTime) > MAX_MONTHLY_FLIGHT_HOURS) {
+                return res.status(403).json({ message: `This duty would exceed your ${MAX_MONTHLY_FLIGHT_HOURS}-hour monthly limit.` });
+            }
+            if ((user.dailyFlightHours + roster.totalFlightTime) > MAX_DAILY_FLIGHT_HOURS) {
+                return res.status(403).json({ message: `This duty would exceed your ${MAX_DAILY_FLIGHT_HOURS}-hour daily flight limit.` });
+            }
         }
         
         const overRankLeg = roster.legs.find(l => !canFlyLeg(user.rank, getLegRequiredRank(l)));
@@ -1858,6 +1865,35 @@ app.put('/api/users/:userId/callsign', authMiddleware, isAdmin, async (req, res)
             return res.status(400).json({ message: 'This callsign is already taken by another user.' });
         }
         res.status(500).json({ message: 'Server error while assigning callsign.' });
+    }
+});
+
+// --- NEW ENDPOINT to toggle FTPL status for a user ---
+app.put('/api/users/:userId/toggle-ftpl', authMiddleware, isPilotManager, async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const user = await User.findById(userId);
+        if (!user) return res.status(404).json({ message: 'User not found.' });
+
+        // Toggle the boolean field
+        user.isFtplExempt = !user.isFtplExempt;
+        await user.save();
+
+        const status = user.isFtplExempt ? 'DISABLED' : 'ENABLED';
+        
+        // Log the action
+        const log = new AdminLog({
+            adminUser: req.user._id,
+            action: 'FTPL_STATUS_UPDATE',
+            targetUser: userId,
+            details: `Set FTPL status to ${status} for user ${user.email}.`
+        });
+        await log.save();
+
+        res.json({ message: `Successfully set FTPL engine status to ${status} for ${user.name}.`, isFtplExempt: user.isFtplExempt });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error while toggling FTPL status.' });
     }
 });
 
