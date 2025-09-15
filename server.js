@@ -21,6 +21,7 @@
 // - FIXED: Off-roster (non-duty) PIREPs no longer affect FTPL counters.
 // - MODIFIED: Roster generation now creates a mix of single-rank and mixed-rank duties.
 // - MODIFIED: PIREP filing is now automated via the flight plan completion process.
+// - MODIFIED: PIREP approval now allows staff to correct the flight time.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -1355,9 +1356,11 @@ app.get('/api/pireps/pending', authMiddleware, isPirepManager, async (req, res) 
     }
 });
 
-// --- MODIFIED PIREP Approval to handle test-based promotions ---
+// --- ***MODIFIED*** PIREP Approval to allow time correction ---
 app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (req, res) => {
     try {
+        const { correctedFlightTime } = req.body; // Staff can optionally send a corrected time
+
         const pirep = await Pirep.findById(req.params.pirepId);
         if (!pirep) return res.status(404).json({ message: 'PIREP not found.' });
         if (pirep.status !== 'PENDING') return res.status(400).json({ message: `This PIREP has already been ${pirep.status.toLowerCase()}.` });
@@ -1366,7 +1369,17 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
         const pilot = await User.findById(pirep.pilot);
         if (!pilot) return res.status(404).json({ message: 'Associated pilot profile not found.' });
 
-        let hoursToAdd = pirep.flightTime;
+        let hoursToAdd = pirep.flightTime; // Default to original time
+        let timeWasCorrected = false;
+
+        // If staff sent a valid, positive corrected flight time, use it instead.
+        const parsedTime = parseFloat(correctedFlightTime);
+        if (parsedTime && !isNaN(parsedTime) && parsedTime > 0) {
+            hoursToAdd = parsedTime;
+            pirep.flightTime = hoursToAdd; // Update the PIREP record with the corrected time
+            timeWasCorrected = true;
+        }
+        
         let multiplierApplied = 1;
         if (pirep.isMultiplierEligible && pirep.rosterLeg?.rosterId) {
             const roster = await Roster.findById(pirep.rosterLeg.rosterId);
@@ -1388,8 +1401,7 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
             pilot.dailyFlightHours += hoursToAdd;
         }
         pilot.lastKnownAirport = pirep.arrival;
-
-        // MODIFIED SECTION
+        
         const promotionResult = checkAndApplyRankUpdate(pilot);
         
         pirep.status = 'APPROVED';
@@ -1397,7 +1409,7 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
         pirep.reviewedAt = Date.now();
         pirep.verificationImageUrl = null;
         
-        await pilot.save(); // Save pilot's new hours and potential status change
+        await pilot.save();
         await pirep.save();
 
         if (pilot.callsign) {
@@ -1405,16 +1417,19 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
         }
         
         let message = `PIREP approved. ${pilot.name} now has ${pilot.flightHours.toFixed(2)} hours.`;
-        if (multiplierApplied > 1) { message += ` A ${multiplierApplied}x multiplier was applied!`; }
+        if (timeWasCorrected) {
+             message += ` Flight time was manually corrected to ${pirep.flightTime.toFixed(2)} hours.`;
+        }
+        if (multiplierApplied > 1) {
+             message += ` A ${multiplierApplied}x multiplier was applied!`;
+        }
 
         const responsePayload = { message, promotionDetails: null };
 
-        // If a standard promotion occurred
         if (promotionResult.promoted) {
             responsePayload.message += ` Congratulations on the promotion to ${promotionResult.rank}!`;
         }
         
-        // NEW: If the pilot is now pending a test, create an admin log and inform user
         if (promotionResult.pendingTest) {
             const log = new AdminLog({
                 adminUser: req.user._id,
