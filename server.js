@@ -24,6 +24,7 @@
 // - MODIFIED: Roster generation now creates a mix of single-rank and mixed-rank duties.
 // - MODIFIED: PIREP filing is now automated via the flight plan completion process.
 // - MODIFIED: PIREP approval now allows staff to correct the flight time.
+// - NEW: Airport country codes are now automatically resolved and stored in rosters.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -45,6 +46,7 @@ require('dotenv').config();
 // 2. INITIALIZE EXPRESS APP & AWS S3 CLIENT
 const app = express();
 const PORT = process.env.PORT || 5000;
+let airportsData = {}; // To hold the airport data in memory
 
 // Configure the AWS S3 client
 const s3Client = new S3Client({
@@ -89,10 +91,27 @@ const upload = multer({
     })
 });
 
+// Function to load airport data into memory
+const loadAirportsData = async () => {
+    try {
+        console.log('Loading airport data into memory...');
+        const filePath = path.join(__dirname, 'airports.json');
+        const data = await fs.readFile(filePath, 'utf8');
+        airportsData = JSON.parse(data);
+        console.log(`Successfully loaded ${Object.keys(airportsData).length} airports.`);
+    } catch (error) {
+        console.error('CRITICAL ERROR: Could not load airports.json. Country lookups will not work.', error);
+    }
+};
+
 // 4. CONNECT TO MONGODB DATABASE
 mongoose.connect(process.env.MONGO_URI)
-    .then(() => console.log('MongoDB connected successfully.'))
+    .then(() => {
+        console.log('MongoDB connected successfully.');
+        loadAirportsData(); // Load airport data after successful DB connection
+    })
     .catch(err => console.error('MongoDB connection error:', err));
+
 
 // 5. DEFINE SCHEMAS AND MODELS
 
@@ -379,7 +398,7 @@ PirepSchema.index({ pilot: 1 });
 PirepSchema.index({ status: 1 });
 PirepSchema.index({ 'rosterLeg.rosterId': 1, 'rosterLeg.flightNumber': 1 });
 
-// --- Roster Schema ---
+// --- Roster Schema (UPDATED) ---
 const RosterSchema = new mongoose.Schema({
     name: { type: String, required: true, trim: true },
     hub: { type: String, required: true, uppercase: true, trim: true },
@@ -387,6 +406,8 @@ const RosterSchema = new mongoose.Schema({
         flightNumber: { type: String, required: true, trim: true },
         departure: { type: String, required: true, uppercase: true, trim: true },
         arrival: { type: String, required: true, uppercase: true, trim: true },
+        departureCountry: { type: String }, // NEW
+        arrivalCountry: { type: String },   // NEW
         aircraft: { type: String, required: true, trim: true },
         flightTime: { type: Number, required: true, min: 0.1 },
         rankUnlock: { type: String },
@@ -404,6 +425,8 @@ RosterSchema.index({ isAvailable: 1, 'legs.0.departure': 1 });
 
 
 // 6. HELPER FUNCTIONS & MIDDLEWARE
+
+const getCountryCode = (icao) => airportsData[icao]?.country || null;
 
 const generateFicNumber = () => `FIC/${new Date().getFullYear()}/${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 const generateAdcNumber = () => `ADC/${crypto.randomBytes(5).toString('hex').toUpperCase()}`;
@@ -696,7 +719,17 @@ const generateRostersFromGoogleSheet = async () => {
                     }
 
                     if (departureIcao && arrivalIcao && flightNumber && aircraft && !isNaN(flightTime) && flightTime > 0 && rankUnlock && operator) {
-                        return { flightNumber, departure: departureIcao, arrival: arrivalIcao, aircraft, flightTime, rankUnlock, operator };
+                        return { 
+                            flightNumber, 
+                            departure: departureIcao, 
+                            arrival: arrivalIcao, 
+                            departureCountry: getCountryCode(departureIcao),
+                            arrivalCountry: getCountryCode(arrivalIcao),
+                            aircraft, 
+                            flightTime, 
+                            rankUnlock, 
+                            operator 
+                        };
                     }
                     return null;
                 })
@@ -934,11 +967,13 @@ const isRouteManager = hasRole(['admin', 'Chief Executive Officer (CEO)', 'Chief
 
 app.get('/api/airports', async (req, res) => {
     try {
-        const filePath = path.join(__dirname, 'airports.json');
-        const data = await fs.readFile(filePath, 'utf8');
-        res.json(JSON.parse(data));
+        // Now serves the data from memory instead of reading the file each time
+        if (Object.keys(airportsData).length === 0) {
+            return res.status(503).json({ message: 'Airport data is not available at the moment. Please try again later.' });
+        }
+        res.json(airportsData);
     } catch (error) {
-        console.error('Error reading airports.json:', error);
+        console.error('Error in /api/airports endpoint:', error);
         res.status(500).json({ message: 'Could not load airport data.' });
     }
 });
@@ -1751,12 +1786,17 @@ app.post('/api/rosters', authMiddleware, isRouteManager, async (req, res) => {
             const aircraft = l.aircraft || '';
             const operator = (l.operator && String(l.operator).trim()) || 'IndGo Air Virtual';
             const rankUnlock = (l.rankUnlock && String(l.rankUnlock).trim()) || deduceRankFromAircraft(aircraft);
+            const departureIcao = normalizeICAO(l.departure);
+            const arrivalIcao = normalizeICAO(l.arrival);
+
             return { 
                 ...l, 
                 operator, 
                 rankUnlock,
-                departure: normalizeICAO(l.departure),
-                arrival: normalizeICAO(l.arrival)
+                departure: departureIcao,
+                arrival: arrivalIcao,
+                departureCountry: getCountryCode(departureIcao),
+                arrivalCountry: getCountryCode(arrivalIcao)
             };
         });
         const computedTFT = typeof totalFlightTime === 'number' && totalFlightTime > 0
