@@ -365,9 +365,10 @@ const FlightPlanSchema = new mongoose.Schema({
     // Actual times
     actualDepartureTime: { type: Date },
     actualArrivalTime: { type: Date },
+
+    dispatchData: { type: mongoose.Schema.Types.Mixed, default: null }
+
 }, { timestamps: true });
-FlightPlanSchema.index({ pilot: 1, status: 1 });
-const FlightPlan = mongoose.model('FlightPlan', FlightPlanSchema);
 
 
 // --- PIREP Schema ---
@@ -1376,6 +1377,40 @@ app.post('/api/flightplans', authMiddleware, async (req, res) => {
         const etdDate = new Date(etd);
         const etaDate = new Date(etdDate.getTime() + eetHours * 60 * 60 * 1000);
 
+        let dispatchData = null;
+        try {
+            console.log('Requesting detailed dispatch from Python service...');
+
+            // Prepare the data payload for the Python service
+            const dispatchPayload = {
+                pilot_id: pilot._id.toString(),
+                flight_number: flightNumber,
+                aircraft_type: aircraft,
+                departure_icao: planData.departure,
+                arrival_icao: planData.arrival,
+                etd: etdDate.toISOString().substr(11, 5).replace(':', ''), // Format as HHMM
+                eta: etaDate.toISOString().substr(11, 5).replace(':', ''), // Format as HHMM
+                duration: `${String(Math.floor(eetHours)).padStart(2, '0')}:${String(Math.round((eetHours % 1) * 60)).padStart(2, '0')}` // Format as HH:MM
+            };
+            
+            // Call the Python dispatch service
+            const dispatchResponse = await axios.post('http://127.0.0.1:5001/dispatch/create', dispatchPayload);
+
+            if (dispatchResponse.data) {
+                console.log('Successfully received dispatch data.');
+                dispatchData = dispatchResponse.data; // Store the full response
+            }
+
+        } catch (dispatchError) {
+            console.error('Error fetching data from Python dispatch service:', dispatchError.response ? dispatchError.response.data : dispatchError.message);
+            // Decide if you want to fail the whole process or continue without dispatch data
+            // For now, we'll just log it and continue without the detailed data.
+        }
+
+        // =================================================================
+        // END: NEW CODE FOR DISPATCH INTEGRATION
+        // =================================================================
+
         const newFlightPlan = new FlightPlan({
             pilot: pilot._id,
             flightNumber,
@@ -1390,7 +1425,8 @@ app.post('/api/flightplans', authMiddleware, async (req, res) => {
             eta: etaDate,
             ficNumber: generateFicNumber(),
             adcNumber: generateAdcNumber(),
-            rosterLeg: pilot.dutyStatus === 'ON_DUTY' ? rosterLegData : undefined
+            rosterLeg: pilot.dutyStatus === 'ON_DUTY' ? rosterLegData : undefined,
+            dispatchData: dispatchData // Add the new data here
         });
 
         await newFlightPlan.save();
