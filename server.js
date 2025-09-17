@@ -1329,7 +1329,7 @@ app.post('/api/me/notifications/read', authMiddleware, async (req, res) => {
 
 app.post('/api/flightplans', authMiddleware, async (req, res) => {
     try {
-        const { flightNumber, departure, arrival, aircraft, etd, eet, alternate, pob } = req.body;
+        const { flightNumber, departure, arrival, aircraft, etd, eet, alternate, pob, route } = req.body;
         if (!flightNumber || !departure || !arrival || !aircraft || !etd || !eet || !alternate || !pob) {
             return res.status(400).json({ message: 'Please provide all required flight plan details.' });
         }
@@ -1395,7 +1395,7 @@ app.post('/api/flightplans', authMiddleware, async (req, res) => {
             };
             
             // Call the Python dispatch service
-            const dispatchResponse = await axios.post('http://127.0.0.1:5001/dispatch/create', dispatchPayload);
+            const dispatchResponse = await axios.post('https://44515db3da23.ngrok-free.app/dispatch/create', dispatchPayload);
 
             if (dispatchResponse.data) {
                 console.log('Successfully received dispatch data.');
