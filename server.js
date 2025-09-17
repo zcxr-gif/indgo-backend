@@ -370,6 +370,7 @@ const FlightPlanSchema = new mongoose.Schema({
 
 }, { timestamps: true });
 
+const FlightPlan = mongoose.model('FlightPlan', FlightPlanSchema);
 
 // --- PIREP Schema ---
 const PirepSchema = new mongoose.Schema({
