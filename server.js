@@ -349,7 +349,7 @@ const FlightPlanSchema = new mongoose.Schema({
     eta: { type: Date, required: true }, // Estimated Time of Arrival
     alternate: { type: String, required: true, uppercase: true, trim: true },
     pob: { type: Number, required: true }, // Persons on Board
-    route: { type: String, required: true },
+    route: { type: String, required: false },
     ficNumber: { type: String, required: true, unique: true }, // Flight Information Code
     adcNumber: { type: String, required: true, unique: true }, // Air Defence Clearance
     status: {
@@ -1329,8 +1329,8 @@ app.post('/api/me/notifications/read', authMiddleware, async (req, res) => {
 
 app.post('/api/flightplans', authMiddleware, async (req, res) => {
     try {
-        const { flightNumber, departure, arrival, aircraft, etd, eet, alternate, pob, route } = req.body;
-        if (!flightNumber || !departure || !arrival || !aircraft || !etd || !eet || !alternate || !pob || !route) {
+        const { flightNumber, departure, arrival, aircraft, etd, eet, alternate, pob } = req.body;
+        if (!flightNumber || !departure || !arrival || !aircraft || !etd || !eet || !alternate || !pob) {
             return res.status(400).json({ message: 'Please provide all required flight plan details.' });
         }
 
