@@ -16,13 +16,14 @@
 // - NEW: Map feature support via airports data endpoint.
 // - NEW: Weekly and Monthly pilot leaderboards for hours and sectors.
 // - NEW: Test & Practical based promotion system for specific ranks.
-// - NEW: Flight Planning system with FIC/ADC codes and automated PIREP generation.
+[cite_start]// - REFACTORED: Flight Planning system now integrates with SimBrief to fetch OFP data. [cite: 18, 25, 26]
+// - MODIFIED: Kept FIC/ADC code generation for all new SimBrief flight records.
 // - NEW: Invite-based registration system for new pilots.
 // - FIXED: Daily flight hour counter now resets intelligently when starting a new duty.
 // - ADDED: Endpoint for user profile now includes time remaining on crew rest and notifications.
 // - FIXED: Off-roster (non-duty) PIREPs no longer affect FTPL counters.
 // - MODIFIED: Roster generation now creates a mix of single-rank and mixed-rank duties.
-// - MODIFIED: PIREP filing is now automated via the flight plan completion process.
+// - MODIFIED: PIREP filing is now automated via the flight completion process.
 // - MODIFIED: PIREP approval now allows staff to correct the flight time.
 // - NEW: Airport country codes are now automatically resolved and stored in rosters.
 
@@ -37,8 +38,8 @@ const path = require('path');
 const { S3Client, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const multerS3 = require('multer-s3');
 const { google } = require('googleapis');
-const Papa = require('papaparse'); // For parsing CSV data from Google Sheets
-const axios = require('axios'); // For fetching the sheet
+const Papa = require('papaparser'); // For parsing CSV data from Google Sheets
+const axios = require('axios'); // For fetching the sheet & SimBrief Data
 const fs = require('fs').promises; // For reading local JSON files
 const crypto = require('crypto'); // For Flight Plan code generation & Invites
 require('dotenv').config();
@@ -180,7 +181,7 @@ const getLegRequiredRank = (leg) => {
 };
 
 
-// --- User Schema (Enhanced for Test-Based Promotions) ---
+// --- User Schema (Enhanced for Test-Based Promotions & SimBrief) ---
 const UserSchema = new mongoose.Schema({
     name: { type: String, default: 'New Staff Member' },
     email: { type: String, required: true, unique: true, trim: true, lowercase: true },
@@ -229,8 +230,9 @@ const UserSchema = new mongoose.Schema({
         enum: ['ACTIVE', 'PENDING_TEST'],
         default: 'ACTIVE'
     },
-    // NEW: Link to active flight plan
-    currentFlightPlan: { type: mongoose.Schema.Types.ObjectId, ref: 'FlightPlan', default: null },
+    // SIMBRIEF INTEGRATION FIELDS
+    simbriefUsername: { type: String, trim: true, default: null },
+    currentSimbriefFlight: { type: mongoose.Schema.Types.ObjectId, ref: 'SimbriefFlight', default: null },
     notifications: [{
         message: { type: String, required: true },
         read: { type: Boolean, default: false },
@@ -248,7 +250,7 @@ UserSchema.pre('findOneAndDelete', { document: true, query: true }, async functi
         console.log(`Performing cascade delete for user: ${user.email}`);
         if (user.imageUrl) { deleteS3Object(user.imageUrl); }
         await mongoose.model('Pirep').deleteMany({ pilot: user._id });
-        await mongoose.model('FlightPlan').deleteMany({ pilot: user._id }); // Cascade delete flight plans
+        await mongoose.model('SimbriefFlight').deleteMany({ pilot: user._id }); // Cascade delete Simbrief flights
         const events = await mongoose.model('Event').find({ author: user._id }).lean();
         for (const event of events) {
             if (event.imageUrl) deleteS3Object(event.imageUrl);
@@ -337,37 +339,33 @@ const HighlightSchema = new mongoose.Schema({
 });
 const Highlight = mongoose.model('Highlight', HighlightSchema);
 
-// --- NEW: Flight Plan Schema ---
-const FlightPlanSchema = new mongoose.Schema({
+// --- NEW: SimBrief Flight Schema ---
+const SimbriefFlightSchema = new mongoose.Schema({
     pilot: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    flightNumber: { type: String, required: true, trim: true },
-    departure: { type: String, required: true, uppercase: true, trim: true },
-    arrival: { type: String, required: true, uppercase: true, trim: true },
+    // Key flight details parsed from SimBrief OFP
+    flightNumber: { type: String, required: true },
+    departure: { type: String, required: true, uppercase: true },
+    arrival: { type: String, required: true, uppercase: true },
     aircraft: { type: String, required: true },
-    etd: { type: Date, required: true }, // Estimated Time of Departure
-    eet: { type: Number, required: true }, // Estimated Elapsed Time in hours
-    eta: { type: Date, required: true }, // Estimated Time of Arrival
-    alternate: { type: String, required: true, uppercase: true, trim: true },
-    pob: { type: Number, required: true }, // Persons on Board
     route: { type: String, required: true },
-    ficNumber: { type: String, required: true, unique: true }, // Flight Information Code
-    adcNumber: { type: String, required: true, unique: true }, // Air Defence Clearance
+    alternate: { type: String, required: true, uppercase: true },
+    flightTime: { type: Number, required: true }, // Planned flight time in hours
+    // Internal VA codes
+    ficNumber: { type: String, required: true, unique: true },
+    adcNumber: { type: String, required: true, unique: true },
+    // Flight status and actual times
     status: {
         type: String,
         enum: ['PLANNED', 'FLYING', 'COMPLETED', 'CANCELLED'],
         default: 'PLANNED'
     },
-    // For roster flights
-    rosterLeg: {
-        rosterId: { type: mongoose.Schema.Types.ObjectId, ref: 'Roster' },
-        flightNumber: { type: String }
-    },
-    // Actual times
     actualDepartureTime: { type: Date },
     actualArrivalTime: { type: Date },
+    // Store the raw SimBrief data for future reference
+    ofp_json: { type: Object, required: true },
 }, { timestamps: true });
-FlightPlanSchema.index({ pilot: 1, status: 1 });
-const FlightPlan = mongoose.model('FlightPlan', FlightPlanSchema);
+SimbriefFlightSchema.index({ pilot: 1, status: 1 });
+const SimbriefFlight = mongoose.model('SimbriefFlight', SimbriefFlightSchema);
 
 
 // --- PIREP Schema ---
@@ -1231,10 +1229,10 @@ app.delete('/api/invites/:inviteId', authMiddleware, isAdmin, async (req, res) =
 });
 
 
-// --- MODIFIED /api/me to deliver notifications ---
+// --- MODIFIED /api/me to deliver notifications and active Simbrief flight ---
 app.get('/api/me', authMiddleware, async (req, res) => {
     try {
-        const user = await User.findById(req.user._id).select('-password').populate('currentFlightPlan').lean();
+        const user = await User.findById(req.user._id).select('-password').populate('currentSimbriefFlight').lean();
         if (!user) return res.status(404).json({ message: 'User not found.' });
 
         user.timeUntilNextDutyMs = 0;
@@ -1259,8 +1257,8 @@ app.get('/api/me', authMiddleware, async (req, res) => {
 
 app.put('/api/me', authMiddleware, upload.single('profilePicture'), async (req, res) => {
     try {
-        const { name, bio, discord, ifc, youtube, preferredContact } = req.body;
-        const updatedData = { name, bio, discord, ifc, youtube, preferredContact };
+        const { name, bio, discord, ifc, youtube, preferredContact, simbriefUsername } = req.body;
+        const updatedData = { name, bio, discord, ifc, youtube, preferredContact, simbriefUsername };
 
         if (req.file) {
             const oldUser = await User.findById(req.user._id);
@@ -1268,7 +1266,7 @@ app.put('/api/me', authMiddleware, upload.single('profilePicture'), async (req, 
             updatedData.imageUrl = req.file.location;
         }
 
-        const user = await User.findByIdAndUpdate(req.user._id, updatedData, { new: true }).select('-password');
+        const user = await User.findByIdAndUpdate(req.user._id, { $set: updatedData }, { new: true }).select('-password');
         if (!user) return res.status(404).json({ message: 'User not found.' });
         const token = jwt.sign({ _id: user._id, role: user.role, name: user.name }, process.env.JWT_SECRET, { expiresIn: '3h' });
         res.json({ message: 'Profile updated successfully!', user, token });
@@ -1323,170 +1321,195 @@ app.post('/api/me/notifications/read', authMiddleware, async (req, res) => {
 });
 
 
-// --- NEW: FLIGHT PLANNING & PIREP AUTOMATION ROUTES ---
+// --- NEW: SIMBRIEF FLIGHT & PIREP AUTOMATION ROUTES ---
 
-app.post('/api/flightplans', authMiddleware, async (req, res) => {
+app.post('/api/simbrief/import', authMiddleware, async (req, res) => {
     try {
-        const { flightNumber, departure, arrival, aircraft, etd, eet, alternate, pob, route } = req.body;
-        if (!flightNumber || !departure || !arrival || !aircraft || !etd || !eet || !alternate || !pob || !route) {
-            return res.status(400).json({ message: 'Please provide all required flight plan details.' });
-        }
-
         const pilot = await User.findById(req.user._id);
         if (!pilot) return res.status(404).json({ message: 'Pilot not found.' });
 
+        if (!pilot.simbriefUsername) {
+            return res.status(400).json({ message: 'Please set your SimBrief Username in your profile before importing a flight plan.' });
+        }
+        if (pilot.currentSimbriefFlight || pilot.dutyStatus === 'ON_DUTY') {
+            return res.status(400).json({ message: 'You already have an active flight or duty. Please complete it first.' });
+        }
         if (pilot.promotionStatus === 'PENDING_TEST') {
-            return res.status(403).json({ message: 'You are awaiting promotion tests and cannot file new flight plans.' });
-        }
-        if (pilot.currentFlightPlan) {
-            return res.status(400).json({ message: 'You already have an active flight plan. Please complete or cancel it first.' });
+            return res.status(403).json({ message: 'You are awaiting promotion tests and cannot start new flights.' });
         }
 
-        const planData = { departure, arrival, aircraft };
-        const rosterLegData = {};
+        [cite_start]const simbriefUrl = `https://www.simbrief.com/api/xml.fetcher.php?username=${pilot.simbriefUsername}&json=v2`; // [cite: 26]
+        const response = await axios.get(simbriefUrl);
 
-        if (pilot.dutyStatus === 'ON_DUTY') {
-            if (!pilot.currentRoster) return res.status(400).json({ message: 'You are on duty but have no assigned roster.' });
-            await pilot.populate('currentRoster');
-
-            const leg = pilot.currentRoster.legs.find(l => l.flightNumber.toUpperCase() === flightNumber.toUpperCase());
-            if (!leg) return res.status(400).json({ message: 'This flight number does not match any leg in your assigned roster.' });
-
-            const existingPlanForLeg = await FlightPlan.findOne({
-                pilot: pilot._id,
-                'rosterLeg.rosterId': pilot.currentRoster._id,
-                'rosterLeg.flightNumber': flightNumber,
-                status: { $in: ['PLANNED', 'FLYING', 'COMPLETED'] }
-            });
-            if (existingPlanForLeg) return res.status(400).json({ message: 'You have already filed a flight plan for this roster leg.' });
-
-            planData.departure = leg.departure;
-            planData.arrival = leg.arrival;
-            planData.aircraft = leg.aircraft;
-            rosterLegData.rosterId = pilot.currentRoster._id;
-            rosterLegData.flightNumber = leg.flightNumber;
+        [cite_start]if (response.status !== 200 || !response.data) { // [cite: 23, 24]
+            return res.status(400).json({ message: 'Failed to fetch flight plan from SimBrief. Please check your username and ensure a flight plan has been generated.' });
         }
 
-        const requiredRank = deduceRankFromAircraft(planData.aircraft);
+        const ofp = response.data;
+        
+        const requiredRank = deduceRankFromAircraft(ofp.aircraft.icao_code);
         if (!canFlyLeg(pilot.rank, requiredRank)) {
-            return res.status(403).json({ message: `This aircraft/route requires ${requiredRank}, which is above your rank (${pilot.rank}).` });
+            return res.status(403).json({ message: `Your latest SimBrief plan uses the ${ofp.aircraft.name}, which requires the rank of ${requiredRank}. Your current rank is ${pilot.rank}.` });
         }
-
-        const eetHours = parseFloat(eet);
-        const etdDate = new Date(etd);
-        const etaDate = new Date(etdDate.getTime() + eetHours * 60 * 60 * 1000);
-
-        const newFlightPlan = new FlightPlan({
+        
+        const newSimbriefFlight = new SimbriefFlight({
             pilot: pilot._id,
-            flightNumber,
-            departure: planData.departure,
-            arrival: planData.arrival,
-            aircraft: planData.aircraft,
-            alternate,
-            pob,
-            route,
-            etd: etdDate,
-            eet: eetHours,
-            eta: etaDate,
+            flightNumber: `${ofp.general.icao_airline}${ofp.general.flight_number}`,
+            departure: ofp.origin.icao_code,
+            arrival: ofp.destination.icao_code,
+            aircraft: ofp.aircraft.icao_code,
+            route: ofp.general.route,
+            alternate: ofp.alternate.icao_code,
+            flightTime: parseFloat(ofp.times.est_time_enroute) / 3600, // Convert seconds to hours
             ficNumber: generateFicNumber(),
             adcNumber: generateAdcNumber(),
-            rosterLeg: pilot.dutyStatus === 'ON_DUTY' ? rosterLegData : undefined
+            ofp_json: ofp, // Store the entire OFP data
         });
 
-        await newFlightPlan.save();
-        pilot.currentFlightPlan = newFlightPlan._id;
+        await newSimbriefFlight.save();
+        pilot.currentSimbriefFlight = newSimbriefFlight._id;
         await pilot.save();
 
-        res.status(201).json({ message: 'Flight plan filed successfully. You are cleared to depart at your ETD.', flightPlan: newFlightPlan });
+        res.status(201).json({ message: 'SimBrief OFP imported successfully. You are cleared for departure.', flight: newSimbriefFlight });
 
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: 'Server error while filing flight plan.' });
+        console.error("SimBrief Import Error:", error.response ? error.response.data : error.message);
+        res.status(500).json({ message: 'An error occurred while importing from SimBrief. The user may be invalid or no flight plan is available.' });
     }
 });
 
-app.get('/api/flightplans/my-active', authMiddleware, async (req, res) => {
+
+// =================================================================
+// ============== NEW ENDPOINT TO GENERATE FLIGHT PLAN ==============
+// =================================================================
+app.post('/api/simbrief/generate', authMiddleware, async (req, res) => {
     try {
-        const pilot = await User.findById(req.user._id).populate('currentFlightPlan');
+        // 1. Get flight details from the user's form submission
+        const { orig, dest, type, callsign } = req.body;
+
+        // 2. Validate the input from the frontend
+        if (!orig || !dest || !type || !callsign) {
+            return res.status(400).json({ message: 'Departure, Arrival, Aircraft Type, and Callsign are required.' });
+        }
+
+        // 3. Perform the same initial checks as the import route
+        const pilot = await User.findById(req.user._id);
         if (!pilot) return res.status(404).json({ message: 'Pilot not found.' });
-        if (!pilot.currentFlightPlan) return res.json(null); // No active plan is a valid state
 
-        res.json(pilot.currentFlightPlan);
+        if (!pilot.simbriefUsername) {
+            return res.status(400).json({ message: 'Please set your SimBrief Username in your profile before generating a flight plan.' });
+        }
+        if (pilot.currentSimbriefFlight || pilot.dutyStatus === 'ON_DUTY') {
+            return res.status(400).json({ message: 'You already have an active flight or duty. Please complete it first.' });
+        }
+        if (pilot.promotionStatus === 'PENDING_TEST') {
+            return res.status(403).json({ message: 'You are awaiting promotion tests and cannot start new flights.' });
+        }
+
+        // 4. Construct the dynamic URL for the SimBrief API with user parameters
+        const simbriefUrl = `https://www.simbrief.com/api/xml.fetcher.php?username=${pilot.simbriefUsername}&json=v2&orig=${encodeURIComponent(orig)}&dest=${encodeURIComponent(dest)}&type=${encodeURIComponent(type)}&callsign=${encodeURIComponent(callsign)}`;
+        
+        const response = await axios.get(simbriefUrl);
+
+        if (response.status !== 200 || !response.data) {
+            return res.status(400).json({ message: 'Failed to generate flight plan from SimBrief. Please check your inputs and try again.' });
+        }
+
+        const ofp = response.data;
+        
+        // 5. Reuse your existing logic for rank checking and flight creation
+        const requiredRank = deduceRankFromAircraft(ofp.aircraft.icao_code);
+        if (!canFlyLeg(pilot.rank, requiredRank)) {
+            return res.status(403).json({ message: `The selected aircraft (${ofp.aircraft.name}) requires the rank of ${requiredRank}. Your current rank is ${pilot.rank}.` });
+        }
+        
+        const newSimbriefFlight = new SimbriefFlight({
+            pilot: pilot._id,
+            flightNumber: `${ofp.general.icao_airline}${ofp.general.flight_number}`,
+            departure: ofp.origin.icao_code,
+            arrival: ofp.destination.icao_code,
+            aircraft: ofp.aircraft.icao_code,
+            route: ofp.general.route,
+            alternate: ofp.alternate.icao_code,
+            flightTime: parseFloat(ofp.times.est_time_enroute) / 3600, // Convert seconds to hours
+            ficNumber: generateFicNumber(),
+            adcNumber: generateAdcNumber(),
+            ofp_json: ofp,
+        });
+
+        await newSimbriefFlight.save();
+        pilot.currentSimbriefFlight = newSimbriefFlight._id;
+        await pilot.save();
+
+        res.status(201).json({ message: 'SimBrief OFP generated successfully. You are cleared for departure.', flight: newSimbriefFlight });
+
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: 'Server error fetching active flight plan.' });
+        console.error("SimBrief Generation Error:", error.response ? error.response.data : error.message);
+        res.status(500).json({ message: 'An error occurred while generating the flight plan with SimBrief.' });
     }
 });
 
-app.post('/api/flightplans/:id/depart', authMiddleware, async (req, res) => {
+
+app.get('/api/simbrief/my-active', authMiddleware, async (req, res) => {
     try {
-        const flightPlan = await FlightPlan.findById(req.params.id);
-        if (!flightPlan) return res.status(404).json({ message: 'Flight plan not found.' });
-        if (flightPlan.pilot.toString() !== req.user._id) return res.status(403).json({ message: 'This is not your flight plan.' });
-        if (flightPlan.status !== 'PLANNED') return res.status(400).json({ message: `Cannot depart. Flight status is already '${flightPlan.status}'.` });
+        const pilot = await User.findById(req.user._id).populate('currentSimbriefFlight');
+        if (!pilot) return res.status(404).json({ message: 'Pilot not found.' });
+        res.json(pilot.currentSimbriefFlight || null);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error fetching active SimBrief flight.' });
+    }
+});
 
-        flightPlan.status = 'FLYING';
-        flightPlan.actualDepartureTime = Date.now();
-        await flightPlan.save();
+app.post('/api/simbrief/:id/depart', authMiddleware, async (req, res) => {
+    try {
+        const flight = await SimbriefFlight.findById(req.params.id);
+        if (!flight) return res.status(404).json({ message: 'Flight not found.' });
+        if (flight.pilot.toString() !== req.user._id) return res.status(403).json({ message: 'This is not your flight.' });
+        if (flight.status !== 'PLANNED') return res.status(400).json({ message: `Cannot depart. Flight status is already '${flight.status}'.` });
 
-        res.json({ message: 'Departure confirmed. Your flight is now active.', flightPlan });
+        flight.status = 'FLYING';
+        flight.actualDepartureTime = Date.now();
+        await flight.save();
+
+        res.json({ message: 'Departure confirmed. Your flight is now active.', flight });
     } catch (error) {
         console.error(error);
         res.status(500).json({ message: 'Server error during departure.' });
     }
 });
 
-app.post('/api/flightplans/:id/arrive', authMiddleware, upload.single('verificationImage'), async (req, res) => {
+app.post('/api/simbrief/:id/arrive', authMiddleware, upload.single('verificationImage'), async (req, res) => {
     try {
         const { remarks } = req.body;
         if (!req.file) return res.status(400).json({ message: 'A verification image of the flight is required to generate a PIREP.' });
 
-        const flightPlan = await FlightPlan.findById(req.params.id);
-        if (!flightPlan) return res.status(404).json({ message: 'Flight plan not found.' });
-        if (flightPlan.pilot.toString() !== req.user._id) return res.status(403).json({ message: 'This is not your flight plan.' });
-        if (flightPlan.status !== 'FLYING') return res.status(400).json({ message: `Cannot arrive. Flight status must be 'FLYING'.` });
+        const flight = await SimbriefFlight.findById(req.params.id);
+        if (!flight) return res.status(404).json({ message: 'Flight not found.' });
+        if (flight.pilot.toString() !== req.user._id) return res.status(403).json({ message: 'This is not your flight.' });
+        if (flight.status !== 'FLYING') return res.status(400).json({ message: `Cannot arrive. Flight status must be 'FLYING'.` });
 
-        flightPlan.status = 'COMPLETED';
-        flightPlan.actualArrivalTime = Date.now();
-        const flightTimeHours = (flightPlan.actualArrivalTime - flightPlan.actualDepartureTime) / (1000 * 60 * 60);
+        flight.status = 'COMPLETED';
+        flight.actualArrivalTime = Date.now();
+        const flightTimeHours = (flight.actualArrivalTime - flight.actualDepartureTime) / (1000 * 60 * 60);
 
-        const newPirepData = {
-            pilot: flightPlan.pilot,
-            flightNumber: flightPlan.flightNumber,
-            departure: flightPlan.departure,
-            arrival: flightPlan.arrival,
-            aircraft: flightPlan.aircraft,
+        const newPirep = new Pirep({
+            pilot: flight.pilot,
+            flightNumber: flight.flightNumber,
+            departure: flight.departure,
+            arrival: flight.arrival,
+            aircraft: flight.aircraft,
             flightTime: parseFloat(flightTimeHours.toFixed(2)),
             remarks,
             verificationImageUrl: req.file.location,
             status: 'PENDING',
-            isMultiplierEligible: false,
-        };
-
-        if (flightPlan.rosterLeg && flightPlan.rosterLeg.rosterId) {
-            const roster = await Roster.findById(flightPlan.rosterLeg.rosterId);
-            if (roster) {
-                const leg = roster.legs.find(l => l.flightNumber === flightPlan.flightNumber);
-                if (leg) {
-                    newPirepData.rankUnlock = leg.rankUnlock;
-                    newPirepData.operator = leg.operator;
-                    newPirepData.rosterLeg = flightPlan.rosterLeg;
-                    const lastLegInRoster = roster.legs[roster.legs.length - 1];
-                    if (lastLegInRoster.flightNumber.toUpperCase() === flightPlan.flightNumber.toUpperCase()) {
-                        newPirepData.isMultiplierEligible = true;
-                    }
-                }
-            }
-        } else {
-            newPirepData.rankUnlock = deduceRankFromAircraft(flightPlan.aircraft);
-            newPirepData.operator = 'IndGo Air Virtual';
-        }
-
-        const newPirep = new Pirep(newPirepData);
+            rankUnlock: deduceRankFromAircraft(flight.aircraft),
+            operator: 'IndGo Air Virtual', // SimBrief flights are considered non-codeshare by default
+        });
         await newPirep.save();
 
-        await User.updateOne({ _id: flightPlan.pilot }, { $set: { currentFlightPlan: null } });
-        await flightPlan.save();
+        await User.updateOne({ _id: flight.pilot }, { $set: { currentSimbriefFlight: null } });
+        await flight.save();
 
         res.status(201).json({ message: 'Flight completed successfully! Your PIREP has been automatically generated and is pending review.', pirep: newPirep });
 
@@ -1496,23 +1519,24 @@ app.post('/api/flightplans/:id/arrive', authMiddleware, upload.single('verificat
     }
 });
 
-app.post('/api/flightplans/:id/cancel', authMiddleware, async (req, res) => {
+app.post('/api/simbrief/:id/cancel', authMiddleware, async (req, res) => {
     try {
-        const flightPlan = await FlightPlan.findById(req.params.id);
-        if (!flightPlan) return res.status(404).json({ message: 'Flight plan not found.' });
-        if (flightPlan.pilot.toString() !== req.user._id) return res.status(403).json({ message: 'This is not your flight plan.' });
-        if (flightPlan.status !== 'PLANNED') return res.status(400).json({ message: `Cannot cancel a flight that is already '${flightPlan.status}'.` });
+        const flight = await SimbriefFlight.findById(req.params.id);
+        if (!flight) return res.status(404).json({ message: 'Flight not found.' });
+        if (flight.pilot.toString() !== req.user._id) return res.status(403).json({ message: 'This is not your flight.' });
+        if (flight.status !== 'PLANNED') return res.status(400).json({ message: `Cannot cancel a flight that is already '${flight.status}'.` });
 
-        flightPlan.status = 'CANCELLED';
-        await flightPlan.save();
-        await User.updateOne({ _id: flightPlan.pilot }, { $set: { currentFlightPlan: null } });
+        flight.status = 'CANCELLED';
+        await flight.save();
+        await User.updateOne({ _id: flight.pilot }, { $set: { currentSimbriefFlight: null } });
 
-        res.json({ message: 'Flight plan has been successfully cancelled.' });
+        res.json({ message: 'Flight has been successfully cancelled.' });
     } catch (error) {
         console.error(error);
-        res.status(500).json({ message: 'Server error while cancelling flight plan.' });
+        res.status(500).json({ message: 'Server error while cancelling flight.' });
     }
 });
+
 
 app.get('/api/me/pireps', authMiddleware, async (req, res) => {
     try {
@@ -1860,6 +1884,7 @@ app.post('/api/duty/start', authMiddleware, async (req, res) => {
 
         if (!roster) return res.status(404).json({ message: 'Selected roster not found.' });
         if (user.dutyStatus === 'ON_DUTY') return res.status(400).json({ message: 'You are already on duty.' });
+        if (user.currentSimbriefFlight) return res.status(400).json({ message: 'You have an active SimBrief flight. You cannot start a roster duty.' });
 
         if (user.promotionStatus === 'PENDING_TEST') {
             return res.status(403).json({
@@ -1927,6 +1952,9 @@ app.post('/api/duty/end', authMiddleware, async (req, res) => {
             status: { $in: ['APPROVED', 'PENDING'] }
         });
 
+        // NOTE: With the new SimBrief flow, pilots on duty will file PIREPs manually after importing a flight.
+        // This check may need adjustment depending on the desired workflow for roster flights vs SimBrief flights.
+        // For now, we assume pilots on roster duty must still have a PIREP for each leg.
         if (filedPireps < roster.legs.length) {
             return res.status(400).json({ message: `You must file PIREPs for all roster legs. ${filedPireps}/${roster.legs.length} complete.` });
         }
