@@ -894,15 +894,28 @@ const generateRostersFromGoogleSheet = async () => {
     }
 
     if (generatedRosters.length > 0) {
-        await Roster.deleteMany({ isGenerated: true });
+     const activeUsers = await User.find({ dutyStatus: 'ON_DUTY', currentRoster: { $ne: null } }).select('currentRoster').lean();
+        const activeRosterIds = activeUsers.map(user => user.currentRoster);
+
+        if (activeRosterIds.length > 0) {
+            console.log(`Preserving ${activeRosterIds.length} active roster(s) currently in use by pilots.`);
+        }
+
+        // MODIFIED: Delete all generated rosters EXCEPT for the ones currently in use.
+        await Roster.deleteMany({
+            isGenerated: true,
+            _id: { $nin: activeRosterIds } // Use $nin (not in) to exclude active rosters
+        });
+
+        // --- MODIFICATION ENDS HERE ---
+
         // Shuffle the combined list of rosters for better presentation
-        generatedRosters.sort(() => Math.random() - 0.5); 
+        generatedRosters.sort(() => Math.random() - 0.5);
         await Roster.insertMany(generatedRosters);
         console.log(`Successfully generated and saved ${generatedRosters.length} new mixed and single-rank rosters.`);
     }
     return { created: generatedRosters.length, legsFound: allLegs.length };
 };
-
 
 // Rank Promotion Helper (OVERHAULED for Manual Promotion)
 const checkAndApplyRankUpdate = (pilot) => {
