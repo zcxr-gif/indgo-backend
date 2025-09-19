@@ -1338,10 +1338,12 @@ app.post('/api/simbrief/import', authMiddleware, async (req, res) => {
             return res.status(403).json({ message: 'You are awaiting promotion tests and cannot start new flights.' });
         }
 
-        [cite_start]const simbriefUrl = `https://www.simbrief.com/api/xml.fetcher.php?username=${pilot.simbriefUsername}&json=v2`; // [cite: 26]
+        // FIX: Removed '' from the beginning of this line
+        const simbriefUrl = `https://www.simbrief.com/api/xml.fetcher.php?username=${pilot.simbriefUsername}&json=v2`; //
         const response = await axios.get(simbriefUrl);
 
-        [cite_start]if (response.status !== 200 || !response.data) { // [cite: 23, 24]
+        // FIX: Removed '' from the beginning of this line
+        if (response.status !== 200 || !response.data) { //
             return res.status(400).json({ message: 'Failed to fetch flight plan from SimBrief. Please check your username and ensure a flight plan has been generated.' });
         }
 
@@ -1365,6 +1367,18 @@ app.post('/api/simbrief/import', authMiddleware, async (req, res) => {
             adcNumber: generateAdcNumber(),
             ofp_json: ofp, // Store the entire OFP data
         });
+
+        await newSimbriefFlight.save();
+        pilot.currentSimbriefFlight = newSimbriefFlight._id;
+        await pilot.save();
+
+        res.status(201).json({ message: 'SimBrief OFP imported successfully. You are cleared for departure.', flight: newSimbriefFlight });
+
+    } catch (error) {
+        console.error("SimBrief Import Error:", error.response ? error.response.data : error.message);
+        res.status(500).json({ message: 'An error occurred while importing from SimBrief. The user may be invalid or no flight plan is available.' });
+    }
+});
 
         await newSimbriefFlight.save();
         pilot.currentSimbriefFlight = newSimbriefFlight._id;
