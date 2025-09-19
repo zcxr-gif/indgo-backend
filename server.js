@@ -16,7 +16,7 @@
 // - NEW: Map feature support via airports data endpoint.
 // - NEW: Weekly and Monthly pilot leaderboards for hours and sectors.
 // - NEW: Test & Practical based promotion system for specific ranks.
-[cite_start]// - REFACTORED: Flight Planning system now integrates with SimBrief to fetch OFP data. [cite: 18, 25, 26]
+// - REFACTORED: Flight Planning system now integrates with SimBrief to fetch OFP data.
 // - MODIFIED: Kept FIC/ADC code generation for all new SimBrief flight records.
 // - NEW: Invite-based registration system for new pilots.
 // - FIXED: Daily flight hour counter now resets intelligently when starting a new duty.
@@ -231,7 +231,7 @@ const UserSchema = new mongoose.Schema({
         default: 'ACTIVE'
     },
     // SIMBRIEF INTEGRATION FIELDS
-    simbriefUsername: { type: String, trim: true, default: null },
+    simbriefUserId: { type: String, trim: true, default: null },
     currentSimbriefFlight: { type: mongoose.Schema.Types.ObjectId, ref: 'SimbriefFlight', default: null },
     notifications: [{
         message: { type: String, required: true },
@@ -1257,8 +1257,8 @@ app.get('/api/me', authMiddleware, async (req, res) => {
 
 app.put('/api/me', authMiddleware, upload.single('profilePicture'), async (req, res) => {
     try {
-        const { name, bio, discord, ifc, youtube, preferredContact, simbriefUsername } = req.body;
-        const updatedData = { name, bio, discord, ifc, youtube, preferredContact, simbriefUsername };
+        const { name, bio, discord, ifc, youtube, preferredContact, simbriefUserId } = req.body;
+        const updatedData = { name, bio, discord, ifc, youtube, preferredContact, simbriefUserId };
 
         if (req.file) {
             const oldUser = await User.findById(req.user._id);
@@ -1328,8 +1328,8 @@ app.post('/api/simbrief/import', authMiddleware, async (req, res) => {
         const pilot = await User.findById(req.user._id);
         if (!pilot) return res.status(404).json({ message: 'Pilot not found.' });
 
-        if (!pilot.simbriefUsername) {
-            return res.status(400).json({ message: 'Please set your SimBrief Username in your profile before importing a flight plan.' });
+        if (!pilot.simbriefUserId) {
+            return res.status(400).json({ message: 'Please set your SimBrief Pilot ID in your profile before importing a flight plan.' });
         }
         if (pilot.currentSimbriefFlight || pilot.dutyStatus === 'ON_DUTY') {
             return res.status(400).json({ message: 'You already have an active flight or duty. Please complete it first.' });
@@ -1339,12 +1339,12 @@ app.post('/api/simbrief/import', authMiddleware, async (req, res) => {
         }
 
         // FIX: Removed '' from the beginning of this line
-        const simbriefUrl = `https://www.simbrief.com/api/xml.fetcher.php?username=${pilot.simbriefUsername}&json=v2`; //
+        const simbriefUrl = `https://www.simbrief.com/api/xml.fetcher.php?userid=${pilot.simbriefUserId}&json=v2`; //
         const response = await axios.get(simbriefUrl);
 
         // FIX: Removed '' from the beginning of this line
         if (response.status !== 200 || !response.data) { //
-            return res.status(400).json({ message: 'Failed to fetch flight plan from SimBrief. Please check your username and ensure a flight plan has been generated.' });
+            return res.status(400).json({ message: 'Failed to fetch flight plan from SimBrief. Please check your Pilot ID and ensure a flight plan has been generated.' });
         }
 
         const ofp = response.data;
@@ -1376,7 +1376,7 @@ app.post('/api/simbrief/import', authMiddleware, async (req, res) => {
 
     } catch (error) {
         console.error("SimBrief Import Error:", error.response ? error.response.data : error.message);
-        res.status(500).json({ message: 'An error occurred while importing from SimBrief. The user may be invalid or no flight plan is available.' });
+        res.status(500).json({ message: 'An error occurred while importing from SimBrief. The user ID may be invalid or no flight plan is available.' });
     }
 });
 
@@ -1410,8 +1410,8 @@ app.post('/api/simbrief/generate', authMiddleware, async (req, res) => {
         const pilot = await User.findById(req.user._id);
         if (!pilot) return res.status(404).json({ message: 'Pilot not found.' });
 
-        if (!pilot.simbriefUsername) {
-            return res.status(400).json({ message: 'Please set your SimBrief Username in your profile before generating a flight plan.' });
+        if (!pilot.simbriefUserId) {
+            return res.status(400).json({ message: 'Please set your SimBrief Pilot ID in your profile before generating a flight plan.' });
         }
         if (pilot.currentSimbriefFlight || pilot.dutyStatus === 'ON_DUTY') {
             return res.status(400).json({ message: 'You already have an active flight or duty. Please complete it first.' });
@@ -1421,7 +1421,7 @@ app.post('/api/simbrief/generate', authMiddleware, async (req, res) => {
         }
 
         // 4. Construct the dynamic URL for the SimBrief API with user parameters
-        const simbriefUrl = `https://www.simbrief.com/api/xml.fetcher.php?username=${pilot.simbriefUsername}&json=v2&orig=${encodeURIComponent(orig)}&dest=${encodeURIComponent(dest)}&type=${encodeURIComponent(type)}&callsign=${encodeURIComponent(callsign)}`;
+        const simbriefUrl = `https://www.simbrief.com/api/xml.fetcher.php?userid=${pilot.simbriefUserId}&json=v2&orig=${encodeURIComponent(orig)}&dest=${encodeURIComponent(dest)}&type=${encodeURIComponent(type)}&callsign=${encodeURIComponent(callsign)}`;
         
         const response = await axios.get(simbriefUrl);
 
