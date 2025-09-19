@@ -1671,7 +1671,6 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
 
         if (promotionResult.promoted) {
             responsePayload.message += ` Congratulations on the promotion to ${promotionResult.rank}!`;
-            // << FIX 1: ADD PERSISTENT NOTIFICATION FOR AUTOMATIC PROMOTION >>
             pilot.notifications.push({
                 message: `Congratulations! Your flight hours have earned you a promotion from ${oldRank} to ${promotionResult.rank}.`
             });
@@ -1686,13 +1685,25 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
             });
             await log.save();
             responsePayload.message += ` You have reached the flight hour requirement for the next rank! Staff has been notified to schedule your practical and written tests. Your account is now in an observation period.`;
-            // << FIX 2: ADD PERSISTENT NOTIFICATION FOR PENDING TEST STATUS >>
+            
             pilot.notifications.push({
                 message: `You have met the hour requirement for ${promotionResult.prospectiveRank}. To proceed, staff will contact you for mandatory promotion tests. Your flight operations are suspended until the tests are complete.`
             });
+
+            // --- NEW: NOTIFICATION FOR STAFF ---
+            const pilotManagerRoles = ['admin', 'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)', 'Head of Training (COT)'];
+            const staffNotification = {
+                message: `Action Required: Pilot ${pilot.name} (${pilot.callsign || 'N/A'}) is awaiting tests for promotion to ${promotionResult.prospectiveRank}.`
+            };
+            await User.updateMany(
+                { role: { $in: pilotManagerRoles } },
+                { $push: { notifications: staffNotification } }
+            );
+            console.log(`Sent promotion test notification to staff for pilot ${pilot.name}.`);
+            // --- END OF NEW LOGIC ---
         }
         
-        await pilot.save(); // Save the pilot model after potentially adding notifications
+        await pilot.save();
 
         if (pilot.callsign) {
             updateGoogleSheet({ callsign: pilot.callsign, name: pilot.name, rank: pilot.rank, flightHours: pilot.flightHours });
@@ -2068,7 +2079,7 @@ app.post('/api/users', authMiddleware, isAdmin, async (req, res) => {
 app.get('/api/users', authMiddleware, isAdmin, async (req, res) => {
     try {
         const users = await User.find()
-            .select('name email callsign rank flightHours role createdAt')
+            .select('name email callsign rank flightHours role createdAt promotionStatus')
             .lean();
         res.json(users);
     } catch (error) {
