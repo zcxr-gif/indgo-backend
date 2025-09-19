@@ -353,6 +353,7 @@ const FlightPlanSchema = new mongoose.Schema({
     route: { type: String, required: true },
     ficNumber: { type: String, required: true, unique: true }, // Flight Information Code
     adcNumber: { type: String, required: true, unique: true }, // Air Defence Clearance
+    squawkCode: { type: String }, // NEW: Added squawk code
     status: {
         type: String,
         enum: ['PLANNED', 'FLYING', 'COMPLETED', 'CANCELLED'],
@@ -431,6 +432,15 @@ const getCountryCode = (icao) => airportsData[icao]?.country || null;
 
 const generateFicNumber = () => `FIC/${new Date().getFullYear()}/${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 const generateAdcNumber = () => `ADC/${crypto.randomBytes(5).toString('hex').toUpperCase()}`;
+
+// NEW: Helper function to generate a random 4-digit squawk code
+const generateSquawkCode = () => {
+    let code = '';
+    for (let i = 0; i < 4; i++) {
+        code += Math.floor(Math.random() * 8); // Generates digits 0-7
+    }
+    return code;
+};
 
 const deleteS3Object = async (imageUrl) => {
     if (!imageUrl) return;
@@ -1329,7 +1339,8 @@ app.post('/api/me/notifications/read', authMiddleware, async (req, res) => {
 
 app.post('/api/flightplans', authMiddleware, async (req, res) => {
     try {
-        const { flightNumber, departure, arrival, aircraft, etd, eet, alternate, pob, route } = req.body;
+        // MODIFIED: Added squawkCode to the destructured request body
+        const { flightNumber, departure, arrival, aircraft, etd, eet, alternate, pob, route, squawkCode } = req.body;
         if (!flightNumber || !departure || !arrival || !aircraft || !etd || !eet || !alternate || !pob || !route) {
             return res.status(400).json({ message: 'Please provide all required flight plan details.' });
         }
@@ -1392,6 +1403,8 @@ app.post('/api/flightplans', authMiddleware, async (req, res) => {
             eta: etaDate,
             ficNumber: generateFicNumber(),
             adcNumber: generateAdcNumber(),
+            // MODIFIED: Use the squawkCode from the request if it exists, otherwise generate a new one.
+            squawkCode: squawkCode || generateSquawkCode(),
             rosterLeg: pilot.dutyStatus === 'ON_DUTY' ? rosterLegData : undefined
         });
 
