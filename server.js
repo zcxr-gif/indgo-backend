@@ -1636,6 +1636,7 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
         }
 
         checkAndResetLeaderboardStats(pilot);
+        const oldRank = pilot.rank; // Capture rank before the change
         pilot.flightHours += hoursToAdd;
         pilot.weeklyFlightHours += hoursToAdd;
         pilot.leaderboardMonthlyFlightHours += hoursToAdd;
@@ -1656,13 +1657,8 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
         pirep.reviewedAt = Date.now();
         pirep.verificationImageUrl = null;
         
-        await pilot.save();
         await pirep.save();
 
-        if (pilot.callsign) {
-            updateGoogleSheet({ callsign: pilot.callsign, name: pilot.name, rank: pilot.rank, flightHours: pilot.flightHours });
-        }
-        
         let message = `PIREP approved. ${pilot.name} now has ${pilot.flightHours.toFixed(2)} hours.`;
         if (timeWasCorrected) {
              message += ` Flight time was manually corrected to ${pirep.flightTime.toFixed(2)} hours.`;
@@ -1675,6 +1671,10 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
 
         if (promotionResult.promoted) {
             responsePayload.message += ` Congratulations on the promotion to ${promotionResult.rank}!`;
+            // << FIX 1: ADD PERSISTENT NOTIFICATION FOR AUTOMATIC PROMOTION >>
+            pilot.notifications.push({
+                message: `Congratulations! Your flight hours have earned you a promotion from ${oldRank} to ${promotionResult.rank}.`
+            });
         }
         
         if (promotionResult.pendingTest) {
@@ -1686,6 +1686,16 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
             });
             await log.save();
             responsePayload.message += ` You have reached the flight hour requirement for the next rank! Staff has been notified to schedule your practical and written tests. Your account is now in an observation period.`;
+            // << FIX 2: ADD PERSISTENT NOTIFICATION FOR PENDING TEST STATUS >>
+            pilot.notifications.push({
+                message: `You have met the hour requirement for ${promotionResult.prospectiveRank}. To proceed, staff will contact you for mandatory promotion tests. Your flight operations are suspended until the tests are complete.`
+            });
+        }
+        
+        await pilot.save(); // Save the pilot model after potentially adding notifications
+
+        if (pilot.callsign) {
+            updateGoogleSheet({ callsign: pilot.callsign, name: pilot.name, rank: pilot.rank, flightHours: pilot.flightHours });
         }
         
         res.json(responsePayload);
