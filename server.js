@@ -1380,18 +1380,6 @@ app.post('/api/simbrief/import', authMiddleware, async (req, res) => {
     }
 });
 
-        await newSimbriefFlight.save();
-        pilot.currentSimbriefFlight = newSimbriefFlight._id;
-        await pilot.save();
-
-        res.status(201).json({ message: 'SimBrief OFP imported successfully. You are cleared for departure.', flight: newSimbriefFlight });
-
-    } catch (error) {
-        console.error("SimBrief Import Error:", error.response ? error.response.data : error.message);
-        res.status(500).json({ message: 'An error occurred while importing from SimBrief. The user may be invalid or no flight plan is available.' });
-    }
-});
-
 
 // =================================================================
 // ============== NEW ENDPOINT TO GENERATE FLIGHT PLAN ==============
