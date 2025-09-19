@@ -1355,7 +1355,6 @@ app.post('/api/me/notifications/read', authMiddleware, async (req, res) => {
 
 app.post('/api/flightplans', authMiddleware, async (req, res) => {
     try {
-        // MODIFIED: Destructure all new fields from the request body
         const { 
             flightNumber, departure, arrival, aircraft, etd, eet, alternate, pob, route, squawkCode,
             zfw, tow, cargo, fuelTaxi, fuelTrip, fuelTotal, v1, vr, v2, vref, departureWeather, arrivalWeather 
@@ -1368,6 +1367,7 @@ app.post('/api/flightplans', authMiddleware, async (req, res) => {
         const pilot = await User.findById(req.user._id);
         if (!pilot) return res.status(404).json({ message: 'Pilot not found.' });
 
+        // These global restrictions remain
         if (pilot.promotionStatus === 'PENDING_TEST') {
             return res.status(403).json({ message: 'You are awaiting promotion tests and cannot file new flight plans.' });
         }
@@ -1375,31 +1375,47 @@ app.post('/api/flightplans', authMiddleware, async (req, res) => {
             return res.status(400).json({ message: 'You already have an active flight plan. Please complete or cancel it first.' });
         }
 
-        const planData = { departure, arrival, aircraft };
+        // --- NEW LOGIC TO HANDLE ALL FLIGHT TYPES ---
+        const planData = {};
         const rosterLegData = {};
 
-        if (pilot.dutyStatus === 'ON_DUTY') {
-            if (!pilot.currentRoster) return res.status(400).json({ message: 'You are on duty but have no assigned roster.' });
+        // 1. Check if the flight is part of an active duty roster
+        if (pilot.dutyStatus === 'ON_DUTY' && pilot.currentRoster) {
             await pilot.populate('currentRoster');
-
+            
+            // Try to find a matching leg in the current roster
             const leg = pilot.currentRoster.legs.find(l => l.flightNumber.toUpperCase() === flightNumber.toUpperCase());
-            if (!leg) return res.status(400).json({ message: 'This flight number does not match any leg in your assigned roster.' });
 
-            const existingPlanForLeg = await FlightPlan.findOne({
-                pilot: pilot._id,
-                'rosterLeg.rosterId': pilot.currentRoster._id,
-                'rosterLeg.flightNumber': flightNumber,
-                status: { $in: ['PLANNED', 'FLYING', 'COMPLETED'] }
-            });
-            if (existingPlanForLeg) return res.status(400).json({ message: 'You have already filed a flight plan for this roster leg.' });
+            // If a match is found, link it to the roster
+            if (leg) {
+                const existingPlanForLeg = await FlightPlan.findOne({
+                    pilot: pilot._id,
+                    'rosterLeg.rosterId': pilot.currentRoster._id,
+                    'rosterLeg.flightNumber': flightNumber,
+                    status: { $in: ['PLANNED', 'FLYING', 'COMPLETED'] }
+                });
+                if (existingPlanForLeg) {
+                    return res.status(400).json({ message: 'You have already filed a flight plan for this specific roster leg.' });
+                }
 
-            planData.departure = leg.departure;
-            planData.arrival = leg.arrival;
-            planData.aircraft = leg.aircraft;
-            rosterLegData.rosterId = pilot.currentRoster._id;
-            rosterLegData.flightNumber = leg.flightNumber;
+                console.log(`Flight plan ${flightNumber} is being filed as a roster leg.`);
+                planData.departure = leg.departure;
+                planData.arrival = leg.arrival;
+                planData.aircraft = leg.aircraft;
+                rosterLegData.rosterId = pilot.currentRoster._id;
+                rosterLegData.flightNumber = leg.flightNumber;
+            }
+        }
+        
+        // 2. If it's not a roster flight (or pilot is off-duty), use the user's provided data
+        if (!rosterLegData.rosterId) {
+             console.log(`Flight plan ${flightNumber} is being filed as a non-roster flight.`);
+             planData.departure = departure;
+             planData.arrival = arrival;
+             planData.aircraft = aircraft;
         }
 
+        // 3. Final validation and creation
         const requiredRank = deduceRankFromAircraft(planData.aircraft);
         if (!canFlyLeg(pilot.rank, requiredRank)) {
             return res.status(403).json({ message: `This aircraft/route requires ${requiredRank}, which is above your rank (${pilot.rank}).` });
@@ -1424,9 +1440,7 @@ app.post('/api/flightplans', authMiddleware, async (req, res) => {
             ficNumber: generateFicNumber(),
             adcNumber: generateAdcNumber(),
             squawkCode: squawkCode || generateSquawkCode(),
-            rosterLeg: pilot.dutyStatus === 'ON_DUTY' ? rosterLegData : undefined,
-
-            // --- NEW: Save the detailed SimBrief data ---
+            rosterLeg: rosterLegData.rosterId ? rosterLegData : undefined, // Only add if it's a roster leg
             zfw, tow, cargo, fuelTaxi, fuelTrip, fuelTotal, 
             v1, vr, v2, vref, 
             departureWeather, arrivalWeather
