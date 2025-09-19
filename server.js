@@ -338,7 +338,7 @@ const HighlightSchema = new mongoose.Schema({
 });
 const Highlight = mongoose.model('Highlight', HighlightSchema);
 
-// --- NEW: Flight Plan Schema ---
+// --- UPDATED: Flight Plan Schema ---
 const FlightPlanSchema = new mongoose.Schema({
     pilot: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     flightNumber: { type: String, required: true, trim: true },
@@ -359,6 +359,22 @@ const FlightPlanSchema = new mongoose.Schema({
         enum: ['PLANNED', 'FLYING', 'COMPLETED', 'CANCELLED'],
         default: 'PLANNED'
     },
+    
+    // --- NEW: FIELDS TO STORE SIMBRIEF OFP DATA ---
+    zfw: { type: Number },
+    tow: { type: Number },
+    cargo: { type: Number },
+    fuelTaxi: { type: Number },
+    fuelTrip: { type: Number },
+    fuelTotal: { type: Number },
+    v1: { type: String },
+    vr: { type: String },
+    v2: { type: String },
+    vref: { type: String },
+    departureWeather: { type: String },
+    arrivalWeather: { type: String },
+    // --- END OF NEW FIELDS ---
+
     // For roster flights
     rosterLeg: {
         rosterId: { type: mongoose.Schema.Types.ObjectId, ref: 'Roster' },
@@ -1339,8 +1355,12 @@ app.post('/api/me/notifications/read', authMiddleware, async (req, res) => {
 
 app.post('/api/flightplans', authMiddleware, async (req, res) => {
     try {
-        // MODIFIED: Added squawkCode to the destructured request body
-        const { flightNumber, departure, arrival, aircraft, etd, eet, alternate, pob, route, squawkCode } = req.body;
+        // MODIFIED: Destructure all new fields from the request body
+        const { 
+            flightNumber, departure, arrival, aircraft, etd, eet, alternate, pob, route, squawkCode,
+            zfw, tow, cargo, fuelTaxi, fuelTrip, fuelTotal, v1, vr, v2, vref, departureWeather, arrivalWeather 
+        } = req.body;
+        
         if (!flightNumber || !departure || !arrival || !aircraft || !etd || !eet || !alternate || !pob || !route) {
             return res.status(400).json({ message: 'Please provide all required flight plan details.' });
         }
@@ -1403,9 +1423,13 @@ app.post('/api/flightplans', authMiddleware, async (req, res) => {
             eta: etaDate,
             ficNumber: generateFicNumber(),
             adcNumber: generateAdcNumber(),
-            // MODIFIED: Use the squawkCode from the request if it exists, otherwise generate a new one.
             squawkCode: squawkCode || generateSquawkCode(),
-            rosterLeg: pilot.dutyStatus === 'ON_DUTY' ? rosterLegData : undefined
+            rosterLeg: pilot.dutyStatus === 'ON_DUTY' ? rosterLegData : undefined,
+
+            // --- NEW: Save the detailed SimBrief data ---
+            zfw, tow, cargo, fuelTaxi, fuelTrip, fuelTotal, 
+            v1, vr, v2, vref, 
+            departureWeather, arrivalWeather
         });
 
         await newFlightPlan.save();
