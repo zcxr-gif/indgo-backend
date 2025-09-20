@@ -474,7 +474,6 @@ const deleteS3Object = async (imageUrl) => {
     }
 };
 
-
 const updateGoogleSheet = async (pilotData) => {
     if (!pilotData || !pilotData.callsign) {
         console.warn('updateGoogleSheet called without pilot data or callsign. Aborting sheet update.');
@@ -596,14 +595,6 @@ const deleteRowFromGoogleSheet = async (callsign) => {
     } catch (error) {
         console.error(`Error deleting row from Google Sheet for callsign ${callsign}:`, error.message);
     }
-};
-
-const acarsAuthMiddleware = (req, res, next) => {
-    const providedKey = req.header('X-ACARS-API-Key');
-    if (!providedKey || providedKey !== process.env.ACARS_API_KEY) {
-        return res.status(401).json({ message: 'Unauthorized: Invalid or missing ACARS API key.' });
-    }
-    next();
 };
 
 const deduceRankFromAircraft = (acStr) => {
@@ -1944,95 +1935,6 @@ app.delete('/api/rosters/:rosterId', authMiddleware, isRouteManager, async (req,
     } catch (error) {
         console.error(error);
         res.status(500).json({ message: 'Server error while deleting roster.' });
-    }
-});
-
-app.get('/api/acars/tracked-flights', acarsAuthMiddleware, async (req, res) => {
-    try {
-        const activeFlights = await FlightPlan.find({ status: 'FLYING' })
-            .select('pilot flightNumber')
-            .populate('pilot', 'ifc'); // We need the pilot's IFC handle for the IF API
-
-        const response = activeFlights.map(plan => ({
-            flightPlanId: plan._id,
-            // The IF API uses the IFC Community Username (userId), not our database ID.
-            // Assuming the 'ifc' field in your User schema stores this username.
-            userId: plan.pilot.ifc, 
-            callsign: plan.flightNumber
-        }));
-
-        res.json(response);
-    } catch (error) {
-        console.error('ACARS Error: Could not fetch tracked flights.', error);
-        res.status(500).json({ message: 'Server error fetching tracked flights.' });
-    }
-});
-
-
-// POST /api/acars/complete-flight
-// Endpoint for the tracker to report that a flight has ended, automatically filing the PIREP.
-app.post('/api/acars/complete-flight', acarsAuthMiddleware, async (req, res) => {
-    const { flightPlanId } = req.body;
-    if (!flightPlanId) {
-        return res.status(400).json({ message: 'flightPlanId is required.' });
-    }
-
-    try {
-        const flightPlan = await FlightPlan.findById(flightPlanId);
-        if (!flightPlan) return res.status(404).json({ message: 'Flight plan not found.' });
-        if (flightPlan.status !== 'FLYING') return res.status(400).json({ message: `Cannot auto-complete. Flight status is '${flightPlan.status}'.` });
-
-        // --- This logic is adapted from your manual '/api/flightplans/:id/arrive' endpoint ---
-        flightPlan.status = 'COMPLETED';
-        flightPlan.actualArrivalTime = Date.now();
-        const flightTimeHours = (flightPlan.actualArrivalTime - flightPlan.actualDepartureTime) / (1000 * 60 * 60);
-
-        const newPirepData = {
-            pilot: flightPlan.pilot,
-            flightNumber: flightPlan.flightNumber,
-            departure: flightPlan.departure,
-            arrival: flightPlan.arrival,
-            aircraft: flightPlan.aircraft,
-            flightTime: parseFloat(flightTimeHours.toFixed(2)),
-            remarks: 'Automatically filed via ACARS tracker.',
-            // No verification image for automatic PIREPs
-            verificationImageUrl: null, 
-            status: 'PENDING',
-            isMultiplierEligible: false,
-        };
-
-        if (flightPlan.rosterLeg && flightPlan.rosterLeg.rosterId) {
-            const roster = await Roster.findById(flightPlan.rosterLeg.rosterId);
-            if (roster) {
-                const leg = roster.legs.find(l => l.flightNumber === flightPlan.flightNumber);
-                if (leg) {
-                    newPirepData.rankUnlock = leg.rankUnlock;
-                    newPirepData.operator = leg.operator;
-                    newPirepData.rosterLeg = flightPlan.rosterLeg;
-                    const lastLegInRoster = roster.legs[roster.legs.length - 1];
-                    if (lastLegInRoster.flightNumber.toUpperCase() === flightPlan.flightNumber.toUpperCase()) {
-                        newPirepData.isMultiplierEligible = true;
-                    }
-                }
-            }
-        } else {
-            newPirepData.rankUnlock = deduceRankFromAircraft(flightPlan.aircraft);
-            newPirepData.operator = 'IndGo Air Virtual';
-        }
-
-        const newPirep = new Pirep(newPirepData);
-        await newPirep.save();
-
-        await User.updateOne({ _id: flightPlan.pilot }, { $set: { currentFlightPlan: null } });
-        await flightPlan.save();
-        // --- End of adapted logic ---
-
-        console.log(`ACARS: Successfully auto-filed PIREP for Flight Plan ${flightPlanId} (${flightPlan.flightNumber}).`);
-        res.status(201).json({ message: 'Flight completed and PIREP auto-filed successfully.', pirep: newPirep });
-
-    } catch (error) {
-        console.error(`ACARS Error: Failed to complete flight for plan ${flightPlanId}`, error);
-        res.status(500).json({ message: 'Server error while auto-completing flight.' });
     }
 });
 
