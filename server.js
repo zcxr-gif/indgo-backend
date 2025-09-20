@@ -1623,19 +1623,7 @@ app.post('/api/flightplans/:id/cancel', authMiddleware, async (req, res) => {
         
         // --- MODIFICATION START ---
         // Erase all Simbrief and map data upon cancellation
-        flightPlan.mapData = undefined;
-        flightPlan.zfw = undefined;
-        flightPlan.tow = undefined;
-        flightPlan.cargo = undefined;
-        flightPlan.fuelTaxi = undefined;
-        flightPlan.fuelTrip = undefined;
-        flightPlan.fuelTotal = undefined;
-        flightPlan.v1 = undefined;
-        flightPlan.vr = undefined;
-        flightPlan.v2 = undefined;
-        flightPlan.vref = undefined;
-        flightPlan.departureWeather = undefined;
-        flightPlan.arrivalWeather = undefined;
+        await FlightPlan.findByIdAndDelete(req.params.id);
         // --- MODIFICATION END ---
         
         await flightPlan.save();
