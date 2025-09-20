@@ -1498,6 +1498,24 @@ app.get('/api/flightplans/my-active', authMiddleware, async (req, res) => {
     }
 });
 
+app.get('/api/flightplans/:id', authMiddleware, async (req, res) => {
+    try {
+        const flightPlan = await FlightPlan.findOne({ 
+            _id: req.params.id, 
+            pilot: req.user._id // Ensure the user only fetches their own plan
+        });
+
+        if (!flightPlan) {
+            return res.status(404).json({ message: 'Flight plan not found or you do not have permission to view it.' });
+        }
+        
+        res.json(flightPlan);
+    } catch (error) {
+        console.error('Error fetching flight plan by ID:', error);
+        res.status(500).json({ message: 'Server error while fetching flight plan.' });
+    }
+});
+
 app.post('/api/flightplans/:id/depart', authMiddleware, async (req, res) => {
     try {
         const flightPlan = await FlightPlan.findById(req.params.id);
