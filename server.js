@@ -373,6 +373,7 @@ const FlightPlanSchema = new mongoose.Schema({
     vref: { type: String },
     departureWeather: { type: String },
     arrivalWeather: { type: String },
+    mapData: { type: mongoose.Schema.Types.Mixed }, // NEW: Compact data for map plotting
     // --- END OF NEW FIELDS ---
 
     // For roster flights
@@ -1370,7 +1371,7 @@ app.post('/api/flightplans', authMiddleware, async (req, res) => {
     try {
         const { 
             flightNumber, departure, arrival, aircraft, etd, eet, alternate, pob, route, squawkCode,
-            zfw, tow, cargo, fuelTaxi, fuelTrip, fuelTotal, v1, vr, v2, vref, departureWeather, arrivalWeather 
+            zfw, tow, cargo, fuelTaxi, fuelTrip, fuelTotal, v1, vr, v2, vref, departureWeather, arrivalWeather, mapData
         } = req.body;
         
         if (!flightNumber || !departure || !arrival || !aircraft || !etd || !eet || !alternate || !pob || !route) {
@@ -1456,7 +1457,8 @@ app.post('/api/flightplans', authMiddleware, async (req, res) => {
             rosterLeg: rosterLegData.rosterId ? rosterLegData : undefined, // Only add if it's a roster leg
             zfw, tow, cargo, fuelTaxi, fuelTrip, fuelTotal, 
             v1, vr, v2, vref, 
-            departureWeather, arrivalWeather
+            departureWeather, arrivalWeather,
+            mapData
         });
 
         await newFlightPlan.save();
@@ -1514,6 +1516,24 @@ app.post('/api/flightplans/:id/arrive', authMiddleware, upload.single('verificat
 
         flightPlan.status = 'COMPLETED';
         flightPlan.actualArrivalTime = Date.now();
+        
+        // --- MODIFICATION START ---
+        // Erase all Simbrief and map data upon completion to save space and for privacy
+        flightPlan.mapData = undefined;
+        flightPlan.zfw = undefined;
+        flightPlan.tow = undefined;
+        flightPlan.cargo = undefined;
+        flightPlan.fuelTaxi = undefined;
+        flightPlan.fuelTrip = undefined;
+        flightPlan.fuelTotal = undefined;
+        flightPlan.v1 = undefined;
+        flightPlan.vr = undefined;
+        flightPlan.v2 = undefined;
+        flightPlan.vref = undefined;
+        flightPlan.departureWeather = undefined;
+        flightPlan.arrivalWeather = undefined;
+        // --- MODIFICATION END ---
+        
         const flightTimeHours = (flightPlan.actualArrivalTime - flightPlan.actualDepartureTime) / (1000 * 60 * 60);
 
         const newPirepData = {
@@ -1570,6 +1590,24 @@ app.post('/api/flightplans/:id/cancel', authMiddleware, async (req, res) => {
         if (flightPlan.status !== 'PLANNED') return res.status(400).json({ message: `Cannot cancel a flight that is already '${flightPlan.status}'.` });
 
         flightPlan.status = 'CANCELLED';
+        
+        // --- MODIFICATION START ---
+        // Erase all Simbrief and map data upon cancellation
+        flightPlan.mapData = undefined;
+        flightPlan.zfw = undefined;
+        flightPlan.tow = undefined;
+        flightPlan.cargo = undefined;
+        flightPlan.fuelTaxi = undefined;
+        flightPlan.fuelTrip = undefined;
+        flightPlan.fuelTotal = undefined;
+        flightPlan.v1 = undefined;
+        flightPlan.vr = undefined;
+        flightPlan.v2 = undefined;
+        flightPlan.vref = undefined;
+        flightPlan.departureWeather = undefined;
+        flightPlan.arrivalWeather = undefined;
+        // --- MODIFICATION END ---
+        
         await flightPlan.save();
         await User.updateOne({ _id: flightPlan.pilot }, { $set: { currentFlightPlan: null } });
 
