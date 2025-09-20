@@ -305,6 +305,17 @@ const InviteSchema = new mongoose.Schema({
 }, { timestamps: true });
 const Invite = mongoose.model('Invite', InviteSchema);
 
+// *** MODIFICATION: ADDED TTL INDEX FOR INVITES ***
+// Add a TTL index to automatically delete used invites after 24 hours.
+// This index only applies to documents where the status is 'ACCEPTED'.
+InviteSchema.index(
+    { "updatedAt": 1 }, // The index is on the 'updatedAt' field, which is set when the status changes
+    {
+        expireAfterSeconds: 86400, // 24 hours in seconds (24 * 60 * 60)
+        partialFilterExpression: { status: 'ACCEPTED' }
+    }
+);
+
 
 // --- Admin Log Schema ---
 const AdminLogSchema = new mongoose.Schema({
