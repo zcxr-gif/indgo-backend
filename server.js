@@ -25,6 +25,8 @@
 // - MODIFIED: PIREP filing is now automated via the flight plan completion process.
 // - MODIFIED: PIREP approval now allows staff to correct the flight time.
 // - NEW: Airport country codes are now automatically resolved and stored in rosters.
+// - FIXED: Flight Plans are now properly deleted after PIREP review (both approved and rejected).
+// - FIXED: Redundant data stripping removed from flight arrival process.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -1547,7 +1549,6 @@ app.post('/api/flightplans/:id/arrive', authMiddleware, upload.single('verificat
         flightPlan.status = 'COMPLETED';
         flightPlan.actualArrivalTime = Date.now();
         
-        
         const flightTimeHours = (flightPlan.actualArrivalTime - flightPlan.actualDepartureTime) / (1000 * 60 * 60);
 
         const newPirepData = {
@@ -1603,17 +1604,12 @@ app.post('/api/flightplans/:id/cancel', authMiddleware, async (req, res) => {
         if (flightPlan.pilot.toString() !== req.user._id) return res.status(403).json({ message: 'This is not your flight plan.' });
         if (flightPlan.status !== 'PLANNED') return res.status(400).json({ message: `Cannot cancel a flight that is already '${flightPlan.status}'.` });
 
-        flightPlan.status = 'CANCELLED';
-        
-        // --- MODIFICATION START ---
-        // Erase all Simbrief and map data upon cancellation
+        // This endpoint now performs a hard delete instead of just updating status.
         await FlightPlan.findByIdAndDelete(req.params.id);
-        // --- MODIFICATION END ---
-        
-        await flightPlan.save();
+
         await User.updateOne({ _id: flightPlan.pilot }, { $set: { currentFlightPlan: null } });
 
-        res.json({ message: 'Flight plan has been successfully cancelled.' });
+        res.json({ message: 'Flight plan has been successfully cancelled and deleted.' });
     } catch (error) {
         console.error(error);
         res.status(500).json({ message: 'Server error while cancelling flight plan.' });
@@ -1642,7 +1638,6 @@ app.get('/api/pireps/pending', authMiddleware, isPirepManager, async (req, res) 
     }
 });
 
-// --- ***MODIFIED*** PIREP Approval to allow time correction and handle FTPL exemption ---
 app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (req, res) => {
     try {
         const { correctedFlightTime } = req.body; // Staff can optionally send a corrected time
@@ -1740,7 +1735,6 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
                 { $push: { notifications: staffNotification } }
             );
             console.log(`Sent promotion test notification to staff for pilot ${pilot.name}.`);
-            // --- END OF NEW LOGIC ---
         }
         
         await pilot.save();
@@ -1748,20 +1742,22 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
         if (pilot.callsign) {
             updateGoogleSheet({ callsign: pilot.callsign, name: pilot.name, rank: pilot.rank, flightHours: pilot.flightHours });
         }
-
+        
+        // --- FIXED: Delete the original flight plan after approval ---
         try {
             await FlightPlan.deleteOne({
                 pilot: pirep.pilot,
                 flightNumber: pirep.flightNumber,
                 departure: pirep.departure,
                 arrival: pirep.arrival,
-                status: 'COMPLETED' // Ensures we only delete the correct, completed plan
+                status: 'COMPLETED'
             });
             console.log(`Deleted completed flight plan for PIREP ${pirep._id}`);
         } catch (deleteError) {
             console.error('Could not delete the source flight plan:', deleteError);
         }
-        
+        // --- END OF FIX ---
+
         res.json(responsePayload);
 
     } catch (error) {
@@ -1790,7 +1786,8 @@ app.put('/api/pireps/:pirepId/reject', authMiddleware, isPirepManager, async (re
         pirep.reviewedAt = Date.now();
         pirep.verificationImageUrl = null;
         await pirep.save();
-
+        
+        // --- FIXED: Also delete the flight plan when a PIREP is rejected ---
         try {
             await FlightPlan.deleteOne({
                 pilot: pirep.pilot,
@@ -1803,7 +1800,8 @@ app.put('/api/pireps/:pirepId/reject', authMiddleware, isPirepManager, async (re
         } catch (deleteError) {
             console.error('Could not delete the source flight plan for rejected PIREP:', deleteError);
         }
-        
+        // --- END OF FIX ---
+
         res.json({ message: 'PIREP has been successfully rejected.' });
     } catch (error) {
         console.error(error);
