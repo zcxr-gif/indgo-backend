@@ -1547,22 +1547,6 @@ app.post('/api/flightplans/:id/arrive', authMiddleware, upload.single('verificat
         flightPlan.status = 'COMPLETED';
         flightPlan.actualArrivalTime = Date.now();
         
-        // --- MODIFICATION START ---
-        // Erase all Simbrief and map data upon completion to save space and for privacy
-        flightPlan.mapData = undefined;
-        flightPlan.zfw = undefined;
-        flightPlan.tow = undefined;
-        flightPlan.cargo = undefined;
-        flightPlan.fuelTaxi = undefined;
-        flightPlan.fuelTrip = undefined;
-        flightPlan.fuelTotal = undefined;
-        flightPlan.v1 = undefined;
-        flightPlan.vr = undefined;
-        flightPlan.v2 = undefined;
-        flightPlan.vref = undefined;
-        flightPlan.departureWeather = undefined;
-        flightPlan.arrivalWeather = undefined;
-        // --- MODIFICATION END ---
         
         const flightTimeHours = (flightPlan.actualArrivalTime - flightPlan.actualDepartureTime) / (1000 * 60 * 60);
 
@@ -1764,6 +1748,19 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
         if (pilot.callsign) {
             updateGoogleSheet({ callsign: pilot.callsign, name: pilot.name, rank: pilot.rank, flightHours: pilot.flightHours });
         }
+
+        try {
+            await FlightPlan.deleteOne({
+                pilot: pirep.pilot,
+                flightNumber: pirep.flightNumber,
+                departure: pirep.departure,
+                arrival: pirep.arrival,
+                status: 'COMPLETED' // Ensures we only delete the correct, completed plan
+            });
+            console.log(`Deleted completed flight plan for PIREP ${pirep._id}`);
+        } catch (deleteError) {
+            console.error('Could not delete the source flight plan:', deleteError);
+        }
         
         res.json(responsePayload);
 
@@ -1793,6 +1790,19 @@ app.put('/api/pireps/:pirepId/reject', authMiddleware, isPirepManager, async (re
         pirep.reviewedAt = Date.now();
         pirep.verificationImageUrl = null;
         await pirep.save();
+
+        try {
+            await FlightPlan.deleteOne({
+                pilot: pirep.pilot,
+                flightNumber: pirep.flightNumber,
+                departure: pirep.departure,
+                arrival: pirep.arrival,
+                status: 'COMPLETED'
+            });
+            console.log(`Deleted completed flight plan for REJECTED PIREP ${pirep._id}`);
+        } catch (deleteError) {
+            console.error('Could not delete the source flight plan for rejected PIREP:', deleteError);
+        }
         
         res.json({ message: 'PIREP has been successfully rejected.' });
     } catch (error) {
