@@ -411,7 +411,8 @@ const PirepSchema = new mongoose.Schema({
         // MODIFIED: rosterId is now a string pointing to a DynamoDB item
         rosterId: { type: String },
         flightNumber: { type: String }
-    }
+    },
+    sourceFlightPlanId: { type: mongoose.Schema.Types.ObjectId, ref: 'FlightPlan' }
 });
 const Pirep = mongoose.model('Pirep', PirepSchema);
 PirepSchema.index({ pilot: 1 });
@@ -1474,6 +1475,7 @@ app.post('/api/flightplans/:id/arrive', authMiddleware, upload.single('verificat
             pilot: flightPlan.pilot, flightNumber: flightPlan.flightNumber, departure: flightPlan.departure,
             arrival: flightPlan.arrival, aircraft: flightPlan.aircraft, flightTime: parseFloat(flightTimeHours.toFixed(2)),
             remarks, verificationImageUrl: req.file.location, status: 'PENDING', isMultiplierEligible: false,
+            sourceFlightPlanId: flightPlan._id 
         };
 
         if (flightPlan.rosterLeg && flightPlan.rosterLeg.rosterId) {
@@ -1662,7 +1664,9 @@ app.put('/api/pireps/:pirepId/reject', authMiddleware, isPirepManager, async (re
         await pirep.save();
 
         try {
-            await FlightPlan.deleteOne({ pilot: pirep.pilot, flightNumber: pirep.flightNumber, departure: pirep.departure, arrival: pirep.arrival, status: 'COMPLETED' });
+            if (pirep.sourceFlightPlanId) {
+        await FlightPlan.findByIdAndDelete(pirep.sourceFlightPlanId);
+            } 
         } catch (deleteError) {
             console.error('Could not delete the source flight plan for rejected PIREP:', deleteError);
         }
