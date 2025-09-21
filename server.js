@@ -1474,8 +1474,10 @@ app.post('/api/flightplans', authMiddleware, async (req, res) => {
             departureWeather, arrivalWeather,
             mapData
         });
+        
+        await newFlightPlan.save();  
 
-         pilot.currentFlightPlans.push(newFlightPlan._id);
+        pilot.currentFlightPlans.push(newFlightPlan._id);
 
         await pilot.save();
 
