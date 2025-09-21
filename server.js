@@ -2093,6 +2093,10 @@ app.get('/api/logs', authMiddleware, isAdmin, async (req, res) => {
     }
 });
 
+app.get('/health', (req, res) => {
+  res.status(200).json({ ok: true, status: 'alive', timestamp: new Date().toISOString() });
+});
+
 // 8. START THE SERVER
 app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
