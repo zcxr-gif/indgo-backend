@@ -1475,8 +1475,8 @@ app.post('/api/flightplans', authMiddleware, async (req, res) => {
             mapData
         });
 
-        await newFlightPlan.save();
-        pilot.currentFlightPlan = newFlightPlan._id;
+         pilot.currentFlightPlans.push(newFlightPlan._id);
+
         await pilot.save();
 
         res.status(201).json({ message: 'Flight plan filed successfully. You are cleared to depart at your ETD.', flightPlan: newFlightPlan });
