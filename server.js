@@ -234,7 +234,7 @@ const UserSchema = new mongoose.Schema({
         default: 'ACTIVE'
     },
     // NEW: Link to active flight plan
-    currentFlightPlan: { type: mongoose.Schema.Types.ObjectId, ref: 'FlightPlan', default: null },
+    currentFlightPlans: [{ type: mongoose.Schema.Types.ObjectId, ref: 'FlightPlan' }],
     notifications: [{
         message: { type: String, required: true },
         read: { type: Boolean, default: false },
@@ -1290,7 +1290,7 @@ app.delete('/api/invites/:inviteId', authMiddleware, isAdmin, async (req, res) =
 // --- MODIFIED /api/me to deliver notifications ---
 app.get('/api/me', authMiddleware, async (req, res) => {
     try {
-        const user = await User.findById(req.user._id).select('-password').populate('currentFlightPlan').lean();
+        const user = await User.findById(req.user._id).select('-password').populate('currentFlightPlans').lean();
         if (!user) return res.status(404).json({ message: 'User not found.' });
 
         user.timeUntilNextDutyMs = 0;
@@ -1399,8 +1399,8 @@ app.post('/api/flightplans', authMiddleware, async (req, res) => {
         if (pilot.promotionStatus === 'PENDING_TEST') {
             return res.status(403).json({ message: 'You are awaiting promotion tests and cannot file new flight plans.' });
         }
-        if (pilot.currentFlightPlan) {
-            return res.status(400).json({ message: 'You already have an active flight plan. Please complete or cancel it first.' });
+        if (pilot.currentFlightPlans && pilot.currentFlightPlans.length >= 2) {
+    return res.status(400).json({ message: 'You have reached the maximum of 2 active flights. Please complete or cancel one first.' });
         }
 
         // --- NEW LOGIC TO HANDLE ALL FLIGHT TYPES ---
@@ -1487,18 +1487,6 @@ app.post('/api/flightplans', authMiddleware, async (req, res) => {
     }
 });
 
-app.get('/api/flightplans/my-active', authMiddleware, async (req, res) => {
-    try {
-        const pilot = await User.findById(req.user._id).populate('currentFlightPlan');
-        if (!pilot) return res.status(404).json({ message: 'Pilot not found.' });
-        if (!pilot.currentFlightPlan) return res.json(null); // No active plan is a valid state
-
-        res.json(pilot.currentFlightPlan);
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: 'Server error fetching active flight plan.' });
-    }
-});
 
 app.get('/api/flightplans/:id', authMiddleware, async (req, res) => {
     try {
@@ -1586,7 +1574,7 @@ app.post('/api/flightplans/:id/arrive', authMiddleware, upload.single('verificat
         const newPirep = new Pirep(newPirepData);
         await newPirep.save();
 
-        await User.updateOne({ _id: flightPlan.pilot }, { $set: { currentFlightPlan: null } });
+        await User.updateOne({ _id: flightPlan.pilot }, { $pull: { currentFlightPlans: flightPlan._id } });
         await flightPlan.save();
 
         res.status(201).json({ message: 'Flight completed successfully! Your PIREP has been automatically generated and is pending review.', pirep: newPirep });
@@ -1607,7 +1595,7 @@ app.post('/api/flightplans/:id/cancel', authMiddleware, async (req, res) => {
         // This endpoint now performs a hard delete instead of just updating status.
         await FlightPlan.findByIdAndDelete(req.params.id);
 
-        await User.updateOne({ _id: flightPlan.pilot }, { $set: { currentFlightPlan: null } });
+        await User.updateOne({ _id: flightPlan.pilot }, { $pull: { currentFlightPlans: flightPlan._id } });
 
         res.json({ message: 'Flight plan has been successfully cancelled and deleted.' });
     } catch (error) {
