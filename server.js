@@ -2162,7 +2162,7 @@ app.get('/auth/discord/start', authMiddleware, (req, res) => {
 });
 
 // Discord callback
-app.get('/auth/discord/callback', async (req, res, next) => {
+app.get('/api/auth/discord/callback', async (req, res, next) => {
   if (!ENABLE_DISCORD) return res.status(501).send('Discord linking not configured');
   try {
     const { state } = req.query;
