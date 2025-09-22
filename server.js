@@ -103,7 +103,7 @@ if (ENABLE_DISCORD) {
     {
       clientID: process.env.DISCORD_CLIENT_ID,
       clientSecret: process.env.DISCORD_CLIENT_SECRET,
-      callbackURL: `${process.env.OAUTH_BASE_URL}/auth/discord/callback`,
+      callbackURL: `${process.env.OAUTH_BASE_URL}/api/auth/discord/callback`,
       scope: ['identify'],
       passReqToCallback: true
     },
@@ -2155,7 +2155,7 @@ app.get('/auth/discord/start', authMiddleware, (req, res) => {
     client_id: process.env.DISCORD_CLIENT_ID,
     response_type: 'code',
     scope: 'identify',
-    redirect_uri: `${process.env.OAUTH_BASE_URL}/auth/discord/callback`,
+    redirect_uri: `${process.env.OAUTH_BASE_URL}/api/auth/discord/callback`,
     state
   });
   res.redirect(`https://discord.com/api/oauth2/authorize?${params.toString()}`);
