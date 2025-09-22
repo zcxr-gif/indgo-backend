@@ -16,7 +16,7 @@
 // - Test & Practical based promotion system for specific ranks.
 // - Flight Planning system with FIC/ADC codes and automated PIREP generation.
 // - Invite-based registration system for new pilots.
-// - Daily flight hour counter now resets intelligently when starting a new duty.
+// - Daily flight hour counter now resets intelligently then starting a new duty.
 // - Endpoint for user profile now includes time remaining on crew rest and notifications.
 // - Off-roster (non-duty) PIREPs no longer affect FTPL counters.
 // - Roster generation now creates a mix of single-rank and mixed-rank duties.
@@ -2148,7 +2148,7 @@ app.listen(PORT, () => {
 // ===== Connected Accounts Linking Routes =====
 
 // Start Discord linking (stateless)
-app.get('/auth/discord/start', authMiddleware, (req, res) => {
+app.get('/api/auth/discord/start', authMiddleware, (req, res) => {
   if (!ENABLE_DISCORD) return res.status(501).json({ message: 'Discord linking not configured.' });
   const state = makeLinkState(req.user._id, 'discord');
   const params = new URLSearchParams({
