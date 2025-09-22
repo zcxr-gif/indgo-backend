@@ -16,7 +16,7 @@
 // - Test & Practical based promotion system for specific ranks.
 // - Flight Planning system with FIC/ADC codes and automated PIREP generation.
 // - Invite-based registration system for new pilots.
-// - Daily flight hour counter now resets intelligently then starting a new duty.
+// - Daily flight hour counter now resets intelligentlyhen starting a new duty.
 // - Endpoint for user profile now includes time remaining on crew rest and notifications.
 // - Off-roster (non-duty) PIREPs no longer affect FTPL counters.
 // - Roster generation now creates a mix of single-rank and mixed-rank duties.
@@ -247,6 +247,7 @@ const UserSchema = new mongoose.Schema({
     bio: { type: String, default: '' },
     imageUrl: { type: String, default: '' },
     discord: { type: String, default: '' },
+    infiniteFlightUsername: { type: String, default: '', trim: true },
     ifc: { type: String, default: '' },
     youtube: { type: String, default: '' },
     preferredContact: { type: String, enum: ['none', 'discord', 'ifc', 'youtube'], default: 'none' },
@@ -1315,8 +1316,8 @@ app.get('/api/me', authMiddleware, async (req, res) => {
 
 app.put('/api/me', authMiddleware, upload.single('profilePicture'), async (req, res) => {
     try {
-        const { name, bio, discord, ifc, youtube, preferredContact } = req.body;
-        const updatedData = { name, bio, discord, ifc, youtube, preferredContact };
+        const { name, bio, discord, infiniteFlightUsername, ifc, youtube, preferredContact } = req.body;
+        const updatedData = { name, bio, discord, infiniteFlightUsername, ifc, youtube, preferredContact };
 
         if (req.file) {
             const oldUser = await User.findById(req.user._id);
@@ -2148,7 +2149,7 @@ app.listen(PORT, () => {
 // ===== Connected Accounts Linking Routes =====
 
 // Start Discord linking (stateless)
-app.get('/api/auth/discord/start', authMiddleware, (req, res) => {
+app.get('/auth/discord/start', authMiddleware, (req, res) => {
   if (!ENABLE_DISCORD) return res.status(501).json({ message: 'Discord linking not configured.' });
   const state = makeLinkState(req.user._id, 'discord');
   const params = new URLSearchParams({
