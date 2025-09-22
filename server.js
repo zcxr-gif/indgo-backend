@@ -31,6 +31,8 @@ const express = require('express');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const passport = require('passport');
+const { Strategy: DiscordStrategy } = require('passport-discord');
 const multer = require('multer');
 const path = require('path');
 const { S3Client, DeleteObjectCommand } = require('@aws-sdk/client-s3');
@@ -82,6 +84,34 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
+
+// Initialize Passport for OAuth linking
+app.use(passport.initialize());
+
+// --- Connected Accounts Linking: helpers & Discord strategy ---
+function makeLinkState(userId, provider) {
+  return jwt.sign({ uid: userId, provider, typ: 'link' }, process.env.JWT_SECRET, { expiresIn: '10m' });
+}
+function verifyLinkState(token) {
+  return jwt.verify(token, process.env.JWT_SECRET);
+}
+
+const ENABLE_DISCORD = !!(process.env.DISCORD_CLIENT_ID && process.env.DISCORD_CLIENT_SECRET && process.env.OAUTH_BASE_URL);
+
+if (ENABLE_DISCORD) {
+  passport.use('discord-link', new DiscordStrategy(
+    {
+      clientID: process.env.DISCORD_CLIENT_ID,
+      clientSecret: process.env.DISCORD_CLIENT_SECRET,
+      callbackURL: `${process.env.OAUTH_BASE_URL}/auth/discord/callback`,
+      scope: ['identify'],
+      passReqToCallback: true
+    },
+    async (req, accessToken, refreshToken, profile, done) => {
+      try { return done(null, { profile }); } catch (err) { return done(err); }
+    }
+  ));
+}
 
 // Multer configuration for AWS S3 uploads
 const upload = multer({
@@ -220,6 +250,17 @@ const UserSchema = new mongoose.Schema({
     ifc: { type: String, default: '' },
     youtube: { type: String, default: '' },
     preferredContact: { type: String, enum: ['none', 'discord', 'ifc', 'youtube'], default: 'none' },
+
+    // Connected accounts (OAuth or manual)
+    connectedAccounts: [{
+        provider: { type: String, enum: ['discord','google','youtube','ifc','vatsim','ivao','infiniteflight'], required: true },
+        externalId: { type: String, default: '' },
+        username: { type: String, default: '' },
+        url: { type: String, default: '' },
+        verified: { type: Boolean, default: true },
+        linkedAt: { type: Date, default: Date.now },
+        meta: { type: mongoose.Schema.Types.Mixed }
+    }],
     createdAt: { type: Date, default: Date.now },
     // FTPL Fields
     dutyStatus: { type: String, enum: ['ON_REST', 'ON_DUTY'], default: 'ON_REST' },
@@ -2097,7 +2138,112 @@ app.get('/health', (req, res) => {
   res.status(200).json({ ok: true, status: 'alive', timestamp: new Date().toISOString() });
 });
 
-// 8. START THE SERVER
+
+// 8. START THE SERVE1
 app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
+});
+
+
+// ===== Connected Accounts Linking Routes =====
+
+// Start Discord linking (stateless)
+app.get('/auth/discord/start', authMiddleware, (req, res) => {
+  if (!ENABLE_DISCORD) return res.status(501).json({ message: 'Discord linking not configured.' });
+  const state = makeLinkState(req.user._id, 'discord');
+  const params = new URLSearchParams({
+    client_id: process.env.DISCORD_CLIENT_ID,
+    response_type: 'code',
+    scope: 'identify',
+    redirect_uri: `${process.env.OAUTH_BASE_URL}/auth/discord/callback`,
+    state
+  });
+  res.redirect(`https://discord.com/api/oauth2/authorize?${params.toString()}`);
+});
+
+// Discord callback
+app.get('/auth/discord/callback', async (req, res, next) => {
+  if (!ENABLE_DISCORD) return res.status(501).send('Discord linking not configured');
+  try {
+    const { state } = req.query;
+    if (!state) return res.status(400).send('Missing state');
+    let decoded;
+    try { decoded = verifyLinkState(state); } catch { return res.status(400).send('State expired or invalid'); }
+    if (decoded.typ !== 'link' || decoded.provider !== 'discord') return res.status(400).send('Invalid state');
+
+    passport.authenticate('discord-link', { session: false }, async (err, data) => {
+      if (err || !data?.profile) return res.status(400).send('Discord auth failed');
+      const profile = data.profile;
+      const discordId = profile.id;
+      const username = `${profile.username}${profile.discriminator ? '#' + profile.discriminator : ''}`;
+
+      const user = await User.findById(decoded.uid);
+      if (!user) return res.status(404).send('User not found');
+
+      user.connectedAccounts = user.connectedAccounts || [];
+      const existing = user.connectedAccounts.find(a => a.provider === 'discord');
+      const payload = {
+        provider: 'discord',
+        externalId: discordId,
+        username,
+        url: `https://discord.com/users/${discordId}`,
+        verified: true,
+        linkedAt: new Date(),
+        meta: { avatar: profile.avatar }
+      };
+      if (existing) { Object.assign(existing, payload); } else { user.connectedAccounts.push(payload); }
+      if (!user.discord) user.discord = username; // optional mirror
+      await user.save();
+
+      const redirectTo = process.env.POST_LINK_REDIRECT || '/';
+      res.redirect(redirectTo);
+    })(req, res, next);
+  } catch (e) {
+    console.error('Discord link callback error', e);
+    res.status(500).send('Linking failed');
+  }
+});
+
+// List connected accounts
+app.get('/api/me/links', authMiddleware, async (req, res) => {
+  const me = await User.findById(req.user._id).select('connectedAccounts discord ifc youtube');
+  if (!me) return res.status(404).json({ message: 'User not found' });
+  res.json({ connectedAccounts: me.connectedAccounts || [], legacy: { discord: me.discord, ifc: me.ifc, youtube: me.youtube } });
+});
+
+// Manually add/update a link (unverified)
+app.post('/api/me/links', authMiddleware, async (req, res) => {
+  const { provider, externalId, username, url } = req.body || {};
+  const allowed = ['ifc','vatsim','ivao','infiniteflight','youtube','google','discord'];
+  if (!allowed.includes(provider)) return res.status(400).json({ message: 'Unsupported provider' });
+  if (!externalId && !username && !url) return res.status(400).json({ message: 'Provide at least one of externalId, username, or url' });
+
+  const user = await User.findById(req.user._id);
+  if (!user) return res.status(404).json({ message: 'User not found' });
+  user.connectedAccounts = user.connectedAccounts || [];
+
+  let entry = user.connectedAccounts.find(a => a.provider === provider);
+  if (!entry) {
+    entry = { provider, externalId: externalId || '', username: username || '', url: url || '', verified: false, linkedAt: new Date(), meta: {} };
+    user.connectedAccounts.push(entry);
+  } else {
+    if (externalId != null) entry.externalId = externalId;
+    if (username   != null) entry.username  = username;
+    if (url        != null) entry.url       = url;
+    entry.verified = entry.verified && provider !== 'ifc' ? entry.verified : false;
+    entry.linkedAt = new Date();
+  }
+  await user.save();
+  res.json({ message: 'Account link saved', connectedAccounts: user.connectedAccounts });
+});
+
+// Unlink
+app.delete('/api/me/links/:provider', authMiddleware, async (req, res) => {
+  const provider = req.params.provider;
+  const user = await User.findById(req.user._id);
+  if (!user) return res.status(404).json({ message: 'User not found' });
+  const before = (user.connectedAccounts || []).length;
+  user.connectedAccounts = (user.connectedAccounts || []).filter(a => a.provider !== provider);
+  await user.save();
+  res.json({ message: before === (user.connectedAccounts || []).length ? 'No link found for provider' : 'Unlinked successfully' });
 });
