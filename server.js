@@ -2158,7 +2158,10 @@ app.get('/auth/discord/start', authMiddleware, (req, res) => {
     redirect_uri: `${process.env.OAUTH_BASE_URL}/api/auth/discord/callback`,
     state
   });
-  res.redirect(`https://discord.com/api/oauth2/authorize?${params.toString()}`);
+  // ✅ Create the URL but don't redirect
+  const discordAuthUrl = `https://discord.com/api/oauth2/authorize?${params.toString()}`;
+  // ✅ Send the URL back to the frontend in a JSON response
+  res.json({ redirectUrl: discordAuthUrl });
 });
 
 // Discord callback
