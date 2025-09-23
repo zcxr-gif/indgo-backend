@@ -1,4 +1,4 @@
-// server.js (Fully Merged, Updated & Performance Tuned with Rosters in DynamoDB)
+// server.js (Fully Merged, Updated & Performance Tuned with Rosters in DynamoDB and ACARS-lite tracking)
 // - Roster system fully migrated to DynamoDB for scalability.
 // - Automated Roster Generation reads from Google Sheets and writes directly to DynamoDB.
 // - Strict Flight & Duty Time Limitations (FTPL) engine.
@@ -24,6 +24,7 @@
 // - PIREP approval now allows staff to correct the flight time.
 // - Airport country codes are now automatically resolved and stored in rosters.
 // - Flight Plans are now properly deleted after PIREP review (both approved and rejected).
+// - ACARS-lite flight tracking system integrated via live_flights service.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -996,6 +997,37 @@ const isPilotManager = hasRole(['admin', 'Chief Executive Officer (CEO)', 'Chief
 const isPirepManager = hasRole(['admin', 'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)', 'PIREP Manager (PM)']);
 const isRouteManager = hasRole(['admin', 'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)', 'Route Manager (RM)']);
 
+// --- ACARS Tracking Config & Helpers ---
+const LIVE_FLIGHTS_URL = (process.env.LIVE_FLIGHTS_URL || '').trim();
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').trim();
+const TRACK_WEBHOOK_SECRET = (process.env.TRACK_WEBHOOK_SECRET || '').trim();
+const DEFAULT_IF_SERVER = (process.env.DEFAULT_IF_SERVER || 'Expert Server').trim();
+
+function requireWebhookSecret(req, res, next) {
+    const got = req.header('x-acars-signature') || '';
+    if (!TRACK_WEBHOOK_SECRET || got !== TRACK_WEBHOOK_SECRET) {
+        return res.status(401).json({ message: 'Unauthorized webhook' });
+    }
+    next();
+}
+
+function ensureMap(obj) {
+    if (!obj.mapData) obj.mapData = {};
+    if (!obj.mapData.ifTracking) obj.mapData.ifTracking = {};
+}
+
+async function callLiveFlightsStart({ username, server, flightPlanId }) {
+    if (!LIVE_FLIGHTS_URL) throw new Error('LIVE_FLIGHTS_URL not set');
+    const callbackUrl = `${PUBLIC_BASE_URL}/api/acars/track-hook?flightPlanId=${encodeURIComponent(flightPlanId)}`;
+    const body = { username, server: server || DEFAULT_IF_SERVER, callbackUrl };
+
+    const r = await axios.post(`${LIVE_FLIGHTS_URL}/track/start`, body, {
+        timeout: 10000,
+        headers: { 'x-acars-signature': TRACK_WEBHOOK_SECRET || '' }
+    });
+    return r.data;
+}
+
 
 // 7. API ROUTES (ENDPOINTS)
 
@@ -1583,6 +1615,127 @@ app.post('/api/flightplans/:id/cancel', authMiddleware, async (req, res) => {
     }
 });
 
+// --- ACARS Tracking Routes ---
+app.post('/api/acars/track/start/:flightPlanId', authMiddleware, async (req, res) => {
+    try {
+        const { flightPlanId } = req.params;
+        const server = (req.body?.server || DEFAULT_IF_SERVER);
+
+        const flightPlan = await FlightPlan.findById(flightPlanId);
+        if (!flightPlan) return res.status(404).json({ message: 'Flight plan not found.' });
+        if (flightPlan.pilot.toString() !== req.user._id) return res.status(403).json({ message: 'This is not your flight plan.' });
+
+        const pilot = await User.findById(req.user._id).lean();
+        const username = (pilot?.infiniteFlightUsername || '').trim();
+        if (!username) return res.status(400).json({ message: 'Please set your Infinite Flight username in your profile.' });
+
+        const resp = await callLiveFlightsStart({ username, server, flightPlanId });
+
+        const plan = await FlightPlan.findById(flightPlanId);
+        ensureMap(plan);
+        plan.mapData.ifTracking = {
+            status: 'searching',
+            server,
+            tracker: (resp?.trackers?.[0] || null),
+            lastUpdate: new Date().toISOString()
+        };
+        await plan.save();
+
+        res.json({ ok: true, message: 'Tracking started', tracker: plan.mapData.ifTracking });
+    } catch (e) {
+        console.error('track/start error', e?.message);
+        res.status(500).json({ message: 'Failed to start tracking.' });
+    }
+});
+
+app.post('/api/acars/track-hook', requireWebhookSecret, async (req, res) => {
+    try {
+        const { status, username, server, flight, trackerId } = req.body || {};
+        const flightPlanId = req.query.flightPlanId;
+        if (!flightPlanId) return res.status(400).json({ message: 'Missing flightPlanId' });
+
+        const plan = await FlightPlan.findById(flightPlanId);
+        if (!plan) return res.status(404).json({ message: 'Flight plan not found.' });
+
+        ensureMap(plan);
+        const info = plan.mapData.ifTracking || {};
+        info.lastUpdate = new Date().toISOString();
+        info.status = status || info.status;
+        if (trackerId) info.tracker = { ...(info.tracker || {}), id: trackerId };
+        if (server) info.server = server;
+
+        if (status === 'found' && flight) {
+            info.flight = {
+                sessionId: flight.sessionId,
+                flightId: flight.flightId,
+                callsign: flight.callsign,
+                userId: flight.userId
+            };
+            if (plan.status === 'PLANNED') {
+                plan.status = 'FLYING';
+                plan.actualDepartureTime = new Date();
+            }
+        } else if (status === 'not_found') {
+            info.reason = req.body?.reason || 'timeout_15m';
+        }
+
+        plan.mapData.ifTracking = info;
+        await plan.save();
+
+        // Optional: notify pilot
+        try {
+            const pilot = await User.findById(plan.pilot);
+            if (pilot) {
+                const message = (status === 'found')
+                    ? `Detected your IF flight (${info.flight?.callsign || username}). Flight set to FLYING.`
+                    : (status === 'not_found')
+                        ? 'Could not find your IF flight within 15 minutes.'
+                        : null;
+                if (message) {
+                    pilot.notifications = pilot.notifications || [];
+                    pilot.notifications.push({ message, createdAt: new Date(), read: false });
+                    await pilot.save();
+                }
+            }
+        } catch {}
+
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('track-hook error', e?.message);
+        res.status(500).json({ message: 'Server error in webhook.' });
+    }
+});
+
+app.post('/api/acars/track/stop/:flightPlanId', authMiddleware, async (req, res) => {
+    try {
+        const plan = await FlightPlan.findById(req.params.flightPlanId);
+        if (!plan) return res.status(404).json({ message: 'Flight plan not found.' });
+        if (plan.pilot.toString() !== req.user._id) return res.status(403).json({ message: 'This is not your flight plan.' });
+
+        ensureMap(plan);
+        if (plan.mapData.ifTracking) plan.mapData.ifTracking.status = 'stopped';
+        await plan.save();
+
+        res.json({ ok: true, message: 'Tracking stopped.' });
+    } catch (e) {
+        res.status(500).json({ message: 'Failed to stop tracking.' });
+    }
+});
+
+app.get('/api/acars/status/:flightPlanId', authMiddleware, async (req, res) => {
+    try {
+        const plan = await FlightPlan.findById(req.params.flightPlanId);
+        if (!plan) return res.status(404).json({ message: 'Flight plan not found.' });
+        if (plan.pilot.toString() !== req.user._id) return res.status(403).json({ message: 'This is not your flight plan.' });
+
+        ensureMap(plan);
+        res.json({ ok: true, ifTracking: plan.mapData.ifTracking || null, status: plan.status });
+    } catch (e) {
+        res.status(500).json({ message: 'Failed to get tracking status.' });
+    }
+});
+
+
 app.get('/api/me/pireps', authMiddleware, async (req, res) => {
     try {
         const pireps = await Pirep.find({ pilot: req.user._id }).sort({ createdAt: -1 }).lean();
@@ -2152,7 +2305,7 @@ app.get('/health', (req, res) => {
 });
 
 
-// 8. START THE SERVE1
+// 8. START THE SERVER
 app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
 });
