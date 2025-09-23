@@ -1038,6 +1038,18 @@ app.delete('/api/routes/:flightNumber', authMiddleware, isRouteManager, async (r
     }
 });
 
+// NEW: Endpoint to get all routes for the dashboard
+app.get('/api/routes', authMiddleware, isRouteManager, async (req, res) => {
+    try {
+        // Uses the existing ddbScanAll helper to fetch all items from the routes table
+        const items = await ddbScanAll(ROUTES_TABLE);
+        res.json(items);
+    } catch (e) {
+        console.error('Error scanning routes table:', e);
+        res.status(500).json({ message: 'Failed to fetch routes.' });
+    }
+});
+
 app.get('/api/routes/by-departure/:icao', authMiddleware, isRouteManager, async (req, res) => {
     try {
         const icao = req.params.icao.toUpperCase();
@@ -1517,7 +1529,7 @@ app.post('/api/flightplans/:id/arrive', authMiddleware, upload.single('verificat
             pilot: flightPlan.pilot, flightNumber: flightPlan.flightNumber, departure: flightPlan.departure,
             arrival: flightPlan.arrival, aircraft: flightPlan.aircraft, flightTime: parseFloat(flightTimeHours.toFixed(2)),
             remarks, verificationImageUrl: req.file.location, status: 'PENDING', isMultiplierEligible: false,
-            sourceFlightPlanId: flightPlan._id 
+            sourceFlightPlanId: flightPlan._id
         };
 
         if (flightPlan.rosterLeg && flightPlan.rosterLeg.rosterId) {
@@ -1708,7 +1720,7 @@ app.put('/api/pireps/:pirepId/reject', authMiddleware, isPirepManager, async (re
         try {
             if (pirep.sourceFlightPlanId) {
         await FlightPlan.findByIdAndDelete(pirep.sourceFlightPlanId);
-            } 
+            }
         } catch (deleteError) {
             console.error('Could not delete the source flight plan for rejected PIREP:', deleteError);
         }
