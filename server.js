@@ -25,6 +25,8 @@
 // - Airport country codes are now automatically resolved and stored in rosters.
 // - Flight Plans are now properly deleted after PIREP review (both approved and rejected).
 // - ACARS-lite flight tracking system integrated via live_flights service.
+// - NEW: Codeshare partner management system with logo uploads (S3 + DynamoDB).
+// - NEW: Routes now require both 'operator' and 'livery' fields upon creation.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -74,6 +76,7 @@ const ddb = new DynamoDBClient({
 const ddbDoc = DynamoDBDocumentClient.from(ddb, { marshallOptions: { removeUndefinedValues: true } });
 const ROUTES_TABLE = process.env.DDB_ROUTES_TABLE || 'Routes';
 const ROSTERS_TABLE = process.env.DDB_ROSTERS_TABLE || 'Rosters';
+const CODESHARE_TABLE = process.env.DDB_CODESHARE_TABLE || 'CodesharePartners';
 
 
 // 3. MIDDLEWARE
@@ -135,6 +138,20 @@ const upload = multer({
             const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
             const fileName = `${file.fieldname}-${uniqueSuffix}${path.extname(file.originalname)}`;
             cb(null, `${folder}${fileName}`);
+        }
+    })
+});
+
+// NEW: Multer configuration specifically for codeshare logos
+const uploadCodeshareLogo = multer({
+    storage: multerS3({
+        s3: s3Client,
+        bucket: process.env.AWS_S3_BUCKET_NAME,
+        contentType: multerS3.AUTO_CONTENT_TYPE,
+        key: function (req, file, cb) {
+            const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+            const fileName = `logo-${uniqueSuffix}${path.extname(file.originalname)}`;
+            cb(null, `codeshares/${fileName}`);
         }
     })
 });
@@ -620,7 +637,7 @@ const deleteRowFromGoogleSheet = async (callsign) => {
 
 const deduceRankFromAircraft = (acStr) => {
     const s = String(acStr || '').toUpperCase();
-    if (!s) return 'Unknown';
+    if (!s) return 'IndGo Cadet'; // Return a default valid rank
     const has = (pat) => new RegExp(pat, 'i').test(s);
     if (has('(DH8D|Q400|A320|B738)')) return 'IndGo Cadet';
     if (has('(A321|B737|B739)')) return 'Skyline Observer';
@@ -633,7 +650,7 @@ const deduceRankFromAircraft = (acStr) => {
     if (has('CHIEF')) return 'Chief Flight Instructor';
     if (has('SKYMASTER')) return 'IndGo SkyMaster';
     if (has('COMMANDER')) return 'Blue Legacy Commander';
-    return 'Unknown';
+    return 'IndGo Cadet'; // Return a default valid rank
 };
 
 
@@ -1043,37 +1060,51 @@ app.get('/api/airports', async (req, res) => {
     }
 });
 
-// --- Admin Routes CRUD (DynamoDB for Routes) ---
+// --- Admin Routes & Codeshares CRUD (DynamoDB) ---
+
+// MERGED & FIXED: Add/replace a route — now requires operator and livery
 app.post('/api/routes', authMiddleware, isRouteManager, async (req, res) => {
     try {
         const item = req.body || {};
-        const required = ['flightNumber', 'departure', 'arrival', 'aircraft', 'flightTime', 'operator'];
+        const required = ['flightNumber', 'departure', 'arrival', 'aircraft', 'flightTime', 'operator', 'livery'];
         const missing = required.filter(k => !item[k]);
-        if (missing.length) return res.status(400).json({ message: `Missing fields: ${missing.join(', ')}` });
-        item.departure = String(item.departure).toUpperCase();
-        item.arrival = String(item.arrival).toUpperCase();
+        if (missing.length) {
+            return res.status(400).json({ message: `Missing fields: ${missing.join(', ')}` });
+        }
+
+        // Normalize and clean data
+        item.flightNumber = String(item.flightNumber).toUpperCase().trim();
+        item.departure = String(item.departure).toUpperCase().trim();
+        item.arrival = String(item.arrival).toUpperCase().trim();
+        item.aircraft = String(item.aircraft).trim();
+        item.operator = String(item.operator).trim();
+        item.livery = String(item.livery).trim();
+        item.flightTime = Number(item.flightTime);
         item.type = item.type || 'primary';
         item.rankUnlock = item.rankUnlock || deduceRankFromAircraft(item.aircraft || '');
+
         await ddbDoc.send(new PutCommand({ TableName: ROUTES_TABLE, Item: item }));
         res.status(201).json({ message: 'Route saved.' });
     } catch (e) {
+        console.error('POST /api/routes failed:', e);
         res.status(500).json({ message: 'Failed to save route.' });
     }
 });
 
 app.delete('/api/routes/:flightNumber', authMiddleware, isRouteManager, async (req, res) => {
     try {
-        await ddbDoc.send(new DeleteCommand({ TableName: ROUTES_TABLE, Key: { flightNumber: req.params.flightNumber } }));
+        const flightNumber = String(req.params.flightNumber || '').toUpperCase().trim();
+        if (!flightNumber) return res.status(400).json({ message: 'flightNumber is required' });
+        await ddbDoc.send(new DeleteCommand({ TableName: ROUTES_TABLE, Key: { flightNumber } }));
         res.json({ message: 'Route deleted.' });
     } catch (e) {
+        console.error('DELETE /api/routes/:flightNumber failed:', e);
         res.status(500).json({ message: 'Failed to delete route.' });
     }
 });
 
-// NEW: Endpoint to get all routes for the dashboard
 app.get('/api/routes', authMiddleware, isRouteManager, async (req, res) => {
     try {
-        // Uses the existing ddbScanAll helper to fetch all items from the routes table
         const items = await ddbScanAll(ROUTES_TABLE);
         res.json(items);
     } catch (e) {
@@ -1092,6 +1123,66 @@ app.get('/api/routes/by-departure/:icao', authMiddleware, isRouteManager, async 
     } catch (e) {
         res.status(500).json({ message: 'Failed to query routes.' });
     }
+});
+
+
+// --- NEW: CODESHARE PARTNER MANAGEMENT ---
+
+// List all codeshare partners
+app.get('/api/codeshares', authMiddleware, isRouteManager, async (req, res) => {
+    try {
+        const items = await ddbScanAll(CODESHARE_TABLE);
+        res.json(items);
+    } catch (e) {
+        console.error('GET /api/codeshares failed:', e);
+        res.status(500).json({ message: 'Failed to load codeshare partners.' });
+    }
+});
+
+// Add/update a codeshare partner
+app.post('/api/codeshares', authMiddleware, isRouteManager, async (req, res) => {
+    try {
+        const { name, logoUrl } = req.body || {};
+        if (!name || !logoUrl) {
+            return res.status(400).json({ message: 'Missing fields: name, logoUrl' });
+        }
+        await ddbDoc.send(new PutCommand({
+            TableName: CODESHARE_TABLE,
+            Item: { name, logoUrl }
+        }));
+        res.status(201).json({ message: 'Codeshare partner saved.' });
+    } catch (e) {
+        console.error('POST /api/codeshares failed:', e);
+        res.status(500).json({ message: 'Failed to save codeshare partner.' });
+    }
+});
+
+// Delete a codeshare partner by name
+app.delete('/api/codeshares/:name', authMiddleware, isRouteManager, async (req, res) => {
+    try {
+        const name = req.params.name;
+        await ddbDoc.send(new DeleteCommand({
+            TableName: CODESHARE_TABLE,
+            Key: { name }
+        }));
+        res.json({ message: 'Codeshare partner deleted.' });
+    } catch (e) {
+        console.error('DELETE /api/codeshares/:name failed:', e);
+        res.status(500).json({ message: 'Failed to delete codeshare partner.' });
+    }
+});
+
+// Upload a logo for a codeshare partner
+app.post('/api/codeshares/logo', authMiddleware, isRouteManager, (req, res, next) => {
+    if (!process.env.AWS_S3_BUCKET_NAME) {
+        return res.status(400).json({ message: 'AWS_S3_BUCKET_NAME environment variable not set.' });
+    }
+    next();
+}, uploadCodeshareLogo.single('logo'), (req, res) => {
+    if (!req.file || !req.file.location) {
+        return res.status(400).json({ message: 'File upload failed.' });
+    }
+    res.status(201).json({ logoUrl: req.file.location });
 });
 
 
