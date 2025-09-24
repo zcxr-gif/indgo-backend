@@ -25,6 +25,7 @@
 // - Airport country codes are now automatically resolved and stored in rosters.
 // - Flight Plans are now properly deleted after PIREP review (both approved and rejected).
 // - ACARS-lite flight tracking system integrated via live_flights service.
+// - NEW: Automatic PIREP filing on landing detection via ACARS.
 // - Codeshare partner management system with logo uploads (S3 + DynamoDB).
 // - Routes now require both 'operator' and 'livery' fields upon creation.
 // - NEW: Aircraft management system with image uploads and rank unlocks (MongoDB + S3).
@@ -488,6 +489,11 @@ const PirepSchema = new mongoose.Schema({
         // MODIFIED: rosterId is now a string pointing to a DynamoDB item
         rosterId: { type: String },
         flightNumber: { type: String }
+    },
+    source: {
+        type: String,
+        enum: ['MANUAL', 'ACARS'],
+        default: 'MANUAL'
     },
     sourceFlightPlanId: { type: mongoose.Schema.Types.ObjectId, ref: 'FlightPlan' }
 });
@@ -1787,6 +1793,7 @@ app.post('/api/flightplans/:id/arrive', authMiddleware, upload.single('verificat
             pilot: flightPlan.pilot, flightNumber: flightPlan.flightNumber, departure: flightPlan.departure,
             arrival: flightPlan.arrival, aircraft: flightPlan.aircraft, flightTime: parseFloat(flightTimeHours.toFixed(2)),
             remarks, verificationImageUrl: req.file.location, status: 'PENDING', isMultiplierEligible: false,
+            source: 'MANUAL',
             sourceFlightPlanId: flightPlan._id
         };
 
@@ -1876,7 +1883,7 @@ app.post('/api/acars/track/start/:flightPlanId', authMiddleware, async (req, res
 
 app.post('/api/acars/track-hook', requireWebhookSecret, async (req, res) => {
     try {
-        const { status, username, server, flight, trackerId } = req.body || {};
+        const { status, username, server, flight, trackerId, flightDurationMs, airport, reason } = req.body || {};
         const flightPlanId = req.query.flightPlanId;
         if (!flightPlanId) return res.status(400).json({ message: 'Missing flightPlanId' });
 
@@ -1902,32 +1909,80 @@ app.post('/api/acars/track-hook', requireWebhookSecret, async (req, res) => {
                 plan.actualDepartureTime = new Date();
             }
         } else if (status === 'not_found') {
-            info.reason = req.body?.reason || 'timeout_15m';
+            info.reason = reason || 'timeout_15m';
+        } else if (status === 'landed') {
+            // --- START: NEW ACARS PIREP FILING LOGIC ---
+            info.status = 'landed';
+            if (airport) info.landedAt = airport.icao;
+
+            if (plan.status === 'COMPLETED') {
+                console.log(`[ACARS] Received 'landed' webhook for already completed flight plan ${plan._id}. Ignoring.`);
+                plan.mapData.ifTracking = info;
+                await plan.save();
+                return res.json({ ok: true, message: 'Flight plan was already completed.' });
+            }
+
+            plan.status = 'COMPLETED';
+            plan.actualArrivalTime = new Date();
+
+            const flightTimeHours = flightDurationMs > 0 ? (flightDurationMs / (1000 * 60 * 60)) : 0;
+
+            const newPirepData = {
+                pilot: plan.pilot,
+                flightNumber: plan.flightNumber,
+                departure: plan.departure,
+                arrival: plan.arrival,
+                aircraft: plan.aircraft,
+                flightTime: parseFloat(flightTimeHours.toFixed(2)),
+                remarks: `Automatically filed via ACARS. Detected landing at ${airport?.icao || plan.arrival}.`,
+                status: 'PENDING',
+                isMultiplierEligible: false,
+                sourceFlightPlanId: plan._id,
+                source: 'ACARS' // Tag this PIREP as coming from ACARS
+            };
+
+            // Handle Roster Leg logic for multipliers and rank unlocks
+            if (plan.rosterLeg && plan.rosterLeg.rosterId) {
+                const rosterResponse = await ddbDoc.send(new GetCommand({ TableName: ROSTERS_TABLE, Key: { rosterId: plan.rosterLeg.rosterId } }));
+                const roster = rosterResponse.Item;
+                if (roster) {
+                    const leg = roster.legs.find(l => l.flightNumber === plan.flightNumber);
+                    if (leg) {
+                        newPirepData.rankUnlock = leg.rankUnlock;
+                        newPirepData.operator = leg.operator;
+                        newPirepData.rosterLeg = plan.rosterLeg;
+                        const lastLegInRoster = roster.legs[roster.legs.length - 1];
+                        if (lastLegInRoster.flightNumber.toUpperCase() === plan.flightNumber.toUpperCase()) {
+                            newPirepData.isMultiplierEligible = true;
+                        }
+                    }
+                }
+            } else {
+                newPirepData.rankUnlock = deduceRankFromAircraft(plan.aircraft);
+                newPirepData.operator = 'IndGo Air Virtual';
+            }
+
+            const newPirep = new Pirep(newPirepData);
+            await newPirep.save();
+            
+            console.log(`[ACARS] Filed new PIREP ${newPirep._id} for Flight Plan ${plan._id}`);
+
+            // Update pilot's active flights and send notification
+            const pilot = await User.findById(plan.pilot);
+            if (pilot) {
+                pilot.notifications.push({ message: `Flight ${plan.flightNumber} landed. A PIREP has been automatically filed for review.`, createdAt: new Date() });
+                pilot.currentFlightPlans.pull(plan._id);
+                await pilot.save();
+            }
+            // --- END: NEW ACARS PIREP FILING LOGIC ---
         }
 
         plan.mapData.ifTracking = info;
         await plan.save();
 
-        // Optional: notify pilot
-        try {
-            const pilot = await User.findById(plan.pilot);
-            if (pilot) {
-                const message = (status === 'found')
-                    ? `Detected your IF flight (${info.flight?.callsign || username}). Flight set to FLYING.`
-                    : (status === 'not_found')
-                        ? 'Could not find your IF flight within 15 minutes.'
-                        : null;
-                if (message) {
-                    pilot.notifications = pilot.notifications || [];
-                    pilot.notifications.push({ message, createdAt: new Date(), read: false });
-                    await pilot.save();
-                }
-            }
-        } catch {}
-
         res.json({ ok: true });
     } catch (e) {
-        console.error('track-hook error', e?.message);
+        console.error('track-hook error', e?.message, e);
         res.status(500).json({ message: 'Server error in webhook.' });
     }
 });
@@ -2063,7 +2118,9 @@ app.put('/api/pireps/:pirepId/approve', authMiddleware, isPirepManager, async (r
         }
 
         try {
-            await FlightPlan.deleteOne({ pilot: pirep.pilot, flightNumber: pirep.flightNumber, departure: pirep.departure, arrival: pirep.arrival, status: 'COMPLETED' });
+            if (pirep.sourceFlightPlanId) {
+                await FlightPlan.findByIdAndDelete(pirep.sourceFlightPlanId);
+            }
         } catch (deleteError) {
             console.error('Could not delete the source flight plan:', deleteError);
         }
@@ -2098,7 +2155,7 @@ app.put('/api/pireps/:pirepId/reject', authMiddleware, isPirepManager, async (re
 
         try {
             if (pirep.sourceFlightPlanId) {
-        await FlightPlan.findByIdAndDelete(pirep.sourceFlightPlanId);
+                await FlightPlan.findByIdAndDelete(pirep.sourceFlightPlanId);
             }
         } catch (deleteError) {
             console.error('Could not delete the source flight plan for rejected PIREP:', deleteError);
