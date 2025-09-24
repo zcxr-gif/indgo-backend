@@ -1,4 +1,4 @@
-// server.js (Fully Merged, Updated & Performance Tuned with Rosters in DynamoDB and ACARS-lite tracking)
+// server.js (Fully Merged, Updated & Performance Tuned with Rosters in DynamoDB, ACARS-lite tracking, and Aircraft Manager)
 // - Roster system fully migrated to DynamoDB for scalability.
 // - Automated Roster Generation reads from Google Sheets and writes directly to DynamoDB.
 // - Strict Flight & Duty Time Limitations (FTPL) engine.
@@ -25,8 +25,10 @@
 // - Airport country codes are now automatically resolved and stored in rosters.
 // - Flight Plans are now properly deleted after PIREP review (both approved and rejected).
 // - ACARS-lite flight tracking system integrated via live_flights service.
-// - NEW: Codeshare partner management system with logo uploads (S3 + DynamoDB).
-// - NEW: Routes now require both 'operator' and 'livery' fields upon creation.
+// - Codeshare partner management system with logo uploads (S3 + DynamoDB).
+// - Routes now require both 'operator' and 'livery' fields upon creation.
+// - NEW: Aircraft management system with image uploads and rank unlocks (MongoDB + S3).
+// - NEW: Enhanced /api/routes GET endpoint with server-side filtering.
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -142,7 +144,7 @@ const upload = multer({
     })
 });
 
-// NEW: Multer configuration specifically for codeshare logos
+// Multer configuration specifically for codeshare logos
 const uploadCodeshareLogo = multer({
     storage: multerS3({
         s3: s3Client,
@@ -155,6 +157,21 @@ const uploadCodeshareLogo = multer({
         }
     })
 });
+
+// Multer configuration for aircraft images
+const uploadAircraftImage = multer({
+    storage: multerS3({
+        s3: s3Client,
+        bucket: process.env.AWS_S3_BUCKET_NAME,
+        contentType: multerS3.AUTO_CONTENT_TYPE,
+        key: function (req, file, cb) {
+            const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+            const fileName = `aircraft-${uniqueSuffix}${path.extname(file.originalname)}`;
+            cb(null, `aircraft/${fileName}`);
+        }
+    })
+});
+
 
 // Function to load airport data into memory
 const loadAirportsData = async () => {
@@ -480,6 +497,21 @@ PirepSchema.index({ status: 1 });
 PirepSchema.index({ 'rosterLeg.rosterId': 1, 'rosterLeg.flightNumber': 1 });
 
 // --- REMOVED: RosterSchema and Roster model are deleted. Rosters are now in DynamoDB. ---
+
+// --- Aircraft Schema ---
+const AircraftSchema = new mongoose.Schema({
+    name:       { type: String, required: true, trim: true },
+    icao:       { type: String, required: true, trim: true, uppercase: true },
+    type:       { type: String, required: true, trim: true }, // e.g., narrowbody, widebody, turboprop
+    rankUnlock: { type: String, required: true, enum: pilotRanks }, // Uses the existing pilotRanks constant
+    codeshare:  { type: String, required: true, trim: true }, // operator name (must match route.operator)
+    imageUrl:   { type: String, default: null },             // external link
+    s3ImageUrl: { type: String, default: null },             // S3 link for uploaded files
+    createdAt:  { type: Date, default: Date.now }
+}, { timestamps: true });
+
+AircraftSchema.index({ icao: 1, codeshare: 1 });
+const Aircraft = mongoose.model('Aircraft', AircraftSchema);
 
 
 // 6. HELPER FUNCTIONS & MIDDLEWARE
@@ -1062,7 +1094,7 @@ app.get('/api/airports', async (req, res) => {
 
 // --- Admin Routes & Codeshares CRUD (DynamoDB) ---
 
-// MERGED & FIXED: Add/replace a route — now requires operator and livery
+// Add/replace a route — now requires operator and livery
 app.post('/api/routes', authMiddleware, isRouteManager, async (req, res) => {
     try {
         const item = req.body || {};
@@ -1103,15 +1135,27 @@ app.delete('/api/routes/:flightNumber', authMiddleware, isRouteManager, async (r
     }
 });
 
+// Enhanced GET with server-side filtering
 app.get('/api/routes', authMiddleware, isRouteManager, async (req, res) => {
     try {
         const items = await ddbScanAll(ROUTES_TABLE);
-        res.json(items);
+        const { operator, aircraft, icao } = req.query;
+        const norm = s => String(s || '').trim().toUpperCase();
+
+        const filtered = items.filter(it => {
+            const opOk   = !operator || String(it.operator || '') === operator;
+            const acOk   = !aircraft || norm(it.aircraft).includes(norm(aircraft));
+            const icaoOk = !icao || (norm(it.departure).includes(norm(icao)) || norm(it.arrival).includes(norm(icao)));
+            return opOk && acOk && icaoOk;
+        });
+
+        res.json(filtered);
     } catch (e) {
-        console.error('Error scanning routes table:', e);
+        console.error('[GET /api/routes] error:', e);
         res.status(500).json({ message: 'Failed to fetch routes.' });
     }
 });
+
 
 app.get('/api/routes/by-departure/:icao', authMiddleware, isRouteManager, async (req, res) => {
     try {
@@ -1126,7 +1170,7 @@ app.get('/api/routes/by-departure/:icao', authMiddleware, isRouteManager, async 
 });
 
 
-// --- NEW: CODESHARE PARTNER MANAGEMENT ---
+// --- CODESHARE PARTNER MANAGEMENT ---
 
 // List all codeshare partners
 app.get('/api/codeshares', authMiddleware, isRouteManager, async (req, res) => {
@@ -1183,6 +1227,97 @@ app.post('/api/codeshares/logo', authMiddleware, isRouteManager, (req, res, next
         return res.status(400).json({ message: 'File upload failed.' });
     }
     res.status(201).json({ logoUrl: req.file.location });
+});
+
+// --- AIRCRAFT MANAGEMENT ---
+
+// GET all aircraft (optional filter by codeshare/operator)
+app.get('/api/aircrafts', authMiddleware, isRouteManager, async (req, res) => {
+    try {
+        const { codeshare } = req.query;
+        const q = codeshare ? { codeshare } : {};
+        const items = await Aircraft.find(q).sort({ codeshare: 1, icao: 1 }).lean();
+        res.json(items);
+    } catch (e) {
+        console.error('[GET /api/aircrafts] error:', e);
+        res.status(500).json({ message: 'Failed to load aircraft.' });
+    }
+});
+
+// GET unique aircraft types
+app.get('/api/aircrafts/types', authMiddleware, isRouteManager, async (req, res) => {
+    try {
+        const types = await Aircraft.distinct('type');
+        res.json(types.sort());
+    } catch (e) {
+        console.error('[GET /api/aircrafts/types] error:', e);
+        res.status(500).json({ message: 'Failed to load aircraft types.' });
+    }
+});
+
+// POST create/upsert aircraft
+app.post('/api/aircrafts', authMiddleware, isRouteManager,
+    (req, res, next) => {
+        const ct = (req.headers['content-type'] || '').toLowerCase();
+        if (ct.includes('multipart/form-data')) {
+            if (!process.env.AWS_S3_BUCKET_NAME) {
+                return res.status(400).json({ message: 'AWS_S3_BUCKET_NAME not set for uploads.' });
+            }
+            return uploadAircraftImage.single('aircraftImage')(req, res, next);
+        }
+        next();
+    },
+    async (req, res) => {
+        try {
+            const body = req.body || {};
+            const doc = {
+                name: (body.name || '').trim(),
+                icao: String(body.icao || '').trim().toUpperCase(),
+                type: (body.type || '').trim(),
+                rankUnlock: (body.rankUnlock || '').trim(),
+                codeshare: (body.codeshare || '').trim(),
+            };
+
+            if (!doc.name || !doc.icao || !doc.type || !doc.rankUnlock || !doc.codeshare) {
+                return res.status(400).json({ message: 'Missing fields: name, icao, type, rankUnlock, codeshare' });
+            }
+
+            const uploaded = req.file && req.file.location ? req.file.location : null;
+            const external = (body.imageUrl || '').trim() || null;
+
+            doc.imageUrl = external || null;
+            doc.s3ImageUrl = external ? null : uploaded; // only store S3 if no external link
+
+            const saved = await Aircraft.findOneAndUpdate(
+                { icao: doc.icao, codeshare: doc.codeshare },
+                { $set: doc },
+                { new: true, upsert: true }
+            );
+
+            res.status(201).json(saved);
+        } catch (e) {
+            console.error('[POST /api/aircrafts] error:', e);
+            res.status(500).json({ message: 'Failed to save aircraft.' });
+        }
+    }
+);
+
+// DELETE aircraft by id
+app.delete('/api/aircrafts/:id', authMiddleware, isRouteManager, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const item = await Aircraft.findById(id);
+        if (!item) return res.status(404).json({ message: 'Not found' });
+
+        if (item.s3ImageUrl) {
+            await deleteS3Object(item.s3ImageUrl);
+        }
+        await item.deleteOne();
+        res.json({ message: 'Aircraft deleted.' });
+    } catch (e) {
+        console.error('[DELETE /api/aircrafts/:id] error:', e);
+        res.status(500).json({ message: 'Failed to delete aircraft.' });
+    }
 });
 
 
@@ -2415,9 +2550,7 @@ app.get('/auth/discord/start', authMiddleware, (req, res) => {
     redirect_uri: `${process.env.OAUTH_BASE_URL}/api/auth/discord/callback`,
     state
   });
-  // ✅ Create the URL but don't redirect
   const discordAuthUrl = `https://discord.com/api/oauth2/authorize?${params.toString()}`;
-  // ✅ Send the URL back to the frontend in a JSON response
   res.json({ redirectUrl: discordAuthUrl });
 });
 
