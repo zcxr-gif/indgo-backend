@@ -47,7 +47,7 @@ const { DynamoDBDocumentClient, GetCommand, PutCommand, DeleteCommand, QueryComm
 
 const multerS3 = require('multer-s3');
 const { google } = require('googleapis');
-const Papa = require('papaparse');
+const Papa = require('papaparser');
 const axios = require('axios');
 const fs = require('fs').promises;
 const crypto = require('crypto');
@@ -1291,8 +1291,9 @@ app.post('/api/aircrafts', authMiddleware, isRouteManager,
             const uploaded = req.file && req.file.location ? req.file.location : null;
             const external = (body.imageUrl || '').trim() || null;
 
-            doc.imageUrl = external || null;
-            doc.s3ImageUrl = external ? null : uploaded; // only store S3 if no external link
+            doc.s3ImageUrl = uploaded;
+            doc.imageUrl = uploaded || external;
+
 
             const saved = await Aircraft.findOneAndUpdate(
                 { icao: doc.icao, codeshare: doc.codeshare },
@@ -1307,6 +1308,66 @@ app.post('/api/aircrafts', authMiddleware, isRouteManager,
         }
     }
 );
+
+// NEW: PUT update existing aircraft by ID
+app.put('/api/aircrafts/:id', authMiddleware, isRouteManager,
+    (req, res, next) => {
+        const ct = (req.headers['content-type'] || '').toLowerCase();
+        if (ct.includes('multipart/form-data')) {
+            if (!process.env.AWS_S3_BUCKET_NAME) {
+                return res.status(400).json({ message: 'AWS_S3_BUCKET_NAME not set for uploads.' });
+            }
+            return uploadAircraftImage.single('aircraftImage')(req, res, next);
+        }
+        next();
+    },
+    async (req, res) => {
+        try {
+            const { id } = req.params;
+            const body = req.body || {};
+
+            const aircraft = await Aircraft.findById(id);
+            if (!aircraft) {
+                return res.status(404).json({ message: 'Aircraft not found.' });
+            }
+
+            // Update fields from request body
+            aircraft.name = (body.name || aircraft.name).trim();
+            aircraft.icao = String(body.icao || aircraft.icao).trim().toUpperCase();
+            aircraft.type = (body.type || aircraft.type).trim();
+            aircraft.rankUnlock = (body.rankUnlock || aircraft.rankUnlock).trim();
+            aircraft.codeshare = (body.codeshare || aircraft.codeshare).trim();
+
+            const uploaded = req.file && req.file.location ? req.file.location : null;
+            const external = (body.imageUrl || '').trim() || null;
+
+            // Image update logic
+            if (uploaded) {
+                // If a new file is uploaded, delete the old one from S3
+                if (aircraft.s3ImageUrl) {
+                    await deleteS3Object(aircraft.s3ImageUrl);
+                }
+                aircraft.s3ImageUrl = uploaded;
+                aircraft.imageUrl = uploaded;
+            } else if (external) {
+                 // If an external URL is provided, remove any old S3 image
+                if (aircraft.s3ImageUrl) {
+                    await deleteS3Object(aircraft.s3ImageUrl);
+                    aircraft.s3ImageUrl = null;
+                }
+                aircraft.imageUrl = external;
+            }
+
+            const updatedAircraft = await aircraft.save();
+            res.json(updatedAircraft);
+
+        } catch (e) {
+            console.error('[PUT /api/aircrafts/:id] error:', e);
+            res.status(500).json({ message: 'Failed to update aircraft.' });
+        }
+    }
+);
+
 
 // DELETE aircraft by id
 app.delete('/api/aircrafts/:id', authMiddleware, isRouteManager, async (req, res) => {
