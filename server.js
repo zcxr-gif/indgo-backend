@@ -1849,6 +1849,7 @@ app.post('/api/flightplans/:id/cancel', authMiddleware, async (req, res) => {
 });
 
 // --- ACARS Tracking Routes ---
+
 app.post('/api/acars/track/start/:flightPlanId', authMiddleware, async (req, res) => {
     try {
         const { flightPlanId } = req.params;
@@ -1862,7 +1863,14 @@ app.post('/api/acars/track/start/:flightPlanId', authMiddleware, async (req, res
         const username = (pilot?.infiniteFlightUsername || '').trim();
         if (!username) return res.status(400).json({ message: 'Please set your Infinite Flight username in your profile.' });
 
+        // <<< NEW LOGGING: Log the URL we are about to call >>>
+        console.log(`[ACARS B2B] Attempting to contact ACARS service at: ${LIVE_FLIGHTS_URL}/track/start`);
+        
         const resp = await callLiveFlightsStart({ username, server, flightPlanId });
+        
+        // <<< NEW LOGGING: Log success >>>
+        console.log(`[ACARS B2B] Successfully started ACARS tracking service for user: ${username}`);
+
 
         const plan = await FlightPlan.findById(flightPlanId);
         ensureMap(plan);
@@ -1875,9 +1883,22 @@ app.post('/api/acars/track/start/:flightPlanId', authMiddleware, async (req, res
         await plan.save();
 
         res.json({ ok: true, message: 'Tracking started', tracker: plan.mapData.ifTracking });
+
     } catch (e) {
-        console.error('track/start error', e?.message);
-        res.status(500).json({ message: 'Failed to start tracking.' });
+        // <<< MODIFIED LOGGING: Log the FULL, DETAILED error >>>
+        console.error('[ACARS B2B] FAILED to contact ACARS service. Full Error:', e);
+        
+        // Also check for axios-specific error details
+        if (e.response) {
+            console.error('[ACARS B2B] Axios Response Error Data:', e.response.data);
+            console.error('[ACARS B2B] Axios Response Error Status:', e.response.status);
+        } else if (e.request) {
+            console.error('[ACARS B2B] Axios Request Error: No response received.', e.request);
+        } else {
+            console.error('[ACARS B2B] General Error:', e.message);
+        }
+
+        res.status(500).json({ message: 'Failed to start tracking. The ACARS service could not be reached.' });
     }
 });
 
