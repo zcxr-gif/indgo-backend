@@ -1898,6 +1898,9 @@ app.post('/api/acars/track-hook', requireWebhookSecret, async (req, res) => {
         if (server) info.server = server;
 
         if (status === 'found' && flight) {
+            // <<< DEBUGGER: Log that the departure event was received >>>
+            console.log(`[ACARS Debug] Received 'found' (departure) event for Flight Plan ${plan._id} and user ${username}.`);
+
             info.flight = {
                 sessionId: flight.sessionId,
                 flightId: flight.flightId,
@@ -1968,11 +1971,20 @@ app.post('/api/acars/track-hook', requireWebhookSecret, async (req, res) => {
             console.log(`[ACARS] Filed new PIREP ${newPirep._id} for Flight Plan ${plan._id}`);
 
             // Update pilot's active flights and send notification
+            // <<< DEBUGGER: Log that the system is looking for the user >>>
+            console.log(`[ACARS Debug] Looking for user with ID: ${plan.pilot}`);
             const pilot = await User.findById(plan.pilot);
+            
             if (pilot) {
+                // <<< DEBUGGER: Log that the user was found >>>
+                console.log(`[ACARS Debug] User found: ${pilot.callsign} (${pilot.email})`);
+                
                 pilot.notifications.push({ message: `Flight ${plan.flightNumber} landed. A PIREP has been automatically filed for review.`, createdAt: new Date() });
                 pilot.currentFlightPlans.pull(plan._id);
                 await pilot.save();
+            } else {
+                // <<< DEBUGGER: Log if the user was NOT found >>>
+                console.warn(`[ACARS Debug] User NOT found for pilot ID: ${plan.pilot}`);
             }
             // --- END: NEW ACARS PIREP FILING LOGIC ---
         }
