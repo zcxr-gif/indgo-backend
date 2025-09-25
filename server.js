@@ -2620,6 +2620,157 @@ app.get('/health', (req, res) => {
   res.status(200).json({ ok: true, status: 'alive', timestamp: new Date().toISOString() });
 });
 
+app.post('/api/routes/import-sheet', authMiddleware, isRouteManager, async (req, res) => {
+    const { sheetUrl, operator } = req.body;
+
+    if (!sheetUrl || !operator) {
+        return res.status(400).json({ message: 'A sheetUrl and operator are required.' });
+    }
+
+    console.log(`Starting route import for operator "${operator}" from URL: ${sheetUrl}`);
+
+    // 1. DEFINE HEADER ALIASES (similar to your migration script)
+    // We use a single comprehensive list here.
+    const headerAliases = {
+        flightNumber: ['Flight No.', 'Flight Number', 'Callsign'],
+        departure: ['Departure ICAO', 'Departure', 'Origin', 'From'],
+        arrival: ['Arrival ICAO', 'Arrival', 'Destination', 'To'],
+        aircraft: ['Aircraft(s)', 'Aircraft', 'Plane', 'ICAO'],
+        flightTime: ['Avg. Flight Time', 'Flight Time', 'Duration', 'EET']
+    };
+    const canonicalKeys = Object.keys(headerAliases);
+
+    try {
+        // 2. FETCH AND PARSE THE GOOGLE SHEET (CSV)
+        const response = await axios.get(sheetUrl.trim());
+        const parsed = Papa.parse(response.data, { header: false, skipEmptyLines: true });
+        if (!parsed.data || parsed.data.length < 2) { // Need at least a header and one data row
+            return res.status(400).json({ message: 'Sheet is empty or could not be parsed. Ensure it has a header row and data.' });
+        }
+
+        // 3. DYNAMICALLY FIND THE HEADER ROW AND COLUMN MAPPING
+        let headerRowIndex = -1;
+        let columnMap = {};
+        for (let i = 0; i < parsed.data.length; i++) {
+            const row = parsed.data[i];
+            const tempMap = {};
+            row.forEach((cell, index) => {
+                const header = String(cell || '').trim().toLowerCase();
+                if (!header) return;
+                for (const key of canonicalKeys) {
+                    if (headerAliases[key].some(alias => alias.toLowerCase() === header)) {
+                        tempMap[key] = index;
+                        break;
+                    }
+                }
+            });
+            // Check if we found all essential columns
+            if (Object.keys(tempMap).length >= canonicalKeys.length) {
+                columnMap = tempMap;
+                headerRowIndex = i;
+                console.log(`- Found a valid header row at index ${i}.`);
+                break;
+            }
+        }
+
+        if (headerRowIndex === -1) {
+            return res.status(400).json({ message: `Could not find a valid header row. Please ensure columns like "${canonicalKeys.join('", "')}" are present.` });
+        }
+
+        // 4. PROCESS EACH ROW INTO A ROUTE ITEM
+        const routesToSave = [];
+        const newAircraftAdded = new Set();
+        const dataRows = parsed.data.slice(headerRowIndex + 1);
+
+        for (const row of dataRows) {
+            // Extract and clean data from the row using the column map
+            const aircraftIcao = String(row[columnMap.aircraft] || '').trim().toUpperCase();
+            
+            // Helper function to convert time string (e.g., "3:30" or "3h 30m") to decimal
+            const convertTimeToDecimal = (timeStr) => {
+                if (!timeStr || typeof timeStr !== 'string') return NaN;
+                const trimmedStr = timeStr.trim();
+                if (trimmedStr.includes(':')) {
+                    const parts = trimmedStr.split(':');
+                    if (parts.length >= 2) {
+                        const hours = parseInt(parts[0], 10);
+                        const minutes = parseInt(parts[1], 10);
+                        return !isNaN(hours) && !isNaN(minutes) ? hours + (minutes / 60) : NaN;
+                    }
+                }
+                const hourMatch = trimmedStr.match(/(\d+)\s*h/);
+                const minMatch = trimmedStr.match(/(\d+)\s*m/);
+                let totalHours = 0;
+                if (hourMatch) totalHours += parseInt(hourMatch[1], 10);
+                if (minMatch) totalHours += parseInt(minMatch[1], 10) / 60;
+                return totalHours > 0 ? totalHours : NaN;
+            };
+            
+            // Helper to extract a 4-letter ICAO code
+            const extractIcao = (text) => text ? (String(text).match(/^\s*([A-Z]{4})/) || [])[1] || null : null;
+
+
+            const item = {
+                flightNumber: String(row[columnMap.flightNumber] || '').trim().toUpperCase(),
+                departure: extractIcao(row[columnMap.departure]),
+                arrival: extractIcao(row[columnMap.arrival]),
+                aircraft: aircraftIcao,
+                flightTime: convertTimeToDecimal(row[columnMap.flightTime]),
+                operator: operator.trim(),
+                rankUnlock: deduceRankFromAircraft(aircraftIcao), // Use existing helper
+                type: operator.trim().toLowerCase() === 'indgo air virtual' ? 'primary' : 'codeshare'
+            };
+
+            // 5. VALIDATE THE ITEM AND ADD TO AIRCRAFT MANAGER
+            if (item.flightNumber && item.departure && item.arrival && item.aircraft && item.flightTime > 0) {
+                routesToSave.push(item);
+
+                // --- Automatic Aircraft Manager Linking ---
+                // If this aircraft doesn't exist for this operator, add it.
+                // We use findOneAndUpdate with `upsert` to avoid duplicates.
+                const newAircraft = await Aircraft.findOneAndUpdate(
+                    { icao: item.aircraft, codeshare: item.operator },
+                    { 
+                        $setOnInsert: {
+                            name: item.aircraft, // Defaults to the ICAO code; can be edited by staff later
+                            icao: item.aircraft,
+                            codeshare: item.operator,
+                            type: 'Unknown', // Default value
+                            rankUnlock: item.rankUnlock
+                        }
+                    },
+                    { new: true, upsert: true }
+                );
+                
+                // Track if a *new* aircraft was actually created by the upsert
+                if (newAircraft && newAircraft.createdAt.getTime() === newAircraft.updatedAt.getTime()) {
+                    newAircraftAdded.add(item.aircraft);
+                }
+            }
+        }
+
+        if (routesToSave.length === 0) {
+            return res.status(400).json({ message: 'No valid routes were found in the provided sheet.' });
+        }
+
+        // 6. BATCH WRITE TO DYNAMODB
+        // This uses the existing `batchWriteToDynamo` helper function in your server.js
+        await batchWriteToDynamo(routesToSave, ROUTES_TABLE, 'PutRequest');
+
+        // 7. SEND SUCCESS RESPONSE
+        res.status(201).json({
+            message: 'Import successful!',
+            routesAdded: routesToSave.length,
+            newAircraftCreated: newAircraftAdded.size,
+            aircraftList: Array.from(newAircraftAdded)
+        });
+
+    } catch (error) {
+        console.error(`- ERROR: Failed to process sheet for operator ${operator}:`, error.message);
+        res.status(500).json({ message: 'Failed to fetch or process the Google Sheet. Please check the URL and sheet format.' });
+    }
+});
+
 
 // 8. START THE SERVER
 app.listen(PORT, () => {
