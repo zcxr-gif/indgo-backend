@@ -2629,8 +2629,6 @@ app.post('/api/routes/import-sheet', authMiddleware, isRouteManager, async (req,
 
     console.log(`Starting route import for operator "${operator}" from URL: ${sheetUrl}`);
 
-    // 1. DEFINE HEADER ALIASES (similar to your migration script)
-    // We use a single comprehensive list here.
     const headerAliases = {
         flightNumber: ['Flight No.', 'Flight Number', 'Callsign'],
         departure: ['Departure ICAO', 'Departure', 'Origin', 'From'],
@@ -2641,14 +2639,12 @@ app.post('/api/routes/import-sheet', authMiddleware, isRouteManager, async (req,
     const canonicalKeys = Object.keys(headerAliases);
 
     try {
-        // 2. FETCH AND PARSE THE GOOGLE SHEET (CSV)
         const response = await axios.get(sheetUrl.trim());
         const parsed = Papa.parse(response.data, { header: false, skipEmptyLines: true });
-        if (!parsed.data || parsed.data.length < 2) { // Need at least a header and one data row
+        if (!parsed.data || parsed.data.length < 2) {
             return res.status(400).json({ message: 'Sheet is empty or could not be parsed. Ensure it has a header row and data.' });
         }
 
-        // 3. DYNAMICALLY FIND THE HEADER ROW AND COLUMN MAPPING
         let headerRowIndex = -1;
         let columnMap = {};
         for (let i = 0; i < parsed.data.length; i++) {
@@ -2664,7 +2660,6 @@ app.post('/api/routes/import-sheet', authMiddleware, isRouteManager, async (req,
                     }
                 }
             });
-            // Check if we found all essential columns
             if (Object.keys(tempMap).length >= canonicalKeys.length) {
                 columnMap = tempMap;
                 headerRowIndex = i;
@@ -2676,17 +2671,14 @@ app.post('/api/routes/import-sheet', authMiddleware, isRouteManager, async (req,
         if (headerRowIndex === -1) {
             return res.status(400).json({ message: `Could not find a valid header row. Please ensure columns like "${canonicalKeys.join('", "')}" are present.` });
         }
-
-        // 4. PROCESS EACH ROW INTO A ROUTE ITEM
-        const routesToSave = [];
+        
+        // --- START OF FIX ---
+        // Use a Map to automatically handle duplicates. The key will be the flight number.
+        const routesMap = new Map();
         const newAircraftAdded = new Set();
         const dataRows = parsed.data.slice(headerRowIndex + 1);
 
         for (const row of dataRows) {
-            // Extract and clean data from the row using the column map
-            const aircraftIcao = String(row[columnMap.aircraft] || '').trim().toUpperCase();
-            
-            // Helper function to convert time string (e.g., "3:30" or "3h 30m") to decimal
             const convertTimeToDecimal = (timeStr) => {
                 if (!timeStr || typeof timeStr !== 'string') return NaN;
                 const trimmedStr = timeStr.trim();
@@ -2705,59 +2697,64 @@ app.post('/api/routes/import-sheet', authMiddleware, isRouteManager, async (req,
                 if (minMatch) totalHours += parseInt(minMatch[1], 10) / 60;
                 return totalHours > 0 ? totalHours : NaN;
             };
-            
-            // Helper to extract a 4-letter ICAO code
             const extractIcao = (text) => text ? (String(text).match(/^\s*([A-Z]{4})/) || [])[1] || null : null;
 
+            const aircraftIcao = String(row[columnMap.aircraft] || '').trim().toUpperCase();
+            const flightNumber = String(row[columnMap.flightNumber] || '').trim().toUpperCase();
+
+            // Skip rows that don't have a flight number
+            if (!flightNumber) {
+                continue;
+            }
 
             const item = {
-                flightNumber: String(row[columnMap.flightNumber] || '').trim().toUpperCase(),
+                flightNumber: flightNumber,
                 departure: extractIcao(row[columnMap.departure]),
                 arrival: extractIcao(row[columnMap.arrival]),
                 aircraft: aircraftIcao,
                 flightTime: convertTimeToDecimal(row[columnMap.flightTime]),
                 operator: operator.trim(),
-                rankUnlock: deduceRankFromAircraft(aircraftIcao), // Use existing helper
+                rankUnlock: deduceRankFromAircraft(aircraftIcao),
                 type: operator.trim().toLowerCase() === 'indgo air virtual' ? 'primary' : 'codeshare'
             };
 
-            // 5. VALIDATE THE ITEM AND ADD TO AIRCRAFT MANAGER
-            if (item.flightNumber && item.departure && item.arrival && item.aircraft && item.flightTime > 0) {
-                routesToSave.push(item);
+            if (item.departure && item.arrival && item.aircraft && item.flightTime > 0) {
+                // If a flight number already exists in the map, this will overwrite it.
+                // This ensures only the last-seen version of a route is kept.
+                routesMap.set(item.flightNumber, item);
 
-                // --- Automatic Aircraft Manager Linking ---
-                // If this aircraft doesn't exist for this operator, add it.
-                // We use findOneAndUpdate with `upsert` to avoid duplicates.
                 const newAircraft = await Aircraft.findOneAndUpdate(
                     { icao: item.aircraft, codeshare: item.operator },
                     { 
                         $setOnInsert: {
-                            name: item.aircraft, // Defaults to the ICAO code; can be edited by staff later
+                            name: item.aircraft,
                             icao: item.aircraft,
                             codeshare: item.operator,
-                            type: 'Unknown', // Default value
+                            type: 'Unknown',
                             rankUnlock: item.rankUnlock
                         }
                     },
                     { new: true, upsert: true }
                 );
                 
-                // Track if a *new* aircraft was actually created by the upsert
                 if (newAircraft && newAircraft.createdAt.getTime() === newAircraft.updatedAt.getTime()) {
                     newAircraftAdded.add(item.aircraft);
                 }
             }
         }
+        
+        // Convert the map's values back to an array for batch writing.
+        const routesToSave = Array.from(routesMap.values());
+
+        // --- END OF FIX ---
+
 
         if (routesToSave.length === 0) {
             return res.status(400).json({ message: 'No valid routes were found in the provided sheet.' });
         }
 
-        // 6. BATCH WRITE TO DYNAMODB
-        // This uses the existing `batchWriteToDynamo` helper function in your server.js
         await batchWriteToDynamo(routesToSave, ROUTES_TABLE, 'PutRequest');
 
-        // 7. SEND SUCCESS RESPONSE
         res.status(201).json({
             message: 'Import successful!',
             routesAdded: routesToSave.length,
@@ -2767,6 +2764,10 @@ app.post('/api/routes/import-sheet', authMiddleware, isRouteManager, async (req,
 
     } catch (error) {
         console.error(`- ERROR: Failed to process sheet for operator ${operator}:`, error.message);
+        // Add more detailed logging for the specific batch write error
+        if (error.name === 'ValidationException') {
+            console.error('DynamoDB Validation Error Details:', error);
+        }
         res.status(500).json({ message: 'Failed to fetch or process the Google Sheet. Please check the URL and sheet format.' });
     }
 });
