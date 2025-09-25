@@ -47,7 +47,7 @@ const { DynamoDBDocumentClient, GetCommand, PutCommand, DeleteCommand, QueryComm
 
 const multerS3 = require('multer-s3');
 const { google } = require('googleapis');
-const Papa = require('papaparser');
+const Papa = require('papaparse');
 const axios = require('axios');
 const fs = require('fs').promises;
 const crypto = require('crypto');
