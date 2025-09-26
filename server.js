@@ -802,39 +802,93 @@ const generateRostersFromDynamo = async () => {
     if (allLegs.length === 0) return { created: 0, legsFound: 0 };
 
     const generatedRosters = [];
-    const rosterCountPerType = 2;
+    // --- MODIFICATION START ---
+    // Define specific counts for single-rank and mixed-rank rosters.
+    const minRostersPerRank = 3;
+    const mixedRostersPerHub = 5;
+    // --- MODIFICATION END ---
+
     const legsByDeparture = allLegs.reduce((acc, leg) => { (acc[leg.departure] = acc[leg.departure] || []).push(leg); return acc; }, {});
     const legsByRank = allLegs.reduce((acc, leg) => { (acc[leg.rankUnlock] = acc[leg.rankUnlock] || []).push(leg); return acc; }, {});
 
+    // --- LOOP 1: Generate dedicated rosters for each rank ---
+    console.log(`Attempting to generate ${minRostersPerRank} rosters per rank per hub...`);
     for (const rank in legsByRank) {
         if (!pilotRanks.includes(rank)) continue;
         const legsByDepartureForRank = legsByRank[rank].reduce((acc, leg) => { (acc[leg.departure] = acc[leg.departure] || []).push(leg); return acc; }, {});
+        
         for (const departureAirport of Object.keys(legsByDepartureForRank)) {
-            for (let i = 0; i < rosterCountPerType; i++) {
-                const rosterLegs = []; let currentAirport = departureAirport; let totalTime = 0; const usedFlightNumbers = new Set();
+            // This loop will now attempt to create 3 single-rank rosters.
+            for (let i = 0; i < minRostersPerRank; i++) {
+                const rosterLegs = []; 
+                let currentAirport = departureAirport; 
+                let totalTime = 0; 
+                const usedFlightNumbers = new Set();
+                
+                // Build a roster with 2 to 4 legs
                 for (let j = 0; j < (Math.floor(Math.random() * 3) + 2); j++) {
                     const possibleNextLegs = (legsByDepartureForRank[currentAirport] || []).filter(l => !usedFlightNumbers.has(l.flightNumber));
                     if (possibleNextLegs.length === 0) break;
+                    
                     const nextLeg = possibleNextLegs[Math.floor(Math.random() * possibleNextLegs.length)];
                     if ((totalTime + nextLeg.flightTime) > MAX_DAILY_FLIGHT_HOURS) break;
-                    rosterLegs.push(nextLeg); totalTime += nextLeg.flightTime; currentAirport = nextLeg.arrival; usedFlightNumbers.add(nextLeg.flightNumber);
+                    
+                    rosterLegs.push(nextLeg); 
+                    totalTime += nextLeg.flightTime; 
+                    currentAirport = nextLeg.arrival; 
+                    usedFlightNumbers.add(nextLeg.flightNumber);
                 }
-                if (rosterLegs.length >= 2) generatedRosters.push({ name: `${departureAirport} ${rank} Duty #${i + 1}`, hub: departureAirport, legs: rosterLegs, totalFlightTime: totalTime, multiplier: parseFloat((1.1 + Math.random() * 0.4).toFixed(2)), isGenerated: true, isAvailable: true });
+                
+                if (rosterLegs.length >= 2) {
+                    generatedRosters.push({ 
+                        name: `${departureAirport} ${rank} Duty #${i + 1}`, 
+                        hub: departureAirport, 
+                        legs: rosterLegs, 
+                        totalFlightTime: totalTime, 
+                        multiplier: parseFloat((1.1 + Math.random() * 0.4).toFixed(2)), 
+                        isGenerated: true, 
+                        isAvailable: true 
+                    });
+                }
             }
         }
     }
 
+    // --- LOOP 2: Generate additional mixed-rank rosters for variety ---
+    console.log(`Attempting to generate ${mixedRostersPerHub} mixed-rank rosters per hub...`);
     for (const departureAirport of Object.keys(legsByDeparture)) {
-        for (let i = 0; i < rosterCountPerType; i++) {
-            const rosterLegs = []; let currentAirport = departureAirport; let totalTime = 0; const usedFlightNumbers = new Set();
+        // This loop will now create 5 mixed-rank rosters.
+        for (let i = 0; i < mixedRostersPerHub; i++) {
+            const rosterLegs = []; 
+            let currentAirport = departureAirport; 
+            let totalTime = 0; 
+            const usedFlightNumbers = new Set();
+            
+            // Build a roster with 2 to 4 legs
             for (let j = 0; j < (Math.floor(Math.random() * 3) + 2); j++) {
                 const possibleNextLegs = (legsByDeparture[currentAirport] || []).filter(l => !usedFlightNumbers.has(l.flightNumber));
                 if (possibleNextLegs.length === 0) break;
+                
                 const nextLeg = possibleNextLegs[Math.floor(Math.random() * possibleNextLegs.length)];
                 if ((totalTime + nextLeg.flightTime) > MAX_DAILY_FLIGHT_HOURS) break;
-                rosterLegs.push(nextLeg); totalTime += nextLeg.flightTime; currentAirport = nextLeg.arrival; usedFlightNumbers.add(nextLeg.flightNumber);
+                
+                rosterLegs.push(nextLeg); 
+                totalTime += nextLeg.flightTime; 
+                currentAirport = nextLeg.arrival; 
+                usedFlightNumbers.add(nextLeg.flightNumber);
             }
-            if (rosterLegs.length >= 2) generatedRosters.push({ name: `${departureAirport} Sector Duty #${i + 1}`, hub: departureAirport, legs: rosterLegs, totalFlightTime: totalTime, multiplier: parseFloat((1.1 + Math.random() * 0.4).toFixed(2)), isGenerated: true, isAvailable: true });
+            
+            if (rosterLegs.length >= 2) {
+                generatedRosters.push({ 
+                    name: `${departureAirport} Sector Duty #${i + 1}`, 
+                    hub: departureAirport, 
+                    legs: rosterLegs, 
+                    totalFlightTime: totalTime, 
+                    multiplier: parseFloat((1.1 + Math.random() * 0.4).toFixed(2)), 
+                    isGenerated: true, 
+                    isAvailable: true 
+                });
+            }
         }
     }
 
