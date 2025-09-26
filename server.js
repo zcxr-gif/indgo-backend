@@ -1238,7 +1238,7 @@ app.post('/api/codeshares/logo', authMiddleware, isRouteManager, (req, res, next
 // --- AIRCRAFT MANAGEMENT ---
 
 // GET all aircraft (optional filter by codeshare/operator)
-app.get('/api/aircrafts', authMiddleware, isRouteManager, async (req, res) => {
+app.get('/api/aircrafts', authMiddleware, async (req, res) => {
     try {
         const { codeshare } = req.query;
         const q = codeshare ? { codeshare } : {};
