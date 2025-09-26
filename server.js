@@ -1,10 +1,10 @@
 // server.js (Fully Merged, Updated & Performance Tuned with Rosters in DynamoDB, ACARS-lite tracking, and Aircraft Manager)
 // - Roster system fully migrated to DynamoDB for scalability.
-// - Automated Roster Generation reads from Google Sheets and writes directly to DynamoDB.
+// - Automated Roster Generation now reads exclusively from the DynamoDB Routes table.
 // - Strict Flight & Duty Time Limitations (FTPL) engine.
 // - Staff-controlled switch to disable FTPL for individual users.
 // - Location-aware roster availability for pilots.
-// - Robust Google Sheets function with dynamic column mapping.
+// - Robust Google Sheets function for route *importing* with dynamic column mapping.
 // - Advanced PIREP system with a staff review workflow.
 // - Automatic rank promotions upon PIREP approval.
 // - Cascade delete functionality for users and their associated data.
@@ -793,96 +793,12 @@ async function processAndSaveRosters(generatedRosters) {
     return rostersToInsert.length;
 }
 
-const generateRostersFromGoogleSheet = async () => {
-    console.log('Starting automated roster generation from all sources...');
-    const convertTimeToDecimal = (timeStr) => {
-        if (!timeStr || typeof timeStr !== 'string') return NaN;
-        const trimmedStr = timeStr.trim();
-        if (trimmedStr.includes(':')) {
-            const parts = trimmedStr.split(':');
-            if (parts.length >= 2) {
-                const hours = parseInt(parts[0], 10);
-                const minutes = parseInt(parts[1], 10);
-                return !isNaN(hours) && !isNaN(minutes) ? hours + (minutes / 60) : NaN;
-            }
-        }
-        const hourMatch = trimmedStr.match(/(\d+)\s*h/);
-        const minMatch = trimmedStr.match(/(\d+)\s*m/);
-        let totalHours = 0;
-        if (hourMatch) totalHours += parseInt(hourMatch[1], 10);
-        if (minMatch) totalHours += parseInt(minMatch[1], 10) / 60;
-        return totalHours > 0 ? totalHours : NaN;
-    };
-    const extractIcao = (text) => text ? (text.match(/^\s*([A-Z]{4})/) || [])[1] || null : null;
-    const headerAliasesBase = { flightNumber: ['Flight No.', 'Flight Number', 'Callsign'], departure: ['Departure ICAO', 'Departure', 'Origin', 'From'], arrival: ['Arrival ICAO', 'Arrival', 'Destination', 'To'], aircraft: ['Aircraft(s)', 'Aircraft', 'Plane'], flightTime: ['Avg. Flight Time', 'Flight Time', 'Duration'] };
-    const headerAliasesCodeshare = { ...headerAliasesBase, rankUnlock: ['Rank Unlock', 'Rank', 'Rank Required', 'Unlock Rank'], operator: ['Operator', 'Airline', 'Carrier', 'Virtual Airline'] };
+// REMOVED: The generateRostersFromGoogleSheet function has been deleted as it is no longer used.
 
-    let allLegs = [];
-    const primaryUrls = (process.env.ROUTES_SHEET_URL || '').split(',').filter(Boolean);
-    const codeshareUrls = (process.env.CODESHARE_SHEET_URLS || '').split(',').filter(Boolean);
-    const allUrls = [...primaryUrls, ...codeshareUrls];
-
-    if (allUrls.length === 0) {
-        console.warn('No ROUTES_SHEET_URL or CODESHARE_SHEET_URLS defined. Aborting roster generation.');
-        return { created: 0, legsFound: 0 };
-    }
-
-    for (const url of allUrls) {
-        const isCodeshare = codeshareUrls.map(s => s.trim()).includes(url.trim());
-        const headerAliases = isCodeshare ? headerAliasesCodeshare : headerAliasesBase;
-        const canonicalKeys = Object.keys(headerAliases);
-        try {
-            const response = await axios.get(url.trim());
-            const parsed = Papa.parse(response.data, { header: false, skipEmptyLines: true });
-            if (!parsed.data || parsed.data.length === 0) continue;
-
-            let headerRowIndex = -1;
-            let columnMap = {};
-            for (let i = 0; i < parsed.data.length; i++) {
-                const row = parsed.data[i];
-                const tempMap = {};
-                row.forEach((cell, index) => {
-                    const header = cell.trim().toLowerCase();
-                    if (!header) return;
-                    for (const key of canonicalKeys) {
-                        if (headerAliases[key].some(alias => alias.toLowerCase() === header)) {
-                            tempMap[key] = index;
-                            break;
-                        }
-                    }
-                });
-                if (Object.keys(tempMap).length === canonicalKeys.length) {
-                    columnMap = tempMap;
-                    headerRowIndex = i;
-                    break;
-                }
-            }
-            if (headerRowIndex === -1) { console.warn(`- Could not find a valid header row in sheet: ${url}`); continue; }
-
-            const legsFromSheet = parsed.data.slice(headerRowIndex + 1).map(row => {
-                const departureIcao = extractIcao(row[columnMap.departure]);
-                const arrivalIcao = extractIcao(row[columnMap.arrival]);
-                const flightTime = convertTimeToDecimal(row[columnMap.flightTime]);
-                const flightNumber = row[columnMap.flightNumber]?.trim();
-                const aircraft = row[columnMap.aircraft]?.trim();
-                let rankUnlock, operator;
-                if (isCodeshare) {
-                    rankUnlock = row[columnMap.rankUnlock]?.trim();
-                    operator = row[columnMap.operator]?.trim();
-                } else {
-                    rankUnlock = (columnMap.rankUnlock !== undefined) ? (row[columnMap.rankUnlock] || '').trim() : deduceRankFromAircraft(aircraft);
-                    operator = (columnMap.operator !== undefined) ? (row[columnMap.operator] || '').trim() : 'IndGo Air Virtual';
-                }
-                if (departureIcao && arrivalIcao && flightNumber && aircraft && !isNaN(flightTime) && flightTime > 0 && rankUnlock && operator) {
-                    return { flightNumber, departure: departureIcao, arrival: arrivalIcao, departureCountry: getCountryCode(departureIcao), arrivalCountry: getCountryCode(arrivalIcao), aircraft, flightTime, rankUnlock, operator };
-                }
-                return null;
-            }).filter(Boolean);
-            allLegs.push(...legsFromSheet);
-        } catch (error) { console.error(`Failed to process URL ${url}:`, error.message); }
-    }
-
-    console.log(`Total available legs for roster generation from all sources: ${allLegs.length}`);
+const generateRostersFromDynamo = async () => {
+    console.log('Starting automated roster generation from DynamoDB routes...');
+    const allLegs = await fetchAllLegsFromDynamo();
+    console.log(`Total available legs for roster generation from DynamoDB: ${allLegs.length}`);
     if (allLegs.length === 0) return { created: 0, legsFound: 0 };
 
     const generatedRosters = [];
@@ -919,54 +835,6 @@ const generateRostersFromGoogleSheet = async () => {
                 rosterLegs.push(nextLeg); totalTime += nextLeg.flightTime; currentAirport = nextLeg.arrival; usedFlightNumbers.add(nextLeg.flightNumber);
             }
             if (rosterLegs.length >= 2) generatedRosters.push({ name: `${departureAirport} Sector Duty #${i + 1}`, hub: departureAirport, legs: rosterLegs, totalFlightTime: totalTime, multiplier: parseFloat((1.1 + Math.random() * 0.4).toFixed(2)), isGenerated: true, isAvailable: true });
-        }
-    }
-
-    generatedRosters.sort(() => Math.random() - 0.5);
-    const createdCount = await processAndSaveRosters(generatedRosters);
-    return { created: createdCount, legsFound: allLegs.length };
-};
-
-const generateRostersFromDynamo = async () => {
-    console.log('Starting automated roster generation from DynamoDB routes...');
-    const allLegs = await fetchAllLegsFromDynamo();
-    console.log(`Total available legs for roster generation from DynamoDB: ${allLegs.length}`);
-    if (allLegs.length === 0) return { created: 0, legsFound: 0 };
-
-    const generatedRosters = [];
-    const rosterCountPerType = 2;
-    const legsByDeparture = allLegs.reduce((acc, leg) => { (acc[leg.departure] = acc[leg.departure] || []).push(leg); return acc; }, {});
-    const legsByRank = allLegs.reduce((acc, leg) => { (acc[leg.rankUnlock] = acc[leg.rankUnlock] || []).push(leg); return acc; }, {});
-
-    for (const rank in legsByRank) {
-        if (!pilotRanks.includes(rank)) continue;
-        const legsByDepartureForRank = legsByRank[rank].reduce((acc, leg) => { (acc[leg.departure] = acc[leg.departure] || []).push(leg); return acc; }, {});
-        for (const departureAirport of Object.keys(legsByDepartureForRank)) {
-            for (let i = 0; i < rosterCountPerType; i++) {
-                const rosterLegs = []; let currentAirport = departureAirport; let totalTime = 0; const usedFlightNumbers = new Set();
-                for (let j = 0; j < (Math.floor(Math.random() * 3) + 2); j++) {
-                    const possibleNextLegs = (legsByDepartureForRank[currentAirport] || []).filter(l => !usedFlightNumbers.has(l.flightNumber));
-                    if (possibleNextLegs.length === 0) break;
-                    const nextLeg = possibleNextLegs[Math.floor(Math.random() * possibleNextLegs.length)];
-                    if ((totalTime + nextLeg.flightTime) > MAX_DAILY_FLIGHT_HOURS) break;
-                    rosterLegs.push(nextLeg); totalTime += nextLeg.flightTime; currentAirport = nextLeg.arrival; usedFlightNumbers.add(nextLeg.flightNumber);
-                }
-                if (rosterLegs.length >= 2) generatedRosters.push({ name: `${departureAirport} ${rank} Duty #${i + 1} (DDB)`, hub: departureAirport, legs: rosterLegs, totalFlightTime: totalTime, multiplier: parseFloat((1.1 + Math.random() * 0.4).toFixed(2)), isGenerated: true, isAvailable: true });
-            }
-        }
-    }
-
-    for (const departureAirport of Object.keys(legsByDeparture)) {
-        for (let i = 0; i < rosterCountPerType; i++) {
-            const rosterLegs = []; let currentAirport = departureAirport; let totalTime = 0; const usedFlightNumbers = new Set();
-            for (let j = 0; j < (Math.floor(Math.random() * 3) + 2); j++) {
-                const possibleNextLegs = (legsByDeparture[currentAirport] || []).filter(l => !usedFlightNumbers.has(l.flightNumber));
-                if (possibleNextLegs.length === 0) break;
-                const nextLeg = possibleNextLegs[Math.floor(Math.random() * possibleNextLegs.length)];
-                if ((totalTime + nextLeg.flightTime) > MAX_DAILY_FLIGHT_HOURS) break;
-                rosterLegs.push(nextLeg); totalTime += nextLeg.flightTime; currentAirport = nextLeg.arrival; usedFlightNumbers.add(nextLeg.flightNumber);
-            }
-            if (rosterLegs.length >= 2) generatedRosters.push({ name: `${departureAirport} Sector Duty #${i + 1} (DDB)`, hub: departureAirport, legs: rosterLegs, totalFlightTime: totalTime, multiplier: parseFloat((1.1 + Math.random() * 0.4).toFixed(2)), isGenerated: true, isAvailable: true });
         }
     }
 
@@ -2396,11 +2264,11 @@ app.post('/api/rosters', authMiddleware, isRouteManager, async (req, res) => {
 
 app.post('/api/rosters/generate', authMiddleware, isRouteManager, async (req, res) => {
     try {
-        const useDdb = String(process.env.ROUTES_SOURCE || 'DDB').toUpperCase() === 'DDB';
-        const result = useDdb ? await generateRostersFromDynamo() : await generateRostersFromGoogleSheet();
+        // The endpoint now directly calls the function that uses DynamoDB.
+        const result = await generateRostersFromDynamo();
         res.status(201).json({
             message: `Roster generation complete. Found ${result.legsFound} legs and created ${result.created} new rosters.`,
-            source: useDdb ? 'DynamoDB' : 'GoogleSheets'
+            source: 'DynamoDB' // The source is now always DynamoDB.
         });
     } catch (error) {
         console.error(error);
