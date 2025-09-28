@@ -454,6 +454,11 @@ const FlightPlanSchema = new mongoose.Schema({
     vref: { type: String },
     departureWeather: { type: String },
     arrivalWeather: { type: String },
+    // START: UPDATED FIELDS
+    tlr: { type: mongoose.Schema.Types.Mixed }, // For the full Takeoff/Landing Report object
+    cruiseAltitude: { type: Number },
+    cruiseSpeed: { type: Number }, // Storing as a number (e.g., 0.78 for Mach)
+    // END: UPDATED FIELDS
     mapData: { type: mongoose.Schema.Types.Mixed },
     rosterLeg: {
         // MODIFIED: rosterId is now a string pointing to a DynamoDB item
@@ -1639,10 +1644,13 @@ app.post('/api/me/notifications/read', authMiddleware, async (req, res) => {
 
 app.post('/api/flightplans', authMiddleware, async (req, res) => {
     try {
+        // START: UPDATED DESTRUCTURING
         const {
             flightNumber, departure, arrival, aircraft, etd, eet, alternate, pob, route, squawkCode,
-            zfw, tow, cargo, fuelTaxi, fuelTrip, fuelTotal, v1, vr, v2, vref, departureWeather, arrivalWeather, mapData
+            zfw, tow, cargo, fuelTaxi, fuelTrip, fuelTotal, v1, vr, v2, vref, departureWeather, arrivalWeather, mapData,
+            tlr, cruiseAltitude, cruiseSpeed // <-- Added the new fields here
         } = req.body;
+        // END: UPDATED DESTRUCTURING
 
         if (!flightNumber || !departure || !arrival || !aircraft || !etd || !eet || !alternate || !pob || !route) {
             return res.status(400).json({ message: 'Please provide all required flight plan details.' });
@@ -1700,14 +1708,17 @@ app.post('/api/flightplans', authMiddleware, async (req, res) => {
         const etdDate = new Date(etd);
         const etaDate = new Date(etdDate.getTime() + eetHours * 60 * 60 * 1000);
 
+        // START: UPDATED FLIGHT PLAN CONSTRUCTOR
         const newFlightPlan = new FlightPlan({
             pilot: pilot._id, flightNumber, departure: planData.departure, arrival: planData.arrival,
             aircraft: planData.aircraft, alternate, pob, route, etd: etdDate, eet: eetHours, eta: etaDate,
             ficNumber: generateFicNumber(), adcNumber: generateAdcNumber(), squawkCode: squawkCode || generateSquawkCode(),
             rosterLeg: rosterLegData.rosterId ? rosterLegData : undefined,
             zfw, tow, cargo, fuelTaxi, fuelTrip, fuelTotal, v1, vr, v2, vref,
-            departureWeather, arrivalWeather, mapData
+            departureWeather, arrivalWeather, mapData,
+            tlr, cruiseAltitude, cruiseSpeed // <-- Added the new fields here
         });
+        // END: UPDATED FLIGHT PLAN CONSTRUCTOR
 
         await newFlightPlan.save();
         pilot.currentFlightPlans.push(newFlightPlan._id);
