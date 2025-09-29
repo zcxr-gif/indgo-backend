@@ -1102,6 +1102,31 @@ app.get('/api/routes/by-departure/:icao', authMiddleware, isRouteManager, async 
     }
 });
 
+// NEW: GET all routes for any authenticated pilot, with filtering
+app.get('/api/routes/all', authMiddleware, async (req, res) => {
+    try {
+        // Fetch all items from the DynamoDB table for routes
+        const allRoutes = await ddbScanAll(ROUTES_TABLE);
+        const { operator, aircraft, icao } = req.query;
+
+        // Function to normalize strings for case-insensitive searching
+        const normalize = s => String(s || '').trim().toUpperCase();
+
+        // Filter the routes on the server based on query parameters
+        const filteredRoutes = allRoutes.filter(route => {
+            const operatorOK = !operator || normalize(route.operator).includes(normalize(operator));
+            const aircraftOK = !aircraft || normalize(route.aircraft).includes(normalize(aircraft));
+            const icaoOK = !icao || (normalize(route.departure).includes(normalize(icao)) || normalize(route.arrival).includes(normalize(icao)));
+            return operatorOK && aircraftOK && icaoOK;
+        });
+
+        res.json(filteredRoutes); // Send back the filtered list
+    } catch (e) {
+        console.error('[GET /api/routes/all] error:', e);
+        res.status(500).json({ message: 'Failed to fetch all routes.' });
+    }
+});
+
 
 // --- CODESHARE PARTNER MANAGEMENT ---
 
