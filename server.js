@@ -2380,6 +2380,32 @@ app.delete('/api/rosters/:rosterId', authMiddleware, isRouteManager, async (req,
     }
 });
 
+// GET a single roster by its ID from DynamoDB
+app.get('/api/rosters/by-id/:rosterId', authMiddleware, async (req, res) => {
+    try {
+        const { rosterId } = req.params;
+        if (!rosterId) {
+            return res.status(400).json({ message: 'Roster ID is required.' });
+        }
+
+        const command = new GetCommand({
+            TableName: ROSTERS_TABLE,
+            Key: { rosterId: rosterId }
+        });
+        const response = await ddbDoc.send(command);
+        const roster = response.Item;
+
+        if (!roster) {
+            return res.status(404).json({ message: 'The active roster could not be found.' });
+        }
+
+        res.json(roster);
+    } catch (error) {
+        console.error('Error fetching roster by ID:', error);
+        res.status(500).json({ message: 'Server error while fetching the specific roster.' });
+    }
+});
+
 // MODIFIED: Duty start now uses DynamoDB to fetch roster
 app.post('/api/duty/start', authMiddleware, async (req, res) => {
     const { rosterId } = req.body;
