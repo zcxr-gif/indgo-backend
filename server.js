@@ -1010,6 +1010,16 @@ async function callLiveFlightsStart({ username, server, flightPlanId }) {
     return r.data;
 }
 
+const TRACK_WEBHOOK_SECRET = (process.env.TRACK_WEBHOOK_SECRET || '').trim();
+
+function requireInternalSecret(req, res, next) {
+    const got = req.header('x-acars-signature') || '';
+    if (!TRACK_WEBHOOK_SECRET || got !== TRACK_WEBHOOK_SECRET) {
+        return res.status(401).json({ message: 'Unauthorized internal request' });
+    }
+    next();
+}
+
 
 // 7. API ROUTES (ENDPOINTS)
 
@@ -1022,6 +1032,30 @@ app.get('/api/airports', async (req, res) => {
     } catch (error) {
         console.error('Error in /api/airports endpoint:', error);
         res.status(500).json({ message: 'Could not load airport data.' });
+    }
+});
+
+/**
+ * NEW: Internal endpoint for the live_flights service to fetch the VA pilot roster.
+ * This is secured by the internal webhook secret.
+ */
+app.get('/api/internal/pilot-roster', requireInternalSecret, async (req, res) => {
+    try {
+        const pilots = await User.find({
+            infiniteFlightUsername: { $ne: null, $ne: '' }
+        })
+        .select('infiniteFlightUsername role')
+        .lean();
+
+        const roster = pilots.map(p => ({
+            username: p.infiniteFlightUsername,
+            role: p.role
+        }));
+        
+        res.json(roster);
+    } catch (error) {
+        console.error('Error fetching internal pilot roster:', error);
+        res.status(500).json({ message: 'Could not load pilot roster.' });
     }
 });
 
