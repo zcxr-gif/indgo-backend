@@ -1010,8 +1010,6 @@ async function callLiveFlightsStart({ username, server, flightPlanId }) {
     return r.data;
 }
 
-const TRACK_WEBHOOK_SECRET = (process.env.TRACK_WEBHOOK_SECRET || '').trim();
-
 function requireInternalSecret(req, res, next) {
     const got = req.header('x-acars-signature') || '';
     if (!TRACK_WEBHOOK_SECRET || got !== TRACK_WEBHOOK_SECRET) {
