@@ -1499,7 +1499,8 @@ app.get('/api/staff', async (req, res) => {
 
 app.get('/api/pilots/public-roster', async (req, res) => {
     try {
-        const pilots = await User.find({ role: 'pilot' })
+        // --- FIX: Find all users that have a callsign, not just 'pilot' role ---
+        const pilots = await User.find({ callsign: { $ne: null } })
             .select('name callsign rank flightHours imageUrl') // <-- Selects only public-safe fields
             .sort({ flightHours: -1 }); // <-- Sorts by most hours first
 
