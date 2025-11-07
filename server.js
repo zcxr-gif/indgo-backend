@@ -1497,6 +1497,19 @@ app.get('/api/staff', async (req, res) => {
     }
 });
 
+app.get('/api/pilots/public-roster', async (req, res) => {
+    try {
+        const pilots = await User.find({ role: 'pilot' })
+            .select('name callsign rank flightHours imageUrl') // <-- Selects only public-safe fields
+            .sort({ flightHours: -1 }); // <-- Sorts by most hours first
+
+        res.json(pilots);
+    } catch (error) {
+        console.error('Error fetching public pilot roster:', error);
+        res.status(500).json({ message: 'Server error while fetching pilot roster.' });
+    }
+});
+
 app.post('/api/login', async (req, res) => {
     try {
         const { email, password } = req.body;
