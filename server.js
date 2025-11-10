@@ -30,6 +30,7 @@
 // - Routes now require both 'operator' and 'livery' fields upon creation.
 // - NEW: Aircraft management system with image uploads and rank unlocks (MongoDB + S3).
 // - NEW: Enhanced /api/routes GET endpoint with server-side filtering.
+// - NEW: Add Hours to the users move database
 
 // 1. IMPORT DEPENDENCIES
 const cors = require('cors');
@@ -1532,7 +1533,8 @@ app.post('/api/login', async (req, res) => {
 
 app.post('/api/register', async (req, res) => {
     try {
-        const { name, email, password, callsign, inviteCode } = req.body;
+        // --- MODIFICATION 1: Added 'ifcUsername' to the destructuring ---
+        const { name, email, password, callsign, inviteCode, ifcUsername } = req.body;
 
         if (!name || !email || !password || !callsign || !inviteCode) {
             return res.status(400).json({ message: 'All fields, including an invite code, are required.' });
@@ -1561,7 +1563,9 @@ app.post('/api/register', async (req, res) => {
             email: String(email).toLowerCase().trim(),
             password: await bcrypt.hash(password, salt),
             callsign: normalizedCallsign,
-            role: 'pilot'
+            role: 'pilot',
+            // --- MODIFICATION 2: Added the field to save to the database ---
+            infiniteFlightUsername: ifcUsername ? String(ifcUsername).trim() : ''
         });
         await newUser.save();
 
