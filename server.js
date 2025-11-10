@@ -389,10 +389,14 @@ InviteSchema.index(
 );
 
 
+
 // --- Admin Log Schema ---
 const AdminLogSchema = new mongoose.Schema({
     adminUser: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    action: { type: String, required: true, enum: ['ROLE_UPDATE', 'USER_DELETE', 'ROSTER_CREATE', 'ROSTER_DELETE', 'PROMOTION_TEST_REQUIRED', 'FTPL_STATUS_UPDATE'] },
+    action: { type: String, required: true, enum: [
+        'ROLE_UPDATE', 'USER_DELETE', 'ROSTER_CREATE', 'ROSTER_DELETE', 
+        'PROMOTION_TEST_REQUIRED', 'FTPL_STATUS_UPDATE', 'FLIGHT_HOURS_UPDATE' // <-- ADDED HERE
+    ] },
     targetUser: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     details: { type: String, required: true },
     timestamp: { type: Date, default: Date.now }
@@ -2660,6 +2664,94 @@ app.put('/api/users/:userId/toggle-ftpl', authMiddleware, isPilotManager, async 
     } catch (error) {
         console.error(error);
         res.status(500).json({ message: 'Server error while toggling FTPL status.' });
+    }
+});
+
+app.put('/api/users/:userId/flight-hours', authMiddleware, isPilotManager, async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const { flightHours } = req.body;
+
+        // 1. Validate the input
+        const newFlightHours = parseFloat(flightHours);
+        if (isNaN(newFlightHours) || newFlightHours < 0) {
+            return res.status(400).json({ message: 'A valid, non-negative number for flightHours is required.' });
+        }
+
+        // 2. Find the user
+        const user = await User.findById(userId);
+        if (!user) {
+            return res.status(404).json({ message: 'User not found.' });
+        }
+
+        // 3. Store old data for logging and comparison
+        const oldHours = user.flightHours;
+        const oldRank = user.rank;
+
+        // 4. Update the flight hours
+        user.flightHours = newFlightHours;
+
+        // 5. CRITICAL: Check if this update triggers a rank change or test requirement
+        const promotionResult = checkAndApplyRankUpdate(user);
+
+        // 6. Save the user's changes (hours + any rank/status change)
+        await user.save();
+
+        // 7. Update Google Sheets to reflect the new total
+        if (user.callsign) {
+            updateGoogleSheet({
+                callsign: user.callsign,
+                name: user.name,
+                rank: user.rank,
+                flightHours: user.flightHours
+            });
+        }
+
+        // 8. Prepare response and log details
+        let responseMessage = `Successfully updated ${user.name}'s flight hours from ${oldHours.toFixed(2)} to ${newFlightHours.toFixed(2)}.`;
+        let logDetails = `Manually updated flight hours for ${user.email} from ${oldHours.toFixed(2)} to ${newFlightHours.toFixed(2)}.`;
+
+        // 9. Handle promotion side-effects
+        if (promotionResult.promoted) {
+            const newRank = promotionResult.rank;
+            responseMessage += ` This triggered an automatic promotion to ${newRank}!`;
+            logDetails += ` User was automatically promoted to ${newRank}.`;
+            // Send a notification to the user
+            user.notifications.push({ message: `A staff member adjusted your flight hours, resulting in a promotion from ${oldRank} to ${newRank}. Congratulations!` });
+            await user.save(); // Save notification
+
+        } else if (promotionResult.pendingTest) {
+            const prospectiveRank = promotionResult.prospectiveRank;
+            responseMessage += ` This adjustment makes them eligible for ${prospectiveRank}, which is now pending tests.`;
+            logDetails += ` User is now PENDING_TEST for ${prospectiveRank}.`;
+
+            // Replicate notification logic from PIREP approval for staff
+            const staffNotification = { message: `Action Required: Pilot ${user.name} (${user.callsign || 'N/A'}) is awaiting tests for promotion to ${prospectiveRank} (triggered by manual hour update).` };
+            await User.updateMany(
+                { role: { $in: ['admin', 'Chief Executive Officer (CEO)', 'Chief Operating Officer (COO)', 'Head of Training (COT)'] } }, 
+                { $push: { notifications: staffNotification } }
+            );
+            
+            // Send a notification to the user
+            user.notifications.push({ message: `A staff member adjusted your flight hours, meeting the requirement for ${prospectiveRank}. To proceed, staff will contact you for mandatory promotion tests. Your flight operations are suspended until the tests are complete.` });
+            await user.save(); // Save notification
+        }
+
+        // 10. Log the administrative action
+        const log = new AdminLog({
+            adminUser: req.user._id,
+            action: 'FLIGHT_HOURS_UPDATE',
+            targetUser: userId,
+            details: logDetails
+        });
+        await log.save();
+
+        // 11. Send the final response
+        res.json({ message: responseMessage, user });
+
+    } catch (error) {
+        console.error(`Error in /api/users/${userId}/flight-hours:`, error);
+        res.status(500).json({ message: 'Server error while updating flight hours.' });
     }
 });
 
