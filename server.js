@@ -84,8 +84,22 @@ const CODESHARE_TABLE = process.env.DDB_CODESHARE_TABLE || 'CodesharePartners';
 
 
 // 3. MIDDLEWARE
+const whitelist = [
+    'https://indgo-va.netlify.app', 
+    'http://localhost:8888'         
+];
+
 const corsOptions = {
-    origin: 'https://indgo-va.netlify.app',
+    origin: function (origin, callback) {
+        // Allow requests with no origin (like mobile apps or curl requests)
+        if (!origin) return callback(null, true);
+        
+        if (whitelist.indexOf(origin) !== -1) {
+            callback(null, true); // Origin is in the whitelist, allow it
+        } else {
+            callback(new Error('Not allowed by CORS')); // Origin is not allowed
+        }
+    },
     optionsSuccessStatus: 200
 };
 
