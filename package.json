@@ -23,6 +23,7 @@
     "fast-xml-parser": "^5.2.5",
     "googleapis": "^159.0.0",
     "jsonwebtoken": "^9.0.2",
+    "lucide-react": "^0.554.0",
     "mongoose": "^8.18.0",
     "multer": "^2.0.2",
     "multer-s3": "^3.0.1",
