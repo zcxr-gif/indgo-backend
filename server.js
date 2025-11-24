@@ -143,7 +143,7 @@ app.delete('/api/aircraft/:id', async (req, res) => {
             return res.status(404).json({ message: 'Aircraft not found.' });
         }
 
-        // 1. Delete image from AWS S3
+        // 1. Delete image from AWS
         await deleteS3Object(entry.imageUrl);
 
         // 2. Delete record from MongoDB
