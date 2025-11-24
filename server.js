@@ -81,11 +81,6 @@ const deleteS3Object = async (imageUrl) => {
 
 // 5. API ROUTES
 
-// Health Check
-app.get('/', (req, res) => {
-    res.send('Community Aircraft Backend is Running.');
-});
-
 // GET: Fetch all aircraft contributions
 app.get('/api/aircraft', async (req, res) => {
     try {
@@ -143,7 +138,7 @@ app.delete('/api/aircraft/:id', async (req, res) => {
             return res.status(404).json({ message: 'Aircraft not found.' });
         }
 
-        // 1. Delete image from AWS
+        // 1. Delete image from AWS S3
         await deleteS3Object(entry.imageUrl);
 
         // 2. Delete record from MongoDB
@@ -155,6 +150,16 @@ app.delete('/api/aircraft/:id', async (req, res) => {
         console.error('Delete Error:', error);
         res.status(500).json({ message: 'Server error during deletion.' });
     }
+});
+
+// --- SERVE FRONTEND ---
+
+// 1. Serve Static Files from the "public" folder
+app.use(express.static(path.join(__dirname, 'public')));
+
+// 2. Handle React Routing (Catch-All)
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 // 6. START SERVER
