@@ -371,18 +371,61 @@
 
         function UploadModal({ onClose, onSuccess, isDemoMode }) {
           const [loading, setLoading] = useState(false);
+          const [fetchingMeta, setFetchingMeta] = useState(true);
+          const [metadata, setMetadata] = useState({ aircraft: [], liveries: [] });
+          
           const fileInputRef = useRef(null);
           const [preview, setPreview] = useState(null);
-          const [showPreviewOverlay, setShowPreviewOverlay] = useState(true); // Toggle for the guide
+          const [showPreviewOverlay, setShowPreviewOverlay] = useState(true);
+          
           const [formData, setFormData] = useState({
             contributorName: '',
-            aircraftType: '',
+            aircraftType: '', // This will store the Name string
+            aircraftId: '',   // This stores the ID for filtering liveries
             liveryName: '',
             tailNumber: ''
           });
 
+          // 1. Fetch Aircraft/Livery Data from the OTHER backend (Port 5001)
+          useEffect(() => {
+            const fetchMetadata = async () => {
+                try {
+                    // Assuming live_flights.js runs on port 5001
+                    const res = await fetch('https://site--acars-backend--6dmjph8ltlhv.code.run/api/metadata');
+                    if (!res.ok) throw new Error('Metadata service unreachable');
+                    const data = await res.json();
+                    
+                    // Sort alphabetically for better UX
+                    data.aircraft.sort((a, b) => a.name.localeCompare(b.name));
+                    data.liveries.sort((a, b) => a.name.localeCompare(b.name));
+                    
+                    setMetadata(data);
+                } catch (err) {
+                    console.error("Failed to load dropdowns:", err);
+                    // Fallback: The inputs will just remain empty, user might be stuck 
+                    // or you could toggle a "manual entry" mode here.
+                } finally {
+                    setFetchingMeta(false);
+                }
+            };
+            fetchMetadata();
+          }, []);
+
           const handleChange = (e) => {
             setFormData({ ...formData, [e.target.name]: e.target.value });
+          };
+
+          // Special handler for Aircraft Selection to handle the ID/Name split
+          const handleAircraftChange = (e) => {
+             const selectedId = e.target.value;
+             const selectedObj = metadata.aircraft.find(a => a.id === selectedId);
+             
+             setFormData({
+                 ...formData,
+                 aircraftId: selectedId,
+                 aircraftType: selectedObj ? selectedObj.name : '',
+                 liveryName: '' // Reset livery when aircraft changes
+             });
           };
 
           const handleFileChange = (e) => {
@@ -397,9 +440,8 @@
             setLoading(true);
 
             if (isDemoMode) {
-              // Simulate upload delay
               setTimeout(() => {
-                alert("Demo Mode: Aircraft 'uploaded' locally (refresh will clear it).");
+                alert("Demo Mode: Aircraft 'uploaded' locally.");
                 onSuccess();
               }, 1500);
               return;
@@ -420,7 +462,7 @@
                 return;
               }
 
-              const response = await fetch(API_URL, {
+              const response = await fetch(API_URL, { // This goes to server.js (Port 5000)
                 method: 'POST',
                 body: data, 
               });
@@ -438,6 +480,11 @@
               setLoading(false);
             }
           };
+
+          // Filter liveries based on selected Aircraft ID
+          const availableLiveries = metadata.liveries.filter(
+              l => l.aircraftId === formData.aircraftId
+          );
 
           return (
             <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/80 backdrop-blur-sm animate-in fade-in duration-200">
@@ -457,7 +504,7 @@
                                 onChange={(e) => setShowPreviewOverlay(e.target.checked)}
                                 className="rounded text-blue-600 focus:ring-blue-500"
                             />
-                            Show "In-App" Preview
+                            Show Preview
                         </label>
                     )}
                     <button onClick={onClose} className="text-slate-400 hover:text-slate-600">
@@ -469,7 +516,7 @@
                 <div className="flex-1 overflow-y-auto p-6">
                     <form onSubmit={handleSubmit} className="space-y-6">
                     
-                    {/* File Upload / Preview Area */}
+                    {/* File Upload Area (Unchanged visual) */}
                     <div className="relative group w-full">
                         <input 
                         type="file" 
@@ -479,9 +526,6 @@
                         className={`absolute inset-0 w-full h-full opacity-0 cursor-pointer z-20 ${preview ? 'h-0' : ''}`} 
                         />
                         
-                        {/* THIS IS THE NEW PREVIEW CONTAINER 
-                            It strictly mimics the css from flight.js (.aircraft-overview-panel)
-                        */}
                         <div className={`
                             relative w-full overflow-hidden rounded-xl transition-all
                             ${preview ? 'aspect-[2/1] border-0' : 'h-48 border-2 border-dashed border-slate-300 hover:border-blue-400 hover:bg-slate-50 flex flex-col items-center justify-center'}
@@ -489,50 +533,24 @@
                         
                         {preview ? (
                             <>
-                                {/* The Base Image */}
                                 <img src={preview} alt="Preview" className="absolute inset-0 w-full h-full object-cover" />
-
-                                {/* THE OVERLAY SIMULATOR 
-                                    This reproduces the flight.js gradients and text placement exactly.
-                                */}
                                 {showPreviewOverlay && (
                                     <div className="absolute inset-0 z-10 pointer-events-none flex flex-col justify-between p-5"
-                                        style={{
-                                            background: `linear-gradient(to bottom, rgba(0, 0, 0, 0.7) 0%, rgba(0, 0, 0, 0) 35%, rgba(0, 0, 0, 0.2) 80%, rgba(18, 20, 38, 0.95) 100%)`
-                                        }}
+                                        style={{ background: `linear-gradient(to bottom, rgba(0, 0, 0, 0.7) 0%, rgba(0, 0, 0, 0) 35%, rgba(0, 0, 0, 0.2) 80%, rgba(18, 20, 38, 0.95) 100%)` }}
                                     >
-                                        {/* Top Section (Header simulation) */}
                                         <div className="flex justify-between items-start text-white">
                                             <div>
-                                                {/* Mimic #ac-header-callsign */}
                                                 <h3 className="text-3xl font-bold drop-shadow-md flex items-center gap-2">
-                                                    {/* Fake airline logo box */}
                                                     <div className="w-8 h-8 bg-white/20 rounded"></div>
                                                     {formData.tailNumber || 'N12345'}
                                                 </h3>
-                                                {/* Mimic subtext */}
                                                 <p className="text-sm text-slate-300 mt-1 drop-shadow-md">
                                                     {formData.liveryName || 'Airline Name'} • {formData.aircraftType || 'Aircraft Type'}
                                                 </p>
                                             </div>
-                                            
-                                            {/* Mimic Buttons simulated with placeholders */}
-                                            <div className="flex gap-2 opacity-70">
-                                                <div className="w-8 h-8 rounded-full bg-white/10 border border-white/20"></div>
-                                                <div className="w-8 h-8 rounded-full bg-white/10 border border-white/20"></div>
-                                            </div>
-                                        </div>
-                                        
-                                        {/* Bottom Label to indicate fading */}
-                                        <div className="text-center">
-                                            <p className="text-[10px] text-white/40 uppercase tracking-widest border-t border-white/10 pt-2">
-                                                Bottom 20% Fades into Background
-                                            </p>
                                         </div>
                                     </div>
                                 )}
-
-                                {/* "Change Image" button that appears on hover over the preview */}
                                 <button 
                                     type="button"
                                     onClick={() => fileInputRef.current?.click()}
@@ -576,28 +594,59 @@
                         </div>
                     </div>
 
+                    {/* NEW: DROPDOWN FOR AIRCRAFT */}
                     <div className="space-y-1">
                         <label className="text-xs font-semibold text-slate-500 uppercase">Aircraft Type</label>
-                        <input 
-                        required
-                        name="aircraftType"
-                        placeholder="e.g. Boeing 737-800"
-                        className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all"
-                        value={formData.aircraftType}
-                        onChange={handleChange}
-                        />
+                        {fetchingMeta ? (
+                             <div className="animate-pulse h-10 bg-slate-100 rounded-lg w-full"></div>
+                        ) : (
+                            <div className="relative">
+                                <select 
+                                    required
+                                    name="aircraftId"
+                                    className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all appearance-none bg-white"
+                                    value={formData.aircraftId}
+                                    onChange={handleAircraftChange}
+                                >
+                                    <option value="">Select Aircraft...</option>
+                                    {metadata.aircraft.map(ac => (
+                                        <option key={ac.id} value={ac.id}>{ac.name}</option>
+                                    ))}
+                                </select>
+                                <div className="absolute right-3 top-3 pointer-events-none text-slate-400">
+                                    <Tag size={16} />
+                                </div>
+                            </div>
+                        )}
                     </div>
 
+                    {/* NEW: DROPDOWN FOR LIVERY (Cascading) */}
                     <div className="space-y-1">
                         <label className="text-xs font-semibold text-slate-500 uppercase">Livery Name</label>
-                        <input 
-                        required
-                        name="liveryName"
-                        placeholder="e.g. Standard, Special Retro..."
-                        className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all"
-                        value={formData.liveryName}
-                        onChange={handleChange}
-                        />
+                         {fetchingMeta ? (
+                             <div className="animate-pulse h-10 bg-slate-100 rounded-lg w-full"></div>
+                        ) : (
+                            <div className="relative">
+                                <select 
+                                    required
+                                    name="liveryName"
+                                    disabled={!formData.aircraftId}
+                                    className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all appearance-none bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                                    value={formData.liveryName}
+                                    onChange={handleChange}
+                                >
+                                    <option value="">
+                                        {formData.aircraftId ? "Select Livery..." : "Select Aircraft First"}
+                                    </option>
+                                    {availableLiveries.map(livery => (
+                                        <option key={livery.id} value={livery.name}>{livery.name}</option>
+                                    ))}
+                                </select>
+                                <div className="absolute right-3 top-3 pointer-events-none text-slate-400">
+                                    <Camera size={16} />
+                                </div>
+                            </div>
+                        )}
                     </div>
 
                     <button 
