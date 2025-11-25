@@ -372,38 +372,39 @@
         function UploadModal({ onClose, onSuccess, isDemoMode }) {
           const [loading, setLoading] = useState(false);
           const [fetchingMeta, setFetchingMeta] = useState(true);
-          const [metadata, setMetadata] = useState({ aircraft: [], liveries: [] });
           
+          // ⬇️ UPDATED: specificLiveries stores the data from the new on-demand API
+          const [metadata, setMetadata] = useState({ aircraft: [] }); 
+          const [specificLiveries, setSpecificLiveries] = useState([]); 
+          const [loadingLiveries, setLoadingLiveries] = useState(false);
+
           const fileInputRef = useRef(null);
           const [preview, setPreview] = useState(null);
           const [showPreviewOverlay, setShowPreviewOverlay] = useState(true);
           
           const [formData, setFormData] = useState({
             contributorName: '',
-            aircraftType: '', // This will store the Name string
-            aircraftId: '',   // This stores the ID for filtering liveries
+            aircraftType: '',
+            aircraftId: '',
             liveryName: '',
             tailNumber: ''
           });
 
-          // 1. Fetch Aircraft/Livery Data from the OTHER backend (Port 5001)
+          // 1. Fetch ONLY Aircraft Names on Load
           useEffect(() => {
             const fetchMetadata = async () => {
                 try {
-                    // Assuming live_flights.js runs on port 5001
                     const res = await fetch('https://site--acars-backend--6dmjph8ltlhv.code.run/api/metadata');
                     if (!res.ok) throw new Error('Metadata service unreachable');
                     const data = await res.json();
                     
-                    // Sort alphabetically for better UX
+                    // Sort aircraft alphabetically
                     data.aircraft.sort((a, b) => a.name.localeCompare(b.name));
-                    data.liveries.sort((a, b) => a.name.localeCompare(b.name));
                     
-                    setMetadata(data);
+                    // We only save aircraft; liveries are now fetched on demand
+                    setMetadata({ aircraft: data.aircraft });
                 } catch (err) {
                     console.error("Failed to load dropdowns:", err);
-                    // Fallback: The inputs will just remain empty, user might be stuck 
-                    // or you could toggle a "manual entry" mode here.
                 } finally {
                     setFetchingMeta(false);
                 }
@@ -415,17 +416,41 @@
             setFormData({ ...formData, [e.target.name]: e.target.value });
           };
 
-          // Special handler for Aircraft Selection to handle the ID/Name split
-          const handleAircraftChange = (e) => {
+          // ⬇️ UPDATED: Handle Aircraft Change + Trigger Livery Fetch
+          const handleAircraftChange = async (e) => {
              const selectedId = e.target.value;
              const selectedObj = metadata.aircraft.find(a => a.id === selectedId);
              
+             // 1. Update form state immediately
              setFormData({
                  ...formData,
                  aircraftId: selectedId,
                  aircraftType: selectedObj ? selectedObj.name : '',
-                 liveryName: '' // Reset livery when aircraft changes
+                 liveryName: '' // Reset livery selection
              });
+
+             // 2. Reset liveries list
+             setSpecificLiveries([]);
+
+             // 3. If an aircraft is selected, fetch its liveries!
+             if (selectedId) {
+                setLoadingLiveries(true);
+                try {
+                    const res = await fetch(`https://site--acars-backend--6dmjph8ltlhv.code.run/api/aircraft/${selectedId}/liveries`);
+                    if (res.ok) {
+                        const data = await res.json();
+                        if (data.liveries) {
+                            // Sort and set the specific liveries for this plane
+                            data.liveries.sort((a, b) => a.name.localeCompare(b.name));
+                            setSpecificLiveries(data.liveries);
+                        }
+                    }
+                } catch (err) {
+                    console.error("Failed to fetch liveries for aircraft:", err);
+                } finally {
+                    setLoadingLiveries(false);
+                }
+             }
           };
 
           const handleFileChange = (e) => {
@@ -462,7 +487,7 @@
                 return;
               }
 
-              const response = await fetch(API_URL, { // This goes to server.js (Port 5000)
+              const response = await fetch(API_URL, {
                 method: 'POST',
                 body: data, 
               });
@@ -480,11 +505,6 @@
               setLoading(false);
             }
           };
-
-          // Filter liveries based on selected Aircraft ID
-          const availableLiveries = metadata.liveries.filter(
-              l => l.aircraftId === formData.aircraftId
-          );
 
           return (
             <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/80 backdrop-blur-sm animate-in fade-in duration-200">
@@ -516,7 +536,7 @@
                 <div className="flex-1 overflow-y-auto p-6">
                     <form onSubmit={handleSubmit} className="space-y-6">
                     
-                    {/* File Upload Area (Unchanged visual) */}
+                    {/* File Upload Area */}
                     <div className="relative group w-full">
                         <input 
                         type="file" 
@@ -594,7 +614,7 @@
                         </div>
                     </div>
 
-                    {/* NEW: DROPDOWN FOR AIRCRAFT */}
+                    {/* Aircraft Type Dropdown */}
                     <div className="space-y-1">
                         <label className="text-xs font-semibold text-slate-500 uppercase">Aircraft Type</label>
                         {fetchingMeta ? (
@@ -620,9 +640,11 @@
                         )}
                     </div>
 
-                    {/* NEW: DROPDOWN FOR LIVERY (Cascading) */}
+                    {/* ⬇️ UPDATED: Livery Dropdown (Dynamic Loading) */}
                     <div className="space-y-1">
-                        <label className="text-xs font-semibold text-slate-500 uppercase">Livery Name</label>
+                        <label className="text-xs font-semibold text-slate-500 uppercase">
+                            Livery Name {loadingLiveries && <span className="text-blue-500 ml-2 animate-pulse">(Loading...)</span>}
+                        </label>
                          {fetchingMeta ? (
                              <div className="animate-pulse h-10 bg-slate-100 rounded-lg w-full"></div>
                         ) : (
@@ -630,20 +652,22 @@
                                 <select 
                                     required
                                     name="liveryName"
-                                    disabled={!formData.aircraftId}
+                                    disabled={!formData.aircraftId || loadingLiveries}
                                     className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all appearance-none bg-white disabled:bg-slate-100 disabled:text-slate-400"
                                     value={formData.liveryName}
                                     onChange={handleChange}
                                 >
                                     <option value="">
-                                        {formData.aircraftId ? "Select Livery..." : "Select Aircraft First"}
+                                        {loadingLiveries ? "Fetching Liveries..." : 
+                                         !formData.aircraftId ? "Select Aircraft First" : 
+                                         "Select Livery..."}
                                     </option>
-                                    {availableLiveries.map(livery => (
+                                    {specificLiveries.map(livery => (
                                         <option key={livery.id} value={livery.name}>{livery.name}</option>
                                     ))}
                                 </select>
                                 <div className="absolute right-3 top-3 pointer-events-none text-slate-400">
-                                    <Camera size={16} />
+                                    {loadingLiveries ? <Loader2 size={16} className="animate-spin" /> : <Camera size={16} />}
                                 </div>
                             </div>
                         )}
@@ -663,7 +687,7 @@
             </div>
           );
         }
-
+        
         // --- RENDER APP ---
         const root = createRoot(document.getElementById('root'));
         root.render(<App />);
