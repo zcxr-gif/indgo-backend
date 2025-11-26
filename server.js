@@ -7,6 +7,7 @@ const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { CloudWatchClient, GetMetricStatisticsCommand } = require('@aws-sdk/client-cloudwatch');
 const sharp = require('sharp'); // Image processing library
 require('dotenv').config();
 
@@ -36,8 +37,19 @@ const CommunityAircraftSchema = new mongoose.Schema({
 
 const CommunityAircraft = mongoose.model('CommunityAircraft', CommunityAircraftSchema);
 
-// 4. CONFIGURE AWS S3
+// 4. CONFIGURE AWS CLIENTS
+
+// S3 Client (Storage)
 const s3Client = new S3Client({
+    region: process.env.AWS_REGION,
+    credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    }
+});
+
+// CloudWatch Client (Monitoring/Stats)
+const cloudWatchClient = new CloudWatchClient({
     region: process.env.AWS_REGION,
     credentials: {
         accessKeyId: process.env.AWS_ACCESS_KEY_ID,
@@ -56,8 +68,6 @@ const deleteS3Object = async (imageUrl) => {
     if (!imageUrl) return;
     try {
         // Extract Key from URL
-        // Expected format: https://BUCKET.s3.REGION.amazonaws.com/KEY
-        // We need everything after the domain.
         const urlObj = new URL(imageUrl);
         const key = urlObj.pathname.substring(1); // Remove leading '/'
 
@@ -87,6 +97,61 @@ app.get('/api/aircraft', async (req, res) => {
     } catch (error) {
         console.error(error);
         res.status(500).json({ message: 'Error fetching aircraft.' });
+    }
+});
+
+// GET: Admin System Stats (New - Includes S3 & DB Stats)
+app.get('/api/admin/stats', async (req, res) => {
+    try {
+        // 1. Get MongoDB Stats
+        const dbStats = await mongoose.connection.db.stats();
+        const docCount = await CommunityAircraft.countDocuments();
+        
+        // 2. Get Server Memory Usage (RSS = Resident Set Size)
+        const memoryUsage = process.memoryUsage();
+
+        // 3. Get S3 Storage Metrics from CloudWatch (Fast & Cheap)
+        let s3SizeBytes = 0;
+
+        try {
+            // We ask for the "BucketSizeBytes" metric for the last 2 days
+            const command = new GetMetricStatisticsCommand({
+                Namespace: 'AWS/S3',
+                MetricName: 'BucketSizeBytes',
+                Dimensions: [
+                    { Name: 'BucketName', Value: process.env.AWS_S3_BUCKET_NAME },
+                    { Name: 'StorageType', Value: 'StandardStorage' }
+                ],
+                StartTime: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000), // 2 days ago
+                EndTime: new Date(),
+                Period: 86400, // 1 day intervals
+                Statistics: ['Maximum'] // Get the max size recorded
+            });
+            
+            const data = await cloudWatchClient.send(command);
+            
+            // If data exists, grab the latest datapoint
+            if (data.Datapoints && data.Datapoints.length > 0) {
+                // Sort by timestamp to get the most recent reading
+                data.Datapoints.sort((a, b) => b.Timestamp - a.Timestamp);
+                s3SizeBytes = data.Datapoints[0].Maximum;
+            }
+        } catch (s3Error) {
+            console.error('S3 Stats Error (Non-fatal):', s3Error);
+        }
+        
+        res.json({
+            status: 'online',
+            aircraftCount: docCount,
+            dbSizeBytes: dbStats.storageSize, 
+            dbDataSizeBytes: dbStats.dataSize, 
+            serverMemoryBytes: memoryUsage.rss,
+            uptimeSeconds: process.uptime(),
+            s3SizeBytes: s3SizeBytes
+        });
+    } catch (error) {
+        console.error('Stats Error:', error);
+        res.status(500).json({ message: 'Error fetching system stats.' });
     }
 });
 

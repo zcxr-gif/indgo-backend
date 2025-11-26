@@ -65,12 +65,19 @@
         import { 
           Plane, Upload, Search, X, Info, Camera, User, Tag, Hash, Trash2,
           AlertCircle, CheckCircle2, Loader2, Edit, Pencil, Moon, Sun,
-          Filter, SlidersHorizontal, Settings, Shield, BarChart3, ChevronDown
+          Filter, SlidersHorizontal, Settings, Shield, BarChart3, ChevronDown,
+          Database, Cloud, Server, HardDrive
         } from 'lucide-react';
 
-        const API_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+        const IS_LOCALHOST = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+
+        const API_URL = IS_LOCALHOST
           ? 'http://localhost:5000/api/aircraft'
           : '/api/aircraft';
+        
+        const STATS_URL = IS_LOCALHOST
+          ? 'http://localhost:5000/api/admin/stats'
+          : '/api/admin/stats';
 
         // --- DEMO DATA ---
         const DEMO_DATA = [
@@ -79,7 +86,7 @@
           { _id: '3', contributorName: 'Mike Zulu', aircraftType: 'Cessna 172', liveryName: 'Private', tailNumber: 'N172SP', imageUrl: 'https://images.unsplash.com/photo-1559067515-bf7d799b23e2?auto=format&fit=crop&q=80&w=1000', uploadedAt: new Date(Date.now() - 172800000).toISOString() },
         ];
 
-        // --- FALLBACK METADATA (Used if backend is unreachable) ---
+        // --- FALLBACK METADATA ---
         const DEMO_METADATA_AIRCRAFT = [
             { id: 'a1', name: 'Airbus A320' },
             { id: 'a2', name: 'Airbus A350' },
@@ -100,9 +107,20 @@
             { id: 'l7', name: 'Alliance' }
         ];
 
+        // --- UTILS ---
+        function formatBytes(bytes, decimals = 1) {
+            if (!+bytes) return '0 B';
+            const k = 1024;
+            const dm = decimals < 0 ? 0 : decimals;
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+        }
+
         function App() {
           // --- GLOBAL STATE ---
           const [aircrafts, setAircrafts] = useState([]);
+          const [stats, setStats] = useState(null);
           const [loading, setLoading] = useState(true);
           const [isDemoMode, setIsDemoMode] = useState(false);
           const [theme, setTheme] = useState('light');
@@ -114,10 +132,7 @@
           const [sortBy, setSortBy] = useState('newest'); // 'newest', 'oldest', 'az'
 
           // --- ADMIN / UI STATE ---
-          const [adminMode, setAdminMode] = useState(false);
-          const [showFilters, setShowFilters] = useState(false);
-
-          // --- MODAL STATE ---
+          const [adminMode, setAdminMode] = useState(true);
           const [showFormModal, setShowFormModal] = useState(false);
           const [editingAircraft, setEditingAircraft] = useState(null);
           const [selectedAircraft, setSelectedAircraft] = useState(null);
@@ -136,6 +151,7 @@
 
             // Fetch Data
             fetchAircraft();
+            fetchStats();
           }, []);
 
           const toggleTheme = () => {
@@ -143,6 +159,18 @@
               setTheme(newTheme);
               localStorage.setItem('theme', newTheme);
               document.documentElement.classList.toggle('dark');
+          };
+
+          const fetchStats = async () => {
+              try {
+                  const res = await fetch(STATS_URL);
+                  if (res.ok) {
+                      const data = await res.json();
+                      setStats(data);
+                  }
+              } catch (err) {
+                  console.warn("Stats service unavailable");
+              }
           };
 
           const fetchAircraft = async () => {
@@ -227,6 +255,7 @@
             try {
               await fetch(`${API_URL}/${id}`, { method: 'DELETE' });
               fetchAircraft();
+              fetchStats(); // Update storage stats after delete
               if (selectedAircraft && selectedAircraft._id === id) setSelectedAircraft(null);
             } catch (error) {
               alert('Error deleting aircraft');
@@ -271,14 +300,6 @@
                     {/* Actions */}
                     <div className="flex items-center gap-2 sm:gap-3">
                         <button 
-                            onClick={() => setAdminMode(!adminMode)}
-                            className={`p-2 rounded-lg transition-all ${adminMode ? 'bg-blue-100 text-blue-600 dark:bg-blue-900/30 dark:text-blue-400' : 'text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800'}`}
-                            title="Toggle Admin Mode"
-                        >
-                            <Shield size={20} />
-                        </button>
-                        
-                        <button 
                             onClick={toggleTheme}
                             className="p-2 text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800 rounded-lg transition-colors"
                         >
@@ -302,21 +323,40 @@
                   <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
                       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
                           
-                          {/* Stats - Only visible in Admin Mode or on large screens */}
-                          <div className="flex items-center gap-6 text-sm text-slate-500 dark:text-slate-400">
+                          {/* Stats - Including New Storage Stats */}
+                          <div className="flex flex-wrap items-center gap-4 sm:gap-6 text-sm text-slate-500 dark:text-slate-400">
                                 <div className="flex items-center gap-2">
                                     <BarChart3 size={16} />
-                                    <span className="font-medium text-slate-900 dark:text-white">{aircrafts.length}</span> Total Aircraft
+                                    <span className="font-medium text-slate-900 dark:text-white">{aircrafts.length}</span> <span className="hidden sm:inline">Aircraft</span>
                                 </div>
                                 <div className="hidden sm:flex items-center gap-2">
                                     <Tag size={16} />
-                                    <span className="font-medium text-slate-900 dark:text-white">{uniqueTypes.length - 1}</span> Types
+                                    <span className="font-medium text-slate-900 dark:text-white">{uniqueTypes.length - 1}</span> <span className="hidden sm:inline">Types</span>
                                 </div>
+                                
+                                {/* NEW STORAGE STATS SECTION */}
+                                {stats && (
+                                    <>
+                                        <div className="hidden lg:flex h-4 w-px bg-slate-200 dark:bg-slate-700 mx-1"></div>
+                                        
+                                        <div className="flex items-center gap-2" title="S3 Object Storage Usage">
+                                            <Cloud size={16} className="text-blue-500" />
+                                            <span className="font-medium text-slate-900 dark:text-white">{formatBytes(stats.s3SizeBytes)}</span> 
+                                            <span className="hidden sm:inline text-xs uppercase font-bold tracking-wider">Cloud</span>
+                                        </div>
+                                        
+                                        <div className="flex items-center gap-2" title="MongoDB Storage Usage">
+                                            <Database size={16} className="text-indigo-500" />
+                                            <span className="font-medium text-slate-900 dark:text-white">{formatBytes(stats.dbSizeBytes)}</span> 
+                                            <span className="hidden sm:inline text-xs uppercase font-bold tracking-wider">DB</span>
+                                        </div>
+                                    </>
+                                )}
                           </div>
 
                           {/* Filter Controls */}
                           <div className="flex flex-wrap items-center gap-3">
-                              {/* Mobile Search (visible only on small screens) */}
+                              {/* Mobile Search */}
                               <div className="md:hidden w-full mb-2">
                                    <input
                                         type="text"
@@ -417,6 +457,7 @@
                   onSuccess={() => {
                     setShowFormModal(false);
                     fetchAircraft();
+                    fetchStats(); // Update stats on success
                   }}
                   isDemoMode={isDemoMode}
                   initialData={editingAircraft} 
