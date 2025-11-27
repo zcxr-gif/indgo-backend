@@ -100,6 +100,47 @@ app.get('/api/aircraft', async (req, res) => {
     }
 });
 
+// GET: Find aircraft by Type AND Livery (Partial/Fuzzy Match)
+app.get('/api/aircraft/lookup', async (req, res) => {
+    try {
+        const { type, livery } = req.query;
+
+        // Ensure at least one search term is provided to avoid returning the whole database accidentally
+        if (!type && !livery) {
+            return res.status(400).json({ message: 'At least one search parameter (type or livery) is required.' });
+        }
+
+        // Create the search query object
+        let query = {};
+
+        // If 'type' is provided, add it to the query (Partial match, Case Insensitive)
+        if (type) {
+            query.aircraftType = { $regex: type, $options: 'i' };
+        }
+
+        // If 'livery' is provided, add it to the query (Partial match, Case Insensitive)
+        if (livery) {
+            query.liveryName = { $regex: livery, $options: 'i' };
+        }
+
+        // We use 'find' instead of 'findOne' because a partial match might return multiple results
+        // (e.g. searching "737" might return "737-800" and "737-Max")
+        const results = await CommunityAircraft.find(query);
+
+        if (results.length === 0) {
+            return res.status(404).json({ message: 'No matching aircraft found.' });
+        }
+
+        // Return the first match found, or the whole list if you prefer
+        // Returning results[0] mimics the behavior of "findOne" but with fuzzy matching
+        res.json(results[0]); 
+
+    } catch (error) {
+        console.error('Error looking up aircraft:', error);
+        res.status(500).json({ message: 'Error performing lookup.' });
+    }
+});
+
 // GET: Admin System Stats (New - Includes S3 & DB Stats)
 app.get('/api/admin/stats', async (req, res) => {
     try {
