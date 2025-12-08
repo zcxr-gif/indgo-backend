@@ -66,7 +66,7 @@
           Plane, Upload, Search, X, Info, Camera, User, Tag, Hash, Trash2,
           AlertCircle, CheckCircle2, Loader2, Edit, Pencil, Moon, Sun,
           Filter, SlidersHorizontal, Settings, Shield, BarChart3, ChevronDown,
-          Database, Cloud, Server, HardDrive
+          Database, Cloud, Server, HardDrive, LayoutGrid, ListChecks
         } from 'lucide-react';
 
         const IS_LOCALHOST = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
@@ -125,6 +125,9 @@
           const [isDemoMode, setIsDemoMode] = useState(false);
           const [theme, setTheme] = useState('light');
           
+          // --- VIEW STATE ---
+          const [currentView, setCurrentView] = useState('gallery'); // 'gallery' or 'collection'
+
           // --- FILTER & SEARCH STATE ---
           const [searchTerm, setSearchTerm] = useState('');
           const [filterType, setFilterType] = useState('All');
@@ -136,6 +139,9 @@
           const [showFormModal, setShowFormModal] = useState(false);
           const [editingAircraft, setEditingAircraft] = useState(null);
           const [selectedAircraft, setSelectedAircraft] = useState(null);
+          
+          // --- PREFILL STATE (New) ---
+          const [prefillData, setPrefillData] = useState(null);
 
           // --- INITIALIZATION ---
           useEffect(() => {
@@ -235,12 +241,21 @@
           const handleEdit = (aircraft, e) => {
             if(e) e.stopPropagation();
             setEditingAircraft(aircraft);
+            setPrefillData(null);
             setShowFormModal(true);
           };
 
           const handleCreate = () => {
             setEditingAircraft(null);
+            setPrefillData(null);
             setShowFormModal(true);
+          };
+
+          // Handle uploading missing items from the dashboard
+          const handlePrefillUpload = (aircraftId, aircraftType, liveryName) => {
+              setEditingAircraft(null);
+              setPrefillData({ aircraftId, aircraftType, liveryName });
+              setShowFormModal(true);
           };
 
           const handleDelete = async (id, e) => {
@@ -271,7 +286,7 @@
                   <div className="flex items-center justify-between h-16">
                     
                     {/* Logo */}
-                    <div className="flex items-center gap-3 cursor-pointer" onClick={() => {setSearchTerm(''); setFilterType('All');}}>
+                    <div className="flex items-center gap-3 cursor-pointer" onClick={() => {setSearchTerm(''); setFilterType('All'); setCurrentView('gallery');}}>
                         <div className="bg-gradient-to-br from-blue-600 to-indigo-600 p-2 rounded-xl text-white shadow-lg shadow-blue-500/20">
                             <Plane size={20} fill="currentColor" className="transform -rotate-45" />
                         </div>
@@ -281,20 +296,20 @@
                         </div>
                     </div>
 
-                    {/* Desktop Search Bar */}
-                    <div className="hidden md:flex flex-1 max-w-md mx-8 group">
-                        <div className="relative w-full">
-                            <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                                <Search size={16} className="text-slate-400 group-focus-within:text-blue-500 transition-colors" />
-                            </div>
-                            <input
-                                type="text"
-                                className="block w-full pl-10 pr-3 py-2 border border-slate-200 dark:border-slate-700 rounded-full leading-5 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:bg-white dark:focus:bg-slate-900 focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 transition-all duration-200 sm:text-sm"
-                                placeholder="Search tail number, type, or livery..."
-                                value={searchTerm}
-                                onChange={(e) => setSearchTerm(e.target.value)}
-                            />
-                        </div>
+                    {/* View Switcher */}
+                    <div className="hidden md:flex items-center bg-slate-100 dark:bg-slate-800 p-1 rounded-lg">
+                        <button 
+                            onClick={() => setCurrentView('gallery')}
+                            className={`flex items-center gap-2 px-3 py-1.5 text-xs font-bold uppercase tracking-wide rounded-md transition-all ${currentView === 'gallery' ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`}
+                        >
+                            <LayoutGrid size={14} /> Gallery
+                        </button>
+                        <button 
+                            onClick={() => setCurrentView('collection')}
+                            className={`flex items-center gap-2 px-3 py-1.5 text-xs font-bold uppercase tracking-wide rounded-md transition-all ${currentView === 'collection' ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`}
+                        >
+                            <ListChecks size={14} /> Checklist
+                        </button>
                     </div>
 
                     {/* Actions */}
@@ -318,129 +333,155 @@
                 </div>
               </nav>
 
-              {/* --- CONTROL BAR (Filters & Stats) --- */}
-              <div className="bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 transition-colors duration-300">
-                  <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
-                      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-                          
-                          {/* Stats - Including New Storage Stats */}
-                          <div className="flex flex-wrap items-center gap-4 sm:gap-6 text-sm text-slate-500 dark:text-slate-400">
-                                <div className="flex items-center gap-2">
-                                    <BarChart3 size={16} />
-                                    <span className="font-medium text-slate-900 dark:text-white">{aircrafts.length}</span> <span className="hidden sm:inline">Aircraft</span>
-                                </div>
-                                <div className="hidden sm:flex items-center gap-2">
-                                    <Tag size={16} />
-                                    <span className="font-medium text-slate-900 dark:text-white">{uniqueTypes.length - 1}</span> <span className="hidden sm:inline">Types</span>
-                                </div>
-                                
-                                {/* NEW STORAGE STATS SECTION */}
-                                {stats && (
-                                    <>
-                                        <div className="hidden lg:flex h-4 w-px bg-slate-200 dark:bg-slate-700 mx-1"></div>
-                                        
-                                        <div className="flex items-center gap-2" title="S3 Object Storage Usage">
-                                            <Cloud size={16} className="text-blue-500" />
-                                            <span className="font-medium text-slate-900 dark:text-white">{formatBytes(stats.s3SizeBytes)}</span> 
-                                            <span className="hidden sm:inline text-xs uppercase font-bold tracking-wider">Cloud</span>
-                                        </div>
-                                        
-                                        <div className="flex items-center gap-2" title="MongoDB Storage Usage">
-                                            <Database size={16} className="text-indigo-500" />
-                                            <span className="font-medium text-slate-900 dark:text-white">{formatBytes(stats.dbSizeBytes)}</span> 
-                                            <span className="hidden sm:inline text-xs uppercase font-bold tracking-wider">DB</span>
-                                        </div>
-                                    </>
-                                )}
-                          </div>
-
-                          {/* Filter Controls */}
-                          <div className="flex flex-wrap items-center gap-3">
-                              {/* Mobile Search */}
-                              <div className="md:hidden w-full mb-2">
-                                   <input
-                                        type="text"
-                                        className="w-full pl-4 pr-4 py-2 border border-slate-200 dark:border-slate-700 rounded-lg bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none text-sm"
-                                        placeholder="Search..."
-                                        value={searchTerm}
-                                        onChange={(e) => setSearchTerm(e.target.value)}
-                                    />
+              {/* --- CONTENT AREA SWITCHER --- */}
+              
+              {currentView === 'gallery' ? (
+                  <>
+                  {/* --- CONTROL BAR (Filters & Stats) --- */}
+                  <div className="bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 transition-colors duration-300 animate-in slide-in-from-top-2">
+                      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+                          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                              
+                              {/* Stats - Including New Storage Stats */}
+                              <div className="flex flex-wrap items-center gap-4 sm:gap-6 text-sm text-slate-500 dark:text-slate-400">
+                                    <div className="flex items-center gap-2">
+                                        <BarChart3 size={16} />
+                                        <span className="font-medium text-slate-900 dark:text-white">{aircrafts.length}</span> <span className="hidden sm:inline">Aircraft</span>
+                                    </div>
+                                    <div className="hidden sm:flex items-center gap-2">
+                                        <Tag size={16} />
+                                        <span className="font-medium text-slate-900 dark:text-white">{uniqueTypes.length - 1}</span> <span className="hidden sm:inline">Types</span>
+                                    </div>
+                                    
+                                    {/* NEW STORAGE STATS SECTION */}
+                                    {stats && (
+                                        <>
+                                            <div className="hidden lg:flex h-4 w-px bg-slate-200 dark:bg-slate-700 mx-1"></div>
+                                            
+                                            <div className="flex items-center gap-2" title="S3 Object Storage Usage">
+                                                <Cloud size={16} className="text-blue-500" />
+                                                <span className="font-medium text-slate-900 dark:text-white">{formatBytes(stats.s3SizeBytes)}</span> 
+                                                <span className="hidden sm:inline text-xs uppercase font-bold tracking-wider">Cloud</span>
+                                            </div>
+                                            
+                                            <div className="flex items-center gap-2" title="MongoDB Storage Usage">
+                                                <Database size={16} className="text-indigo-500" />
+                                                <span className="font-medium text-slate-900 dark:text-white">{formatBytes(stats.dbSizeBytes)}</span> 
+                                                <span className="hidden sm:inline text-xs uppercase font-bold tracking-wider">DB</span>
+                                            </div>
+                                        </>
+                                    )}
                               </div>
 
-                              <div className="flex items-center gap-2 w-full md:w-auto overflow-x-auto pb-2 md:pb-0 scrollbar-hide">
-                                <FilterSelect 
-                                    label="Type" 
-                                    options={uniqueTypes} 
-                                    value={filterType} 
-                                    onChange={(e) => setFilterType(e.target.value)} 
-                                />
-                                <FilterSelect 
-                                    label="Contributor" 
-                                    options={uniqueContributors} 
-                                    value={filterContributor} 
-                                    onChange={(e) => setFilterContributor(e.target.value)} 
-                                />
-                                
-                                <div className="h-6 w-px bg-slate-200 dark:bg-slate-700 mx-1"></div>
+                              {/* Filter Controls */}
+                              <div className="flex flex-wrap items-center gap-3">
+                                  {/* Mobile Search */}
+                                  <div className="md:hidden w-full mb-2">
+                                      <input
+                                            type="text"
+                                            className="w-full pl-4 pr-4 py-2 border border-slate-200 dark:border-slate-700 rounded-lg bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none text-sm"
+                                            placeholder="Search..."
+                                            value={searchTerm}
+                                            onChange={(e) => setSearchTerm(e.target.value)}
+                                        />
+                                  </div>
 
-                                <select 
-                                    value={sortBy}
-                                    onChange={(e) => setSortBy(e.target.value)}
-                                    className="bg-transparent text-sm font-medium text-slate-700 dark:text-slate-300 border-none focus:ring-0 cursor-pointer hover:text-blue-600 dark:hover:text-blue-400 transition-colors outline-none"
-                                >
-                                    <option value="newest">Newest First</option>
-                                    <option value="oldest">Oldest First</option>
-                                    <option value="az">A-Z (Tail)</option>
-                                </select>
+                                  {/* Desktop Search */}
+                                  <div className="hidden md:flex relative max-w-[200px]">
+                                        <input
+                                            type="text"
+                                            className="w-full pl-3 pr-8 py-1.5 border border-slate-200 dark:border-slate-700 rounded-lg bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none text-sm"
+                                            placeholder="Quick search..."
+                                            value={searchTerm}
+                                            onChange={(e) => setSearchTerm(e.target.value)}
+                                        />
+                                        <Search size={14} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400" />
+                                  </div>
+
+                                  <div className="flex items-center gap-2 w-full md:w-auto overflow-x-auto pb-2 md:pb-0 scrollbar-hide">
+                                    <FilterSelect 
+                                        label="Type" 
+                                        options={uniqueTypes} 
+                                        value={filterType} 
+                                        onChange={(e) => setFilterType(e.target.value)} 
+                                    />
+                                    <FilterSelect 
+                                        label="Contributor" 
+                                        options={uniqueContributors} 
+                                        value={filterContributor} 
+                                        onChange={(e) => setFilterContributor(e.target.value)} 
+                                    />
+                                    
+                                    <div className="h-6 w-px bg-slate-200 dark:bg-slate-700 mx-1"></div>
+
+                                    <select 
+                                        value={sortBy}
+                                        onChange={(e) => setSortBy(e.target.value)}
+                                        className="bg-transparent text-sm font-medium text-slate-700 dark:text-slate-300 border-none focus:ring-0 cursor-pointer hover:text-blue-600 dark:hover:text-blue-400 transition-colors outline-none"
+                                    >
+                                        <option value="newest">Newest First</option>
+                                        <option value="oldest">Oldest First</option>
+                                        <option value="az">A-Z (Tail)</option>
+                                    </select>
+                                  </div>
                               </div>
                           </div>
                       </div>
                   </div>
-              </div>
 
-              {/* --- DEMO BANNER --- */}
-              {isDemoMode && (
-                <div className="bg-amber-50 dark:bg-amber-900/30 border-b border-amber-200 dark:border-amber-800/50 px-4 py-2 text-center text-xs font-medium text-amber-800 dark:text-amber-200 flex items-center justify-center gap-2">
-                  <AlertCircle size={14} />
-                  Demo Mode Active: Changes are local only.
-                </div>
-              )}
-
-              {/* --- MAIN GRID --- */}
-              <main className="flex-1 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full">
-                {loading ? (
-                  <div className="flex flex-col items-center justify-center h-64 text-slate-400">
-                    <Loader2 className="animate-spin mb-4 text-blue-600" size={40} />
-                    <p className="animate-pulse font-medium">Loading fleet data...</p>
-                  </div>
-                ) : filteredAndSortedAircraft.length === 0 ? (
-                  <div className="flex flex-col items-center justify-center py-20 bg-white dark:bg-slate-800/50 rounded-3xl border border-dashed border-slate-300 dark:border-slate-700">
-                    <div className="bg-slate-100 dark:bg-slate-700 p-4 rounded-full mb-4">
-                        <Search size={32} className="text-slate-400 dark:text-slate-500" />
+                  {/* --- DEMO BANNER --- */}
+                  {isDemoMode && (
+                    <div className="bg-amber-50 dark:bg-amber-900/30 border-b border-amber-200 dark:border-amber-800/50 px-4 py-2 text-center text-xs font-medium text-amber-800 dark:text-amber-200 flex items-center justify-center gap-2">
+                      <AlertCircle size={14} />
+                      Demo Mode Active: Changes are local only.
                     </div>
-                    <h3 className="text-lg font-semibold text-slate-900 dark:text-white">No aircraft found</h3>
-                    <p className="text-slate-500 dark:text-slate-400 text-sm mt-1 max-w-xs text-center">
-                        Try adjusting your filters or search terms, or add a new aircraft.
-                    </p>
-                    <button onClick={() => {setSearchTerm(''); setFilterType('All'); setFilterContributor('All');}} className="mt-6 text-blue-600 dark:text-blue-400 hover:underline font-medium text-sm">
-                      Clear Filters
-                    </button>
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 pb-20">
-                    {filteredAndSortedAircraft.map((aircraft) => (
-                      <AircraftCard 
-                        key={aircraft._id} 
-                        data={aircraft} 
-                        adminMode={adminMode}
-                        onClick={() => setSelectedAircraft(aircraft)}
-                        onDelete={handleDelete}
-                        onEdit={handleEdit}
+                  )}
+
+                  {/* --- MAIN GRID --- */}
+                  <main className="flex-1 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full fade-in">
+                    {loading ? (
+                      <div className="flex flex-col items-center justify-center h-64 text-slate-400">
+                        <Loader2 className="animate-spin mb-4 text-blue-600" size={40} />
+                        <p className="animate-pulse font-medium">Loading fleet data...</p>
+                      </div>
+                    ) : filteredAndSortedAircraft.length === 0 ? (
+                      <div className="flex flex-col items-center justify-center py-20 bg-white dark:bg-slate-800/50 rounded-3xl border border-dashed border-slate-300 dark:border-slate-700">
+                        <div className="bg-slate-100 dark:bg-slate-700 p-4 rounded-full mb-4">
+                            <Search size={32} className="text-slate-400 dark:text-slate-500" />
+                        </div>
+                        <h3 className="text-lg font-semibold text-slate-900 dark:text-white">No aircraft found</h3>
+                        <p className="text-slate-500 dark:text-slate-400 text-sm mt-1 max-w-xs text-center">
+                            Try adjusting your filters or search terms, or add a new aircraft.
+                        </p>
+                        <button onClick={() => {setSearchTerm(''); setFilterType('All'); setFilterContributor('All');}} className="mt-6 text-blue-600 dark:text-blue-400 hover:underline font-medium text-sm">
+                          Clear Filters
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 pb-20">
+                        {filteredAndSortedAircraft.map((aircraft) => (
+                          <AircraftCard 
+                            key={aircraft._id} 
+                            data={aircraft} 
+                            adminMode={adminMode}
+                            onClick={() => setSelectedAircraft(aircraft)}
+                            onDelete={handleDelete}
+                            onEdit={handleEdit}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </main>
+                  </>
+              ) : (
+                  /* --- COLLECTION DASHBOARD VIEW --- */
+                  <main className="flex-1 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full">
+                      <CollectionDashboard 
+                          uploadedAircrafts={aircrafts} 
+                          onUploadPrefill={handlePrefillUpload}
                       />
-                    ))}
-                  </div>
-                )}
-              </main>
+                  </main>
+              )}
 
               {/* --- FLOAT BUTTON (Mobile) --- */}
               <button 
@@ -460,7 +501,8 @@
                     fetchStats(); // Update stats on success
                   }}
                   isDemoMode={isDemoMode}
-                  initialData={editingAircraft} 
+                  initialData={editingAircraft}
+                  prefillData={prefillData}
                 />
               )}
 
@@ -472,6 +514,202 @@
                   onEdit={(e) => { handleEdit(selectedAircraft, e); setSelectedAircraft(null); }} 
                 />
               )}
+            </div>
+          );
+        }
+
+        // --- NEW COMPONENT: COLLECTION DASHBOARD ---
+        function CollectionDashboard({ uploadedAircrafts, onUploadPrefill }) {
+          const [masterAircraft, setMasterAircraft] = useState([]);
+          const [expandedAircraftId, setExpandedAircraftId] = useState(null);
+          const [masterLiveries, setMasterLiveries] = useState([]);
+          const [loadingMeta, setLoadingMeta] = useState(true);
+          const [loadingLiveries, setLoadingLiveries] = useState(false);
+
+          // Fetch Master Aircraft List on mount
+          useEffect(() => {
+            const fetchMasterData = async () => {
+              try {
+                const res = await fetch('https://site--acars-backend--6dmjph8ltlhv.code.run/api/metadata');
+                if (!res.ok) throw new Error('Failed to fetch metadata');
+                const data = await res.json();
+                // Sort alphabetically
+                setMasterAircraft(data.aircraft.sort((a, b) => a.name.localeCompare(b.name)));
+              } catch (err) {
+                console.warn("Metadata fetch failed", err);
+              } finally {
+                setLoadingMeta(false);
+              }
+            };
+            fetchMasterData();
+          }, []);
+
+          // Fetch Liveries when an aircraft is expanded
+          const handleExpand = async (aircraftId) => {
+            if (expandedAircraftId === aircraftId) {
+              setExpandedAircraftId(null); // Collapse
+              return;
+            }
+            
+            setExpandedAircraftId(aircraftId);
+            setLoadingLiveries(true);
+            setMasterLiveries([]); // Reset while loading
+
+            try {
+              const res = await fetch(`https://site--acars-backend--6dmjph8ltlhv.code.run/api/aircraft/${aircraftId}/liveries`);
+              if (res.ok) {
+                const data = await res.json();
+                setMasterLiveries(data.liveries.sort((a, b) => a.name.localeCompare(b.name)));
+              }
+            } catch (err) {
+              console.warn("Livery fetch failed", err);
+            } finally {
+              setLoadingLiveries(false);
+            }
+          };
+
+          // Helper: Check if we have at least one photo of this aircraft type
+          const hasType = (typeName) => {
+            return uploadedAircrafts.some(a => a.aircraftType === typeName);
+          };
+
+          // Helper: Get count of photos for this type
+          const getTypeCount = (typeName) => {
+            return uploadedAircrafts.filter(a => a.aircraftType === typeName).length;
+          };
+
+          // Helper: Check if we have a specific livery
+          const hasLivery = (typeName, liveryName) => {
+            return uploadedAircrafts.some(a => 
+              a.aircraftType === typeName && a.liveryName === liveryName
+            );
+          };
+
+          if (loadingMeta) {
+            return (
+              <div className="flex flex-col items-center justify-center h-64 text-slate-400">
+                <Loader2 className="animate-spin mb-4 text-blue-600" size={40} />
+                <p>Analyzing Fleet Database...</p>
+              </div>
+            );
+          }
+
+          // Calculate Progress
+          const collectedTypes = masterAircraft.filter(a => hasType(a.name)).length;
+          const totalTypes = masterAircraft.length;
+          const progressPercent = Math.round((collectedTypes / totalTypes) * 100);
+
+          return (
+            <div className="max-w-5xl mx-auto pb-20 fade-in">
+              {/* Progress Header */}
+              <div className="bg-white dark:bg-slate-900 rounded-2xl p-6 shadow-sm border border-slate-200 dark:border-slate-800 mb-8">
+                <div className="flex items-center justify-between mb-4">
+                  <div>
+                    <h2 className="text-xl font-bold text-slate-900 dark:text-white">Collection Status</h2>
+                    <p className="text-sm text-slate-500 dark:text-slate-400">Compare your uploads against the Global Database</p>
+                  </div>
+                  <div className="text-right">
+                    <span className="text-3xl font-bold text-blue-600 dark:text-blue-400">{progressPercent}%</span>
+                    <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">Completion</p>
+                  </div>
+                </div>
+                <div className="w-full bg-slate-100 dark:bg-slate-800 rounded-full h-3 overflow-hidden">
+                  <div 
+                    className="bg-blue-600 h-full rounded-full transition-all duration-1000 ease-out"
+                    style={{ width: `${progressPercent}%` }}
+                  ></div>
+                </div>
+                <div className="mt-2 text-xs text-slate-500 text-right">
+                  {collectedTypes} of {totalTypes} Aircraft Types Collected
+                </div>
+              </div>
+
+              {/* Grid of Aircraft */}
+              <div className="grid gap-4">
+                {masterAircraft.map((ac) => {
+                  const isCollected = hasType(ac.name);
+                  const isExpanded = expandedAircraftId === ac.id;
+                  const count = getTypeCount(ac.name);
+
+                  return (
+                    <div key={ac.id} className={`bg-white dark:bg-slate-900 rounded-xl border transition-all duration-300 overflow-hidden ${isCollected ? 'border-slate-200 dark:border-slate-800' : 'border-amber-200 dark:border-amber-900/50'}`}>
+                      
+                      {/* Header Row */}
+                      <div 
+                        onClick={() => handleExpand(ac.id)}
+                        className={`p-4 flex items-center justify-between cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors ${isExpanded ? 'bg-slate-50 dark:bg-slate-800/50' : ''}`}
+                      >
+                        <div className="flex items-center gap-4">
+                          <div className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${isCollected ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-600' : 'bg-slate-100 dark:bg-slate-800 text-slate-400'}`}>
+                             {isCollected ? <CheckCircle2 size={20} /> : <Plane size={20} />}
+                          </div>
+                          <div>
+                            <h3 className={`font-bold text-lg ${isCollected ? 'text-slate-900 dark:text-white' : 'text-slate-500 dark:text-slate-400'}`}>
+                              {ac.name}
+                            </h3>
+                            <p className="text-xs text-slate-500 dark:text-slate-500 flex items-center gap-1">
+                              {isCollected ? (
+                                <span className="text-blue-600 dark:text-blue-400 font-medium">{count} Photos in fleet</span>
+                              ) : (
+                                <span className="text-amber-600 dark:text-amber-500 font-medium">Missing from fleet</span>
+                              )}
+                            </p>
+                          </div>
+                        </div>
+                        
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide mr-2 hidden sm:block">
+                            {isExpanded ? 'Hide Liveries' : 'View Liveries'}
+                          </span>
+                          <ChevronDown size={20} className={`text-slate-400 transition-transform duration-300 ${isExpanded ? 'rotate-180' : ''}`} />
+                        </div>
+                      </div>
+
+                      {/* Expanded Livery Section */}
+                      {isExpanded && (
+                        <div className="border-t border-slate-100 dark:border-slate-800 p-4 bg-slate-50/50 dark:bg-slate-950/30 animate-in slide-in-from-top-2">
+                          {loadingLiveries ? (
+                            <div className="flex items-center gap-2 text-slate-400 text-sm py-4">
+                              <Loader2 className="animate-spin" size={16} /> Fetching known liveries...
+                            </div>
+                          ) : (
+                            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+                              {masterLiveries.map(liv => {
+                                const haveLivery = hasLivery(ac.name, liv.name);
+                                return (
+                                  <div key={liv.id} className="flex items-center justify-between p-3 bg-white dark:bg-slate-900 rounded-lg border border-slate-200 dark:border-slate-800">
+                                    <div className="flex items-center gap-2 overflow-hidden">
+                                      <div className={`w-2 h-2 rounded-full shrink-0 ${haveLivery ? 'bg-green-500' : 'bg-slate-300 dark:bg-slate-700'}`}></div>
+                                      <span className={`text-sm truncate ${haveLivery ? 'text-slate-900 dark:text-white font-medium' : 'text-slate-500 dark:text-slate-400'}`}>
+                                        {liv.name}
+                                      </span>
+                                    </div>
+                                    
+                                    {!haveLivery && (
+                                      <button 
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          onUploadPrefill(ac.id, ac.name, liv.name);
+                                        }}
+                                        className="text-xs bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 px-2 py-1 rounded-md hover:bg-blue-100 dark:hover:bg-blue-900/40 transition-colors font-medium whitespace-nowrap ml-2"
+                                      >
+                                        Upload
+                                      </button>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                              {masterLiveries.length === 0 && (
+                                <div className="text-slate-400 text-sm italic col-span-full">No specific liveries listed in database.</div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           );
         }
@@ -644,7 +882,7 @@
         /**
          * FORM MODAL
          */
-        function AircraftFormModal({ onClose, onSuccess, isDemoMode, initialData = null }) {
+        function AircraftFormModal({ onClose, onSuccess, isDemoMode, initialData = null, prefillData = null }) {
           const isEditMode = !!initialData;
           const [loading, setLoading] = useState(false);
           const [fetchingMeta, setFetchingMeta] = useState(true);
@@ -658,9 +896,9 @@
           
           const [formData, setFormData] = useState({
             contributorName: initialData?.contributorName || '',
-            aircraftType: initialData?.aircraftType || '',
-            aircraftId: '', 
-            liveryName: initialData?.liveryName || '',
+            aircraftType: initialData?.aircraftType || prefillData?.aircraftType || '',
+            aircraftId: prefillData?.aircraftId || '', 
+            liveryName: initialData?.liveryName || prefillData?.liveryName || '',
             tailNumber: initialData?.tailNumber || ''
           });
 
@@ -679,17 +917,18 @@
                             setFormData(prev => ({ ...prev, aircraftId: match.id }));
                             await fetchLiveries(match.id, initialData.liveryName);
                         }
+                    } else if (prefillData && prefillData.aircraftId) {
+                         // PREFILL LOGIC: Load liveries if we have a prefilled ID
+                         await fetchLiveries(prefillData.aircraftId, prefillData.liveryName);
                     }
 
                 } catch (err) {
                     console.warn("Failed to load dropdowns, using demo metadata:", err);
                     setMetadata({ aircraft: DEMO_METADATA_AIRCRAFT });
-                    // If we're editing, we need to try and match the text to the demo IDs
                     if (isEditMode && initialData.aircraftType) {
                         const match = DEMO_METADATA_AIRCRAFT.find(a => a.name === initialData.aircraftType);
                         if (match) {
                             setFormData(prev => ({ ...prev, aircraftId: match.id }));
-                            // Load fallback liveries
                             setSpecificLiveries(DEMO_METADATA_LIVERIES);
                         }
                     }
