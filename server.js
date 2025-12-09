@@ -100,39 +100,56 @@ app.get('/api/aircraft', async (req, res) => {
     }
 });
 
-// GET: Find aircraft by Type AND Livery (Partial/Fuzzy Match)
+// GET: Find aircraft by Type AND Livery (Prioritizes Exact & Word Matches)
 app.get('/api/aircraft/lookup', async (req, res) => {
     try {
         const { type, livery } = req.query;
 
-        // Ensure at least one search term is provided to avoid returning the whole database accidentally
         if (!type && !livery) {
-            return res.status(400).json({ message: 'At least one search parameter (type or livery) is required.' });
+            return res.status(400).json({ message: 'At least one search parameter is required.' });
         }
 
-        // Create the search query object
         let query = {};
 
-        // If 'type' is provided, add it to the query (Partial match, Case Insensitive)
-        if (type) {
-            query.aircraftType = { $regex: type, $options: 'i' };
-        }
+        // Basic fuzzy query to gather all POTENTIAL candidates
+        if (type) query.aircraftType = { $regex: type, $options: 'i' };
+        if (livery) query.liveryName = { $regex: livery, $options: 'i' };
 
-        // If 'livery' is provided, add it to the query (Partial match, Case Insensitive)
-        if (livery) {
-            query.liveryName = { $regex: livery, $options: 'i' };
-        }
-
-        // We use 'find' instead of 'findOne' because a partial match might return multiple results
-        // (e.g. searching "737" might return "737-800" and "737-Max")
         const results = await CommunityAircraft.find(query);
 
         if (results.length === 0) {
             return res.status(404).json({ message: 'No matching aircraft found.' });
         }
 
-        // Return the first match found, or the whole list if you prefer
-        // Returning results[0] mimics the behavior of "findOne" but with fuzzy matching
+        // --- INTELLIGENT SORTING LOGIC ---
+        // If we found multiple results, we need to pick the best one.
+        
+        if (livery) {
+            const searchLower = livery.toLowerCase();
+
+            // PRIORITY 1: Exact Match
+            // e.g., Query "ANA" matches DB "ANA" exactly
+            const exactMatch = results.find(
+                item => item.liveryName.toLowerCase() === searchLower
+            );
+            if (exactMatch) return res.json(exactMatch);
+
+            // PRIORITY 2: Word Boundary Match
+            // e.g., Query "ANA" matches "ANA 777" but NOT "Air Canada" (because 'ana' is inside 'Canada')
+            try {
+                // Escape special regex characters to prevent crashes
+                const escapedLivery = livery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const wordBoundaryRegex = new RegExp(`\\b${escapedLivery}\\b`, 'i');
+                
+                const boundaryMatch = results.find(item => wordBoundaryRegex.test(item.liveryName));
+                if (boundaryMatch) return res.json(boundaryMatch);
+            } catch (e) {
+                // If regex fails for some reason, continue to fallback
+            }
+        }
+
+        // PRIORITY 3: Fallback (The original behavior)
+        // If no exact or word match, just take the first fuzzy result found.
         res.json(results[0]); 
 
     } catch (error) {
