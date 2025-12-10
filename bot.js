@@ -21,7 +21,7 @@ const sharp = require('sharp');
 // CONFIGURATION - REPLACE THESE WITH YOUR REAL CHANNEL IDS
 const ADMIN_CHANNEL_ID = '1448137363795742942'; 
 const PUBLIC_FEED_CHANNEL_ID = '1448138153335586988'; 
-const WELCOME_CHANNEL_ID = '1442459109608656917'; // <--- NEW: Add your welcome channel ID here
+const WELCOME_CHANNEL_ID = '1442462899451858975'; // <--- NEW: Add your welcome channel ID here
 const METADATA_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api/metadata';
 const BASE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api';
 
@@ -179,7 +179,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
             const welcomeEmbed = new EmbedBuilder()
                 .setTitle(`Welcome to Inflight!`)
-                .setDescription(`Hello ${member}, welcome to the server! We are thrilled to have you here.\n\nInflight is the place for aviation enthusiasts to track flights and share their spots.`)
+                .setDescription(`Hello ${member}, welcome to the server! We are thrilled to have you here.`)
                 .setColor(0x0099FF)
                 .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 })) // User's avatar
                 .setImage('https://media.discordapp.net/attachments/1448147572878344405/1448166201741279254/inflight.png?ex=693a4560&is=6938f3e0&hm=e0222d89cc7498a4aca039865ba0ae854741d9fbbffda2a03974769a46b12b63&=&format=webp&quality=lossless&width=930&height=396') // Your Logo
@@ -195,11 +195,11 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         inline: false 
                     }
                 )
-                .setFooter({ text: 'Happy Spotting!' })
+                .setFooter({ text: 'For any concerns, reach out to MODs!' })
                 .setTimestamp();
 
             await channel.send({ 
-                content: `Welcome to the crew, ${member}! 👋`, 
+                content: `Welcome ${member}! 👋`, 
                 embeds: [welcomeEmbed] 
             });
 
