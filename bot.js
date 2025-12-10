@@ -21,7 +21,14 @@ const sharp = require('sharp');
 // CONFIGURATION - REPLACE THESE WITH YOUR REAL CHANNEL IDS
 const ADMIN_CHANNEL_ID = '1448137363795742942'; 
 const PUBLIC_FEED_CHANNEL_ID = '1448138153335586988'; 
-const WELCOME_CHANNEL_ID = '1442462899451858975'; // <--- NEW: Add your welcome channel ID here
+const WELCOME_CHANNEL_ID = '1442462899451858975'; 
+
+// --- NEW CONFIGURATION ---
+const MEMBER_ROLE_ID = '1442472513849397248';          // Role given on join
+const CONTRIBUTOR_ROLE_ID = '1442534816863223888';     // Role given on 1st accepted photo
+const LEADERBOARD_CHANNEL_ID = '1448178846875521064';  // Channel for daily stats
+const TOP_CONTRIBUTOR_ROLE_ID = '1448179466722611291'; // Role for the #1 contributor
+
 const METADATA_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api/metadata';
 const BASE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api';
 
@@ -99,7 +106,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         intents: [
             GatewayIntentBits.Guilds,
             GatewayIntentBits.GuildMessages,
-            GatewayIntentBits.GuildMembers, // <--- ADDED: Required to detect new members
+            GatewayIntentBits.GuildMembers, 
         ] 
     });
 
@@ -136,7 +143,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             .addStringOption(option => 
                 option.setName('livery')
                     .setDescription('The livery/airline name')
-                    .setAutocomplete(true) // ENABLED AUTOCOMPLETE FOR LIVERIES
+                    .setAutocomplete(true) 
                     .setRequired(true))
             .addAttachmentOption(option => 
                 option.setName('photo')
@@ -147,6 +154,105 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     .setDescription('Registration (Optional - helps verification!)')
                     .setRequired(false)) 
     ].map(command => command.toJSON());
+
+    // --- NEW: DAILY LEADERBOARD FUNCTION ---
+    const updateLeaderboard = async () => {
+        if (!LEADERBOARD_CHANNEL_ID) return;
+        console.log('🔄 Running Daily Leaderboard Update...');
+
+        try {
+            // 1. Aggregate Top Contributors
+            // Group by contributorName (and grab the ID if available)
+            const leaderboard = await CommunityAircraftModel.aggregate([
+                { 
+                    $group: { 
+                        _id: "$contributorName", 
+                        count: { $sum: 1 },
+                        lastId: { $first: "$contributorId" } // Try to get the Discord ID
+                    } 
+                },
+                { $sort: { count: -1 } },
+                { $limit: 10 }
+            ]);
+
+            if (leaderboard.length === 0) return;
+
+            const topUserEntry = leaderboard[0];
+            const channel = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
+            if (!channel) return;
+
+            // 2. Build Leaderboard String
+            const description = leaderboard.map((entry, index) => {
+                const medal = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `#${index + 1}`;
+                return `${medal} **${entry._id}** — ${entry.count} contributions`;
+            }).join('\n');
+
+            const leaderboardEmbed = new EmbedBuilder()
+                .setTitle('🏆 Top Contributors Leaderboard')
+                .setDescription(`Here are the top pilots helping build our database!\n\n${description}`)
+                .setColor(0xFFD700)
+                .setFooter({ text: 'Updated Daily • Submit photos to climb the ranks!' })
+                .setTimestamp();
+
+            // 3. Post or Update Message
+            // We try to find the last message sent by the bot to edit it, otherwise send new
+            let lastMessage = (await channel.messages.fetch({ limit: 10 })).find(m => m.author.id === client.user.id);
+            if (lastMessage) {
+                await lastMessage.edit({ embeds: [leaderboardEmbed] });
+            } else {
+                await channel.send({ embeds: [leaderboardEmbed] });
+            }
+
+            // 4. Manage "Top Contributor" Role
+            if (topUserEntry && TOP_CONTRIBUTOR_ROLE_ID) {
+                const guild = channel.guild;
+                const role = await guild.roles.fetch(TOP_CONTRIBUTOR_ROLE_ID);
+                
+                if (role) {
+                    // Remove role from current holders who are NOT the top user
+                    // (We have to iterate because we might not know exactly who has it)
+                    const currentHolders = role.members; // Maps
+                    for (const [memberId, member] of currentHolders) {
+                        // Check if this member is the new top user
+                        // We check against lastId (if saved) or username
+                        const isTopUser = (topUserEntry.lastId && memberId === topUserEntry.lastId) || 
+                                          (member.user.username === topUserEntry._id);
+                        
+                        if (!isTopUser) {
+                            await member.roles.remove(role);
+                            console.log(`📉 Removed Top Contributor role from ${member.user.tag}`);
+                        }
+                    }
+
+                    // Assign role to the new Top User
+                    // We prefer ID, fallback to username search
+                    let topMember = null;
+                    if (topUserEntry.lastId) {
+                        try {
+                            topMember = await guild.members.fetch(topUserEntry.lastId);
+                        } catch (e) { /* user might have left */ }
+                    }
+
+                    // Fallback: search by username if ID failed or wasn't saved
+                    if (!topMember) {
+                        const members = await guild.members.fetch();
+                        topMember = members.find(m => m.user.username === topUserEntry._id);
+                    }
+
+                    if (topMember) {
+                        if (!topMember.roles.cache.has(TOP_CONTRIBUTOR_ROLE_ID)) {
+                            await topMember.roles.add(role);
+                            console.log(`🎉 Assigned Top Contributor role to ${topMember.user.tag}`);
+                            await channel.send(`🎉 Congratulations to ${topMember} for becoming the new **#1 Top Contributor**!`);
+                        }
+                    }
+                }
+            }
+
+        } catch (error) {
+            console.error('❌ Error updating leaderboard:', error);
+        }
+    };
 
     // 2. Initialize Bot
     client.once('ready', async () => {
@@ -163,13 +269,30 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         } catch (error) {
             console.error('❌ Error registering commands:', error);
         }
+
+        // --- START LEADERBOARD LOOP ---
+        updateLeaderboard(); // Run once immediately
+        // Run every 24 hours (86400000 ms)
+        setInterval(updateLeaderboard, 86400000);
     });
 
-    // --- NEW: WELCOME MESSAGE EVENT ---
+    // --- WELCOME MESSAGE + AUTO ROLE ---
     client.on('guildMemberAdd', async (member) => {
-        // Prevent crashing if the channel isn't set
+        // 1. Give Member Role
+        if (MEMBER_ROLE_ID) {
+            try {
+                const role = await member.guild.roles.fetch(MEMBER_ROLE_ID);
+                if (role) {
+                    await member.roles.add(role);
+                    console.log(`✅ Assigned Member role to ${member.user.tag}`);
+                }
+            } catch (error) {
+                console.error('❌ Failed to assign member role:', error);
+            }
+        }
+
+        // 2. Welcome Message
         if (!WELCOME_CHANNEL_ID || WELCOME_CHANNEL_ID === 'REPLACE_THIS_WITH_YOUR_WELCOME_CHANNEL_ID') {
-            console.warn('⚠️ Welcome channel ID not configured.');
             return;
         }
 
@@ -181,8 +304,8 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 .setTitle(`Welcome to Inflight!`)
                 .setDescription(`Hello ${member}, welcome to the server! We are thrilled to have you here.`)
                 .setColor(0x0099FF)
-                .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 })) // User's avatar
-                .setImage('https://media.discordapp.net/attachments/1448147572878344405/1448166201741279254/inflight.png?ex=693a4560&is=6938f3e0&hm=e0222d89cc7498a4aca039865ba0ae854741d9fbbffda2a03974769a46b12b63&=&format=webp&quality=lossless&width=930&height=396') // Your Logo
+                .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 })) 
+                .setImage('https://media.discordapp.net/attachments/1448147572878344405/1448166201741279254/inflight.png?ex=693a4560&is=6938f3e0&hm=e0222d89cc7498a4aca039865ba0ae854741d9fbbffda2a03974769a46b12b63&=&format=webp&quality=lossless&width=930&height=396') 
                 .addFields(
                     { 
                         name: '📸 Submit Photos', 
@@ -256,32 +379,24 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 );
             }
 
-            // LIVERY AUTOCOMPLETE (DEPENDS ON AIRCRAFT TYPE)
+            // LIVERY AUTOCOMPLETE
             if (focusedOption.name === 'livery') {
-                // 1. Get the currently selected aircraft type string
                 const selectedType = interaction.options.getString('aircraft_type');
                 
                 if (!selectedType) {
-                    // User hasn't selected an aircraft yet
                     await interaction.respond([{ name: "Please select Aircraft Type first", value: "Unknown" }]);
                     return;
                 }
 
-                // 2. Find the ID for that aircraft name
                 const aircraftList = await fetchAircraftMetadata();
                 const matchedAircraft = aircraftList.find(a => a.name === selectedType);
 
                 if (matchedAircraft) {
-                    // 3. Fetch specific liveries for this ID
                     const liveries = await fetchLiveriesForAircraft(matchedAircraft.id);
-                    
-                    // 4. Filter based on what user is typing in livery field
                     const filteredLiveries = liveries
                         .filter(l => l.toLowerCase().includes(focusedOption.value.toLowerCase()))
-                        .slice(0, 24); // Limit to 24 to leave room for "Other"
+                        .slice(0, 24); 
 
-                    // 5. Always add the user's current input as an option if it's not in the list (Custom Livery support)
-                    // This is important because the API might not have EVERY livery in existence.
                     const finalOptions = filteredLiveries.map(l => ({ name: l, value: l }));
                     
                     if (focusedOption.value && !liveries.includes(focusedOption.value)) {
@@ -329,24 +444,33 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         contributorName = user.username;
                     } catch (e) {}
 
+                    // Common update object - We now save contributorId for Leaderboard tracking
+                    const updateData = {
+                        contributorName: contributorName,
+                        contributorId: targetUserId, // NEW: Save ID for reliable role assignment
+                        aircraftType: typeField,
+                        liveryName: liveryField,
+                        imageUrl: permanentUrl,
+                        uploadedAt: new Date()
+                    };
+                    if (tailField !== 'UNKNOWN') updateData.tailNumber = tailField.toUpperCase();
+
                     if (existingEntry) {
-                        existingEntry.imageUrl = permanentUrl;
-                        existingEntry.uploadedAt = new Date(); 
-                        existingEntry.contributorName = contributorName;
-                        if (tailField !== 'UNKNOWN') {
-                            existingEntry.tailNumber = tailField.toUpperCase();
-                        }
+                        Object.assign(existingEntry, updateData);
                         await existingEntry.save();
                     } else {
-                        const newEntry = new CommunityAircraftModel({
-                            contributorName: contributorName,
-                            aircraftType: typeField,
-                            liveryName: liveryField,
-                            tailNumber: tailField.toUpperCase(),
-                            imageUrl: permanentUrl,
-                            uploadedAt: new Date()
-                        });
+                        const newEntry = new CommunityAircraftModel(updateData);
                         await newEntry.save();
+                    }
+
+                    // --- NEW: GIVE CONTRIBUTOR ROLE ---
+                    try {
+                        const member = await interaction.guild.members.fetch(targetUserId);
+                        if (CONTRIBUTOR_ROLE_ID) {
+                            await member.roles.add(CONTRIBUTOR_ROLE_ID);
+                        }
+                    } catch (roleError) {
+                        console.error('Failed to assign Contributor Role:', roleError);
                     }
 
                     // 2. Update Admin Embed
@@ -379,7 +503,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
                     try {
                         const user = await client.users.fetch(targetUserId);
-                        await user.send(`✅ Your submission for **${typeField}** has been approved!`);
+                        await user.send(`✅ Your submission for **${typeField}** has been approved! You have been granted the contributor role.`);
                     } catch (e) { }
 
                 } catch (error) {
@@ -450,14 +574,12 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         await publicMsg.edit({ embeds: [publicEmbed] });
 
                         // --- CREATE THREAD FOR QUESTIONS ---
-                        // Create a thread on the public rejection message
                         const thread = await publicMsg.startThread({
                             name: `Rejection Appeal - ${typeField}`,
                             autoArchiveDuration: 1440, // 24 Hours
                             reason: 'User inquiry regarding rejected aircraft submission',
                         });
 
-                        // Send an initial message tagging the user so they see the thread
                         await thread.send({
                             content: `Hello <@${targetUserId}>,\n\nYour submission for **${typeField}** was rejected by the moderation team.\n\n**Reason:** ${reason}\n\nIf you have any questions or would like to clarify details about this photo, please ask here.`
                         });
@@ -469,7 +591,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
                 try {
                     const user = await client.users.fetch(targetUserId);
-                    // Updated DM to mention the thread
                     await user.send(`❌ Your submission for **${typeField} (${liveryField})** was rejected.\n**Reason:** ${reason}\n\nA thread has been created on the public post if you wish to appeal or ask questions.`);
                 } catch (e) { }
             }
