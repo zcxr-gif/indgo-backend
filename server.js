@@ -6,10 +6,14 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
+const axios = require('axios'); // Added for Webhook
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { CloudWatchClient, GetMetricStatisticsCommand } = require('@aws-sdk/client-cloudwatch');
 const sharp = require('sharp'); // Image processing library
 require('dotenv').config();
+
+// IMPORT THE BOT
+const { startDiscordBot } = require('./bot');
 
 // 1. INITIALIZE APP
 const app = express();
@@ -36,6 +40,11 @@ const CommunityAircraftSchema = new mongoose.Schema({
 });
 
 const CommunityAircraft = mongoose.model('CommunityAircraft', CommunityAircraftSchema);
+
+// --- START THE BOT ---
+// We pass the Model to the bot so it can search the database
+startDiscordBot(CommunityAircraft);
+// ---------------------
 
 // 4. CONFIGURE AWS CLIENTS
 
@@ -82,6 +91,34 @@ const deleteS3Object = async (imageUrl) => {
     }
 };
 
+// Helper: Send Discord Webhook Notification
+const sendDiscordWebhook = async (entry) => {
+    if (!process.env.DISCORD_WEBHOOK_URL) return;
+
+    try {
+        const payload = {
+            embeds: [{
+                title: "✈️ New Aircraft Contribution!",
+                color: 5763719, // Greenish color
+                fields: [
+                    { name: "Aircraft Type", value: entry.aircraftType, inline: true },
+                    { name: "Livery", value: entry.liveryName, inline: true },
+                    { name: "Tail Number", value: entry.tailNumber, inline: true },
+                    { name: "Contributor", value: entry.contributorName, inline: false }
+                ],
+                image: { url: entry.imageUrl },
+                timestamp: new Date().toISOString(),
+                footer: { text: "Community Tracker Bot" }
+            }]
+        };
+
+        await axios.post(process.env.DISCORD_WEBHOOK_URL, payload);
+        console.log(`🔔 Notification sent to Discord for ${entry.tailNumber}`);
+    } catch (error) {
+        console.error("❌ Failed to send Discord Webhook:", error.message);
+    }
+};
+
 // 5. API ROUTES
 
 // Health Check
@@ -122,34 +159,28 @@ app.get('/api/aircraft/lookup', async (req, res) => {
         }
 
         // --- INTELLIGENT SORTING LOGIC ---
-        // If we found multiple results, we need to pick the best one.
-        
         if (livery) {
             const searchLower = livery.toLowerCase();
 
             // PRIORITY 1: Exact Match
-            // e.g., Query "ANA" matches DB "ANA" exactly
             const exactMatch = results.find(
                 item => item.liveryName.toLowerCase() === searchLower
             );
             if (exactMatch) return res.json(exactMatch);
 
             // PRIORITY 2: Word Boundary Match
-            // e.g., Query "ANA" matches "ANA 777" but NOT "Air Canada" (because 'ana' is inside 'Canada')
             try {
-                // Escape special regex characters to prevent crashes
                 const escapedLivery = livery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
                 const wordBoundaryRegex = new RegExp(`\\b${escapedLivery}\\b`, 'i');
                 
                 const boundaryMatch = results.find(item => wordBoundaryRegex.test(item.liveryName));
                 if (boundaryMatch) return res.json(boundaryMatch);
             } catch (e) {
-                // If regex fails for some reason, continue to fallback
+                // If regex fails, continue
             }
         }
 
-        // PRIORITY 3: Fallback (The original behavior)
-        // If no exact or word match, just take the first fuzzy result found.
+        // PRIORITY 3: Fallback
         res.json(results[0]); 
 
     } catch (error) {
@@ -172,7 +203,6 @@ app.get('/api/admin/stats', async (req, res) => {
         let s3SizeBytes = 0;
 
         try {
-            // We ask for the "BucketSizeBytes" metric for the last 2 days
             const command = new GetMetricStatisticsCommand({
                 Namespace: 'AWS/S3',
                 MetricName: 'BucketSizeBytes',
@@ -180,17 +210,15 @@ app.get('/api/admin/stats', async (req, res) => {
                     { Name: 'BucketName', Value: process.env.AWS_S3_BUCKET_NAME },
                     { Name: 'StorageType', Value: 'StandardStorage' }
                 ],
-                StartTime: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000), // 2 days ago
+                StartTime: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000), 
                 EndTime: new Date(),
-                Period: 86400, // 1 day intervals
-                Statistics: ['Maximum'] // Get the max size recorded
+                Period: 86400, 
+                Statistics: ['Maximum'] 
             });
             
             const data = await cloudWatchClient.send(command);
             
-            // If data exists, grab the latest datapoint
             if (data.Datapoints && data.Datapoints.length > 0) {
-                // Sort by timestamp to get the most recent reading
                 data.Datapoints.sort((a, b) => b.Timestamp - a.Timestamp);
                 s3SizeBytes = data.Datapoints[0].Maximum;
             }
@@ -250,6 +278,11 @@ app.post('/api/aircraft', upload.single('image'), async (req, res) => {
         });
 
         await newEntry.save();
+
+        // --- NEW: Trigger Webhook ---
+        await sendDiscordWebhook(newEntry);
+        // ----------------------------
+
         res.status(201).json({ message: 'Aircraft uploaded successfully!', data: newEntry });
 
     } catch (error) {
@@ -264,17 +297,14 @@ app.put('/api/aircraft/:id', upload.single('image'), async (req, res) => {
         const { id } = req.params;
         const { contributorName, aircraftType, liveryName, tailNumber } = req.body;
 
-        // 1. Find existing entry
         const existingEntry = await CommunityAircraft.findById(id);
         if (!existingEntry) return res.status(404).json({ message: 'Aircraft not found.' });
 
         let updatedImageUrl = existingEntry.imageUrl;
 
-        // 2. Check if a NEW image was uploaded
         if (req.file) {
             console.log(`Processing new image for update: ${id}`);
             
-            // Optimization
             const optimizedBuffer = await sharp(req.file.buffer)
                 .resize({ width: 1920, withoutEnlargement: true }) 
                 .webp({ quality: 80 }) 
@@ -283,7 +313,6 @@ app.put('/api/aircraft/:id', upload.single('image'), async (req, res) => {
             const cleanTail = tailNumber.replace(/[^a-zA-Z0-9]/g, '');
             const fileName = `community-aircraft/${cleanTail}-${Date.now()}.webp`;
 
-            // Upload new image
             await s3Client.send(new PutObjectCommand({
                 Bucket: process.env.AWS_S3_BUCKET_NAME,
                 Key: fileName,
@@ -293,13 +322,11 @@ app.put('/api/aircraft/:id', upload.single('image'), async (req, res) => {
 
             updatedImageUrl = `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileName}`;
 
-            // DELETE OLD IMAGE to save space
             if (existingEntry.imageUrl) {
                 await deleteS3Object(existingEntry.imageUrl);
             }
         }
 
-        // 3. Update Database
         existingEntry.contributorName = contributorName;
         existingEntry.aircraftType = aircraftType;
         existingEntry.liveryName = liveryName;
