@@ -21,6 +21,7 @@ const sharp = require('sharp');
 // CONFIGURATION - REPLACE THESE WITH YOUR REAL CHANNEL IDS
 const ADMIN_CHANNEL_ID = '1448137363795742942'; 
 const PUBLIC_FEED_CHANNEL_ID = '1448138153335586988'; 
+const WELCOME_CHANNEL_ID = 'REPLACE_THIS_WITH_YOUR_WELCOME_CHANNEL_ID'; // <--- NEW: Add your welcome channel ID here
 const METADATA_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api/metadata';
 const BASE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api';
 
@@ -98,6 +99,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         intents: [
             GatewayIntentBits.Guilds,
             GatewayIntentBits.GuildMessages,
+            GatewayIntentBits.GuildMembers, // <--- ADDED: Required to detect new members
         ] 
     });
 
@@ -160,6 +162,49 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             console.log('✅ Successfully reloaded application (/) commands.');
         } catch (error) {
             console.error('❌ Error registering commands:', error);
+        }
+    });
+
+    // --- NEW: WELCOME MESSAGE EVENT ---
+    client.on('guildMemberAdd', async (member) => {
+        // Prevent crashing if the channel isn't set
+        if (!WELCOME_CHANNEL_ID || WELCOME_CHANNEL_ID === 'REPLACE_THIS_WITH_YOUR_WELCOME_CHANNEL_ID') {
+            console.warn('⚠️ Welcome channel ID not configured.');
+            return;
+        }
+
+        try {
+            const channel = await member.guild.channels.fetch(WELCOME_CHANNEL_ID);
+            if (!channel) return;
+
+            const welcomeEmbed = new EmbedBuilder()
+                .setTitle(`Welcome to Inflight!`)
+                .setDescription(`Hello ${member}, welcome to the server! We are thrilled to have you here.\n\nInflight is the place for aviation enthusiasts to track flights and share their spots.`)
+                .setColor(0x0099FF)
+                .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 })) // User's avatar
+                .setImage('https://media.discordapp.net/attachments/1448147572878344405/1448166201741279254/inflight.png?ex=693a4560&is=6938f3e0&hm=e0222d89cc7498a4aca039865ba0ae854741d9fbbffda2a03974769a46b12b63&=&format=webp&quality=lossless&width=930&height=396') // Your Logo
+                .addFields(
+                    { 
+                        name: '📸 Submit Photos', 
+                        value: 'Help us grow the database! Use the `/submit` command to upload your aircraft photos.', 
+                        inline: false 
+                    },
+                    { 
+                        name: '🌍 Live Tracker', 
+                        value: 'Check out our live flight tracker at [inflight.info](https://inflight.info/)', 
+                        inline: false 
+                    }
+                )
+                .setFooter({ text: 'Happy Spotting!' })
+                .setTimestamp();
+
+            await channel.send({ 
+                content: `Welcome to the crew, ${member}! 👋`, 
+                embeds: [welcomeEmbed] 
+            });
+
+        } catch (error) {
+            console.error('❌ Error sending welcome message:', error);
         }
     });
 
@@ -400,17 +445,32 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                             .setColor(0xFF0000)
                             .setDescription(`This submission was not accepted into the database.`)
                             .addFields({ name: 'Reason', value: reason })
-                            .setFooter({ text: 'Better luck next time!' });
+                            .setFooter({ text: 'Check the thread below for details/questions.' });
 
                         await publicMsg.edit({ embeds: [publicEmbed] });
+
+                        // --- CREATE THREAD FOR QUESTIONS ---
+                        // Create a thread on the public rejection message
+                        const thread = await publicMsg.startThread({
+                            name: `Rejection Appeal - ${typeField}`,
+                            autoArchiveDuration: 1440, // 24 Hours
+                            reason: 'User inquiry regarding rejected aircraft submission',
+                        });
+
+                        // Send an initial message tagging the user so they see the thread
+                        await thread.send({
+                            content: `Hello <@${targetUserId}>,\n\nYour submission for **${typeField}** was rejected by the moderation team.\n\n**Reason:** ${reason}\n\nIf you have any questions or would like to clarify details about this photo, please ask here.`
+                        });
+
                     } catch (feedError) {
-                        console.error("Failed to update public feed message:", feedError);
+                        console.error("Failed to update public feed message or create thread:", feedError);
                     }
                 }
 
                 try {
                     const user = await client.users.fetch(targetUserId);
-                    await user.send(`❌ Your submission for **${typeField} (${liveryField})** was rejected.\n**Reason:** ${reason}`);
+                    // Updated DM to mention the thread
+                    await user.send(`❌ Your submission for **${typeField} (${liveryField})** was rejected.\n**Reason:** ${reason}\n\nA thread has been created on the public post if you wish to appeal or ask questions.`);
                 } catch (e) { }
             }
         }
