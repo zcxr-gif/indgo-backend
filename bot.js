@@ -133,9 +133,10 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
     /**
      * CORE SUBMISSION LOGIC (Reusable for Slash Command & Modal)
-     * interaction: The interaction to update/reply to (must be deferred or available)
+     * interaction: The interaction to update/reply to
+     * messageToDelete: (Optional) The user's message object to delete after we secure the image
      */
-    const startSubmissionFlow = async (interaction, type, livery, tail, photoUrl, user) => {
+    const startSubmissionFlow = async (interaction, type, livery, tail, photoUrl, user, messageToDelete = null) => {
         let isDuplicate = false;
         try {
             const existing = await CommunityAircraftModel.findOne({ 
@@ -145,14 +146,21 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             if (existing) isDuplicate = true;
         } catch (err) { console.error("DB Check failed", err); }
 
-        const createPreviewEmbed = (t, tp, l, imgUrl, isDup) => {
+        // Helper to generate the embed
+        // We use attachment://preview.webp if we are proxying, otherwise the direct URL
+        const createPreviewEmbed = (t, tp, l, imgUrl, isDup, isProxying) => {
             const embed = new EmbedBuilder()
                 .addFields(
                     { name: 'Aircraft Type', value: tp, inline: true },
                     { name: 'Livery', value: l, inline: true },
                     { name: 'Tail Number', value: t.toUpperCase(), inline: true },
-                )
-                .setImage(imgUrl);
+                );
+
+            if (isProxying) {
+                embed.setImage('attachment://preview.webp');
+            } else {
+                embed.setImage(imgUrl);
+            }
 
             if (isDup) {
                 embed.setTitle('⚠️ Existing Entry Detected');
@@ -174,29 +182,58 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 new ButtonBuilder().setCustomId('discard_submission').setLabel('Discard').setStyle(ButtonStyle.Danger),
             );
 
-        // Send the preview. If we are in a modal flow, we might need editReply.
+        // --- IMAGE PROXY LOGIC ---
+        // If we have a messageToDelete, it means the URL is volatile. We must re-upload to the preview.
+        let finalPhotoUrl = photoUrl;
+        let payload = {};
+        const isProxying = !!messageToDelete;
+
+        if (isProxying) {
+            // We attach the file directly to the bot's reply so it persists after we delete the user's msg
+            payload = { 
+                embeds: [createPreviewEmbed(tail, type, livery, photoUrl, isDuplicate, true)], 
+                components: [row],
+                files: [{ attachment: photoUrl, name: 'preview.webp' }], // Discord re-uploads this
+                fetchReply: true 
+            };
+        } else {
+            payload = { 
+                embeds: [createPreviewEmbed(tail, type, livery, photoUrl, isDuplicate, false)], 
+                components: [row],
+                fetchReply: true 
+            };
+        }
+
+        // Send the preview
         let reply;
         if (interaction.isRepliable() && (interaction.deferred || interaction.replied)) {
-            reply = await interaction.editReply({ 
-                content: ' ', // Clear any "Upload photo" text
-                embeds: [createPreviewEmbed(tail, type, livery, photoUrl, isDuplicate)], 
-                components: [row],
-                fetchReply: true 
-            });
+            // Clear any "Upload photo" text and send preview
+            payload.content = ' '; 
+            reply = await interaction.editReply(payload);
         } else {
-            reply = await interaction.reply({ 
-                embeds: [createPreviewEmbed(tail, type, livery, photoUrl, isDuplicate)], 
-                components: [row],
-                ephemeral: true,
-                fetchReply: true 
-            });
+            payload.ephemeral = true;
+            reply = await interaction.reply(payload);
+        }
+
+        // --- CRITICAL FIX ---
+        // If we proxied the image, we must grab the NEW url from the bot's message
+        // and safely delete the user's original message now that we have a copy.
+        if (isProxying && reply) {
+            const attachment = reply.attachments.first();
+            if (attachment) {
+                finalPhotoUrl = attachment.url; // Use this safe URL for DB and Admin channel
+            }
+            // Now it is safe to delete the user's message
+            if (messageToDelete) {
+                messageToDelete.delete().catch(() => {});
+            }
         }
 
         const collector = reply.createMessageComponentCollector({ componentType: ComponentType.Button, time: 120000 });
 
         collector.on('collect', async i => {
             if (i.customId === 'discard_submission') {
-                await i.update({ content: '🗑️ Submission discarded.', embeds: [], components: [] });
+                await i.update({ content: '🗑️ Submission discarded.', embeds: [], components: [], files: [] }); // Clear files to save space
                 collector.stop();
                 return;
             }
@@ -231,8 +268,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     });
                     if (reCheck) isDuplicate = true;
 
+                    // Update the preview embed. Note: We keep the image handling consistent.
                     await submission.update({ 
-                        embeds: [createPreviewEmbed(tail, type, livery, photoUrl, isDuplicate)],
+                        embeds: [createPreviewEmbed(tail, type, livery, finalPhotoUrl, isDuplicate, isProxying)],
                         components: [row] 
                     });
                 } catch (e) { }
@@ -255,7 +293,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         { name: 'Tail Number', value: tail.toUpperCase(), inline: true },
                         { name: 'Spotted By', value: `<@${user.id}>`, inline: false }
                     )
-                    .setImage(photoUrl)
+                    .setImage(finalPhotoUrl) // Use the Safe URL
                     .setFooter({ text: 'Submissions are reviewed by admins before database entry.' })
                     .setTimestamp();
 
@@ -269,7 +307,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         { name: 'Aircraft Type', value: type, inline: true },
                         { name: 'Livery', value: livery, inline: true },
                     )
-                    .setImage(photoUrl)
+                    .setImage(finalPhotoUrl) // Use the Safe URL
                     .setTimestamp();
 
                 if (isDuplicate) {
@@ -290,7 +328,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     );
 
                 await adminChannel.send({ embeds: [finalEmbed], components: [adminRow] });
-                await i.update({ content: '✅ Submission posted to feed (pending) and sent to admins!', embeds: [], components: [] });
+                await i.update({ content: '✅ Submission posted to feed (pending) and sent to admins!', embeds: [], components: [], files: [] });
                 collector.stop();
             }
         });
@@ -572,7 +610,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             }
         }
 
-        // --- MODAL HANDLING ---
         if (interaction.isModalSubmit()) {
             // NEW: MODAL SUBMISSION FROM CHANNEL
             if (interaction.customId === 'submission_modal_entry') {
@@ -599,12 +636,10 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                          return;
                     }
 
-                    // Delete user's image message to keep channel clean
-                    m.delete().catch(() => {});
-
-                    // Hand off to the shared submission logic
-                    // We pass 'interaction' so it updates the ephemeral 'Almost done' message with the preview
-                    await startSubmissionFlow(interaction, type, livery, tail, photo.url, interaction.user);
+                    // DO NOT DELETE 'm' HERE.
+                    // We pass 'm' to startSubmissionFlow. It will upload the image to the bot's preview,
+                    // secure the URL, and THEN delete 'm'.
+                    await startSubmissionFlow(interaction, type, livery, tail, photo.url, interaction.user, m);
                 });
 
                 collector.on('end', collected => {
@@ -614,33 +649,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 });
                 return; 
             }
-
-            // REJECT MODAL
-            if (interaction.customId.startsWith('rejectModal_')) {
-                await interaction.deferUpdate();
-                const targetUserId = interaction.customId.split('_')[1];
-                const reason = interaction.fields.getTextInputValue('reasonInput');
-                const receivedEmbed = interaction.message.embeds[0];
-                const typeField = receivedEmbed.fields.find(f => f.name === 'Aircraft Type').value;
-                const footerText = receivedEmbed.footer?.text || '';
-                const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
-
-                const rejectEmbed = EmbedBuilder.from(receivedEmbed).setColor(0xFF0000).setTitle('❌ Submission Rejected').addFields({ name: 'Reason', value: reason }).setFooter({ text: `Rejected by ${interaction.user.tag}` });
-                await interaction.editReply({ embeds: [rejectEmbed], components: [] });
-
-                if (publicMsgId) {
-                    try {
-                        const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
-                        const publicMsg = await feedChannel.messages.fetch(publicMsgId);
-                        const publicEmbed = EmbedBuilder.from(publicMsg.embeds[0]).setTitle('❌ Submission Denied').setColor(0xFF0000).setDescription(`Submission not accepted.`).addFields({ name: 'Reason', value: reason });
-                        await publicMsg.edit({ embeds: [publicEmbed] });
-                        const thread = await publicMsg.startThread({ name: `Rejection Appeal - ${typeField}`, autoArchiveDuration: 1440 });
-                        await thread.send({ content: `Hello <@${targetUserId}>,\n\nRejected Reason: ${reason}\n\nAsk questions here.` });
-                    } catch (e) {}
-                }
-                try { (await client.users.fetch(targetUserId)).send(`❌ Your submission for **${typeField}** was rejected.\nReason: ${reason}`); } catch (e) { }
-            }
-        }
 
         // --- CHAT COMMANDS ---
         if (!interaction.isChatInputCommand()) return;
