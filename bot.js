@@ -21,7 +21,7 @@ const sharp = require('sharp');
 // CONFIGURATION - REPLACE THESE WITH YOUR REAL CHANNEL IDS
 const ADMIN_CHANNEL_ID = '1448137363795742942'; 
 const PUBLIC_FEED_CHANNEL_ID = '1448138153335586988'; 
-const WELCOME_CHANNEL_ID = 'REPLACE_THIS_WITH_YOUR_WELCOME_CHANNEL_ID'; // <--- NEW: Add your welcome channel ID here
+const WELCOME_CHANNEL_ID = '1442459109608656917'; // <--- NEW: Add your welcome channel ID here
 const METADATA_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api/metadata';
 const BASE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api';
 
