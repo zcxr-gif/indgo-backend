@@ -649,6 +649,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 });
                 return; 
             }
+        }
 
         // --- CHAT COMMANDS ---
         if (!interaction.isChatInputCommand()) return;
