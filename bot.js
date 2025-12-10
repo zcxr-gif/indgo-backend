@@ -22,27 +22,75 @@ const sharp = require('sharp');
 const ADMIN_CHANNEL_ID = '1448137363795742942'; 
 const PUBLIC_FEED_CHANNEL_ID = '1448138153335586988'; 
 const METADATA_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api/metadata';
+const BASE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api';
 
-// CACHE FOR AUTOCOMPLETE
-let cachedAircraftNames = [];
-let lastCacheUpdate = 0;
+// --- CACHE SYSTEMS ---
+// 1. Aircraft Cache: Stores [{ name: "Airbus A320", id: "123" }]
+let cachedAircraftData = []; 
+let lastAircraftCacheUpdate = 0;
 
+// 2. Livery Cache: Stores { "aircraftID": { timestamp: 123456, data: ["Livery A", "Livery B"] } }
+let cachedLiveries = {}; 
+
+/**
+ * Fetches and caches the list of all aircraft types + IDs
+ */
 const fetchAircraftMetadata = async () => {
-    if (Date.now() - lastCacheUpdate < 3600000 && cachedAircraftNames.length > 0) {
-        return cachedAircraftNames;
+    // Refresh only if older than 1 hour or empty
+    if (Date.now() - lastAircraftCacheUpdate < 3600000 && cachedAircraftData.length > 0) {
+        return cachedAircraftData;
     }
     try {
         const response = await axios.get(METADATA_API_URL);
         if (response.data && response.data.aircraft) {
-            cachedAircraftNames = response.data.aircraft.map(a => a.name).sort();
-            lastCacheUpdate = Date.now();
+            // Map to store Name AND ID
+            cachedAircraftData = response.data.aircraft.map(a => ({
+                name: a.name,
+                id: a.id
+            })).sort((a, b) => a.name.localeCompare(b.name));
+            
+            lastAircraftCacheUpdate = Date.now();
+            console.log(`✈️  Cached ${cachedAircraftData.length} aircraft types.`);
         }
-        return cachedAircraftNames;
+        return cachedAircraftData;
     } catch (error) {
         console.error('❌ Failed to fetch aircraft metadata:', error.message);
         return [];
     }
 };
+
+/**
+ * Fetches liveries for a specific aircraft ID (with 5-minute caching)
+ */
+const fetchLiveriesForAircraft = async (aircraftId) => {
+    // Check cache first (valid for 5 mins)
+    const now = Date.now();
+    if (cachedLiveries[aircraftId] && (now - cachedLiveries[aircraftId].timestamp < 300000)) {
+        return cachedLiveries[aircraftId].data;
+    }
+
+    try {
+        const url = `${BASE_API_URL}/aircraft/${aircraftId}/liveries`;
+        const response = await axios.get(url);
+        
+        let liveryList = [];
+        if (response.data && response.data.liveries) {
+            liveryList = response.data.liveries.map(l => l.name).sort();
+        }
+
+        // Update Cache
+        cachedLiveries[aircraftId] = {
+            timestamp: now,
+            data: liveryList
+        };
+        
+        return liveryList;
+    } catch (error) {
+        console.error(`❌ Failed to fetch liveries for ID ${aircraftId}:`, error.message);
+        return [];
+    }
+};
+
 
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) => {
 
@@ -86,6 +134,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             .addStringOption(option => 
                 option.setName('livery')
                     .setDescription('The livery/airline name')
+                    .setAutocomplete(true) // ENABLED AUTOCOMPLETE FOR LIVERIES
                     .setRequired(true))
             .addAttachmentOption(option => 
                 option.setName('photo')
@@ -146,18 +195,58 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
     // 3. Handle Interactions
     client.on('interactionCreate', async interaction => {
         
-        // --- AUTOCOMPLETE ---
+        // --- AUTOCOMPLETE LOGIC ---
         if (interaction.isAutocomplete()) {
             const focusedOption = interaction.options.getFocused(true);
-            const aircraftList = await fetchAircraftMetadata();
             
+            // AIRCRAFT TYPE AUTOCOMPLETE
             if (focusedOption.name === 'aircraft_type' || focusedOption.name === 'query') {
-                const filtered = aircraftList.filter(choice => 
-                    choice.toLowerCase().includes(focusedOption.value.toLowerCase())
-                );
+                const aircraftList = await fetchAircraftMetadata();
+                const filtered = aircraftList
+                    .filter(a => a.name.toLowerCase().includes(focusedOption.value.toLowerCase()))
+                    .slice(0, 25);
+                
                 await interaction.respond(
-                    filtered.slice(0, 25).map(choice => ({ name: choice, value: choice }))
+                    filtered.map(a => ({ name: a.name, value: a.name }))
                 );
+            }
+
+            // LIVERY AUTOCOMPLETE (DEPENDS ON AIRCRAFT TYPE)
+            if (focusedOption.name === 'livery') {
+                // 1. Get the currently selected aircraft type string
+                const selectedType = interaction.options.getString('aircraft_type');
+                
+                if (!selectedType) {
+                    // User hasn't selected an aircraft yet
+                    await interaction.respond([{ name: "Please select Aircraft Type first", value: "Unknown" }]);
+                    return;
+                }
+
+                // 2. Find the ID for that aircraft name
+                const aircraftList = await fetchAircraftMetadata();
+                const matchedAircraft = aircraftList.find(a => a.name === selectedType);
+
+                if (matchedAircraft) {
+                    // 3. Fetch specific liveries for this ID
+                    const liveries = await fetchLiveriesForAircraft(matchedAircraft.id);
+                    
+                    // 4. Filter based on what user is typing in livery field
+                    const filteredLiveries = liveries
+                        .filter(l => l.toLowerCase().includes(focusedOption.value.toLowerCase()))
+                        .slice(0, 24); // Limit to 24 to leave room for "Other"
+
+                    // 5. Always add the user's current input as an option if it's not in the list (Custom Livery support)
+                    // This is important because the API might not have EVERY livery in existence.
+                    const finalOptions = filteredLiveries.map(l => ({ name: l, value: l }));
+                    
+                    if (focusedOption.value && !liveries.includes(focusedOption.value)) {
+                         finalOptions.push({ name: `${focusedOption.value} (Custom)`, value: focusedOption.value });
+                    }
+                    
+                    await interaction.respond(finalOptions);
+                } else {
+                    await interaction.respond([{ name: "Aircraft not found in database", value: "Unknown" }]);
+                }
             }
         }
 
@@ -176,7 +265,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 const liveryField = receivedEmbed.fields.find(f => f.name === 'Livery').value;
                 const imageUrl = receivedEmbed.image.url;
 
-                // Parse Public Message ID from Footer: "Pending | User: 123 | Msg: 456"
+                // Parse Public Message ID from Footer
                 const footerText = receivedEmbed.footer?.text || '';
                 const publicMsgIdMatch = footerText.match(/Msg: (\d+)/);
                 const publicMsgId = publicMsgIdMatch ? publicMsgIdMatch[1] : null;
@@ -215,7 +304,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         await newEntry.save();
                     }
 
-                    // 2. Update Admin Embed to Approved
+                    // 2. Update Admin Embed
                     const approveEmbed = EmbedBuilder.from(receivedEmbed)
                         .setColor(0x00FF00)
                         .setTitle('✅ Submission Approved')
@@ -223,7 +312,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     
                     await interaction.editReply({ embeds: [approveEmbed], components: [] });
 
-                    // 3. Update PUBLIC Feed Message (The "Pop out")
+                    // 3. Update PUBLIC Feed Message
                     if (publicMsgId) {
                         try {
                             const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
@@ -231,9 +320,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                             
                             const publicEmbed = EmbedBuilder.from(publicMsg.embeds[0])
                                 .setTitle('✅ Verified Aircraft Spotted!')
-                                .setColor(0x00FF00) // Green
+                                .setColor(0x00FF00)
                                 .setDescription(`This submission has been **verified** and added to the database.`)
-                                .setImage(permanentUrl) // Update to permanent S3 URL
+                                .setImage(permanentUrl)
                                 .setFooter({ text: 'Verified by Staff' })
                                 .setTimestamp();
 
@@ -243,7 +332,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         }
                     }
 
-                    // 4. Notify User
                     try {
                         const user = await client.users.fetch(targetUserId);
                         await user.send(`✅ Your submission for **${typeField}** has been approved!`);
@@ -255,11 +343,10 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 }
             }
 
-            // ADMIN REJECT BUTTON - OPENS MODAL
+            // ADMIN REJECT BUTTON
             if (interaction.customId.startsWith('reject_')) {
                 const targetUserId = interaction.customId.split('_')[1];
                 
-                // We need to pass the targetUserId to the modal so we know who to DM later
                 const modal = new ModalBuilder()
                     .setCustomId(`rejectModal_${targetUserId}`)
                     .setTitle('Rejection Reason');
@@ -278,28 +365,23 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             }
         }
 
-        // --- MODAL SUBMIT HANDLING (Actually processing the Rejection) ---
+        // --- MODAL SUBMIT ---
         if (interaction.isModalSubmit()) {
             if (interaction.customId.startsWith('rejectModal_')) {
-                await interaction.deferUpdate(); // Acknowledge modal submission
+                await interaction.deferUpdate();
                 
                 const targetUserId = interaction.customId.split('_')[1];
                 const reason = interaction.fields.getTextInputValue('reasonInput');
                 
-                // Get the original Admin Message (from where the button was clicked)
                 const adminMessage = interaction.message; 
                 const receivedEmbed = adminMessage.embeds[0];
 
-                // Parse fields for notification
                 const typeField = receivedEmbed.fields.find(f => f.name === 'Aircraft Type').value;
                 const liveryField = receivedEmbed.fields.find(f => f.name === 'Livery').value;
-
-                // Parse Public Message ID from Footer
                 const footerText = receivedEmbed.footer?.text || '';
                 const publicMsgIdMatch = footerText.match(/Msg: (\d+)/);
                 const publicMsgId = publicMsgIdMatch ? publicMsgIdMatch[1] : null;
 
-                // 1. Update Admin Embed to Rejected
                 const rejectEmbed = EmbedBuilder.from(receivedEmbed)
                     .setColor(0xFF0000)
                     .setTitle('❌ Submission Rejected')
@@ -308,7 +390,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 
                 await interaction.editReply({ embeds: [rejectEmbed], components: [] });
 
-                // 2. Update PUBLIC Feed Message
                 if (publicMsgId) {
                     try {
                         const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
@@ -316,7 +397,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         
                         const publicEmbed = EmbedBuilder.from(publicMsg.embeds[0])
                             .setTitle('❌ Submission Denied')
-                            .setColor(0xFF0000) // Red
+                            .setColor(0xFF0000)
                             .setDescription(`This submission was not accepted into the database.`)
                             .addFields({ name: 'Reason', value: reason })
                             .setFooter({ text: 'Better luck next time!' });
@@ -327,7 +408,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     }
                 }
 
-                // 3. Notify User
                 try {
                     const user = await client.users.fetch(targetUserId);
                     await user.send(`❌ Your submission for **${typeField} (${liveryField})** was rejected.\n**Reason:** ${reason}`);
@@ -445,7 +525,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
                     if (!adminChannel || !feedChannel) return i.update({ content: '❌ Channel configuration error.', components: [] });
 
-                    // 1. Post to PUBLIC FEED Immediately (Pending State)
+                    // 1. Post to PUBLIC FEED
                     const publicEmbed = new EmbedBuilder()
                         .setTitle('📸 New Aircraft Spotted! (Pending Review)')
                         .setColor(0xFFFF00) // Yellow for Pending
@@ -482,7 +562,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         finalEmbed.setColor(0x00FF00);
                     }
                     
-                    // IMPORTANT: We store the User ID AND the Public Message ID in the footer so we can find it later
                     finalEmbed.setFooter({ text: `Pending | User: ${interaction.user.id} | Msg: ${publicMsg.id}` });
 
                     const adminRow = new ActionRowBuilder()
