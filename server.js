@@ -42,8 +42,13 @@ const CommunityAircraftSchema = new mongoose.Schema({
 const CommunityAircraft = mongoose.model('CommunityAircraft', CommunityAircraftSchema);
 
 // --- START THE BOT ---
-// We pass the Model to the bot so it can search the database
-startDiscordBot(CommunityAircraft);
+// We pass the Model AND the S3 Client/Config to the bot
+startDiscordBot(
+    CommunityAircraft, 
+    s3Client, 
+    process.env.AWS_S3_BUCKET_NAME, 
+    process.env.AWS_REGION
+);
 // ---------------------
 
 // 4. CONFIGURE AWS CLIENTS
