@@ -91,7 +91,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 option.setName('photo')
                     .setDescription('Upload the photo')
                     .setRequired(true))
-            // UPDATED: Tail Number is now Optional
             .addStringOption(option => 
                 option.setName('tail_number')
                     .setDescription('Registration (Optional - helps verification!)')
@@ -162,9 +161,12 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             }
         }
 
-        // --- ADMIN BUTTONS ---
+        // --- BUTTON HANDLING (Approve / Reject Logic) ---
         if (interaction.isButton()) {
-            if (interaction.customId.startsWith('approve_') || interaction.customId.startsWith('reject_')) {
+            
+            // ADMIN APPROVE
+            if (interaction.customId.startsWith('approve_')) {
+                await interaction.deferUpdate();
                 const [action, targetUserId] = interaction.customId.split('_');
                 const receivedEmbed = interaction.message.embeds[0];
                 
@@ -174,121 +176,179 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 const liveryField = receivedEmbed.fields.find(f => f.name === 'Livery').value;
                 const imageUrl = receivedEmbed.image.url;
 
-                if (action === 'reject') {
-                    const rejectEmbed = EmbedBuilder.from(receivedEmbed)
-                        .setColor(0xFF0000)
-                        .setTitle('❌ Submission Rejected')
-                        .setFooter({ text: `Rejected by ${interaction.user.tag}` });
+                // Parse Public Message ID from Footer: "Pending | User: 123 | Msg: 456"
+                const footerText = receivedEmbed.footer?.text || '';
+                const publicMsgIdMatch = footerText.match(/Msg: (\d+)/);
+                const publicMsgId = publicMsgIdMatch ? publicMsgIdMatch[1] : null;
+
+                try {
+                    // 1. Database & S3 Operations
+                    const existingEntry = await CommunityAircraftModel.findOne({ 
+                        aircraftType: { $regex: new RegExp(`^${typeField}$`, "i") },
+                        liveryName: { $regex: new RegExp(`^${liveryField}$`, "i") }
+                    });
                     
-                    await interaction.update({ embeds: [rejectEmbed], components: [] });
+                    const permanentUrl = await uploadImageToS3(imageUrl, tailField);
+                    let contributorName = "Unknown";
                     try {
                         const user = await client.users.fetch(targetUserId);
-                        await user.send(`Your submission for **${typeField} (${liveryField})** was rejected.`);
-                    } catch (e) { }
-                    return;
-                }
+                        contributorName = user.username;
+                    } catch (e) {}
 
-                if (action === 'approve') {
-                    await interaction.deferUpdate();
-                    try {
-                        // 1. DUPLICATE LOGIC: Check by TYPE + LIVERY (Case insensitive)
-                        // This finds the existing plane even if the old one had a wrong tail number
-                        const existingEntry = await CommunityAircraftModel.findOne({ 
-                            aircraftType: { $regex: new RegExp(`^${typeField}$`, "i") },
-                            liveryName: { $regex: new RegExp(`^${liveryField}$`, "i") }
-                        });
-                        
-                        const permanentUrl = await uploadImageToS3(imageUrl, tailField);
-                        let contributorName = "Unknown";
-                        try {
-                            const user = await client.users.fetch(targetUserId);
-                            contributorName = user.username;
-                        } catch (e) {}
-
-                        if (existingEntry) {
-                             console.log(`♻️ Replacing existing entry: ${typeField} - ${liveryField}`);
-                             
-                             // Update existing record
-                             existingEntry.imageUrl = permanentUrl;
-                             existingEntry.uploadedAt = new Date(); 
-                             existingEntry.contributorName = contributorName;
-                             
-                             // Also update tail number if the new one is "better" (not "UNKNOWN")
-                             if (tailField !== 'UNKNOWN') {
-                                 existingEntry.tailNumber = tailField.toUpperCase();
-                             }
-                             
-                             await existingEntry.save();
-                        } else {
-                            // Create New
-                            const newEntry = new CommunityAircraftModel({
-                                contributorName: contributorName,
-                                aircraftType: typeField,
-                                liveryName: liveryField,
-                                tailNumber: tailField.toUpperCase(),
-                                imageUrl: permanentUrl,
-                                uploadedAt: new Date()
-                            });
-                            await newEntry.save();
+                    if (existingEntry) {
+                        existingEntry.imageUrl = permanentUrl;
+                        existingEntry.uploadedAt = new Date(); 
+                        existingEntry.contributorName = contributorName;
+                        if (tailField !== 'UNKNOWN') {
+                            existingEntry.tailNumber = tailField.toUpperCase();
                         }
+                        await existingEntry.save();
+                    } else {
+                        const newEntry = new CommunityAircraftModel({
+                            contributorName: contributorName,
+                            aircraftType: typeField,
+                            liveryName: liveryField,
+                            tailNumber: tailField.toUpperCase(),
+                            imageUrl: permanentUrl,
+                            uploadedAt: new Date()
+                        });
+                        await newEntry.save();
+                    }
 
-                        const approveEmbed = EmbedBuilder.from(receivedEmbed)
-                            .setColor(0x00FF00)
-                            .setTitle('✅ Submission Approved')
-                            .setFooter({ text: `Approved by ${interaction.user.tag}` });
-                        
-                        await interaction.editReply({ embeds: [approveEmbed], components: [] });
+                    // 2. Update Admin Embed to Approved
+                    const approveEmbed = EmbedBuilder.from(receivedEmbed)
+                        .setColor(0x00FF00)
+                        .setTitle('✅ Submission Approved')
+                        .setFooter({ text: `Approved by ${interaction.user.tag}` });
+                    
+                    await interaction.editReply({ embeds: [approveEmbed], components: [] });
 
+                    // 3. Update PUBLIC Feed Message (The "Pop out")
+                    if (publicMsgId) {
                         try {
                             const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
-                            if (feedChannel) {
-                                const publicEmbed = new EmbedBuilder()
-                                    .setTitle('📸 New Aircraft Spotted!')
-                                    .setColor(0x0099FF)
-                                    .setDescription(`A new contribution has been added to the global database!`)
-                                    .addFields(
-                                        { name: 'Aircraft', value: typeField, inline: true },
-                                        { name: 'Livery', value: liveryField, inline: true },
-                                        { name: 'Tail Number', value: tailField, inline: true },
-                                        { name: 'Spotted By', value: `<@${targetUserId}>`, inline: false }
-                                    )
-                                    .setImage(permanentUrl) 
-                                    .setFooter({ text: 'Submit your own photos using /submit' })
-                                    .setTimestamp();
-                                await feedChannel.send({ embeds: [publicEmbed] });
-                            }
-                        } catch (feedError) { console.error("Could not post to public feed:", feedError); }
+                            const publicMsg = await feedChannel.messages.fetch(publicMsgId);
+                            
+                            const publicEmbed = EmbedBuilder.from(publicMsg.embeds[0])
+                                .setTitle('✅ Verified Aircraft Spotted!')
+                                .setColor(0x00FF00) // Green
+                                .setDescription(`This submission has been **verified** and added to the database.`)
+                                .setImage(permanentUrl) // Update to permanent S3 URL
+                                .setFooter({ text: 'Verified by Staff' })
+                                .setTimestamp();
 
-                        try {
-                            const user = await client.users.fetch(targetUserId);
-                            await user.send(`✅ Your submission for **${typeField}** has been approved!`);
-                        } catch (e) { }
-
-                    } catch (error) {
-                        console.error(error);
-                        await interaction.followUp({ content: '❌ Error saving to database/S3.', ephemeral: true });
+                            await publicMsg.edit({ embeds: [publicEmbed] });
+                        } catch (feedError) {
+                            console.error("Failed to update public feed message:", feedError);
+                        }
                     }
+
+                    // 4. Notify User
+                    try {
+                        const user = await client.users.fetch(targetUserId);
+                        await user.send(`✅ Your submission for **${typeField}** has been approved!`);
+                    } catch (e) { }
+
+                } catch (error) {
+                    console.error(error);
+                    await interaction.followUp({ content: '❌ Error saving to database/S3.', ephemeral: true });
                 }
+            }
+
+            // ADMIN REJECT BUTTON - OPENS MODAL
+            if (interaction.customId.startsWith('reject_')) {
+                const targetUserId = interaction.customId.split('_')[1];
+                
+                // We need to pass the targetUserId to the modal so we know who to DM later
+                const modal = new ModalBuilder()
+                    .setCustomId(`rejectModal_${targetUserId}`)
+                    .setTitle('Rejection Reason');
+
+                const reasonInput = new TextInputBuilder()
+                    .setCustomId('reasonInput')
+                    .setLabel("Why is this being rejected?")
+                    .setStyle(TextInputStyle.Paragraph)
+                    .setPlaceholder("e.g., Image too dark, wrong aircraft type...")
+                    .setRequired(true);
+
+                const firstActionRow = new ActionRowBuilder().addComponents(reasonInput);
+                modal.addComponents(firstActionRow);
+
+                await interaction.showModal(modal);
             }
         }
 
-        // --- COMMANDS ---
+        // --- MODAL SUBMIT HANDLING (Actually processing the Rejection) ---
+        if (interaction.isModalSubmit()) {
+            if (interaction.customId.startsWith('rejectModal_')) {
+                await interaction.deferUpdate(); // Acknowledge modal submission
+                
+                const targetUserId = interaction.customId.split('_')[1];
+                const reason = interaction.fields.getTextInputValue('reasonInput');
+                
+                // Get the original Admin Message (from where the button was clicked)
+                const adminMessage = interaction.message; 
+                const receivedEmbed = adminMessage.embeds[0];
+
+                // Parse fields for notification
+                const typeField = receivedEmbed.fields.find(f => f.name === 'Aircraft Type').value;
+                const liveryField = receivedEmbed.fields.find(f => f.name === 'Livery').value;
+
+                // Parse Public Message ID from Footer
+                const footerText = receivedEmbed.footer?.text || '';
+                const publicMsgIdMatch = footerText.match(/Msg: (\d+)/);
+                const publicMsgId = publicMsgIdMatch ? publicMsgIdMatch[1] : null;
+
+                // 1. Update Admin Embed to Rejected
+                const rejectEmbed = EmbedBuilder.from(receivedEmbed)
+                    .setColor(0xFF0000)
+                    .setTitle('❌ Submission Rejected')
+                    .addFields({ name: 'Reason', value: reason })
+                    .setFooter({ text: `Rejected by ${interaction.user.tag}` });
+                
+                await interaction.editReply({ embeds: [rejectEmbed], components: [] });
+
+                // 2. Update PUBLIC Feed Message
+                if (publicMsgId) {
+                    try {
+                        const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
+                        const publicMsg = await feedChannel.messages.fetch(publicMsgId);
+                        
+                        const publicEmbed = EmbedBuilder.from(publicMsg.embeds[0])
+                            .setTitle('❌ Submission Denied')
+                            .setColor(0xFF0000) // Red
+                            .setDescription(`This submission was not accepted into the database.`)
+                            .addFields({ name: 'Reason', value: reason })
+                            .setFooter({ text: 'Better luck next time!' });
+
+                        await publicMsg.edit({ embeds: [publicEmbed] });
+                    } catch (feedError) {
+                        console.error("Failed to update public feed message:", feedError);
+                    }
+                }
+
+                // 3. Notify User
+                try {
+                    const user = await client.users.fetch(targetUserId);
+                    await user.send(`❌ Your submission for **${typeField} (${liveryField})** was rejected.\n**Reason:** ${reason}`);
+                } catch (e) { }
+            }
+        }
+
+        // --- CHAT COMMANDS ---
         if (!interaction.isChatInputCommand()) return;
 
         // COMMAND: /submit
         if (interaction.commandName === 'submit') {
-            // 1. Capture Input (Tail is optional now)
             let type = interaction.options.getString('aircraft_type');
             let livery = interaction.options.getString('livery');
-            let tail = interaction.options.getString('tail_number') || 'UNKNOWN'; // Default if empty
+            let tail = interaction.options.getString('tail_number') || 'UNKNOWN';
             const photo = interaction.options.getAttachment('photo');
 
             if (!photo.contentType.startsWith('image/')) {
                 return interaction.reply({ content: '❌ Please upload a valid image file (JPG, PNG).', ephemeral: true });
             }
 
-            // 2. CHECK FOR DUPLICATES BY TYPE + LIVERY
-            // We ignore tail number for detection, because users might typo the tail
             let isDuplicate = false;
             try {
                 const existing = await CommunityAircraftModel.findOne({ 
@@ -298,7 +358,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 if (existing) isDuplicate = true;
             } catch (err) { console.error("DB Check failed", err); }
 
-            // 3. Build Preview
             const createPreviewEmbed = (t, tp, l, imgUrl, isDup) => {
                 const embed = new EmbedBuilder()
                     .addFields(
@@ -310,21 +369,20 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
                 if (isDup) {
                     embed.setTitle('⚠️ Existing Entry Detected');
-                    embed.setColor(0xFFA500); // Orange
-                    embed.setDescription(`**Note:** We already have a photo for **${tp}** in **${l}** livery.\n\nYour submission will be reviewed as a **replacement** for the existing image.`);
+                    embed.setColor(0xFFA500); 
+                    embed.setDescription(`**Note:** We already have a photo for **${tp}** in **${l}** livery.\n\nYour submission will be reviewed as a **replacement**.`);
                 } else {
                     embed.setTitle('📝 Review Your Submission');
-                    embed.setColor(0x0099FF); // Blue
+                    embed.setColor(0x0099FF);
                     embed.setDescription('Please check the details below.');
-                    embed.setFooter({ text: 'Click Confirm to send to Admins.' });
+                    embed.setFooter({ text: 'Click Confirm to post to the feed.' });
                 }
-                
                 return embed;
             };
 
             const row = new ActionRowBuilder()
                 .addComponents(
-                    new ButtonBuilder().setCustomId('confirm_submission').setLabel('Confirm & Send').setStyle(ButtonStyle.Success),
+                    new ButtonBuilder().setCustomId('confirm_submission').setLabel('Confirm & Post').setStyle(ButtonStyle.Success),
                     new ButtonBuilder().setCustomId('edit_details').setLabel('Edit Details').setStyle(ButtonStyle.Secondary),
                     new ButtonBuilder().setCustomId('discard_submission').setLabel('Discard').setStyle(ButtonStyle.Danger),
                 );
@@ -336,7 +394,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 fetchReply: true 
             });
 
-            // 4. Collector
             const collector = reply.createMessageComponentCollector({ componentType: ComponentType.Button, time: 120000 });
 
             collector.on('collect', async i => {
@@ -348,7 +405,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
                 if (i.customId === 'edit_details') {
                     const modal = new ModalBuilder().setCustomId('editModal').setTitle('Edit Aircraft Details');
-                    
                     const tailInput = new TextInputBuilder().setCustomId('m_tail').setLabel("Tail Number (Optional)").setValue(tail === 'UNKNOWN' ? '' : tail).setRequired(false).setStyle(TextInputStyle.Short);
                     const typeInput = new TextInputBuilder().setCustomId('m_type').setLabel("Aircraft Type").setValue(type).setStyle(TextInputStyle.Short);
                     const liveryInput = new TextInputBuilder().setCustomId('m_livery').setLabel("Livery Name").setValue(livery).setStyle(TextInputStyle.Short);
@@ -364,14 +420,11 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     const modalFilter = (submission) => submission.customId === 'editModal' && submission.user.id === interaction.user.id;
                     try {
                         const submission = await i.awaitModalSubmit({ filter: modalFilter, time: 60000 });
-                        
-                        // Update values (Handle empty tail)
                         const newTail = submission.fields.getTextInputValue('m_tail');
                         tail = newTail.trim() === '' ? 'UNKNOWN' : newTail;
                         type = submission.fields.getTextInputValue('m_type');
                         livery = submission.fields.getTextInputValue('m_livery');
 
-                        // Re-check duplicate with updated Type/Livery
                         isDuplicate = false;
                         const reCheck = await CommunityAircraftModel.findOne({ 
                             aircraftType: { $regex: new RegExp(`^${type}$`, "i") },
@@ -388,8 +441,28 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
                 if (i.customId === 'confirm_submission') {
                     const adminChannel = await client.channels.fetch(ADMIN_CHANNEL_ID);
-                    if (!adminChannel) return i.update({ content: '❌ Admin channel error.', components: [] });
+                    const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
 
+                    if (!adminChannel || !feedChannel) return i.update({ content: '❌ Channel configuration error.', components: [] });
+
+                    // 1. Post to PUBLIC FEED Immediately (Pending State)
+                    const publicEmbed = new EmbedBuilder()
+                        .setTitle('📸 New Aircraft Spotted! (Pending Review)')
+                        .setColor(0xFFFF00) // Yellow for Pending
+                        .setDescription(`A user has submitted a new photo! Status: **Under Review**`)
+                        .addFields(
+                            { name: 'Aircraft', value: type, inline: true },
+                            { name: 'Livery', value: livery, inline: true },
+                            { name: 'Tail Number', value: tail.toUpperCase(), inline: true },
+                            { name: 'Spotted By', value: `<@${interaction.user.id}>`, inline: false }
+                        )
+                        .setImage(photo.url)
+                        .setFooter({ text: 'Submissions are reviewed by admins before database entry.' })
+                        .setTimestamp();
+
+                    const publicMsg = await feedChannel.send({ embeds: [publicEmbed] });
+
+                    // 2. Post to ADMIN CHANNEL
                     const finalEmbed = new EmbedBuilder()
                         .addFields(
                             { name: 'Contributor', value: `<@${interaction.user.id}>`, inline: true },
@@ -407,17 +480,19 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     } else {
                         finalEmbed.setTitle('📋 New Submission Request');
                         finalEmbed.setColor(0x00FF00);
-                        finalEmbed.setFooter({ text: `Pending Approval | UserID: ${interaction.user.id}` });
                     }
+                    
+                    // IMPORTANT: We store the User ID AND the Public Message ID in the footer so we can find it later
+                    finalEmbed.setFooter({ text: `Pending | User: ${interaction.user.id} | Msg: ${publicMsg.id}` });
 
                     const adminRow = new ActionRowBuilder()
                         .addComponents(
-                            new ButtonBuilder().setCustomId(`approve_${interaction.user.id}`).setLabel(isDuplicate ? 'Replace & Publish' : 'Approve & Publish').setStyle(ButtonStyle.Success),
+                            new ButtonBuilder().setCustomId(`approve_${interaction.user.id}`).setLabel('Approve & Verify').setStyle(ButtonStyle.Success),
                             new ButtonBuilder().setCustomId(`reject_${interaction.user.id}`).setLabel('Reject').setStyle(ButtonStyle.Danger),
                         );
 
                     await adminChannel.send({ embeds: [finalEmbed], components: [adminRow] });
-                    await i.update({ content: '✅ Submission sent to admins successfully!', embeds: [], components: [] });
+                    await i.update({ content: '✅ Submission posted to feed (pending) and sent to admins!', embeds: [], components: [] });
                     collector.stop();
                 }
             });
