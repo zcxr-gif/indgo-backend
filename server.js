@@ -41,17 +41,8 @@ const CommunityAircraftSchema = new mongoose.Schema({
 
 const CommunityAircraft = mongoose.model('CommunityAircraft', CommunityAircraftSchema);
 
-// --- START THE BOT ---
-// We pass the Model AND the S3 Client/Config to the bot
-startDiscordBot(
-    CommunityAircraft, 
-    s3Client, 
-    process.env.AWS_S3_BUCKET_NAME, 
-    process.env.AWS_REGION
-);
-// ---------------------
-
 // 4. CONFIGURE AWS CLIENTS
+// (Moved UP so they exist before the bot tries to use them)
 
 // S3 Client (Storage)
 const s3Client = new S3Client({
@@ -76,6 +67,16 @@ const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 10 * 1024 * 1024 } // Allow up to 10MB input
 });
+
+// --- START THE BOT ---
+// We pass the Model AND the S3 Client/Config to the bot
+startDiscordBot(
+    CommunityAircraft, 
+    s3Client, 
+    process.env.AWS_S3_BUCKET_NAME, 
+    process.env.AWS_REGION
+);
+// ---------------------
 
 // Helper to delete image from S3
 const deleteS3Object = async (imageUrl) => {
