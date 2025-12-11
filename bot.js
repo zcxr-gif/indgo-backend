@@ -23,7 +23,7 @@ const sharp = require('sharp');
 const ADMIN_CHANNEL_ID = '1448137363795742942'; 
 const PUBLIC_FEED_CHANNEL_ID = '1448138153335586988'; 
 const WELCOME_CHANNEL_ID = '1442462899451858975'; 
-const SUBMISSION_CHANNEL_ID = '1442461970371444880'; // Channel where users post images
+const SUBMISSION_CHANNEL_ID = '1442461970371444880'; // <-- PUT YOUR FORUM CHANNEL ID HERE
 
 // --- NEW CONFIGURATION ---
 const MEMBER_ROLE_ID = '1442472513849397248';          // Role given on join
@@ -431,16 +431,32 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         // Ignore bots
         if (message.author.bot) return;
 
-        // Check if message is in the submission channel
-        if (message.channelId === SUBMISSION_CHANNEL_ID) {
+        // DEBUG LOGS - Verify channel IDs and Thread Parent IDs
+        if (message.attachments.size > 0) {
+            console.log(`[DEBUG] Image in Channel: ${message.channelId} | Parent(Forum): ${message.channel.parentId} | User: ${message.author.tag}`);
+        }
+
+        // UPDATED LOGIC FOR FORUM CHANNELS
+        // We check if:
+        // 1. The message is directly in the ID (Standard Channel)
+        // 2. OR The message is in a Thread (Post) whose Parent is the ID (Forum Channel)
+        const isSubmissionChannel = message.channelId === SUBMISSION_CHANNEL_ID || 
+                                   (message.channel.isThread() && message.channel.parentId === SUBMISSION_CHANNEL_ID);
+
+        if (isSubmissionChannel) {
             
             // Must have an image
             if (message.attachments.size > 0) {
                 const photo = message.attachments.first();
-                if (!photo.contentType || !photo.contentType.startsWith('image/')) return;
+                const isImage = photo.contentType?.startsWith('image/') || /\.(png|jpe?g|webp|gif)$/i.test(photo.name);
 
-                // Create the button to trigger the Modal
-                // This is required because Modals must be triggered by an interaction (click)
+                if (!isImage) {
+                    console.log(`[DEBUG] Ignored non-image: ${photo.name}`);
+                    return;
+                }
+
+                console.log(`[DEBUG] Processing submission...`);
+
                 const row = new ActionRowBuilder()
                     .addComponents(
                         new ButtonBuilder()
@@ -454,7 +470,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     .setColor(0x0099FF)
                     .setDescription(`**Thanks for the photo!**\nPlease click the button below to enter the **Aircraft**, **Livery**, and **Registration** details.`);
 
-                // Reply to the user's photo
                 await message.reply({ 
                     embeds: [promptEmbed], 
                     components: [row] 
