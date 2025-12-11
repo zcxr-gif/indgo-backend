@@ -142,6 +142,8 @@ const normalizeData = async (rawType, rawLivery) => {
     return { type: finalType, livery: finalLivery };
 };
 
+// I have added the "Memory Janitor" inside the client.once('ready') block.
+
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) => {
 
     const client = new Client({ 
@@ -155,7 +157,10 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
     const uploadImageToS3 = async (url, tailNumber) => {
         try {
+            // Force garbage collection hint by keeping scope tight
             const response = await axios.get(url, { responseType: 'arraybuffer' });
+            
+            // Optimization: Process buffer immediately and let response.data be eligible for GC
             const optimizedBuffer = await sharp(response.data)
                 .resize({ width: 1920, withoutEnlargement: true })
                 .webp({ quality: 80 })
@@ -179,23 +184,36 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
     };
 
     /**
-     * CORE SUBMISSION LOGIC
+     * CORE SUBMISSION LOGIC - FIX: ROBUST DEFERRAL HANDLING
      */
     const startSubmissionFlow = async (source, rawType, rawLivery, tail, photoUrl, user, originChannelId) => {
         
-        // --- STEP 1: NORMALIZE INPUTS ---
-        const { type, livery } = await normalizeData(rawType, rawLivery);
+        // --- DATA PREPARATION ---
+        let currentType = rawType;
+        let currentLivery = rawLivery;
+        let currentTail = tail;
 
-        let isDuplicate = false;
+        // Helper to check duplicates safely
+        const checkDuplicate = async (t, l) => {
+            try {
+                const existing = await CommunityAircraftModel.findOne({ 
+                    aircraftType: { $regex: new RegExp(`^${escapeRegex(t)}$`, "i") },
+                    liveryName: { $regex: new RegExp(`^${escapeRegex(l)}$`, "i") }
+                });
+                return !!existing;
+            } catch (err) { return false; }
+        };
+
+        // 1. Normalize & Check DB (Heavy operations)
         try {
-            const existing = await CommunityAircraftModel.findOne({ 
-                aircraftType: { $regex: new RegExp(`^${escapeRegex(type)}$`, "i") },
-                liveryName: { $regex: new RegExp(`^${escapeRegex(livery)}$`, "i") }
-            });
-            if (existing) isDuplicate = true;
-        } catch (err) { console.error("DB Check failed", err); }
+            const normalized = await normalizeData(currentType, currentLivery);
+            currentType = normalized.type;
+            currentLivery = normalized.livery;
+        } catch (e) { console.error("Normalization error:", e); }
 
-        // Preview Embed
+        let isDuplicate = await checkDuplicate(currentType, currentLivery);
+
+        // 2. Build Preview Embed
         const createPreviewEmbed = (t, tp, l, imgUrl, isDup) => {
             const embed = new EmbedBuilder()
                 .addFields(
@@ -225,22 +243,27 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             );
 
         const payload = { 
-            embeds: [createPreviewEmbed(tail, type, livery, photoUrl, isDuplicate)], 
+            embeds: [createPreviewEmbed(currentTail, currentType, currentLivery, photoUrl, isDuplicate)], 
             components: [row],
             files: [{ attachment: photoUrl, name: 'preview.webp' }] 
         };
 
+        // 3. Send/Update the Reply
         let reply;
-        if (source.commandName || source.customId === 'identify_modal') {
-            payload.fetchReply = true;
-            if (source.deferred || source.replied) reply = await source.editReply(payload);
-            else reply = await source.reply(payload);
-        } else {
-            reply = await source.reply(payload);
+        try {
+            // If the source was already deferred (loading state) or replied to, we MUST use editReply
+            if (source.deferred || source.replied) {
+                reply = await source.editReply(payload);
+            } else {
+                // Otherwise we reply normally
+                reply = await source.reply({ ...payload, fetchReply: true });
+            }
+        } catch (err) {
+            console.error("Error sending preview:", err);
+            return; 
         }
 
         const finalPhotoUrl = reply.attachments.first() ? reply.attachments.first().url : photoUrl;
-
         const collector = reply.createMessageComponentCollector({ componentType: ComponentType.Button, time: 120000 });
 
         collector.on('collect', async i => {
@@ -256,11 +279,28 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 return;
             }
 
+            // --- EDIT DETAILS FIX ---
             if (i.customId === 'edit_details') {
                 const modal = new ModalBuilder().setCustomId('editModal').setTitle('Edit Aircraft Details');
-                const tailInput = new TextInputBuilder().setCustomId('m_tail').setLabel("Tail Number").setValue(tail === 'UNKNOWN' ? '' : tail).setRequired(false).setStyle(TextInputStyle.Short);
-                const typeInput = new TextInputBuilder().setCustomId('m_type').setLabel("Aircraft Type").setValue(type).setStyle(TextInputStyle.Short);
-                const liveryInput = new TextInputBuilder().setCustomId('m_livery').setLabel("Livery Name").setValue(livery).setStyle(TextInputStyle.Short);
+                
+                const tailInput = new TextInputBuilder()
+                    .setCustomId('m_tail')
+                    .setLabel("Tail Number")
+                    .setValue(currentTail === 'UNKNOWN' ? '' : currentTail)
+                    .setRequired(false)
+                    .setStyle(TextInputStyle.Short);
+
+                const typeInput = new TextInputBuilder()
+                    .setCustomId('m_type')
+                    .setLabel("Aircraft Type")
+                    .setValue(currentType)
+                    .setStyle(TextInputStyle.Short);
+
+                const liveryInput = new TextInputBuilder()
+                    .setCustomId('m_livery')
+                    .setLabel("Livery Name")
+                    .setValue(currentLivery)
+                    .setStyle(TextInputStyle.Short);
 
                 modal.addComponents(
                     new ActionRowBuilder().addComponents(tailInput),
@@ -271,49 +311,54 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 await i.showModal(modal);
 
                 const modalFilter = (submission) => submission.customId === 'editModal' && submission.user.id === user.id;
+                
                 try {
                     const submission = await i.awaitModalSubmit({ filter: modalFilter, time: 60000 });
-                    const newTail = submission.fields.getTextInputValue('m_tail');
-                    tail = newTail.trim() === '' ? 'UNKNOWN' : newTail;
+                    
+                    // CRITICAL FIX: Defer immediately. 
+                    await submission.deferUpdate(); 
+
+                    const newTailRaw = submission.fields.getTextInputValue('m_tail');
+                    currentTail = newTailRaw.trim() === '' ? 'UNKNOWN' : newTailRaw;
                     
                     const editedType = submission.fields.getTextInputValue('m_type');
                     const editedLivery = submission.fields.getTextInputValue('m_livery');
-                    const normalized = await normalizeData(editedType, editedLivery);
                     
-                    type = normalized.type;
-                    livery = normalized.livery;
+                    const normalized = await normalizeData(editedType, editedLivery);
+                    currentType = normalized.type;
+                    currentLivery = normalized.livery;
 
-                    isDuplicate = false;
-                    const reCheck = await CommunityAircraftModel.findOne({ 
-                        aircraftType: { $regex: new RegExp(`^${escapeRegex(type)}$`, "i") },
-                        liveryName: { $regex: new RegExp(`^${escapeRegex(livery)}$`, "i") }
-                    });
-                    if (reCheck) isDuplicate = true;
+                    isDuplicate = await checkDuplicate(currentType, currentLivery);
 
-                    await submission.update({ 
-                        embeds: [createPreviewEmbed(tail, type, livery, finalPhotoUrl, isDuplicate)],
+                    await submission.editReply({ 
+                        embeds: [createPreviewEmbed(currentTail, currentType, currentLivery, finalPhotoUrl, isDuplicate)],
                         components: [row] 
                     });
-                } catch (e) { }
+
+                } catch (e) { 
+                    if (e.code !== 'InteractionCollectorError') console.error("Edit flow error:", e);
+                }
             }
 
             if (i.customId === 'confirm_submission') {
+                await i.deferUpdate();
+
                 const adminChannel = await client.channels.fetch(ADMIN_CHANNEL_ID);
                 const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
 
-                if (!adminChannel || !feedChannel) return i.update({ content: '❌ Channel configuration error.', components: [] });
+                if (!adminChannel || !feedChannel) return i.editReply({ content: '❌ Channel configuration error.', components: [] });
 
                 const attachmentData = { attachment: finalPhotoUrl, name: 'aircraft.webp' };
 
-                // 1. Post to PUBLIC FEED
+                // Post to PUBLIC FEED
                 const publicEmbed = new EmbedBuilder()
                     .setTitle('📸 New Aircraft Spotted! (Pending Review)')
                     .setColor(0xFFFF00) 
                     .setDescription(`A user has submitted a new photo! Status: **Under Review**`)
                     .addFields(
-                        { name: 'Aircraft', value: type, inline: true },
-                        { name: 'Livery', value: livery, inline: true },
-                        { name: 'Tail Number', value: tail.toUpperCase(), inline: true },
+                        { name: 'Aircraft', value: currentType, inline: true },
+                        { name: 'Livery', value: currentLivery, inline: true },
+                        { name: 'Tail Number', value: currentTail.toUpperCase(), inline: true },
                         { name: 'Spotted By', value: `<@${user.id}>`, inline: false }
                     )
                     .setFooter({ text: 'Submissions are reviewed by admins before database entry.' })
@@ -321,20 +366,20 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
                 const publicMsg = await feedChannel.send({ embeds: [publicEmbed], files: [attachmentData] });
 
-                // 2. Post to ADMIN CHANNEL
+                // Post to ADMIN CHANNEL
                 const finalEmbed = new EmbedBuilder()
                     .addFields(
                         { name: 'Contributor', value: `<@${user.id}>`, inline: true },
-                        { name: 'Tail Number', value: tail.toUpperCase(), inline: true },
-                        { name: 'Aircraft Type', value: type, inline: true },
-                        { name: 'Livery', value: livery, inline: true },
+                        { name: 'Tail Number', value: currentTail.toUpperCase(), inline: true },
+                        { name: 'Aircraft Type', value: currentType, inline: true },
+                        { name: 'Livery', value: currentLivery, inline: true },
                     )
                     .setTimestamp();
 
                 if (isDuplicate) {
                     finalEmbed.setTitle('⚠️ REPLACEMENT REQUEST');
                     finalEmbed.setColor(0xFFA500);
-                    finalEmbed.setDescription(`**Admin Notice:** Matches existing **${type} / ${livery}**.\nApproving this will **REPLACE** the old image.`);
+                    finalEmbed.setDescription(`**Admin Notice:** Matches existing **${currentType} / ${currentLivery}**.\nApproving this will **REPLACE** the old image.`);
                 } else {
                     finalEmbed.setTitle('📋 New Submission Request');
                     finalEmbed.setColor(0x00FF00);
@@ -351,14 +396,14 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 await adminChannel.send({ embeds: [finalEmbed], components: [adminRow], files: [attachmentData] });
                 
                 userSessions.set(user.id, {
-                    type: type, 
-                    livery: livery,
-                    tail: tail,
+                    type: currentType, 
+                    livery: currentLivery,
+                    tail: currentTail,
                     expiresAt: Date.now() + 300000 
                 });
 
-                await i.update({ 
-                    content: `✅ Submission sent for review!\n\n**Have another photo of this same aircraft?**\nUpload it now and I'll automatically apply the corrected details (${type}, ${tail}).`, 
+                await i.editReply({ 
+                    content: `✅ Submission sent for review!\n\n**Have another photo of this same aircraft?**\nUpload it now and I'll automatically apply the corrected details (${currentType}, ${currentTail}).`, 
                     embeds: [], 
                     components: [], 
                     files: [] 
@@ -370,18 +415,16 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         });
     };
 
-    // --- LEADERBOARD LOGIC (UPDATED FOR IDs) ---
+    // --- LEADERBOARD LOGIC ---
     const updateLeaderboard = async () => {
         if (!LEADERBOARD_CHANNEL_ID) return;
         try {
-            // Group by ID if available, otherwise fallback to Name
             const leaderboard = await CommunityAircraftModel.aggregate([
                 { 
                     $group: { 
                         _id: { $ifNull: ["$contributorId", "$contributorName"] }, 
                         count: { $sum: 1 }, 
                         displayName: { $first: "$contributorName" },
-                        // Store a flag so we know if this group is based on an ID or a Legacy Name
                         isId: { $max: { $cond: [{ $ifNull: ["$contributorId", false] }, true, false] } }
                     } 
                 },
@@ -396,7 +439,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
             const description = leaderboard.map((entry, index) => {
                 const medal = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `#${index + 1}`;
-                // If we grouped by ID, display as a Mention. If legacy name, just display text.
                 const nameDisplay = (entry.isId && entry._id.match && entry._id.match(/^\d+$/)) ? `<@${entry._id}>` : entry.displayName;
                 return `${medal} ${nameDisplay} — **${entry.count}** contributions`;
             }).join('\n');
@@ -412,8 +454,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             if (lastMessage) await lastMessage.edit({ embeds: [leaderboardEmbed] });
             else await channel.send({ embeds: [leaderboardEmbed] });
 
-            // (Optional Role assignment logic would go here, checking entry.isId)
-
         } catch (error) { console.error('❌ Error updating leaderboard:', error); }
     };
 
@@ -422,6 +462,36 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         console.log(`🤖 Discord Bot Online as ${client.user.tag}`);
         await fetchAircraftMetadata();
         
+        // --- MEMORY FIX: START CACHE CLEANUP TASK ---
+        console.log('🧹 Starting Memory Janitor...');
+        setInterval(() => {
+            const now = Date.now();
+            let cleanedLiveries = 0;
+            let cleanedSessions = 0;
+
+            // 1. Clean Livery Cache
+            Object.keys(cachedLiveries).forEach(key => {
+                // If data is older than 20 mins, delete it
+                if (now - cachedLiveries[key].timestamp > 1200000) { 
+                    delete cachedLiveries[key];
+                    cleanedLiveries++;
+                }
+            });
+
+            // 2. Clean User Sessions (Abandoned flows)
+            userSessions.forEach((value, key) => {
+                if (now > value.expiresAt) {
+                    userSessions.delete(key);
+                    cleanedSessions++;
+                }
+            });
+
+            if (cleanedLiveries > 0 || cleanedSessions > 0) {
+                console.log(`🧹 Memory Cleaned: Pruned ${cleanedLiveries} livery caches and ${cleanedSessions} stale sessions.`);
+            }
+        }, 600000); // Run every 10 minutes
+        // ---------------------------------------------
+
         const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
         
         const commands = [
@@ -433,10 +503,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true))
                 .addAttachmentOption(o => o.setName('photo').setDescription('Upload photo').setRequired(true))
                 .addStringOption(o => o.setName('tail_number').setDescription('Registration').setRequired(false)),
-            
-            // --- NEW MIGRATION COMMAND ---
             new SlashCommandBuilder().setName('migrate_legacy').setDescription('[ADMIN] Auto-match legacy DB names to current Discord Users'),
-            // --- LINKS COMMAND ---
             new SlashCommandBuilder().setName('links').setDescription('Get helpful resource links (Tracker, Forum, Liveries)'),
         ].map(c => c.toJSON());
 
@@ -670,6 +737,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             }
         }
 
+        // --- MODAL SUBMISSIONS ---
         if (interaction.isModalSubmit()) {
 
             if (interaction.customId === 'identify_modal') {
@@ -688,11 +756,16 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                             photoUrl = originalMsg.attachments.first().url;
                         }
                     }
-                } catch (err) { console.error("Could not fetch original image:", err); }
+                } catch (err) { 
+                    console.error("Could not fetch original image:", err); 
+                }
 
-                if (!photoUrl) return interaction.editReply("❌ Could not find the original image. Did you delete it?");
+                if (!photoUrl) {
+                    return interaction.editReply("❌ Could not find the original image. If you deleted the original photo message, please upload it again.");
+                }
 
                 await startSubmissionFlow(interaction, type, livery, tail, photoUrl, interaction.user, interaction.channelId);
+                
                 try { await interaction.message.delete(); } catch(e) {}
                 return;
             }
@@ -762,7 +835,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
         if (!interaction.isChatInputCommand()) return;
 
-        // --- COMMAND: LINKS (NEW) ---
         if (interaction.commandName === 'links') {
             const embed = new EmbedBuilder()
                 .setTitle('🔗 Useful Resources')
@@ -778,9 +850,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             await interaction.reply({ embeds: [embed] });
         }
 
-        // --- COMMAND: MIGRATE LEGACY DATA (AUTO-MATCH) ---
         if (interaction.commandName === 'migrate_legacy') {
-            // Permission Check (Admins Only)
             if (!interaction.member.permissions.has(GatewayIntentBits.Administrator) && interaction.channelId !== ADMIN_CHANNEL_ID) {
                 return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
             }
@@ -788,10 +858,8 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             await interaction.deferReply();
 
             try {
-                // 1. Fetch current guild members (cache them all)
                 const guildMembers = await interaction.guild.members.fetch();
                 
-                // 2. Find legacy records (missing IDs)
                 const legacyRecords = await CommunityAircraftModel.find({
                     $or: [{ contributorId: { $exists: false } }, { contributorId: null }]
                 });
@@ -800,7 +868,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     return interaction.editReply("✅ Database is fully linked! No legacy records found.");
                 }
 
-                // 3. Group by Name (so we don't process 'PilotDave' 50 times)
                 const uniqueNames = [...new Set(legacyRecords.map(r => r.contributorName))];
                 
                 let linkedCount = 0;
@@ -808,16 +875,12 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 let log = [];
 
                 for (const name of uniqueNames) {
-                    // 4. SMART MATCHING LOGIC (Case Insensitive)
-                    // Checks Username OR DisplayName
                     const match = guildMembers.find(m => 
                         m.user.username.toLowerCase() === name.toLowerCase() ||
                         m.displayName.toLowerCase() === name.toLowerCase()
                     );
 
                     if (match) {
-                        // Update ALL records with this name to include the ID
-                        // Also updates the name to the user's *current* username to standardize it
                         const res = await CommunityAircraftModel.updateMany(
                             { contributorName: name },
                             { 
@@ -835,7 +898,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     }
                 }
 
-                // 5. Report Results
                 const reportEmbed = new EmbedBuilder()
                     .setTitle('🔄 Migration Report')
                     .setDescription(`**Processed:** ${uniqueNames.length} unique names\n**Records Updated:** ${linkedCount}\n**Unmatched Users:** ${failedCount}\n\n${log.slice(0, 15).join('\n')}${log.length > 15 ? '\n...(and more)' : ''}`)
@@ -885,11 +947,10 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             const targetUser = interaction.options.getUser('user') || interaction.user;
             await interaction.deferReply();
             try {
-                // Modified to count by ID if available, otherwise Name (for legacy fallback)
                 const count = await CommunityAircraftModel.countDocuments({
                     $or: [
                         { contributorId: targetUser.id },
-                        { contributorName: targetUser.username } // Fallback for unmigrated data
+                        { contributorName: targetUser.username } 
                     ]
                 });
                 

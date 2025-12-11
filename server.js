@@ -11,6 +11,8 @@ const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/cl
 const { CloudWatchClient, GetMetricStatisticsCommand } = require('@aws-sdk/client-cloudwatch');
 const sharp = require('sharp'); // Image processing library
 require('dotenv').config();
+const fs = require('fs');
+const os = require('os');
 
 // IMPORT THE BOT
 const { startDiscordBot } = require('./bot');
@@ -64,8 +66,8 @@ const cloudWatchClient = new CloudWatchClient({
 
 // Configure Multer to store file in MEMORY temporarily
 const upload = multer({
-    storage: multer.memoryStorage(),
-    limits: { fileSize: 10 * 1024 * 1024 } // Allow up to 10MB input
+    dest: os.tmpdir(), 
+    limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
 });
 
 // --- START THE BOT ---
@@ -254,11 +256,14 @@ app.post('/api/aircraft', upload.single('image'), async (req, res) => {
         
         const { contributorName, aircraftType, liveryName, tailNumber } = req.body;
         if (!contributorName || !aircraftType || !liveryName || !tailNumber) {
+            // Clean up temp file if validation fails
+            if (req.file) fs.unlink(req.file.path, () => {});
             return res.status(400).json({ message: 'All fields are required.' });
         }
 
-        // Image Processing
-        const optimizedBuffer = await sharp(req.file.buffer)
+        // 1. Process from DISK (req.file.path) instead of BUFFER
+        // Sharp can read directly from a file path, which is much more memory efficient
+        const optimizedBuffer = await sharp(req.file.path)
             .resize({ width: 1920, withoutEnlargement: true }) 
             .webp({ quality: 80 }) 
             .toBuffer();
@@ -273,6 +278,11 @@ app.post('/api/aircraft', upload.single('image'), async (req, res) => {
             ContentType: 'image/webp',
         }));
 
+        // 2. IMPORTANT: Delete the local temp file to free up disk space
+        fs.unlink(req.file.path, (err) => {
+            if (err) console.error("Failed to clean up temp file:", err);
+        });
+
         const fileUrl = `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileName}`;
 
         const newEntry = new CommunityAircraft({
@@ -285,13 +295,14 @@ app.post('/api/aircraft', upload.single('image'), async (req, res) => {
 
         await newEntry.save();
 
-        // --- NEW: Trigger Webhook ---
         await sendDiscordWebhook(newEntry);
-        // ----------------------------
 
         res.status(201).json({ message: 'Aircraft uploaded successfully!', data: newEntry });
 
     } catch (error) {
+        // Ensure cleanup happens even on error
+        if (req.file && req.file.path) fs.unlink(req.file.path, () => {});
+        
         console.error('Upload Error:', error);
         res.status(500).json({ message: 'Server error during upload.' });
     }
