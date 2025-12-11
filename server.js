@@ -29,9 +29,9 @@ mongoose.connect(process.env.MONGO_URI)
     .then(() => console.log('✅ MongoDB Connected'))
     .catch(err => console.error('❌ MongoDB Connection Error:', err));
 
-// 3. DEFINE DATABASE SCHEMA
 const CommunityAircraftSchema = new mongoose.Schema({
     contributorName: { type: String, required: true }, 
+    contributorId: { type: String, required: false }, // <--- THIS MUST BE ADDED
     aircraftType: { type: String, required: true },    
     liveryName: { type: String, required: true },      
     tailNumber: { type: String, required: true },      
