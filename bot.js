@@ -436,6 +436,8 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             
             // --- NEW MIGRATION COMMAND ---
             new SlashCommandBuilder().setName('migrate_legacy').setDescription('[ADMIN] Auto-match legacy DB names to current Discord Users'),
+            // --- LINKS COMMAND ---
+            new SlashCommandBuilder().setName('links').setDescription('Get helpful resource links (Tracker, Forum, Liveries)'),
         ].map(c => c.toJSON());
 
         try {
@@ -759,6 +761,22 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         }
 
         if (!interaction.isChatInputCommand()) return;
+
+        // --- COMMAND: LINKS (NEW) ---
+        if (interaction.commandName === 'links') {
+            const embed = new EmbedBuilder()
+                .setTitle('🔗 Useful Resources')
+                .setColor(0x0099FF)
+                .setDescription('Here are the links to the flight tracker, forum thread, and livery database:')
+                .addFields(
+                    { name: '📡 Flight Tracker', value: '[Inflight.info](https://inflight.info)', inline: true },
+                    { name: '📢 Official Thread', value: '[Community Forum](https://community.infiniteflight.com/t/inflight-official-open-beta-infinite-flight-tracker-update/1114286/80)', inline: true },
+                    { name: '🎨 Livery Database', value: '[Livery Search](https://www.helpathand.nl/janpolet/infinite-flight-aircraft-liveries/)', inline: true }
+                )
+                .setFooter({ text: 'Use these to verify registrations!' });
+
+            await interaction.reply({ embeds: [embed] });
+        }
 
         // --- COMMAND: MIGRATE LEGACY DATA (AUTO-MATCH) ---
         if (interaction.commandName === 'migrate_legacy') {
