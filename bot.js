@@ -12,7 +12,8 @@ const {
     TextInputBuilder,
     TextInputStyle,
     SlashCommandBuilder,
-    ComponentType
+    ComponentType,
+    ChannelType
 } = require('discord.js');
 const { PutObjectCommand } = require('@aws-sdk/client-s3');
 const axios = require('axios');
@@ -22,7 +23,7 @@ const sharp = require('sharp');
 const ADMIN_CHANNEL_ID = '1448137363795742942'; 
 const PUBLIC_FEED_CHANNEL_ID = '1448138153335586988'; 
 const WELCOME_CHANNEL_ID = '1442462899451858975'; 
-const SUBMISSION_CHANNEL_ID = '1448188638251978873'; // New Submission Channel
+const SUBMISSION_CHANNEL_ID = '1442461970371444880'; // Channel where users post images
 
 // --- NEW CONFIGURATION ---
 const MEMBER_ROLE_ID = '1442472513849397248';          // Role given on join
@@ -58,7 +59,7 @@ const fetchAircraftMetadata = async () => {
             cachedAircraftData = response.data.aircraft.map(a => ({
                 name: a.name,
                 id: a.id
-            })).sort((a, b) => a.name.localeCompare(b.name));
+            })).sort((a, b) => b.name.length - a.name.length); // Sort by length DESC for better matching
             
             lastAircraftCacheUpdate = Date.now();
             console.log(`✈️  Cached ${cachedAircraftData.length} aircraft types.`);
@@ -92,6 +93,44 @@ const fetchLiveriesForAircraft = async (aircraftId) => {
         console.error(`❌ Failed to fetch liveries for ID ${aircraftId}:`, error.message);
         return [];
     }
+};
+
+/**
+ * Intelligent Parsing: Extracts Type, Livery, and Tail from a user string.
+ */
+const parseAircraftDetails = (content, aircraftList) => {
+    let cleanContent = content || "";
+    let detectedType = "Unknown";
+    let detectedTail = "UNKNOWN";
+
+    // 1. Try to find Aircraft Type (Longest match first)
+    // We iterate the sorted list (longest names first) to avoid matching "737" inside "737 Max"
+    for (const aircraft of aircraftList) {
+        const regex = new RegExp(`\\b${escapeRegex(aircraft.name)}\\b`, 'i');
+        if (regex.test(cleanContent)) {
+            detectedType = aircraft.name;
+            // Remove the type from the string to isolate Livery
+            cleanContent = cleanContent.replace(regex, '').trim();
+            break;
+        }
+    }
+
+    // 2. Try to find Tail Number (Standard Patterns)
+    // US (N12345), General (AA-123 or ABCD), etc.
+    // This is a loose regex to catch common formats like N123AB, G-ABCD, D-AIBA
+    const tailRegex = /\b([A-Z0-9]{1,2}-[A-Z0-9]{3,5}|N[0-9]{1,5}[A-Z]{0,2})\b/i;
+    const tailMatch = cleanContent.match(tailRegex);
+    if (tailMatch) {
+        detectedTail = tailMatch[0].toUpperCase();
+        cleanContent = cleanContent.replace(tailMatch[0], '').trim();
+    }
+
+    // 3. Whatever is left is likely the Livery/Airline
+    // Clean up punctuation (commas, dashes at start/end)
+    let detectedLivery = cleanContent.replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$/g, '');
+    if (!detectedLivery) detectedLivery = "Unknown Livery";
+
+    return { type: detectedType, livery: detectedLivery, tail: detectedTail };
 };
 
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) => {
@@ -132,11 +171,10 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
     };
 
     /**
-     * CORE SUBMISSION LOGIC (Reusable for Slash Command & Modal)
-     * interaction: The interaction to update/reply to
-     * messageToDelete: (Optional) The user's message object to delete after we secure the image
+     * CORE SUBMISSION LOGIC
+     * Handles both Slash Commands (interaction) and Message Uploads (message)
      */
-    const startSubmissionFlow = async (interaction, type, livery, tail, photoUrl, user, messageToDelete = null) => {
+    const startSubmissionFlow = async (source, type, livery, tail, photoUrl, user) => {
         let isDuplicate = false;
         try {
             const existing = await CommunityAircraftModel.findOne({ 
@@ -147,100 +185,76 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         } catch (err) { console.error("DB Check failed", err); }
 
         // Helper to generate the embed
-        // We use attachment://preview.webp if we are proxying, otherwise the direct URL
-        const createPreviewEmbed = (t, tp, l, imgUrl, isDup, isProxying) => {
+        const createPreviewEmbed = (t, tp, l, imgUrl, isDup) => {
             const embed = new EmbedBuilder()
                 .addFields(
                     { name: 'Aircraft Type', value: tp, inline: true },
                     { name: 'Livery', value: l, inline: true },
                     { name: 'Tail Number', value: t.toUpperCase(), inline: true },
-                );
-
-            if (isProxying) {
-                embed.setImage('attachment://preview.webp');
-            } else {
-                embed.setImage(imgUrl);
-            }
+                )
+                .setImage('attachment://preview.webp'); // Always use attachment for preview
 
             if (isDup) {
                 embed.setTitle('⚠️ Existing Entry Detected');
                 embed.setColor(0xFFA500); 
-                embed.setDescription(`**Note:** We already have a photo for **${tp}** in **${l}** livery.\n\nYour submission will be reviewed as a **replacement**.`);
+                embed.setDescription(`**Note:** We already have a photo for **${tp}** in **${l}** livery.\nThis will generally be treated as a **replacement**.`);
             } else {
                 embed.setTitle('📝 Review Your Submission');
                 embed.setColor(0x0099FF);
-                embed.setDescription('Please check the details below.');
-                embed.setFooter({ text: 'Click Confirm to post to the feed.' });
+                embed.setDescription('Please confirm the details I detected from your post.');
+                embed.setFooter({ text: 'Click Confirm to submit.' });
             }
             return embed;
         };
 
         const row = new ActionRowBuilder()
             .addComponents(
-                new ButtonBuilder().setCustomId('confirm_submission').setLabel('Confirm & Post').setStyle(ButtonStyle.Success),
+                new ButtonBuilder().setCustomId('confirm_submission').setLabel('Confirm & Submit').setStyle(ButtonStyle.Success),
                 new ButtonBuilder().setCustomId('edit_details').setLabel('Edit Details').setStyle(ButtonStyle.Secondary),
                 new ButtonBuilder().setCustomId('discard_submission').setLabel('Discard').setStyle(ButtonStyle.Danger),
             );
 
-        // --- IMAGE PROXY LOGIC ---
-        // If we have a messageToDelete, it means the URL is volatile. We must re-upload to the preview.
-        let finalPhotoUrl = photoUrl;
-        let payload = {};
-        const isProxying = !!messageToDelete;
+        // We proxy the image by attaching it to the bot's response.
+        // This ensures the image works even if the user deletes their original post later.
+        const payload = { 
+            embeds: [createPreviewEmbed(tail, type, livery, photoUrl, isDuplicate)], 
+            components: [row],
+            files: [{ attachment: photoUrl, name: 'preview.webp' }] 
+        };
 
-        if (isProxying) {
-            // We attach the file directly to the bot's reply so it persists after we delete the user's msg
-            payload = { 
-                embeds: [createPreviewEmbed(tail, type, livery, photoUrl, isDuplicate, true)], 
-                components: [row],
-                files: [{ attachment: photoUrl, name: 'preview.webp' }], // Discord re-uploads this
-                fetchReply: true 
-            };
-        } else {
-            payload = { 
-                embeds: [createPreviewEmbed(tail, type, livery, photoUrl, isDuplicate, false)], 
-                components: [row],
-                fetchReply: true 
-            };
-        }
-
-        // Send the preview
+        // Send the preview (Handle Message vs Interaction differences)
         let reply;
-        if (interaction.isRepliable() && (interaction.deferred || interaction.replied)) {
-            // Clear any "Upload photo" text and send preview
-            payload.content = ' '; 
-            reply = await interaction.editReply(payload);
+        if (source.commandName) {
+            // It's a Slash Command
+            payload.fetchReply = true;
+            if (source.deferred || source.replied) reply = await source.editReply(payload);
+            else reply = await source.reply(payload);
         } else {
-            payload.ephemeral = true;
-            reply = await interaction.reply(payload);
+            // It's a Message
+            reply = await source.reply(payload);
         }
 
-        // --- CRITICAL FIX ---
-        // If we proxied the image, we must grab the NEW url from the bot's message
-        // and safely delete the user's original message now that we have a copy.
-        if (isProxying && reply) {
-            const attachment = reply.attachments.first();
-            if (attachment) {
-                finalPhotoUrl = attachment.url; // Use this safe URL for DB and Admin channel
-            }
-            // Now it is safe to delete the user's message
-            if (messageToDelete) {
-                messageToDelete.delete().catch(() => {});
-            }
-        }
+        // Get the Proxied URL from the bot's message attachment (Safety)
+        const finalPhotoUrl = reply.attachments.first() ? reply.attachments.first().url : photoUrl;
 
         const collector = reply.createMessageComponentCollector({ componentType: ComponentType.Button, time: 120000 });
 
         collector.on('collect', async i => {
+            if (i.user.id !== user.id) {
+                return i.reply({ content: "This is not your submission.", ephemeral: true });
+            }
+
             if (i.customId === 'discard_submission') {
-                await i.update({ content: '🗑️ Submission discarded.', embeds: [], components: [], files: [] }); // Clear files to save space
+                await i.update({ content: '🗑️ Submission discarded.', embeds: [], components: [], files: [] }); 
+                // If it was a message submission, maybe delete the bot's reply after a delay?
+                setTimeout(() => reply.delete().catch(() => {}), 5000);
                 collector.stop();
                 return;
             }
 
             if (i.customId === 'edit_details') {
                 const modal = new ModalBuilder().setCustomId('editModal').setTitle('Edit Aircraft Details');
-                const tailInput = new TextInputBuilder().setCustomId('m_tail').setLabel("Tail Number (Optional)").setValue(tail === 'UNKNOWN' ? '' : tail).setRequired(false).setStyle(TextInputStyle.Short);
+                const tailInput = new TextInputBuilder().setCustomId('m_tail').setLabel("Tail Number").setValue(tail === 'UNKNOWN' ? '' : tail).setRequired(false).setStyle(TextInputStyle.Short);
                 const typeInput = new TextInputBuilder().setCustomId('m_type').setLabel("Aircraft Type").setValue(type).setStyle(TextInputStyle.Short);
                 const liveryInput = new TextInputBuilder().setCustomId('m_livery').setLabel("Livery Name").setValue(livery).setStyle(TextInputStyle.Short);
 
@@ -268,9 +282,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     });
                     if (reCheck) isDuplicate = true;
 
-                    // Update the preview embed. Note: We keep the image handling consistent.
+                    // Update the preview embed
                     await submission.update({ 
-                        embeds: [createPreviewEmbed(tail, type, livery, finalPhotoUrl, isDuplicate, isProxying)],
+                        embeds: [createPreviewEmbed(tail, type, livery, finalPhotoUrl, isDuplicate)],
                         components: [row] 
                     });
                 } catch (e) { }
@@ -282,13 +296,12 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
                 if (!adminChannel || !feedChannel) return i.update({ content: '❌ Channel configuration error.', components: [] });
 
-                // Prepare the file attachment (Re-uploading ensures visibility)
                 const attachmentData = { attachment: finalPhotoUrl, name: 'aircraft.webp' };
 
                 // 1. Post to PUBLIC FEED
                 const publicEmbed = new EmbedBuilder()
                     .setTitle('📸 New Aircraft Spotted! (Pending Review)')
-                    .setColor(0xFFFF00) // Yellow for Pending
+                    .setColor(0xFFFF00) 
                     .setDescription(`A user has submitted a new photo! Status: **Under Review**`)
                     .addFields(
                         { name: 'Aircraft', value: type, inline: true },
@@ -296,11 +309,10 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         { name: 'Tail Number', value: tail.toUpperCase(), inline: true },
                         { name: 'Spotted By', value: `<@${user.id}>`, inline: false }
                     )
-                    .setImage('attachment://aircraft.webp') // Reference the attachment
+                    .setImage('attachment://aircraft.webp')
                     .setFooter({ text: 'Submissions are reviewed by admins before database entry.' })
                     .setTimestamp();
 
-                // Send with 'files' array to ensure the image actually renders
                 const publicMsg = await feedChannel.send({ embeds: [publicEmbed], files: [attachmentData] });
 
                 // 2. Post to ADMIN CHANNEL
@@ -311,7 +323,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         { name: 'Aircraft Type', value: type, inline: true },
                         { name: 'Livery', value: livery, inline: true },
                     )
-                    .setImage('attachment://aircraft.webp') // Reference the attachment
+                    .setImage('attachment://aircraft.webp') 
                     .setTimestamp();
 
                 if (isDuplicate) {
@@ -331,17 +343,19 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         new ButtonBuilder().setCustomId(`reject_${user.id}`).setLabel('Reject').setStyle(ButtonStyle.Danger),
                     );
 
-                // Send to Admin with the file attached
                 await adminChannel.send({ embeds: [finalEmbed], components: [adminRow], files: [attachmentData] });
                 
-                // Cleanup
-                await i.update({ content: '✅ Submission posted to feed (pending) and sent to admins!', embeds: [], components: [], files: [] });
+                // Cleanup the interaction/reply
+                await i.update({ content: '✅ Submission sent to admins!', embeds: [], components: [], files: [] });
+                // We do NOT delete the user's original message in this flow, as they "Made a post".
+                // But we can clean up the bot's preview message after a moment to keep the thread tidy
+                setTimeout(() => reply.delete().catch(() => {}), 3000);
                 collector.stop();
             }
         });
     };
 
-    // --- LEADERBOARD & SETUP ---
+    // --- LEADERBOARD LOGIC (Unchanged) ---
     const updateLeaderboard = async () => {
         if (!LEADERBOARD_CHANNEL_ID) return;
         try {
@@ -369,12 +383,10 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 .setFooter({ text: 'Updated Daily • Submit photos to climb the ranks!' })
                 .setTimestamp();
 
-            // Edit last or send new
             let lastMessage = (await channel.messages.fetch({ limit: 10 })).find(m => m.author.id === client.user.id);
             if (lastMessage) await lastMessage.edit({ embeds: [leaderboardEmbed] });
             else await channel.send({ embeds: [leaderboardEmbed] });
 
-            // Manage Roles
             if (topUserEntry && TOP_CONTRIBUTOR_ROLE_ID) {
                 const guild = channel.guild;
                 const role = await guild.roles.fetch(TOP_CONTRIBUTOR_ROLE_ID);
@@ -401,59 +413,20 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         } catch (error) { console.error('❌ Error updating leaderboard:', error); }
     };
 
-    /**
-     * Checks the Submission Channel and posts the UI if missing.
-     */
-    const setupSubmissionChannel = async () => {
-        if (!SUBMISSION_CHANNEL_ID) return;
-        try {
-            const channel = await client.channels.fetch(SUBMISSION_CHANNEL_ID);
-            if (!channel) return;
-
-            // Check if our message exists
-            const messages = await channel.messages.fetch({ limit: 5 });
-            const existingMsg = messages.find(m => m.author.id === client.user.id && m.embeds.length > 0 && m.components.length > 0);
-
-            if (!existingMsg) {
-                const embed = new EmbedBuilder()
-                    .setTitle('📸 Submit Your Aircraft Photos')
-                    .setDescription('Help us build the ultimate aircraft database! \nClick the button below to submit a new photo.')
-                    .setColor(0x0099FF)
-                    .addFields(
-                        { name: '📋 Guidelines', value: '• Photo must be clear and owned by you.\n• Include the Tail Number if visible.\n• Ensure the entire aircraft is in frame.' }
-                    )
-                    .setImage('https://media.discordapp.net/attachments/1448147572878344405/1448166201741279254/inflight.png?ex=693a4560&is=6938f3e0&hm=e0222d89cc7498a4aca039865ba0ae854741d9fbbffda2a03974769a46b12b63&=&format=webp&quality=lossless&width=930&height=396')
-                    .setFooter({ text: 'Inflight Database • Community Driven' });
-
-                const row = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder()
-                        .setCustomId('start_submission_entry')
-                        .setLabel('Submit Photo')
-                        .setStyle(ButtonStyle.Primary)
-                        .setEmoji('📷')
-                );
-
-                await channel.send({ embeds: [embed], components: [row] });
-                console.log('✅ Submission Channel UI posted.');
-            }
-        } catch (error) {
-            console.error('❌ Error setting up submission channel:', error);
-        }
-    };
-
     // 2. Initialize Bot
     client.once('ready', async () => {
         console.log(`🤖 Discord Bot Online as ${client.user.tag}`);
         await fetchAircraftMetadata();
-        await setupSubmissionChannel(); // Setup persistent UI
+        
+        // Removed setupSubmissionChannel() as we now use natural posting
 
         const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
         
-        // Define Commands
         const commands = [
             new SlashCommandBuilder().setName('lookup').setDescription('Find an aircraft').addStringOption(o => o.setName('query').setDescription('Tail/Livery/Type').setAutocomplete(true).setRequired(true)),
             new SlashCommandBuilder().setName('stats').setDescription('View stats'),
             new SlashCommandBuilder().setName('profile').setDescription('Check contribution stats').addUserOption(o => o.setName('user').setDescription('User to check')),
+            // Kept submit command as a backup, though main flow is now posting in channel
             new SlashCommandBuilder().setName('submit').setDescription('Submit a new aircraft photo')
                 .addStringOption(o => o.setName('aircraft_type').setDescription('Type (Start typing to search)').setAutocomplete(true).setRequired(true))
                 .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true))
@@ -487,13 +460,43 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 .setDescription(`Hello ${member}, welcome to the server!`)
                 .setColor(0x0099FF)
                 .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
-                .addFields({ name: '📸 Submit Photos', value: 'Use `/submit` or the submission channel.' })
+                .addFields({ name: '📸 Submit Photos', value: `Post your photos directly in <#${SUBMISSION_CHANNEL_ID}> to contribute!` })
                 .setTimestamp();
             await channel.send({ content: `Welcome ${member}! 👋`, embeds: [welcomeEmbed] });
         } catch (e) {}
     });
 
-    // 3. Handle Interactions
+    // --- NEW: HANDLE MESSAGE SUBMISSIONS (POSTING IN CHANNEL) ---
+    client.on('messageCreate', async (message) => {
+        // Ignore bots
+        if (message.author.bot) return;
+
+        // Check if message is in the submission channel
+        if (message.channelId === SUBMISSION_CHANNEL_ID) {
+            
+            // Must have an image
+            if (message.attachments.size > 0) {
+                const photo = message.attachments.first();
+                if (!photo.contentType || !photo.contentType.startsWith('image/')) return;
+
+                // Attempt to parse details from the message text
+                const extracted = parseAircraftDetails(message.content, cachedAircraftData);
+                
+                // Trigger the submission flow
+                // We pass the 'message' object as the source
+                await startSubmissionFlow(
+                    message, 
+                    extracted.type, 
+                    extracted.livery, 
+                    extracted.tail, 
+                    photo.url, 
+                    message.author
+                );
+            }
+        }
+    });
+
+    // 3. Handle Interactions (Buttons, Slash Commands)
     client.on('interactionCreate', async interaction => {
         
         // --- AUTOCOMPLETE ---
@@ -527,21 +530,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
         // --- BUTTON HANDLING ---
         if (interaction.isButton()) {
-            // NEW: START SUBMISSION FROM CHANNEL
-            if (interaction.customId === 'start_submission_entry') {
-                const modal = new ModalBuilder().setCustomId('submission_modal_entry').setTitle('New Aircraft Submission');
-                const typeInput = new TextInputBuilder().setCustomId('s_type').setLabel("Aircraft Type").setPlaceholder("e.g. Airbus A320").setStyle(TextInputStyle.Short).setRequired(true);
-                const liveryInput = new TextInputBuilder().setCustomId('s_livery').setLabel("Livery Name").setPlaceholder("e.g. Delta Airlines").setStyle(TextInputStyle.Short).setRequired(true);
-                const tailInput = new TextInputBuilder().setCustomId('s_tail').setLabel("Tail Number (Optional)").setPlaceholder("e.g. N12345").setStyle(TextInputStyle.Short).setRequired(false);
-
-                modal.addComponents(
-                    new ActionRowBuilder().addComponents(typeInput),
-                    new ActionRowBuilder().addComponents(liveryInput),
-                    new ActionRowBuilder().addComponents(tailInput)
-                );
-                await interaction.showModal(modal);
-            }
-
+            
             // ADMIN APPROVE
             if (interaction.customId.startsWith('approve_')) {
                 await interaction.deferUpdate();
@@ -632,42 +621,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         }
 
         if (interaction.isModalSubmit()) {
-            // NEW: MODAL SUBMISSION FROM CHANNEL
-            if (interaction.customId === 'submission_modal_entry') {
-                const type = interaction.fields.getTextInputValue('s_type');
-                const livery = interaction.fields.getTextInputValue('s_livery');
-                const tailRaw = interaction.fields.getTextInputValue('s_tail');
-                const tail = tailRaw.trim() === '' ? 'UNKNOWN' : tailRaw;
-
-                await interaction.reply({ 
-                    content: `**Almost done!**\n\nPlease **upload the photo** for **${type}** in this channel now.\nI will detect it, delete your message to keep chat clean, and process the submission.`,
-                    ephemeral: true 
-                });
-
-                const filter = m => m.author.id === interaction.user.id && m.attachments.size > 0;
-                const collector = interaction.channel.createMessageCollector({ filter, max: 1, time: 60000 });
-
-                collector.on('collect', async m => {
-                    const photo = m.attachments.first();
-                    if (!photo.contentType.startsWith('image/')) {
-                         await interaction.followUp({ content: '❌ File was not an image. Submission cancelled.', ephemeral: true });
-                         m.delete().catch(() => {});
-                         return;
-                    }
-                    await startSubmissionFlow(interaction, type, livery, tail, photo.url, interaction.user, m);
-                });
-
-                collector.on('end', collected => {
-                    if (collected.size === 0) {
-                        interaction.editReply({ content: '❌ Timed out waiting for photo. Please start over.', embeds: [] });
-                    }
-                });
-                return; 
-            }
-
-            // --- REJECTION MODAL HANDLER (UPDATED FOR THREADS) ---
+            // --- REJECTION MODAL HANDLER ---
             if (interaction.customId.startsWith('rejectModal_')) {
-                await interaction.deferUpdate(); // Acknowledge modal submission
+                await interaction.deferUpdate(); 
                 const targetUserId = interaction.customId.split('_')[1];
                 const reason = interaction.fields.getTextInputValue('reasonInput');
                 
@@ -683,7 +639,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     .setDescription(`**Reason:** ${reason}`)
                     .setFooter({ text: `Rejected by ${interaction.user.tag}` });
                 
-                // Clear buttons
                 await interaction.editReply({ embeds: [rejectedEmbed], components: [], files: [] });
 
                 // 2. Update Public Feed & Create Discussion Thread
@@ -693,30 +648,28 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         const publicMsg = await feedChannel.messages.fetch(publicMsgId);
                         
                         if (publicMsg) {
-                            // Update the embed to show it was rejected
                             const publicRejectedEmbed = EmbedBuilder.from(publicMsg.embeds[0])
                                 .setTitle('❌ Submission Rejected')
-                                .setColor(0xFF0000) // Red
+                                .setColor(0xFF0000) 
                                 .setDescription(`This submission was not accepted.\n**Reason:** ${reason}`)
                                 .setFooter({ text: `Reviewed by Staff` });
 
                             await publicMsg.edit({ embeds: [publicRejectedEmbed] });
 
-                            // Create the Thread for discussion
                             const thread = await publicMsg.startThread({
                                 name: `Rejection Appeal - ${aircraftName}`,
                                 autoArchiveDuration: 1440, // 24 hours
                                 reason: 'Submission Rejection Discussion'
                             });
 
-                            await thread.send(`Hi <@${targetUserId}>, your submission was rejected by <@${interaction.user.id}>.\n**Reason:** ${reason}\n\nIf you have questions or want to appeal, you can discuss it here with the staff.`);
+                            await thread.send(`Hi <@${targetUserId}>, your submission was rejected by <@${interaction.user.id}>.\n**Reason:** ${reason}\n\nIf you have questions or want to submit a different one, you can discuss it here with the staff.`);
                         }
                     } catch (e) {
                         console.error('Could not handle public rejection thread:', e.message);
                     }
                 }
 
-                // 3. DM The User (Notification Only)
+                // 3. DM The User
                 try {
                     const user = await client.users.fetch(targetUserId);
                     const dmEmbed = new EmbedBuilder()
@@ -730,9 +683,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         .setTimestamp();
                     
                     await user.send({ embeds: [dmEmbed] });
-                } catch (e) {
-                    // User DMs likely closed
-                }
+                } catch (e) {}
             }
         }
 
