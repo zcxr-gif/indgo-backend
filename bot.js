@@ -204,8 +204,8 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     { name: 'Aircraft Type', value: tp, inline: true },
                     { name: 'Livery', value: l, inline: true },
                     { name: 'Tail Number', value: t.toUpperCase(), inline: true },
-                )
-                .setImage('attachment://preview.webp'); 
+                );
+                // REMOVED .setImage() so the image floats OUTSIDE the card (above it)
 
             if (isDup) {
                 embed.setTitle('⚠️ Existing Entry Detected');
@@ -320,7 +320,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         { name: 'Tail Number', value: tail.toUpperCase(), inline: true },
                         { name: 'Spotted By', value: `<@${user.id}>`, inline: false }
                     )
-                    .setImage('attachment://aircraft.webp')
+                    // REMOVED .setImage() so image stays OUTSIDE
                     .setFooter({ text: 'Submissions are reviewed by admins before database entry.' })
                     .setTimestamp();
 
@@ -334,7 +334,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         { name: 'Aircraft Type', value: type, inline: true },
                         { name: 'Livery', value: livery, inline: true },
                     )
-                    .setImage('attachment://aircraft.webp') 
+                    // REMOVED .setImage() so image stays OUTSIDE
                     .setTimestamp();
 
                 if (isDuplicate) {
@@ -600,7 +600,10 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 const liveryField = receivedEmbed.fields.find(f => f.name === 'Livery').value;
                 
                 let imageUrl = receivedEmbed.image?.url;
-                if (interaction.message.attachments.size > 0) imageUrl = interaction.message.attachments.first().url;
+                // If image was "outside" the embed (attachment), we need to grab it from message attachments
+                if (!imageUrl && interaction.message.attachments.size > 0) {
+                    imageUrl = interaction.message.attachments.first().url;
+                }
 
                 const footerText = receivedEmbed.footer?.text || '';
                 const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
@@ -637,7 +640,11 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         if (CONTRIBUTOR_ROLE_ID) await member.roles.add(CONTRIBUTOR_ROLE_ID);
                     } catch (e) {}
 
-                    const approveEmbed = EmbedBuilder.from(receivedEmbed).setColor(0x00FF00).setTitle('✅ Submission Approved').setFooter({ text: `Approved by ${interaction.user.tag}` });
+                    const approveEmbed = EmbedBuilder.from(receivedEmbed)
+                        .setColor(0x00FF00)
+                        .setTitle('✅ Submission Approved')
+                        .setImage(null) // Ensure admin image stays outside
+                        .setFooter({ text: `Approved by ${interaction.user.tag}` });
                     await interaction.editReply({ embeds: [approveEmbed], components: [] });
 
                     if (publicMsgId) {
@@ -648,9 +655,11 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                                 .setTitle('✅ Verified Aircraft Spotted!')
                                 .setColor(0x00FF00)
                                 .setDescription(`Verified and added to database.`)
-                                .setImage(permanentUrl) 
+                                .setImage(null) // Remove internal image
                                 .setFooter({ text: 'Verified by Staff' });
-                            await publicMsg.edit({ embeds: [publicEmbed] });
+                            
+                            // Send URL as content so it renders above the embed
+                            await publicMsg.edit({ content: permanentUrl, embeds: [publicEmbed], files: [] });
                         } catch (e) {}
                     }
                     
@@ -660,7 +669,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                             .setTitle('✅ Submission Approved')
                             .setColor(0x00FF00)
                             .setDescription(`Your photo of **${typeField}** has been approved!`)
-                            .setThumbnail(permanentUrl); 
+                            .setImage(permanentUrl); // For DM, we can keep it inside or out, inside is cleaner for DMs
                         
                         await user.send({ embeds: [userNotifyEmbed] }); 
                     } catch (e) { }
@@ -714,7 +723,12 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 
                 const originalEmbed = interaction.message.embeds[0];
                 const aircraftName = originalEmbed.fields.find(f => f.name === 'Aircraft Type')?.value || 'Unknown Aircraft';
-                const thumbUrl = originalEmbed.image?.url;
+                
+                // Check if image is inside (old style) or attached (new style)
+                let thumbUrl = originalEmbed.image?.url;
+                if (!thumbUrl && interaction.message.attachments.size > 0) {
+                     thumbUrl = interaction.message.attachments.first().url;
+                }
 
                 const footerText = originalEmbed.footer?.text || '';
                 const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
@@ -724,9 +738,10 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     .setTitle('❌ Submission Rejected')
                     .setColor(0xFF0000)
                     .setDescription(`**Reason:** ${reason}`)
+                    .setImage(null) // Force image OUTSIDE
                     .setFooter({ text: `Rejected by ${interaction.user.tag}` });
                 
-                await interaction.editReply({ embeds: [rejectedEmbed], components: [], files: [] });
+                await interaction.editReply({ embeds: [rejectedEmbed], components: [] }); // Files persist automatically
 
                 if (publicMsgId) {
                     try {
@@ -737,6 +752,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                                 .setTitle('❌ Submission Rejected')
                                 .setColor(0xFF0000) 
                                 .setDescription(`This submission was not accepted by the moderators.`)
+                                .setImage(null) // Force image OUTSIDE
                                 .setFooter({ text: `Reviewed by Staff` });
                             await publicMsg.edit({ embeds: [publicRejectedEmbed] });
                         }
