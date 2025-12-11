@@ -95,44 +95,6 @@ const fetchLiveriesForAircraft = async (aircraftId) => {
     }
 };
 
-/**
- * Intelligent Parsing: Extracts Type, Livery, and Tail from a user string.
- */
-const parseAircraftDetails = (content, aircraftList) => {
-    let cleanContent = content || "";
-    let detectedType = "Unknown";
-    let detectedTail = "UNKNOWN";
-
-    // 1. Try to find Aircraft Type (Longest match first)
-    // We iterate the sorted list (longest names first) to avoid matching "737" inside "737 Max"
-    for (const aircraft of aircraftList) {
-        const regex = new RegExp(`\\b${escapeRegex(aircraft.name)}\\b`, 'i');
-        if (regex.test(cleanContent)) {
-            detectedType = aircraft.name;
-            // Remove the type from the string to isolate Livery
-            cleanContent = cleanContent.replace(regex, '').trim();
-            break;
-        }
-    }
-
-    // 2. Try to find Tail Number (Standard Patterns)
-    // US (N12345), General (AA-123 or ABCD), etc.
-    // This is a loose regex to catch common formats like N123AB, G-ABCD, D-AIBA
-    const tailRegex = /\b([A-Z0-9]{1,2}-[A-Z0-9]{3,5}|N[0-9]{1,5}[A-Z]{0,2})\b/i;
-    const tailMatch = cleanContent.match(tailRegex);
-    if (tailMatch) {
-        detectedTail = tailMatch[0].toUpperCase();
-        cleanContent = cleanContent.replace(tailMatch[0], '').trim();
-    }
-
-    // 3. Whatever is left is likely the Livery/Airline
-    // Clean up punctuation (commas, dashes at start/end)
-    let detectedLivery = cleanContent.replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$/g, '');
-    if (!detectedLivery) detectedLivery = "Unknown Livery";
-
-    return { type: detectedType, livery: detectedLivery, tail: detectedTail };
-};
-
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) => {
 
     const client = new Client({ 
@@ -224,8 +186,8 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
         // Send the preview (Handle Message vs Interaction differences)
         let reply;
-        if (source.commandName) {
-            // It's a Slash Command
+        if (source.commandName || source.customId === 'identify_modal') {
+            // It's a Slash Command or Modal Submit
             payload.fetchReply = true;
             if (source.deferred || source.replied) reply = await source.editReply(payload);
             else reply = await source.reply(payload);
@@ -418,8 +380,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         console.log(`🤖 Discord Bot Online as ${client.user.tag}`);
         await fetchAircraftMetadata();
         
-        // Removed setupSubmissionChannel() as we now use natural posting
-
         const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
         
         const commands = [
@@ -479,19 +439,26 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 const photo = message.attachments.first();
                 if (!photo.contentType || !photo.contentType.startsWith('image/')) return;
 
-                // Attempt to parse details from the message text
-                const extracted = parseAircraftDetails(message.content, cachedAircraftData);
-                
-                // Trigger the submission flow
-                // We pass the 'message' object as the source
-                await startSubmissionFlow(
-                    message, 
-                    extracted.type, 
-                    extracted.livery, 
-                    extracted.tail, 
-                    photo.url, 
-                    message.author
-                );
+                // Create the button to trigger the Modal
+                // This is required because Modals must be triggered by an interaction (click)
+                const row = new ActionRowBuilder()
+                    .addComponents(
+                        new ButtonBuilder()
+                            .setCustomId(`start_ident_${message.author.id}`)
+                            .setLabel('Identify Aircraft')
+                            .setEmoji('✈️')
+                            .setStyle(ButtonStyle.Primary)
+                    );
+
+                const promptEmbed = new EmbedBuilder()
+                    .setColor(0x0099FF)
+                    .setDescription(`**Thanks for the photo!**\nPlease click the button below to enter the **Aircraft**, **Livery**, and **Registration** details.`);
+
+                // Reply to the user's photo
+                await message.reply({ 
+                    embeds: [promptEmbed], 
+                    components: [row] 
+                });
             }
         }
     });
@@ -531,6 +498,48 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         // --- BUTTON HANDLING ---
         if (interaction.isButton()) {
             
+            // --- NEW: START IDENTIFICATION (Opens Modal) ---
+            if (interaction.customId.startsWith('start_ident_')) {
+                const originalUserId = interaction.customId.split('_')[2];
+                
+                // Ensure only the person who uploaded the photo can click it
+                if (interaction.user.id !== originalUserId) {
+                    return interaction.reply({ content: "This is not your photo.", ephemeral: true });
+                }
+
+                // Create the Modal
+                const modal = new ModalBuilder()
+                    .setCustomId('identify_modal')
+                    .setTitle('Aircraft Details');
+
+                const typeInput = new TextInputBuilder()
+                    .setCustomId('i_type')
+                    .setLabel("What aircraft is this?")
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true);
+
+                const liveryInput = new TextInputBuilder()
+                    .setCustomId('i_livery')
+                    .setLabel("What livery is this?")
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true);
+
+                const tailInput = new TextInputBuilder()
+                    .setCustomId('i_tail')
+                    .setLabel("Registration (Optional)")
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(false);
+
+                modal.addComponents(
+                    new ActionRowBuilder().addComponents(typeInput),
+                    new ActionRowBuilder().addComponents(liveryInput),
+                    new ActionRowBuilder().addComponents(tailInput)
+                );
+
+                await interaction.showModal(modal);
+                return; // Stop here, modal shown
+            }
+
             // ADMIN APPROVE
             if (interaction.customId.startsWith('approve_')) {
                 await interaction.deferUpdate();
@@ -621,6 +630,44 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         }
 
         if (interaction.isModalSubmit()) {
+
+            // --- NEW: HANDLE AIRCRAFT IDENTIFICATION MODAL ---
+            if (interaction.customId === 'identify_modal') {
+                await interaction.deferReply({ ephemeral: true });
+
+                const type = interaction.fields.getTextInputValue('i_type');
+                const livery = interaction.fields.getTextInputValue('i_livery');
+                let tail = interaction.fields.getTextInputValue('i_tail');
+                
+                if (!tail || tail.trim() === '') tail = 'UNKNOWN';
+
+                // Retrieve original image from the message chain
+                // Chain: Interaction -> Bot Prompt Message -> Reference to User Message
+                let photoUrl = null;
+                try {
+                    if (interaction.message.reference && interaction.message.reference.messageId) {
+                        const originalMsg = await interaction.channel.messages.fetch(interaction.message.reference.messageId);
+                        if (originalMsg && originalMsg.attachments.size > 0) {
+                            photoUrl = originalMsg.attachments.first().url;
+                        }
+                    }
+                } catch (err) {
+                    console.error("Could not fetch original image:", err);
+                }
+
+                if (!photoUrl) {
+                    return interaction.editReply("❌ Could not find the original image. Did you delete it?");
+                }
+
+                // Call shared submission flow
+                // We pass 'interaction' as source to update the current interaction
+                await startSubmissionFlow(interaction, type, livery, tail, photoUrl, interaction.user);
+                
+                // Cleanup the prompt message
+                try { await interaction.message.delete(); } catch(e) {}
+                return;
+            }
+
             // --- REJECTION MODAL HANDLER ---
             if (interaction.customId.startsWith('rejectModal_')) {
                 await interaction.deferUpdate(); 
