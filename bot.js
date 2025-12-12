@@ -109,19 +109,81 @@ const fetchLiveriesForAircraft = async (aircraftId) => {
 
 const lookupRegistration = (aircraftType, liveryName) => {
     if (!aircraftRegistry || !Array.isArray(aircraftRegistry)) return null;
-    const cleanType = aircraftType.toLowerCase().trim();
-    const cleanLivery = liveryName.toLowerCase().trim();
 
-    const match = aircraftRegistry.find(entry => {
-        const jsonLivery = entry.livery.toLowerCase();
-        const liveryMatch = jsonLivery === cleanLivery || jsonLivery.includes(cleanLivery) || cleanLivery.includes(jsonLivery);
-        if (!liveryMatch) return false;
-        const jsonModel = entry.model.toLowerCase();
-        const typeMatch = cleanType.includes(jsonModel);
-        return typeMatch;
-    });
+    // Intelligent Cleaner: Lowercase, remove special chars, keep only letters/numbers
+    // This makes "737-800" equal to "737800" and "DC-10" equal to "dc10"
+    const clean = (str) => (str || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
-    return match ? match.registration : null;
+    const targetType = clean(aircraftType);
+    const targetLivery = clean(liveryName);
+
+    let bestMatch = null;
+    let highestScore = 0;
+
+    // Iterate through EVERY aircraft to find the absolute best match
+    for (const entry of aircraftRegistry) {
+        let score = 0;
+
+        // 1. Prepare JSON Data
+        const jsonMan = clean(entry.manufacturer);
+        const jsonMod = clean(entry.model);
+        const jsonLivery = clean(entry.livery);
+        
+        // Construct the "Full" name from JSON (e.g. "boeing" + "737800" = "boeing737800")
+        const jsonFullPlane = jsonMan + jsonMod; 
+
+        // --- PHASE 1: LIVERY MATCH (Mandatory) ---
+        // We check bi-directionally: Does User input contain JSON? OR Does JSON contain User input?
+        // e.g. User: "Delta" matches JSON: "Delta Air Lines"
+        if (targetLivery.includes(jsonLivery) || jsonLivery.includes(targetLivery)) {
+            score += 10; // Base score for livery match
+            
+            // Bonus: Exact match gets higher priority
+            if (targetLivery === jsonLivery) score += 5;
+        } else {
+            // If livery doesn't match at all, skip this plane immediately
+            continue; 
+        }
+
+        // --- PHASE 2: AIRCRAFT TYPE MATCH ---
+        // We calculate how "good" the aircraft match is
+        
+        let aircraftScore = 0;
+
+        // Scenario A: Exact Model Match (User: "737-800", JSON: "737-800")
+        if (targetType === jsonMod) {
+            aircraftScore += 50; 
+        }
+        // Scenario B: Exact Full Name Match (User: "Boeing 737-800", JSON: "Boeing 737-800")
+        else if (targetType === jsonFullPlane) {
+            aircraftScore += 60; // Higher score for being very specific
+        }
+        // Scenario C: User input contains the specific Model (User: "Boeing 737-800", JSON: "737-800")
+        else if (targetType.includes(jsonMod)) {
+            aircraftScore += 40;
+            // Bonus if they also included the Manufacturer
+            if (targetType.includes(jsonMan)) aircraftScore += 10;
+        }
+        // Scenario D: The JSON contains the User input (User: "737", JSON: "737-800")
+        // This is a partial match. We give it points, but less than specific matches.
+        else if (jsonFullPlane.includes(targetType)) {
+            aircraftScore += 20;
+        }
+
+        // If the aircraft didn't match at all, this entry is invalid (even if livery matched)
+        if (aircraftScore === 0) continue;
+
+        // --- PHASE 3: DETERMINE WINNER ---
+        const totalScore = score + aircraftScore;
+
+        if (totalScore > highestScore) {
+            highestScore = totalScore;
+            bestMatch = entry;
+        }
+    }
+
+    // Return the registration of the highest scoring match
+    return bestMatch ? bestMatch.registration : null;
 };
 
 const normalizeData = async (rawType, rawLivery) => {
