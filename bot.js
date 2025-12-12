@@ -13,7 +13,8 @@ const {
     TextInputStyle,
     SlashCommandBuilder,
     ComponentType,
-    ChannelType
+    ChannelType,
+    Options // Import Options for cache control
 } = require('discord.js');
 const { PutObjectCommand } = require('@aws-sdk/client-s3');
 const axios = require('axios');
@@ -30,8 +31,10 @@ const aircraftRegistry = require('./aircraft.json');
 // Promisify pipeline for efficient stream handling
 const pipeline = util.promisify(stream.pipeline);
 
-// MEMORY FIX: Disable Sharp's internal cache to prevent holding image data in RAM
+// MEMORY FIX: Disable Sharp's internal cache
 sharp.cache(false);
+// MEMORY FIX: limit concurrency to prevent CPU/RAM saturation during bursts
+sharp.concurrency(1); 
 
 // CONFIGURATION - REPLACE THESE WITH YOUR REAL CHANNEL IDS
 const ADMIN_CHANNEL_ID = '1448137363795742942'; 
@@ -56,16 +59,10 @@ let cachedLiveries = {};
 // --- SESSION MANAGEMENT ---
 const userSessions = new Map(); 
 
-/**
- * Helper to escape regex characters to prevent crashes
- */
 const escapeRegex = (string) => {
     return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 };
 
-/**
- * Fetches and caches the list of all aircraft types + IDs
- */
 const fetchAircraftMetadata = async () => {
     if (Date.now() - lastAircraftCacheUpdate < 3600000 && cachedAircraftData.length > 0) {
         return cachedAircraftData;
@@ -73,7 +70,6 @@ const fetchAircraftMetadata = async () => {
     try {
         const response = await axios.get(METADATA_API_URL);
         if (response.data && response.data.aircraft) {
-            // Sort by length DESC so "737-800" is matched before "737" to avoid partial match errors
             cachedAircraftData = response.data.aircraft.map(a => ({
                 name: a.name,
                 id: a.id
@@ -89,9 +85,6 @@ const fetchAircraftMetadata = async () => {
     }
 };
 
-/**
- * Fetches liveries for a specific aircraft ID (with 5-minute caching)
- */
 const fetchLiveriesForAircraft = async (aircraftId) => {
     const now = Date.now();
     if (cachedLiveries[aircraftId] && (now - cachedLiveries[aircraftId].timestamp < 300000)) {
@@ -113,74 +106,47 @@ const fetchLiveriesForAircraft = async (aircraftId) => {
     }
 };
 
-/**
- * --- REGISTRY LOOKUP HELPER ---
- * Scans aircraft.json to find a registration based on Type and Livery
- */
 const lookupRegistration = (aircraftType, liveryName) => {
     if (!aircraftRegistry || !Array.isArray(aircraftRegistry)) return null;
-
-    // Clean inputs for comparison
     const cleanType = aircraftType.toLowerCase().trim();
     const cleanLivery = liveryName.toLowerCase().trim();
 
     const match = aircraftRegistry.find(entry => {
-        // 1. Check Livery Match (Exact or Fuzzy)
         const jsonLivery = entry.livery.toLowerCase();
-        // Check if DB livery contains user input OR user input contains DB livery
         const liveryMatch = jsonLivery === cleanLivery || jsonLivery.includes(cleanLivery) || cleanLivery.includes(jsonLivery);
-
         if (!liveryMatch) return false;
-
-        // 2. Check Model Match
-        // We check if the User's "aircraftType" contains the JSON "model"
-        // Example: User "Boeing 737-800" contains JSON "737-800" -> TRUE
         const jsonModel = entry.model.toLowerCase();
         const typeMatch = cleanType.includes(jsonModel);
-
         return typeMatch;
     });
 
     return match ? match.registration : null;
 };
 
-/**
- * --- DATA NORMALIZATION HELPER ---
- * Tries to find the "Official" backend name based on sloppy user input.
- */
 const normalizeData = async (rawType, rawLivery) => {
     let finalType = rawType.trim();
     let finalLivery = rawLivery.trim();
     let aircraftId = null;
 
-    // 1. Normalize Aircraft Type
-    // Try exact match first (case-insensitive)
     let matchedAircraft = cachedAircraftData.find(a => a.name.toLowerCase() === finalType.toLowerCase());
     
-    // If no exact match, try fuzzy (does official name CONTAIN user input?)
     if (!matchedAircraft) {
         matchedAircraft = cachedAircraftData.find(a => a.name.toLowerCase().includes(finalType.toLowerCase()));
     }
 
     if (matchedAircraft) {
-        finalType = matchedAircraft.name; // Swap to official name
-        aircraftId = matchedAircraft.id;  // Save ID for livery lookup
+        finalType = matchedAircraft.name; 
+        aircraftId = matchedAircraft.id;  
     }
 
-    // 2. Normalize Livery (Only if we found a valid aircraft)
     if (aircraftId) {
         const validLiveries = await fetchLiveriesForAircraft(aircraftId);
-        
-        // Try exact match
         let matchedLivery = validLiveries.find(l => l.toLowerCase() === finalLivery.toLowerCase());
-        
-        // Try fuzzy match
         if (!matchedLivery) {
             matchedLivery = validLiveries.find(l => l.toLowerCase().includes(finalLivery.toLowerCase()));
         }
-
         if (matchedLivery) {
-            finalLivery = matchedLivery; // Swap to official name
+            finalLivery = matchedLivery; 
         }
     }
 
@@ -189,7 +155,25 @@ const normalizeData = async (rawType, rawLivery) => {
 
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) => {
 
+    // --- MEMORY FIX: CONFIGURE SWEEPERS ---
+    // This tells Discord.js to aggressively delete old messages/users from RAM
     const client = new Client({ 
+        makeCache: Options.cacheEverything({
+            MessageManager: 50, // Only keep 50 messages per channel
+            UserManager: 100,   // Only keep 100 users in cache
+            GuildMemberManager: 100,
+            ThreadManager: 10,
+        }),
+        sweepers: {
+            messages: {
+                interval: 300, // Every 5 minutes
+                lifetime: 900, // Remove messages older than 15 minutes
+            },
+            users: {
+                interval: 3600, // Every hour
+                filter: () => user => user.id !== client.user.id, // Remove everyone but the bot itself
+            },
+        },
         intents: [
             GatewayIntentBits.Guilds,
             GatewayIntentBits.GuildMessages,
@@ -199,70 +183,69 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
     });
 
     /**
-     * MEMORY OPTIMIZED UPLOAD FUNCTION
-     * 1. Downloads to disk (temp file) instead of RAM
-     * 2. Processes with Sharp from disk
-     * 3. Cleans up temp file immediately
+     * MEMORY OPTIMIZED UPLOAD FUNCTION (STREAM VERSION)
+     * Replaces .toBuffer() with streams to prevent RAM spikes
      */
     const uploadImageToS3 = async (url, tailNumber) => {
         let tempFilePath = null;
         try {
-            // 1. Generate a temporary file path
             const tempFileName = `upload_${Date.now()}_${Math.random().toString(36).substring(7)}.dat`;
             tempFilePath = path.join(os.tmpdir(), tempFileName);
 
-            // 2. Stream the download to DISK (Saves RAM)
+            // 1. Download stream to disk
             const response = await axios({
                 url,
                 method: 'GET',
                 responseType: 'stream'
             });
 
-            // Pipe the data to the file system
             await pipeline(response.data, fs.createWriteStream(tempFilePath));
 
-            // 3. Process from DISK
-            // Sharp reads the file from disk, minimizing memory footprint
-            const optimizedBuffer = await sharp(tempFilePath)
-                .resize({ width: 1920, withoutEnlargement: true })
-                .webp({ quality: 80 })
-                .toBuffer();
-
+            // 2. Prepare Stream Upload
             const cleanTail = (tailNumber || 'unknown').replace(/[^a-zA-Z0-9]/g, '');
             const fileName = `community-aircraft/${cleanTail}-${Date.now()}.webp`; 
 
-            await s3Client.send(new PutObjectCommand({
+            // Create a readable stream from the file on disk
+            const fileReadStream = fs.createReadStream(tempFilePath);
+
+            // Pipe it through Sharp (Transformer)
+            // We do NOT use .toBuffer(). We let the data flow.
+            const transformStream = fileReadStream.pipe(
+                sharp()
+                .resize({ width: 1920, withoutEnlargement: true })
+                .webp({ quality: 80 })
+            );
+
+            // 3. Upload Stream directly
+            // The PutObjectCommand Body accepts a stream.
+            const uploadCommand = new PutObjectCommand({
                 Bucket: bucketName,
                 Key: fileName,
-                Body: optimizedBuffer,
+                Body: transformStream,
                 ContentType: 'image/webp',
-            }));
+            });
+
+            await s3Client.send(uploadCommand);
 
             return `https://${bucketName}.s3.${region}.amazonaws.com/${fileName}`;
+
         } catch (error) {
             console.error('S3 Upload Error:', error);
             throw new Error('Failed to upload image to storage.');
         } finally {
-            // 4. ALWAYS Clean up the temp file
+            // 4. Cleanup
             if (tempFilePath) {
-                fs.unlink(tempFilePath, (err) => {
-                    if (err && err.code !== 'ENOENT') console.error("Failed to clean up temp file:", err);
-                });
+                fs.unlink(tempFilePath, (err) => {});
             }
         }
     };
 
-    /**
-     * CORE SUBMISSION LOGIC
-     */
     const startSubmissionFlow = async (source, rawType, rawLivery, ignoredTail, photoUrl, user, originChannelId) => {
         
-        // --- DATA PREPARATION ---
         let currentType = rawType;
         let currentLivery = rawLivery;
-        let currentTail = 'UNKNOWN'; // Default, we will lookup momentarily
+        let currentTail = 'UNKNOWN'; 
 
-        // Helper to check duplicates safely
         const checkDuplicate = async (t, l) => {
             try {
                 const existing = await CommunityAircraftModel.findOne({ 
@@ -273,28 +256,18 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             } catch (err) { return false; }
         };
 
-        // 1. Normalize & Check DB (Heavy operations)
         try {
             const normalized = await normalizeData(currentType, currentLivery);
             currentType = normalized.type;
             currentLivery = normalized.livery;
         } catch (e) { console.error("Normalization error:", e); }
 
-        // --- AUTOMATIC REGISTRATION LOOKUP (MANDATORY) ---
-        // We ignore any passed tail. The system defines the tail.
         const autoReg = lookupRegistration(currentType, currentLivery);
-        
-        if (autoReg) {
-            console.log(`🤖 Auto-matched Registration: ${currentType} (${currentLivery}) -> ${autoReg}`);
-            currentTail = autoReg;
-        } else {
-            currentTail = 'UNKNOWN';
-        }
-        // -------------------------------------
+        if (autoReg) currentTail = autoReg;
+        else currentTail = 'UNKNOWN';
 
         let isDuplicate = await checkDuplicate(currentType, currentLivery);
 
-        // 2. Build Preview Embed
         const createPreviewEmbed = (t, tp, l, imgUrl, isDup) => {
             const embed = new EmbedBuilder()
                 .addFields(
@@ -329,28 +302,17 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             files: [{ attachment: photoUrl, name: 'preview.webp' }] 
         };
 
-        // 3. Send/Update the Reply
         let reply;
         try {
-            // If the source was already deferred (loading state) or replied to, we MUST use editReply
-            if (source.deferred || source.replied) {
-                reply = await source.editReply(payload);
-            } else {
-                // Otherwise we reply normally
-                reply = await source.reply({ ...payload, fetchReply: true });
-            }
-        } catch (err) {
-            console.error("Error sending preview:", err);
-            return; 
-        }
+            if (source.deferred || source.replied) reply = await source.editReply(payload);
+            else reply = await source.reply({ ...payload, fetchReply: true });
+        } catch (err) { return; }
 
         const finalPhotoUrl = reply.attachments.first() ? reply.attachments.first().url : photoUrl;
         const collector = reply.createMessageComponentCollector({ componentType: ComponentType.Button, time: 120000 });
 
         collector.on('collect', async i => {
-            if (i.user.id !== user.id) {
-                return i.reply({ content: "This is not your submission.", ephemeral: true });
-            }
+            if (i.user.id !== user.id) return i.reply({ content: "This is not your submission.", ephemeral: true });
 
             if (i.customId === 'discard_submission') {
                 await i.update({ content: '🗑️ Submission discarded.', embeds: [], components: [], files: [] }); 
@@ -360,36 +322,19 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 return;
             }
 
-            // --- EDIT DETAILS (UPDATED: NO MANUAL TAIL INPUT) ---
             if (i.customId === 'edit_details') {
                 const modal = new ModalBuilder().setCustomId('editModal').setTitle('Edit Aircraft Details');
                 
-                // Note: Tail input removed. User can only change Type and Livery.
-                const typeInput = new TextInputBuilder()
-                    .setCustomId('m_type')
-                    .setLabel("Aircraft Type")
-                    .setValue(currentType)
-                    .setStyle(TextInputStyle.Short);
+                const typeInput = new TextInputBuilder().setCustomId('m_type').setLabel("Aircraft Type").setValue(currentType).setStyle(TextInputStyle.Short);
+                const liveryInput = new TextInputBuilder().setCustomId('m_livery').setLabel("Livery Name").setValue(currentLivery).setStyle(TextInputStyle.Short);
 
-                const liveryInput = new TextInputBuilder()
-                    .setCustomId('m_livery')
-                    .setLabel("Livery Name")
-                    .setValue(currentLivery)
-                    .setStyle(TextInputStyle.Short);
-
-                modal.addComponents(
-                    new ActionRowBuilder().addComponents(typeInput),
-                    new ActionRowBuilder().addComponents(liveryInput)
-                );
-
+                modal.addComponents(new ActionRowBuilder().addComponents(typeInput), new ActionRowBuilder().addComponents(liveryInput));
                 await i.showModal(modal);
 
                 const modalFilter = (submission) => submission.customId === 'editModal' && submission.user.id === user.id;
                 
                 try {
                     const submission = await i.awaitModalSubmit({ filter: modalFilter, time: 60000 });
-                    
-                    // CRITICAL FIX: Defer immediately. 
                     await submission.deferUpdate(); 
                     
                     const editedType = submission.fields.getTextInputValue('m_type');
@@ -399,7 +344,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     currentType = normalized.type;
                     currentLivery = normalized.livery;
 
-                    // Re-run lookup automatically since details changed
                     const reCheckReg = lookupRegistration(currentType, currentLivery);
                     currentTail = reCheckReg ? reCheckReg : 'UNKNOWN';
 
@@ -410,9 +354,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         components: [row] 
                     });
 
-                } catch (e) { 
-                    if (e.code !== 'InteractionCollectorError') console.error("Edit flow error:", e);
-                }
+                } catch (e) { }
             }
 
             if (i.customId === 'confirm_submission') {
@@ -421,11 +363,8 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 const adminChannel = await client.channels.fetch(ADMIN_CHANNEL_ID);
                 const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
 
-                if (!adminChannel || !feedChannel) return i.editReply({ content: '❌ Channel configuration error.', components: [] });
-
                 const attachmentData = { attachment: finalPhotoUrl, name: 'aircraft.webp' };
 
-                // Post to PUBLIC FEED
                 const publicEmbed = new EmbedBuilder()
                     .setTitle('📸 New Aircraft Spotted! (Pending Review)')
                     .setColor(0xFFFF00) 
@@ -441,7 +380,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
                 const publicMsg = await feedChannel.send({ embeds: [publicEmbed], files: [attachmentData] });
 
-                // Post to ADMIN CHANNEL
                 const finalEmbed = new EmbedBuilder()
                     .addFields(
                         { name: 'Contributor', value: `<@${user.id}>`, inline: true },
@@ -479,18 +417,22 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
                 await i.editReply({ 
                     content: `✅ Submission sent for review!\n\n**Have another photo of this same aircraft?**\nUpload it now and I'll automatically apply the corrected details (${currentType}, ${currentTail}).`, 
-                    embeds: [], 
-                    components: [], 
-                    files: [] 
+                    embeds: [], components: [], files: [] 
                 });
 
                 setTimeout(() => reply.delete().catch(() => {}), 15000);
                 collector.stop();
             }
         });
+        
+        // Ensure cleanup of closure variables
+        collector.on('end', () => {
+             // Explicitly release references
+             reply = null;
+             // Other variables in scope will be GC'd when this scope dies, provided collector is dead
+        });
     };
 
-    // --- LEADERBOARD LOGIC ---
     const updateLeaderboard = async () => {
         if (!LEADERBOARD_CHANNEL_ID) return;
         try {
@@ -525,35 +467,31 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 .setFooter({ text: 'Updated Daily • Submit photos to climb the ranks!' })
                 .setTimestamp();
 
-            let lastMessage = (await channel.messages.fetch({ limit: 10 })).find(m => m.author.id === client.user.id);
+            // Fetch less messages to save RAM
+            let lastMessage = (await channel.messages.fetch({ limit: 5 })).find(m => m.author.id === client.user.id);
             if (lastMessage) await lastMessage.edit({ embeds: [leaderboardEmbed] });
             else await channel.send({ embeds: [leaderboardEmbed] });
 
         } catch (error) { console.error('❌ Error updating leaderboard:', error); }
     };
 
-    // 2. Initialize Bot
     client.once('ready', async () => {
         console.log(`🤖 Discord Bot Online as ${client.user.tag}`);
         await fetchAircraftMetadata();
         
-        // --- MEMORY FIX: START CACHE CLEANUP TASK ---
         console.log('🧹 Starting Memory Janitor...');
         setInterval(() => {
             const now = Date.now();
             let cleanedLiveries = 0;
             let cleanedSessions = 0;
 
-            // 1. Clean Livery Cache
             Object.keys(cachedLiveries).forEach(key => {
-                // If data is older than 20 mins, delete it
                 if (now - cachedLiveries[key].timestamp > 1200000) { 
                     delete cachedLiveries[key];
                     cleanedLiveries++;
                 }
             });
 
-            // 2. Clean User Sessions (Abandoned flows)
             userSessions.forEach((value, key) => {
                 if (now > value.expiresAt) {
                     userSessions.delete(key);
@@ -561,11 +499,15 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 }
             });
 
+            // --- EXPLICIT GARBAGE COLLECTION HINT ---
+            if (global.gc) {
+                global.gc();
+            }
+
             if (cleanedLiveries > 0 || cleanedSessions > 0) {
                 console.log(`🧹 Memory Cleaned: Pruned ${cleanedLiveries} livery caches and ${cleanedSessions} stale sessions.`);
             }
-        }, 600000); // Run every 10 minutes
-        // ---------------------------------------------
+        }, 600000);
 
         const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
         
@@ -573,7 +515,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             new SlashCommandBuilder().setName('lookup').setDescription('Find an aircraft').addStringOption(o => o.setName('query').setDescription('Tail/Livery/Type').setAutocomplete(true).setRequired(true)),
             new SlashCommandBuilder().setName('stats').setDescription('View stats'),
             new SlashCommandBuilder().setName('profile').setDescription('Check contribution stats').addUserOption(o => o.setName('user').setDescription('User to check')),
-            // UPDATED: 'tail_number' option removed from submit
             new SlashCommandBuilder().setName('submit').setDescription('Submit a new aircraft photo')
                 .addStringOption(o => o.setName('aircraft_type').setDescription('Type (Start typing to search)').setAutocomplete(true).setRequired(true))
                 .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true))
@@ -591,7 +532,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         setInterval(updateLeaderboard, 86400000);
     });
 
-    // --- WELCOME ---
     client.on('guildMemberAdd', async (member) => {
         if (MEMBER_ROLE_ID) {
             try { 
@@ -614,7 +554,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         } catch (e) {}
     });
 
-    // --- HANDLE MESSAGE SUBMISSIONS (POSTING IN CHANNEL) ---
     client.on('messageCreate', async (message) => {
         if (message.author.bot) return;
 
@@ -636,7 +575,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         message, 
                         session.type, 
                         session.livery, 
-                        null, // Ignore tail, handled by lookup
+                        null, 
                         photo.url, 
                         message.author,
                         message.channelId 
@@ -657,18 +596,13 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     .setColor(0x0099FF)
                     .setDescription(`**Thanks for the photo!**\nPlease click the button below to enter the **Aircraft** and **Livery** details.`);
 
-                await message.reply({ 
-                    embeds: [promptEmbed], 
-                    components: [row] 
-                });
+                await message.reply({ embeds: [promptEmbed], components: [row] });
             }
         }
     });
 
-    // 3. Handle Interactions
     client.on('interactionCreate', async interaction => {
         
-        // --- AUTOCOMPLETE ---
         if (interaction.isAutocomplete()) {
             const focused = interaction.options.getFocused(true);
             
@@ -697,7 +631,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             }
         }
 
-        // --- BUTTON HANDLING ---
         if (interaction.isButton()) {
             
             if (interaction.customId.startsWith('start_ident_')) {
@@ -709,7 +642,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 const modal = new ModalBuilder().setCustomId('identify_modal').setTitle('Aircraft Details');
                 const typeInput = new TextInputBuilder().setCustomId('i_type').setLabel("What aircraft is this?").setStyle(TextInputStyle.Short).setRequired(true);
                 const liveryInput = new TextInputBuilder().setCustomId('i_livery').setLabel("What livery is this?").setStyle(TextInputStyle.Short).setRequired(true);
-                // No tail input in modal
                 
                 modal.addComponents(new ActionRowBuilder().addComponents(typeInput), new ActionRowBuilder().addComponents(liveryInput));
                 await interaction.showModal(modal);
@@ -717,9 +649,11 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             }
 
             if (interaction.customId.startsWith('approve_')) {
+                // Defer first to prevent timeout during S3 upload
                 await interaction.deferUpdate();
+                
                 const [_, targetUserId] = interaction.customId.split('_');
-                const receivedEmbed = interaction.message.embeds[0];
+                let receivedEmbed = interaction.message.embeds[0];
                 
                 const tailField = receivedEmbed.fields.find(f => f.name === 'Tail Number').value;
                 const typeField = receivedEmbed.fields.find(f => f.name === 'Aircraft Type').value;
@@ -739,9 +673,14 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         liveryName: { $regex: new RegExp(`^${escapeRegex(liveryField)}$`, "i") }
                     });
                     
+                    // Heavy operation - now streams instead of buffers
                     const permanentUrl = await uploadImageToS3(imageUrl, tailField);
+                    
                     let contributorName = "Unknown";
-                    try { contributorName = (await client.users.fetch(targetUserId)).username; } catch (e) {}
+                    try { 
+                        const cUser = await client.users.fetch(targetUserId); 
+                        contributorName = cUser.username;
+                    } catch (e) {}
 
                     const updateData = {
                         contributorName: contributorName,
@@ -770,6 +709,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         .setTitle('✅ Submission Approved')
                         .setImage(null) 
                         .setFooter({ text: `Approved by ${interaction.user.tag}` });
+                    
                     await interaction.editReply({ embeds: [approveEmbed], components: [] });
 
                     if (publicMsgId) {
@@ -797,6 +737,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         await user.send({ embeds: [userNotifyEmbed] }); 
                     } catch (e) { }
 
+                    // MEMORY CLEANUP
+                    receivedEmbed = null;
+
                 } catch (error) {
                     console.error(error);
                     await interaction.followUp({ content: '❌ Error saving to database/S3.', ephemeral: true });
@@ -812,7 +755,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             }
         }
 
-        // --- MODAL SUBMISSIONS ---
         if (interaction.isModalSubmit()) {
 
             if (interaction.customId === 'identify_modal') {
@@ -820,7 +762,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
                 const type = interaction.fields.getTextInputValue('i_type');
                 const livery = interaction.fields.getTextInputValue('i_livery');
-                // Tail is calculated inside startSubmissionFlow
                 let tail = null; 
 
                 let photoUrl = null;
@@ -836,7 +777,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 }
 
                 if (!photoUrl) {
-                    return interaction.editReply("❌ Could not find the original image. If you deleted the original photo message, please upload it again.");
+                    return interaction.editReply("❌ Could not find the original image. Please upload again.");
                 }
 
                 await startSubmissionFlow(interaction, type, livery, tail, photoUrl, interaction.user, interaction.channelId);
@@ -850,7 +791,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 const targetUserId = interaction.customId.split('_')[1];
                 const reason = interaction.fields.getTextInputValue('reasonInput');
                 
-                const originalEmbed = interaction.message.embeds[0];
+                let originalEmbed = interaction.message.embeds[0];
                 const aircraftName = originalEmbed.fields.find(f => f.name === 'Aircraft Type')?.value || 'Unknown Aircraft';
                 
                 let thumbUrl = originalEmbed.image?.url;
@@ -905,6 +846,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         try { (await client.users.fetch(targetUserId)).send(`❌ Your submission for **${aircraftName}** was rejected: ${reason}`); } catch (e) {}
                     }
                 }
+                
+                // cleanup
+                originalEmbed = null;
             }
         }
 
@@ -989,7 +933,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         if (interaction.commandName === 'submit') {
             const type = interaction.options.getString('aircraft_type');
             const livery = interaction.options.getString('livery');
-            // Tail is no longer an option. Pass null.
             const tail = null;
             const photo = interaction.options.getAttachment('photo');
 
