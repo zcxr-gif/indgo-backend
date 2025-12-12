@@ -458,10 +458,38 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     )
                     .setTimestamp();
 
+                const adminRow = new ActionRowBuilder()
+                    .addComponents(
+                        new ButtonBuilder().setCustomId(`approve_${user.id}`).setLabel('Approve & Verify').setStyle(ButtonStyle.Success),
+                        new ButtonBuilder().setCustomId(`reject_${user.id}`).setLabel('Reject').setStyle(ButtonStyle.Danger),
+                    );
+
+                const embedsToSend = [finalEmbed];
+
                 if (isDuplicate) {
+                    // Fetch existing data to show comparison
+                    let existingEntry = null;
+                    try {
+                        existingEntry = await CommunityAircraftModel.findOne({ 
+                            aircraftType: { $regex: new RegExp(`^${escapeRegex(currentType)}$`, "i") },
+                            liveryName: { $regex: new RegExp(`^${escapeRegex(currentLivery)}$`, "i") }
+                        });
+                    } catch(e) { console.error("Error fetching duplicate for comparison", e); }
+
                     finalEmbed.setTitle('⚠️ REPLACEMENT REQUEST');
                     finalEmbed.setColor(0xFFA500);
-                    finalEmbed.setDescription(`**Admin Notice:** Matches existing **${currentType} / ${currentLivery}**.\nApproving this will **REPLACE** the old image.`);
+                    finalEmbed.setDescription(`**Admin Notice:** Matches existing **${currentType} / ${currentLivery}**.\nApproving this will **REPLACE** the old image (shown below).`);
+                    
+                    if (existingEntry && existingEntry.imageUrl) {
+                        const comparisonEmbed = new EmbedBuilder()
+                            .setTitle('📉 Current Database Image')
+                            .setDescription(`**Current Contributor:** ${existingEntry.contributorName || 'Unknown'}\n**Tail:** ${existingEntry.tailNumber || 'Unknown'}`)
+                            .setColor(0x2B2D31) // Dark grey
+                            .setImage(existingEntry.imageUrl)
+                            .setFooter({ text: 'If you approve the new submission, this image will be deleted/overwritten.' });
+                        
+                        embedsToSend.push(comparisonEmbed);
+                    }
                 } else {
                     finalEmbed.setTitle('📋 New Submission Request');
                     finalEmbed.setColor(0x00FF00);
@@ -469,13 +497,8 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 
                 finalEmbed.setFooter({ text: `Pending | User: ${user.id} | Msg: ${publicMsg.id} | Ch: ${originChannelId}` });
 
-                const adminRow = new ActionRowBuilder()
-                    .addComponents(
-                        new ButtonBuilder().setCustomId(`approve_${user.id}`).setLabel('Approve & Verify').setStyle(ButtonStyle.Success),
-                        new ButtonBuilder().setCustomId(`reject_${user.id}`).setLabel('Reject').setStyle(ButtonStyle.Danger),
-                    );
-
-                await adminChannel.send({ embeds: [finalEmbed], components: [adminRow], files: [attachmentData] });
+                // Send the main embed + the comparison embed (if it exists)
+                await adminChannel.send({ embeds: embedsToSend, components: [adminRow], files: [attachmentData] });
                 
                 userSessions.set(user.id, {
                     type: currentType, 
