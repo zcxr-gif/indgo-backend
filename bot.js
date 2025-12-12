@@ -24,6 +24,9 @@ const path = require('path');
 const stream = require('stream');
 const util = require('util');
 
+// Import the local aircraft registry for auto-registration lookup
+const aircraftRegistry = require('./aircraft.json');
+
 // Promisify pipeline for efficient stream handling
 const pipeline = util.promisify(stream.pipeline);
 
@@ -111,7 +114,38 @@ const fetchLiveriesForAircraft = async (aircraftId) => {
 };
 
 /**
- * --- NEW: DATA NORMALIZATION HELPER ---
+ * --- REGISTRY LOOKUP HELPER ---
+ * Scans aircraft.json to find a registration based on Type and Livery
+ */
+const lookupRegistration = (aircraftType, liveryName) => {
+    if (!aircraftRegistry || !Array.isArray(aircraftRegistry)) return null;
+
+    // Clean inputs for comparison
+    const cleanType = aircraftType.toLowerCase().trim();
+    const cleanLivery = liveryName.toLowerCase().trim();
+
+    const match = aircraftRegistry.find(entry => {
+        // 1. Check Livery Match (Exact or Fuzzy)
+        const jsonLivery = entry.livery.toLowerCase();
+        // Check if DB livery contains user input OR user input contains DB livery
+        const liveryMatch = jsonLivery === cleanLivery || jsonLivery.includes(cleanLivery) || cleanLivery.includes(jsonLivery);
+
+        if (!liveryMatch) return false;
+
+        // 2. Check Model Match
+        // We check if the User's "aircraftType" contains the JSON "model"
+        // Example: User "Boeing 737-800" contains JSON "737-800" -> TRUE
+        const jsonModel = entry.model.toLowerCase();
+        const typeMatch = cleanType.includes(jsonModel);
+
+        return typeMatch;
+    });
+
+    return match ? match.registration : null;
+};
+
+/**
+ * --- DATA NORMALIZATION HELPER ---
  * Tries to find the "Official" backend name based on sloppy user input.
  */
 const normalizeData = async (rawType, rawLivery) => {
@@ -152,8 +186,6 @@ const normalizeData = async (rawType, rawLivery) => {
 
     return { type: finalType, livery: finalLivery };
 };
-
-// I have added the "Memory Janitor" inside the client.once('ready') block.
 
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) => {
 
@@ -221,14 +253,14 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
     };
 
     /**
-     * CORE SUBMISSION LOGIC - FIX: ROBUST DEFERRAL HANDLING
+     * CORE SUBMISSION LOGIC
      */
-    const startSubmissionFlow = async (source, rawType, rawLivery, tail, photoUrl, user, originChannelId) => {
+    const startSubmissionFlow = async (source, rawType, rawLivery, ignoredTail, photoUrl, user, originChannelId) => {
         
         // --- DATA PREPARATION ---
         let currentType = rawType;
         let currentLivery = rawLivery;
-        let currentTail = tail;
+        let currentTail = 'UNKNOWN'; // Default, we will lookup momentarily
 
         // Helper to check duplicates safely
         const checkDuplicate = async (t, l) => {
@@ -248,6 +280,18 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             currentLivery = normalized.livery;
         } catch (e) { console.error("Normalization error:", e); }
 
+        // --- AUTOMATIC REGISTRATION LOOKUP (MANDATORY) ---
+        // We ignore any passed tail. The system defines the tail.
+        const autoReg = lookupRegistration(currentType, currentLivery);
+        
+        if (autoReg) {
+            console.log(`🤖 Auto-matched Registration: ${currentType} (${currentLivery}) -> ${autoReg}`);
+            currentTail = autoReg;
+        } else {
+            currentTail = 'UNKNOWN';
+        }
+        // -------------------------------------
+
         let isDuplicate = await checkDuplicate(currentType, currentLivery);
 
         // 2. Build Preview Embed
@@ -266,7 +310,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             } else {
                 embed.setTitle('📝 Review Your Submission');
                 embed.setColor(0x0099FF);
-                embed.setDescription('I have auto-corrected the names to match our database.\nPlease confirm the details below.');
+                embed.setDescription('I have auto-detected the registration and corrected the names.\nPlease confirm the details below.');
                 embed.setFooter({ text: 'Click Confirm to submit.' });
             }
             return embed;
@@ -275,7 +319,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         const row = new ActionRowBuilder()
             .addComponents(
                 new ButtonBuilder().setCustomId('confirm_submission').setLabel('Confirm & Submit').setStyle(ButtonStyle.Success),
-                new ButtonBuilder().setCustomId('edit_details').setLabel('Edit Details').setStyle(ButtonStyle.Secondary),
+                new ButtonBuilder().setCustomId('edit_details').setLabel('Edit Type/Livery').setStyle(ButtonStyle.Secondary),
                 new ButtonBuilder().setCustomId('discard_submission').setLabel('Discard').setStyle(ButtonStyle.Danger),
             );
 
@@ -316,17 +360,11 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 return;
             }
 
-            // --- EDIT DETAILS FIX ---
+            // --- EDIT DETAILS (UPDATED: NO MANUAL TAIL INPUT) ---
             if (i.customId === 'edit_details') {
                 const modal = new ModalBuilder().setCustomId('editModal').setTitle('Edit Aircraft Details');
                 
-                const tailInput = new TextInputBuilder()
-                    .setCustomId('m_tail')
-                    .setLabel("Tail Number")
-                    .setValue(currentTail === 'UNKNOWN' ? '' : currentTail)
-                    .setRequired(false)
-                    .setStyle(TextInputStyle.Short);
-
+                // Note: Tail input removed. User can only change Type and Livery.
                 const typeInput = new TextInputBuilder()
                     .setCustomId('m_type')
                     .setLabel("Aircraft Type")
@@ -340,7 +378,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     .setStyle(TextInputStyle.Short);
 
                 modal.addComponents(
-                    new ActionRowBuilder().addComponents(tailInput),
                     new ActionRowBuilder().addComponents(typeInput),
                     new ActionRowBuilder().addComponents(liveryInput)
                 );
@@ -354,9 +391,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     
                     // CRITICAL FIX: Defer immediately. 
                     await submission.deferUpdate(); 
-
-                    const newTailRaw = submission.fields.getTextInputValue('m_tail');
-                    currentTail = newTailRaw.trim() === '' ? 'UNKNOWN' : newTailRaw;
                     
                     const editedType = submission.fields.getTextInputValue('m_type');
                     const editedLivery = submission.fields.getTextInputValue('m_livery');
@@ -364,6 +398,10 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     const normalized = await normalizeData(editedType, editedLivery);
                     currentType = normalized.type;
                     currentLivery = normalized.livery;
+
+                    // Re-run lookup automatically since details changed
+                    const reCheckReg = lookupRegistration(currentType, currentLivery);
+                    currentTail = reCheckReg ? reCheckReg : 'UNKNOWN';
 
                     isDuplicate = await checkDuplicate(currentType, currentLivery);
 
@@ -535,11 +573,11 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             new SlashCommandBuilder().setName('lookup').setDescription('Find an aircraft').addStringOption(o => o.setName('query').setDescription('Tail/Livery/Type').setAutocomplete(true).setRequired(true)),
             new SlashCommandBuilder().setName('stats').setDescription('View stats'),
             new SlashCommandBuilder().setName('profile').setDescription('Check contribution stats').addUserOption(o => o.setName('user').setDescription('User to check')),
+            // UPDATED: 'tail_number' option removed from submit
             new SlashCommandBuilder().setName('submit').setDescription('Submit a new aircraft photo')
                 .addStringOption(o => o.setName('aircraft_type').setDescription('Type (Start typing to search)').setAutocomplete(true).setRequired(true))
                 .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true))
-                .addAttachmentOption(o => o.setName('photo').setDescription('Upload photo').setRequired(true))
-                .addStringOption(o => o.setName('tail_number').setDescription('Registration').setRequired(false)),
+                .addAttachmentOption(o => o.setName('photo').setDescription('Upload photo').setRequired(true)),
             new SlashCommandBuilder().setName('migrate_legacy').setDescription('[ADMIN] Auto-match legacy DB names to current Discord Users'),
             new SlashCommandBuilder().setName('links').setDescription('Get helpful resource links (Tracker, Forum, Liveries)'),
         ].map(c => c.toJSON());
@@ -598,7 +636,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         message, 
                         session.type, 
                         session.livery, 
-                        session.tail, 
+                        null, // Ignore tail, handled by lookup
                         photo.url, 
                         message.author,
                         message.channelId 
@@ -617,7 +655,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
                 const promptEmbed = new EmbedBuilder()
                     .setColor(0x0099FF)
-                    .setDescription(`**Thanks for the photo!**\nPlease click the button below to enter the **Aircraft**, **Livery**, and **Registration** details.`);
+                    .setDescription(`**Thanks for the photo!**\nPlease click the button below to enter the **Aircraft** and **Livery** details.`);
 
                 await message.reply({ 
                     embeds: [promptEmbed], 
@@ -671,9 +709,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 const modal = new ModalBuilder().setCustomId('identify_modal').setTitle('Aircraft Details');
                 const typeInput = new TextInputBuilder().setCustomId('i_type').setLabel("What aircraft is this?").setStyle(TextInputStyle.Short).setRequired(true);
                 const liveryInput = new TextInputBuilder().setCustomId('i_livery').setLabel("What livery is this?").setStyle(TextInputStyle.Short).setRequired(true);
-                const tailInput = new TextInputBuilder().setCustomId('i_tail').setLabel("Registration (Optional)").setStyle(TextInputStyle.Short).setRequired(false);
-
-                modal.addComponents(new ActionRowBuilder().addComponents(typeInput), new ActionRowBuilder().addComponents(liveryInput), new ActionRowBuilder().addComponents(tailInput));
+                // No tail input in modal
+                
+                modal.addComponents(new ActionRowBuilder().addComponents(typeInput), new ActionRowBuilder().addComponents(liveryInput));
                 await interaction.showModal(modal);
                 return;
             }
@@ -782,8 +820,8 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
                 const type = interaction.fields.getTextInputValue('i_type');
                 const livery = interaction.fields.getTextInputValue('i_livery');
-                let tail = interaction.fields.getTextInputValue('i_tail');
-                if (!tail || tail.trim() === '') tail = 'UNKNOWN';
+                // Tail is calculated inside startSubmissionFlow
+                let tail = null; 
 
                 let photoUrl = null;
                 try {
@@ -951,7 +989,8 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         if (interaction.commandName === 'submit') {
             const type = interaction.options.getString('aircraft_type');
             const livery = interaction.options.getString('livery');
-            const tail = interaction.options.getString('tail_number') || 'UNKNOWN';
+            // Tail is no longer an option. Pass null.
+            const tail = null;
             const photo = interaction.options.getAttachment('photo');
 
             if (!photo.contentType.startsWith('image/')) {
