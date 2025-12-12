@@ -386,7 +386,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             if (i.customId === 'discard_submission') {
                 await i.update({ content: '🗑️ Submission discarded.', embeds: [], components: [], files: [] }); 
                 userSessions.delete(user.id); 
-                setTimeout(() => reply.delete().catch(() => {}), 5000);
+                setTimeout(() => { if (reply) reply.delete().catch(() => {}); }, 5000);
                 collector.stop();
                 return;
             }
@@ -489,7 +489,12 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     embeds: [], components: [], files: [] 
                 });
 
-                setTimeout(() => reply.delete().catch(() => {}), 15000);
+                // FIX: Capture message reference locally before closure cleanup occurs
+                const messageToDelete = reply;
+                setTimeout(() => {
+                    if (messageToDelete) messageToDelete.delete().catch(() => {});
+                }, 15000);
+                
                 collector.stop();
             }
         });
