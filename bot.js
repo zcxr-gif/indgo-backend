@@ -770,11 +770,20 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     
                     const permanentUrl = await uploadImageToS3(imageUrl, tailField);
                     
+                    // --- CHANGED: Fetch Member for Display Name ---
                     let contributorName = "Unknown";
                     try { 
-                        const cUser = await client.users.fetch(targetUserId); 
-                        contributorName = cUser.username;
-                    } catch (e) {}
+                        // Try to fetch the member from the server to get their Nickname/Display Name
+                        const member = await interaction.guild.members.fetch(targetUserId); 
+                        contributorName = member.displayName;
+                    } catch (e) {
+                        // Fallback: If they left the server, fetch global username
+                        try {
+                            const cUser = await client.users.fetch(targetUserId);
+                            contributorName = cUser.username;
+                        } catch (err) {}
+                    }
+                    // ----------------------------------------------
 
                     const updateData = {
                         contributorName: contributorName,
