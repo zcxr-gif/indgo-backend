@@ -14,6 +14,9 @@ require('dotenv').config();
 const fs = require('fs');
 const os = require('os');
 
+// MEMORY FIX: Disable Sharp's internal cache to prevent RAM balloons
+sharp.cache(false);
+
 // IMPORT THE BOT
 const { startDiscordBot } = require('./bot');
 
@@ -315,14 +318,20 @@ app.put('/api/aircraft/:id', upload.single('image'), async (req, res) => {
         const { contributorName, aircraftType, liveryName, tailNumber } = req.body;
 
         const existingEntry = await CommunityAircraft.findById(id);
-        if (!existingEntry) return res.status(404).json({ message: 'Aircraft not found.' });
+        if (!existingEntry) {
+            // Clean up if file uploaded but record not found
+            if (req.file) fs.unlink(req.file.path, () => {});
+            return res.status(404).json({ message: 'Aircraft not found.' });
+        }
 
         let updatedImageUrl = existingEntry.imageUrl;
 
         if (req.file) {
             console.log(`Processing new image for update: ${id}`);
             
-            const optimizedBuffer = await sharp(req.file.buffer)
+            // FIX: Read from 'req.file.path' (Disk) instead of 'req.file.buffer' (Memory)
+            // Buffer is undefined here because Multer is using 'dest' (DiskStorage)
+            const optimizedBuffer = await sharp(req.file.path)
                 .resize({ width: 1920, withoutEnlargement: true }) 
                 .webp({ quality: 80 }) 
                 .toBuffer();
@@ -342,6 +351,11 @@ app.put('/api/aircraft/:id', upload.single('image'), async (req, res) => {
             if (existingEntry.imageUrl) {
                 await deleteS3Object(existingEntry.imageUrl);
             }
+
+            // FIX: Clean up local temp file
+            fs.unlink(req.file.path, (err) => {
+                if (err) console.error("Failed to clean up temp file:", err);
+            });
         }
 
         existingEntry.contributorName = contributorName;
@@ -355,6 +369,9 @@ app.put('/api/aircraft/:id', upload.single('image'), async (req, res) => {
         res.json({ message: 'Aircraft updated successfully!', data: existingEntry });
 
     } catch (error) {
+        // FIX: Ensure cleanup on error
+        if (req.file && req.file.path) fs.unlink(req.file.path, () => {});
+
         console.error('Update Error:', error);
         res.status(500).json({ message: 'Server error during update.' });
     }

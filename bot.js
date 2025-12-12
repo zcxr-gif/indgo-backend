@@ -17,7 +17,18 @@ const {
 } = require('discord.js');
 const { PutObjectCommand } = require('@aws-sdk/client-s3');
 const axios = require('axios');
-const sharp = require('sharp'); 
+const sharp = require('sharp');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const stream = require('stream');
+const util = require('util');
+
+// Promisify pipeline for efficient stream handling
+const pipeline = util.promisify(stream.pipeline);
+
+// MEMORY FIX: Disable Sharp's internal cache to prevent holding image data in RAM
+sharp.cache(false);
 
 // CONFIGURATION - REPLACE THESE WITH YOUR REAL CHANNEL IDS
 const ADMIN_CHANNEL_ID = '1448137363795742942'; 
@@ -155,13 +166,32 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         ] 
     });
 
+    /**
+     * MEMORY OPTIMIZED UPLOAD FUNCTION
+     * 1. Downloads to disk (temp file) instead of RAM
+     * 2. Processes with Sharp from disk
+     * 3. Cleans up temp file immediately
+     */
     const uploadImageToS3 = async (url, tailNumber) => {
+        let tempFilePath = null;
         try {
-            // Force garbage collection hint by keeping scope tight
-            const response = await axios.get(url, { responseType: 'arraybuffer' });
-            
-            // Optimization: Process buffer immediately and let response.data be eligible for GC
-            const optimizedBuffer = await sharp(response.data)
+            // 1. Generate a temporary file path
+            const tempFileName = `upload_${Date.now()}_${Math.random().toString(36).substring(7)}.dat`;
+            tempFilePath = path.join(os.tmpdir(), tempFileName);
+
+            // 2. Stream the download to DISK (Saves RAM)
+            const response = await axios({
+                url,
+                method: 'GET',
+                responseType: 'stream'
+            });
+
+            // Pipe the data to the file system
+            await pipeline(response.data, fs.createWriteStream(tempFilePath));
+
+            // 3. Process from DISK
+            // Sharp reads the file from disk, minimizing memory footprint
+            const optimizedBuffer = await sharp(tempFilePath)
                 .resize({ width: 1920, withoutEnlargement: true })
                 .webp({ quality: 80 })
                 .toBuffer();
@@ -180,6 +210,13 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         } catch (error) {
             console.error('S3 Upload Error:', error);
             throw new Error('Failed to upload image to storage.');
+        } finally {
+            // 4. ALWAYS Clean up the temp file
+            if (tempFilePath) {
+                fs.unlink(tempFilePath, (err) => {
+                    if (err && err.code !== 'ENOENT') console.error("Failed to clean up temp file:", err);
+                });
+            }
         }
     };
 
