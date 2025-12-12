@@ -14,12 +14,13 @@ const {
     SlashCommandBuilder,
     ComponentType,
     ChannelType,
-    Options // Import Options for cache control
+    Options 
 } = require('discord.js');
 const { PutObjectCommand } = require('@aws-sdk/client-s3');
 const axios = require('axios');
 const sharp = require('sharp');
 const fs = require('fs');
+const fsPromises = require('fs').promises; // Added for cleaner async file ops
 const os = require('os');
 const path = require('path');
 const stream = require('stream');
@@ -33,7 +34,7 @@ const pipeline = util.promisify(stream.pipeline);
 
 // MEMORY FIX: Disable Sharp's internal cache
 sharp.cache(false);
-// MEMORY FIX: limit concurrency to prevent CPU/RAM saturation during bursts
+// MEMORY FIX: limit concurrency to prevent CPU/RAM saturation
 sharp.concurrency(1); 
 
 // CONFIGURATION - REPLACE THESE WITH YOUR REAL CHANNEL IDS
@@ -156,7 +157,6 @@ const normalizeData = async (rawType, rawLivery) => {
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) => {
 
     // --- MEMORY FIX: CONFIGURE SWEEPERS ---
-    // This tells Discord.js to aggressively delete old messages/users from RAM
     const client = new Client({ 
         makeCache: Options.cacheEverything({
             MessageManager: 50, // Only keep 50 messages per channel
@@ -166,12 +166,12 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         }),
         sweepers: {
             messages: {
-                interval: 300, // Every 5 minutes
-                lifetime: 900, // Remove messages older than 15 minutes
+                interval: 300, 
+                lifetime: 900, 
             },
             users: {
-                interval: 3600, // Every hour
-                filter: () => user => user.id !== client.user.id, // Remove everyone but the bot itself
+                interval: 3600, 
+                filter: () => user => user.id !== client.user.id, 
             },
         },
         intents: [
@@ -183,46 +183,51 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
     });
 
     /**
-     * MEMORY OPTIMIZED UPLOAD FUNCTION (STREAM VERSION)
-     * Replaces .toBuffer() with streams to prevent RAM spikes
+     * FIXED UPLOAD FUNCTION (DISK-BASED PROCESSING)
+     * Avoids Pipe+S3 conflicts by writing the processed file to disk first.
+     * Keeps RAM low, prevents race conditions, and satisfies S3 Content-Length.
      */
     const uploadImageToS3 = async (url, tailNumber) => {
-        let tempFilePath = null;
+        let tempInputPath = null;
+        let tempOutputPath = null;
+        
         try {
-            const tempFileName = `upload_${Date.now()}_${Math.random().toString(36).substring(7)}.dat`;
-            tempFilePath = path.join(os.tmpdir(), tempFileName);
+            // Unique filenames for this operation
+            const uniqueId = `${Date.now()}_${Math.random().toString(36).substring(7)}`;
+            tempInputPath = path.join(os.tmpdir(), `raw_${uniqueId}.dat`);
+            tempOutputPath = path.join(os.tmpdir(), `processed_${uniqueId}.webp`);
 
-            // 1. Download stream to disk
+            // 1. Download source to disk (Stream -> File)
             const response = await axios({
                 url,
                 method: 'GET',
                 responseType: 'stream'
             });
+            await pipeline(response.data, fs.createWriteStream(tempInputPath));
 
-            await pipeline(response.data, fs.createWriteStream(tempFilePath));
-
-            // 2. Prepare Stream Upload
-            const cleanTail = (tailNumber || 'unknown').replace(/[^a-zA-Z0-9]/g, '');
-            const fileName = `community-aircraft/${cleanTail}-${Date.now()}.webp`; 
-
-            // Create a readable stream from the file on disk
-            const fileReadStream = fs.createReadStream(tempFilePath);
-
-            // Pipe it through Sharp (Transformer)
-            // We do NOT use .toBuffer(). We let the data flow.
-            const transformStream = fileReadStream.pipe(
-                sharp()
+            // 2. Process with Sharp (File -> File)
+            // This is safer than memory streams and prevents S3 header errors
+            await sharp(tempInputPath)
                 .resize({ width: 1920, withoutEnlargement: true })
                 .webp({ quality: 80 })
-            );
+                .toFile(tempOutputPath);
 
-            // 3. Upload Stream directly
-            // The PutObjectCommand Body accepts a stream.
+            // 3. Get file stats to provide Content-Length
+            const stats = await fsPromises.stat(tempOutputPath);
+
+            // 4. Upload the processed file
+            const cleanTail = (tailNumber || 'unknown').replace(/[^a-zA-Z0-9]/g, '');
+            const fileName = `community-aircraft/${cleanTail}-${Date.now()}.webp`;
+            
+            // Create a read stream of the *finished* processed file
+            const fileStream = fs.createReadStream(tempOutputPath);
+
             const uploadCommand = new PutObjectCommand({
                 Bucket: bucketName,
                 Key: fileName,
-                Body: transformStream,
+                Body: fileStream,
                 ContentType: 'image/webp',
+                ContentLength: stats.size // Crucial for S3 stability
             });
 
             await s3Client.send(uploadCommand);
@@ -233,10 +238,12 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             console.error('S3 Upload Error:', error);
             throw new Error('Failed to upload image to storage.');
         } finally {
-            // 4. Cleanup
-            if (tempFilePath) {
-                fs.unlink(tempFilePath, (err) => {});
-            }
+            // 5. Robust Cleanup
+            // Using Promise.allSettled to ensure one failure doesn't stop the other
+            const cleanup = [];
+            if (tempInputPath) cleanup.push(fsPromises.unlink(tempInputPath));
+            if (tempOutputPath) cleanup.push(fsPromises.unlink(tempOutputPath));
+            await Promise.allSettled(cleanup);
         }
     };
 
@@ -427,9 +434,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         
         // Ensure cleanup of closure variables
         collector.on('end', () => {
-             // Explicitly release references
              reply = null;
-             // Other variables in scope will be GC'd when this scope dies, provided collector is dead
         });
     };
 
@@ -673,7 +678,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         liveryName: { $regex: new RegExp(`^${escapeRegex(liveryField)}$`, "i") }
                     });
                     
-                    // Heavy operation - now streams instead of buffers
                     const permanentUrl = await uploadImageToS3(imageUrl, tailField);
                     
                     let contributorName = "Unknown";
@@ -737,7 +741,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         await user.send({ embeds: [userNotifyEmbed] }); 
                     } catch (e) { }
 
-                    // MEMORY CLEANUP
                     receivedEmbed = null;
 
                 } catch (error) {
@@ -847,7 +850,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     }
                 }
                 
-                // cleanup
                 originalEmbed = null;
             }
         }
