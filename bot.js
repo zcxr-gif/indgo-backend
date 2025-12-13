@@ -682,6 +682,11 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             new SlashCommandBuilder().setName('lookup').setDescription('Find an aircraft by Tail, Livery, or Type (Public)').addStringOption(o => o.setName('query').setDescription('Tail/Livery/Type').setAutocomplete(true).setRequired(true)),
             new SlashCommandBuilder().setName('stats').setDescription('View stats'),
             new SlashCommandBuilder().setName('profile').setDescription('Check contribution stats').addUserOption(o => o.setName('user').setDescription('User to check')),
+            
+            // --- NEW: PULL COMMAND ---
+            new SlashCommandBuilder().setName('pull').setDescription('Fetch a specific aircraft image from the database')
+                .addStringOption(o => o.setName('query').setDescription('Search by Tail, Type, or Livery').setAutocomplete(true).setRequired(true)),
+            
             new SlashCommandBuilder().setName('submit').setDescription('Submit a new aircraft photo')
                 .addStringOption(o => o.setName('aircraft_type').setDescription('Type (Start typing to search)').setAutocomplete(true).setRequired(true))
                 .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true))
@@ -773,7 +778,29 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         if (interaction.isAutocomplete()) {
             const focused = interaction.options.getFocused(true);
             
-            if (focused.name === 'aircraft_type' || focused.name === 'query') {
+            // --- UPDATED AUTOCOMPLETE: Handles both /pull and /lookup ---
+            // If it's /pull, we search the actual DB for specific records.
+            if (interaction.commandName === 'pull' && focused.name === 'query') {
+                const search = focused.value || '';
+                
+                // Search the database for matches (Tail, Type, or Livery)
+                const matches = await CommunityAircraftModel.find({
+                    $or: [
+                        { tailNumber: { $regex: escapeRegex(search), $options: 'i' } },
+                        { aircraftType: { $regex: escapeRegex(search), $options: 'i' } },
+                        { liveryName: { $regex: escapeRegex(search), $options: 'i' } }
+                    ]
+                }).limit(25);
+
+                // Map results to a readable format: "[TAIL] Type (Livery)"
+                await interaction.respond(matches.map(m => ({
+                    name: `[${m.tailNumber}] ${m.aircraftType} (${m.liveryName})`.substring(0, 100),
+                    value: m.tailNumber // We use tailNumber as the lookup key
+                })));
+                return;
+            }
+
+            if (focused.name === 'aircraft_type' || (interaction.commandName === 'lookup' && focused.name === 'query')) {
                 const list = await fetchAircraftMetadata();
                 const filtered = list.filter(a => a.name.toLowerCase().includes(focused.value.toLowerCase())).slice(0, 25);
                 await interaction.respond(filtered.map(a => ({ name: a.name, value: a.name })));
@@ -1194,6 +1221,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             await startSubmissionFlow(interaction, type, livery, tail, photo.url, interaction.user, interaction.channelId);
         }
 
+        // --- UPDATED LOOKUP (Maintained for legacy use) ---
         if (interaction.commandName === 'lookup') {
             const query = interaction.options.getString('query');
             await interaction.deferReply();
@@ -1212,6 +1240,49 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     await interaction.editReply({ embeds: [embed] });
                 }
             } catch (e) { await interaction.editReply('⚠️ Search Error.'); }
+        }
+
+        // --- NEW: PULL COMMAND HANDLER ---
+        if (interaction.commandName === 'pull') {
+            const query = interaction.options.getString('query');
+            await interaction.deferReply();
+            try {
+                // Priority: Exact Tail -> Search Regex
+                const result = await CommunityAircraftModel.findOne({
+                    $or: [
+                        { tailNumber: { $regex: new RegExp(`^${escapeRegex(query)}$`, "i") } }, 
+                        { tailNumber: { $regex: escapeRegex(query), $options: 'i' } },
+                        { liveryName: { $regex: escapeRegex(query), $options: 'i' } },
+                        { aircraftType: { $regex: escapeRegex(query), $options: 'i' } } 
+                    ]
+                });
+
+                if (!result) {
+                    await interaction.editReply(`❌ No record found matching "**${query}**".`);
+                    return;
+                }
+
+                // --- Stylized Embed (Review Channel Look) ---
+                const pullEmbed = new EmbedBuilder()
+                    .setTitle('🗃️ Aircraft Database Record')
+                    .setColor(0x00FF00) // Green for Live/Verified
+                    .setDescription(`**Status:** ✅ Verified / Live`) 
+                    .addFields(
+                        { name: 'Aircraft Type', value: result.aircraftType, inline: true },
+                        { name: 'Livery', value: result.liveryName, inline: true },
+                        { name: 'Tail Number', value: result.tailNumber.toUpperCase(), inline: true },
+                        { name: 'Contributor', value: result.contributorName, inline: true },
+                        { name: 'Uploaded', value: `<t:${Math.floor(new Date(result.uploadedAt).getTime() / 1000)}:R>`, inline: true }
+                    )
+                    .setImage(result.imageUrl)
+                    .setFooter({ text: `Record ID: ${result._id}` });
+
+                await interaction.editReply({ embeds: [pullEmbed] });
+
+            } catch (e) { 
+                console.error(e);
+                await interaction.editReply('⚠️ Error retrieving record.'); 
+            }
         }
 
         if (interaction.commandName === 'profile') {
