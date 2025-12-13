@@ -48,6 +48,7 @@ const MEMBER_ROLE_ID = '1442472513849397248';
 const CONTRIBUTOR_ROLE_ID = '1442534816863223888';     
 const LEADERBOARD_CHANNEL_ID = '1448178846875521064';  
 const TOP_CONTRIBUTOR_ROLE_ID = '1448179466722611291'; 
+const ADMIN_ROLE_ID = '1442258765016469649'; // Added Admin Role
 
 const METADATA_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api/metadata';
 const BASE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api';
@@ -62,6 +63,39 @@ const userSessions = new Map();
 
 const escapeRegex = (string) => {
     return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+};
+
+// --- FUZZY MATCHING HELPERS ---
+// Calculates how many edits (inserts/deletes/swaps) it takes to turn 'a' into 'b'
+const levenshteinDistance = (a, b) => {
+    const matrix = [];
+    for (let i = 0; i <= b.length; i++) matrix[i] = [i];
+    for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+
+    for (let i = 1; i <= b.length; i++) {
+        for (let j = 1; j <= a.length; j++) {
+            if (b.charAt(i - 1) === a.charAt(j - 1)) {
+                matrix[i][j] = matrix[i - 1][j - 1];
+            } else {
+                matrix[i][j] = Math.min(
+                    matrix[i - 1][j - 1] + 1, // substitution
+                    Math.min(
+                        matrix[i][j - 1] + 1, // insertion
+                        matrix[i - 1][j] + 1  // deletion
+                    )
+                );
+            }
+        }
+    }
+    return matrix[b.length][a.length];
+};
+
+// Returns a similarity score from 0 to 1 (1 being exact match)
+const getSimilarity = (s1, s2) => {
+    const longer = s1.length > s2.length ? s1 : s2;
+    const shorter = s1.length > s2.length ? s2 : s1;
+    if (longer.length === 0) return 1.0;
+    return (longer.length - levenshteinDistance(longer, shorter)) / longer.length;
 };
 
 const fetchAircraftMetadata = async () => {
@@ -110,80 +144,77 @@ const fetchLiveriesForAircraft = async (aircraftId) => {
 const lookupRegistration = (aircraftType, liveryName) => {
     if (!aircraftRegistry || !Array.isArray(aircraftRegistry)) return null;
 
-    // Intelligent Cleaner: Lowercase, remove special chars, keep only letters/numbers
-    // This makes "737-800" equal to "737800" and "DC-10" equal to "dc10"
+    // Intelligent Cleaner: Lowercase, remove special chars
     const clean = (str) => (str || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
     const targetType = clean(aircraftType);
     const targetLivery = clean(liveryName);
+    
+    // If input is too short, fuzzy matching is dangerous, fallback to strict
+    const useFuzzy = targetType.length > 3 && targetLivery.length > 3;
 
     let bestMatch = null;
     let highestScore = 0;
 
-    // Iterate through EVERY aircraft to find the absolute best match
     for (const entry of aircraftRegistry) {
         let score = 0;
 
-        // 1. Prepare JSON Data
         const jsonMan = clean(entry.manufacturer);
         const jsonMod = clean(entry.model);
         const jsonLivery = clean(entry.livery);
-        
-        // Construct the "Full" name from JSON (e.g. "boeing" + "737800" = "boeing737800")
         const jsonFullPlane = jsonMan + jsonMod; 
 
-        // --- PHASE 1: LIVERY MATCH (Mandatory) ---
-        // We check bi-directionally: Does User input contain JSON? OR Does JSON contain User input?
-        // e.g. User: "Delta" matches JSON: "Delta Air Lines"
-        if (targetLivery.includes(jsonLivery) || jsonLivery.includes(targetLivery)) {
-            score += 10; // Base score for livery match
-            
-            // Bonus: Exact match gets higher priority
-            if (targetLivery === jsonLivery) score += 5;
-        } else {
-            // If livery doesn't match at all, skip this plane immediately
-            continue; 
+        // --- PHASE 1: LIVERY MATCH ---
+        let liveryScore = 0;
+        
+        // Exact or Includes check (High Confidence)
+        if (targetLivery === jsonLivery) liveryScore = 20;
+        else if (targetLivery.includes(jsonLivery) || jsonLivery.includes(targetLivery)) liveryScore = 15;
+        // Fuzzy check (Lower Confidence)
+        else if (useFuzzy) {
+            const sim = getSimilarity(targetLivery, jsonLivery);
+            if (sim > 0.8) liveryScore = 10 * sim; 
         }
 
-        // --- PHASE 2: AIRCRAFT TYPE MATCH ---
-        // We calculate how "good" the aircraft match is
-        
+        if (liveryScore < 5) continue; // If livery is totally wrong, skip
+        score += liveryScore;
+
+        // --- PHASE 2: AIRCRAFT MATCH ---
         let aircraftScore = 0;
 
-        // Scenario A: Exact Model Match (User: "737-800", JSON: "737-800")
-        if (targetType === jsonMod) {
-            aircraftScore += 50; 
-        }
-        // Scenario B: Exact Full Name Match (User: "Boeing 737-800", JSON: "Boeing 737-800")
-        else if (targetType === jsonFullPlane) {
-            aircraftScore += 60; // Higher score for being very specific
-        }
-        // Scenario C: User input contains the specific Model (User: "Boeing 737-800", JSON: "737-800")
+        // Exact Matches (Highest Priority)
+        if (targetType === jsonMod) aircraftScore = 50;
+        else if (targetType === jsonFullPlane) aircraftScore = 60;
+        
+        // Partial Inclusion (Medium Priority)
         else if (targetType.includes(jsonMod)) {
-            aircraftScore += 40;
-            // Bonus if they also included the Manufacturer
+            aircraftScore = 40;
             if (targetType.includes(jsonMan)) aircraftScore += 10;
         }
-        // Scenario D: The JSON contains the User input (User: "737", JSON: "737-800")
-        // This is a partial match. We give it points, but less than specific matches.
-        else if (jsonFullPlane.includes(targetType)) {
-            aircraftScore += 20;
+        else if (jsonFullPlane.includes(targetType)) aircraftScore = 20;
+
+        // Fuzzy Matching (Low Priority - handling typos like "Boing 737")
+        else if (useFuzzy) {
+            const modSim = getSimilarity(targetType, jsonMod);
+            const fullSim = getSimilarity(targetType, jsonFullPlane);
+            
+            // We set a high threshold (0.85) to prevent "737-800" matching "737-900"
+            if (modSim > 0.85) aircraftScore = 30 * modSim;
+            else if (fullSim > 0.85) aircraftScore = 35 * fullSim;
         }
 
-        // If the aircraft didn't match at all, this entry is invalid (even if livery matched)
         if (aircraftScore === 0) continue;
 
-        // --- PHASE 3: DETERMINE WINNER ---
-        const totalScore = score + aircraftScore;
+        score += aircraftScore;
 
-        if (totalScore > highestScore) {
-            highestScore = totalScore;
+        if (score > highestScore) {
+            highestScore = score;
             bestMatch = entry;
         }
     }
 
-    // Return the registration of the highest scoring match
-    return bestMatch ? bestMatch.registration : null;
+    // Only return if confidence is reasonably high
+    return (bestMatch && highestScore > 15) ? bestMatch.registration : null;
 };
 
 const normalizeData = async (rawType, rawLivery) => {
@@ -191,10 +222,26 @@ const normalizeData = async (rawType, rawLivery) => {
     let finalLivery = rawLivery.trim();
     let aircraftId = null;
 
+    // 1. Try Exact/Include Match first
     let matchedAircraft = cachedAircraftData.find(a => a.name.toLowerCase() === finalType.toLowerCase());
     
     if (!matchedAircraft) {
         matchedAircraft = cachedAircraftData.find(a => a.name.toLowerCase().includes(finalType.toLowerCase()));
+    }
+
+    // 2. Try Fuzzy Match if no exact found (Fixes spelling like "Airbus A320neo" -> "A320-200neo")
+    if (!matchedAircraft && finalType.length > 4) {
+        let bestFuzzy = null;
+        let bestScore = 0;
+        
+        for (const ac of cachedAircraftData) {
+            const sim = getSimilarity(finalType.toLowerCase(), ac.name.toLowerCase());
+            if (sim > 0.7 && sim > bestScore) { // 0.7 threshold
+                bestScore = sim;
+                bestFuzzy = ac;
+            }
+        }
+        if (bestFuzzy) matchedAircraft = bestFuzzy;
     }
 
     if (matchedAircraft) {
@@ -204,10 +251,29 @@ const normalizeData = async (rawType, rawLivery) => {
 
     if (aircraftId) {
         const validLiveries = await fetchLiveriesForAircraft(aircraftId);
+        
+        // Strict match
         let matchedLivery = validLiveries.find(l => l.toLowerCase() === finalLivery.toLowerCase());
+        
+        // Includes match
         if (!matchedLivery) {
             matchedLivery = validLiveries.find(l => l.toLowerCase().includes(finalLivery.toLowerCase()));
         }
+
+        // Fuzzy match for Livery
+        if (!matchedLivery && finalLivery.length > 4) {
+            let bestLiv = null;
+            let bestScore = 0;
+            for (const l of validLiveries) {
+                const sim = getSimilarity(finalLivery.toLowerCase(), l.toLowerCase());
+                if (sim > 0.75 && sim > bestScore) {
+                    bestScore = sim;
+                    bestLiv = l;
+                }
+            }
+            if (bestLiv) matchedLivery = bestLiv;
+        }
+
         if (matchedLivery) {
             finalLivery = matchedLivery; 
         }
@@ -246,8 +312,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
     /**
      * FIXED UPLOAD FUNCTION (DISK-BASED PROCESSING)
-     * Avoids Pipe+S3 conflicts by writing the processed file to disk first.
-     * Keeps RAM low, prevents race conditions, and satisfies S3 Content-Length.
      */
     const uploadImageToS3 = async (url, tailNumber) => {
         let tempInputPath = null;
@@ -268,7 +332,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             await pipeline(response.data, fs.createWriteStream(tempInputPath));
 
             // 2. Process with Sharp (File -> File)
-            // This is safer than memory streams and prevents S3 header errors
             await sharp(tempInputPath)
                 .resize({ width: 1920, withoutEnlargement: true })
                 .webp({ quality: 80 })
@@ -289,7 +352,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 Key: fileName,
                 Body: fileStream,
                 ContentType: 'image/webp',
-                ContentLength: stats.size // Crucial for S3 stability
+                ContentLength: stats.size 
             });
 
             await s3Client.send(uploadCommand);
@@ -301,7 +364,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             throw new Error('Failed to upload image to storage.');
         } finally {
             // 5. Robust Cleanup
-            // Using Promise.allSettled to ensure one failure doesn't stop the other
             const cleanup = [];
             if (tempInputPath) cleanup.push(fsPromises.unlink(tempInputPath));
             if (tempOutputPath) cleanup.push(fsPromises.unlink(tempOutputPath));
@@ -394,8 +456,19 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             if (i.customId === 'edit_details') {
                 const modal = new ModalBuilder().setCustomId('editModal').setTitle('Edit Aircraft Details');
                 
-                const typeInput = new TextInputBuilder().setCustomId('m_type').setLabel("Aircraft Type").setValue(currentType).setStyle(TextInputStyle.Short);
-                const liveryInput = new TextInputBuilder().setCustomId('m_livery').setLabel("Livery Name").setValue(currentLivery).setStyle(TextInputStyle.Short);
+                const typeInput = new TextInputBuilder()
+                    .setCustomId('m_type')
+                    .setLabel("Aircraft Type")
+                    .setPlaceholder("e.g. 737-8 MAX, 777-300ER, A321") // Added Placeholder
+                    .setValue(currentType)
+                    .setStyle(TextInputStyle.Short);
+                    
+                const liveryInput = new TextInputBuilder()
+                    .setCustomId('m_livery')
+                    .setLabel("Livery Name")
+                    .setPlaceholder("e.g. Delta Air Lines, Generic, Private") // Added Placeholder
+                    .setValue(currentLivery)
+                    .setStyle(TextInputStyle.Short);
 
                 modal.addComponents(new ActionRowBuilder().addComponents(typeInput), new ActionRowBuilder().addComponents(liveryInput));
                 await i.showModal(modal);
@@ -461,13 +534,13 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 const adminRow = new ActionRowBuilder()
                     .addComponents(
                         new ButtonBuilder().setCustomId(`approve_${user.id}`).setLabel('Approve & Verify').setStyle(ButtonStyle.Success),
+                        new ButtonBuilder().setCustomId(`edit_admin_${user.id}`).setLabel('Edit Details').setStyle(ButtonStyle.Secondary).setEmoji('✏️'),
                         new ButtonBuilder().setCustomId(`reject_${user.id}`).setLabel('Reject').setStyle(ButtonStyle.Danger),
                     );
 
                 const embedsToSend = [finalEmbed];
 
                 if (isDuplicate) {
-                    // Fetch existing data to show comparison
                     let existingEntry = null;
                     try {
                         existingEntry = await CommunityAircraftModel.findOne({ 
@@ -512,7 +585,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     embeds: [], components: [], files: [] 
                 });
 
-                // FIX: Capture message reference locally before closure cleanup occurs
                 const messageToDelete = reply;
                 setTimeout(() => {
                     if (messageToDelete) messageToDelete.delete().catch(() => {});
@@ -594,7 +666,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 }
             });
 
-            // --- EXPLICIT GARBAGE COLLECTION HINT ---
             if (global.gc) {
                 global.gc();
             }
@@ -607,7 +678,8 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
         
         const commands = [
-            new SlashCommandBuilder().setName('lookup').setDescription('Find an aircraft').addStringOption(o => o.setName('query').setDescription('Tail/Livery/Type').setAutocomplete(true).setRequired(true)),
+            // Ensure permissions are public by default
+            new SlashCommandBuilder().setName('lookup').setDescription('Find an aircraft by Tail, Livery, or Type (Public)').addStringOption(o => o.setName('query').setDescription('Tail/Livery/Type').setAutocomplete(true).setRequired(true)),
             new SlashCommandBuilder().setName('stats').setDescription('View stats'),
             new SlashCommandBuilder().setName('profile').setDescription('Check contribution stats').addUserOption(o => o.setName('user').setDescription('User to check')),
             new SlashCommandBuilder().setName('submit').setDescription('Submit a new aircraft photo')
@@ -728,6 +800,51 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
         if (interaction.isButton()) {
             
+            if (interaction.customId.startsWith('edit_admin_')) {
+                const receivedEmbed = interaction.message.embeds[0];
+                
+                const currentTail = receivedEmbed.fields.find(f => f.name === 'Tail Number')?.value || 'UNKNOWN';
+                const currentType = receivedEmbed.fields.find(f => f.name === 'Aircraft Type')?.value || '';
+                const currentLivery = receivedEmbed.fields.find(f => f.name === 'Livery')?.value || '';
+
+                const modal = new ModalBuilder()
+                    .setCustomId('admin_edit_modal')
+                    .setTitle('Edit Submission Details');
+
+                const tailInput = new TextInputBuilder()
+                    .setCustomId('ae_tail')
+                    .setLabel("Tail Number")
+                    .setPlaceholder("e.g. N12345") // Added Placeholder
+                    .setValue(currentTail)
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true);
+
+                const typeInput = new TextInputBuilder()
+                    .setCustomId('ae_type')
+                    .setLabel("Aircraft Type")
+                    .setPlaceholder("e.g. 737-8 MAX") // Added Placeholder
+                    .setValue(currentType)
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true);
+
+                const liveryInput = new TextInputBuilder()
+                    .setCustomId('ae_livery')
+                    .setLabel("Livery")
+                    .setPlaceholder("e.g. Delta Air Lines") // Added Placeholder
+                    .setValue(currentLivery)
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true);
+
+                modal.addComponents(
+                    new ActionRowBuilder().addComponents(tailInput),
+                    new ActionRowBuilder().addComponents(typeInput),
+                    new ActionRowBuilder().addComponents(liveryInput)
+                );
+
+                await interaction.showModal(modal);
+                return;
+            }
+
             if (interaction.customId.startsWith('start_ident_')) {
                 const originalUserId = interaction.customId.split('_')[2];
                 if (interaction.user.id !== originalUserId) {
@@ -735,8 +852,20 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 }
 
                 const modal = new ModalBuilder().setCustomId('identify_modal').setTitle('Aircraft Details');
-                const typeInput = new TextInputBuilder().setCustomId('i_type').setLabel("What aircraft is this?").setStyle(TextInputStyle.Short).setRequired(true);
-                const liveryInput = new TextInputBuilder().setCustomId('i_livery').setLabel("What livery is this?").setStyle(TextInputStyle.Short).setRequired(true);
+                
+                const typeInput = new TextInputBuilder()
+                    .setCustomId('i_type')
+                    .setLabel("What aircraft is this?")
+                    .setPlaceholder("e.g. 737-8 MAX, 777-300ER") // Added Placeholder
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true);
+                    
+                const liveryInput = new TextInputBuilder()
+                    .setCustomId('i_livery')
+                    .setLabel("What livery is this?")
+                    .setPlaceholder("e.g. Delta Air Lines, Generic, Private") // Added Placeholder
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true);
                 
                 modal.addComponents(new ActionRowBuilder().addComponents(typeInput), new ActionRowBuilder().addComponents(liveryInput));
                 await interaction.showModal(modal);
@@ -744,7 +873,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             }
 
             if (interaction.customId.startsWith('approve_')) {
-                // Defer first to prevent timeout during S3 upload
                 await interaction.deferUpdate();
                 
                 const [_, targetUserId] = interaction.customId.split('_');
@@ -770,20 +898,16 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     
                     const permanentUrl = await uploadImageToS3(imageUrl, tailField);
                     
-                    // --- CHANGED: Fetch Member for Display Name ---
                     let contributorName = "Unknown";
                     try { 
-                        // Try to fetch the member from the server to get their Nickname/Display Name
                         const member = await interaction.guild.members.fetch(targetUserId); 
                         contributorName = member.displayName;
                     } catch (e) {
-                        // Fallback: If they left the server, fetch global username
                         try {
                             const cUser = await client.users.fetch(targetUserId);
                             contributorName = cUser.username;
                         } catch (err) {}
                     }
-                    // ----------------------------------------------
 
                     const updateData = {
                         contributorName: contributorName,
@@ -858,6 +982,32 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         }
 
         if (interaction.isModalSubmit()) {
+
+            if (interaction.customId === 'admin_edit_modal') {
+                await interaction.deferUpdate();
+                
+                const newTail = interaction.fields.getTextInputValue('ae_tail');
+                const newType = interaction.fields.getTextInputValue('ae_type');
+                const newLivery = interaction.fields.getTextInputValue('ae_livery');
+
+                const oldEmbed = interaction.message.embeds[0];
+                const newEmbed = EmbedBuilder.from(oldEmbed);
+
+                const fields = newEmbed.data.fields;
+                const tailIdx = fields.findIndex(f => f.name === 'Tail Number');
+                if (tailIdx >= 0) fields[tailIdx].value = newTail.toUpperCase();
+                
+                const typeIdx = fields.findIndex(f => f.name === 'Aircraft Type');
+                if (typeIdx >= 0) fields[typeIdx].value = newType;
+
+                const liveryIdx = fields.findIndex(f => f.name === 'Livery');
+                if (liveryIdx >= 0) fields[liveryIdx].value = newLivery;
+
+                newEmbed.setFields(fields);
+                
+                await interaction.editReply({ embeds: [newEmbed] });
+                return;
+            }
 
             if (interaction.customId === 'identify_modal') {
                 await interaction.deferReply({ ephemeral: true });
@@ -1050,6 +1200,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             try {
                 const result = await CommunityAircraftModel.findOne({
                     $or: [
+                        { tailNumber: { $regex: new RegExp(`^${escapeRegex(query)}$`, "i") } }, 
                         { tailNumber: { $regex: escapeRegex(query), $options: 'i' } },
                         { liveryName: { $regex: escapeRegex(query), $options: 'i' } },
                         { aircraftType: { $regex: escapeRegex(query), $options: 'i' } } 
