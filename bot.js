@@ -12,6 +12,9 @@ const {
     TextInputBuilder,
     TextInputStyle,
     SlashCommandBuilder,
+    StringSelectMenuBuilder, // Added for Ticket Dropdown
+    StringSelectMenuOptionBuilder, // Added for Ticket Dropdown
+    AttachmentBuilder, // Added for Transcripts
     ComponentType,
     ChannelType,
     Options 
@@ -20,7 +23,7 @@ const { PutObjectCommand } = require('@aws-sdk/client-s3');
 const axios = require('axios');
 const sharp = require('sharp');
 const fs = require('fs');
-const fsPromises = require('fs').promises; // Added for cleaner async file ops
+const fsPromises = require('fs').promises; 
 const os = require('os');
 const path = require('path');
 const stream = require('stream');
@@ -50,6 +53,10 @@ const LEADERBOARD_CHANNEL_ID = '1448178846875521064';
 const TOP_CONTRIBUTOR_ROLE_ID = '1448179466722611291'; 
 const ADMIN_ROLE_ID = '1442258765016469649'; // Added Admin Role
 
+// --- TICKET SYSTEM CONFIGURATION ---
+const TICKET_PANEL_CHANNEL_ID = '1442462474489299115';
+const TRANSCRIPT_CHANNEL_ID = '1442471030642966548';
+
 const METADATA_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api/metadata';
 const BASE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api';
 
@@ -66,7 +73,6 @@ const escapeRegex = (string) => {
 };
 
 // --- FUZZY MATCHING HELPERS ---
-// Calculates how many edits (inserts/deletes/swaps) it takes to turn 'a' into 'b'
 const levenshteinDistance = (a, b) => {
     const matrix = [];
     for (let i = 0; i <= b.length; i++) matrix[i] = [i];
@@ -78,10 +84,10 @@ const levenshteinDistance = (a, b) => {
                 matrix[i][j] = matrix[i - 1][j - 1];
             } else {
                 matrix[i][j] = Math.min(
-                    matrix[i - 1][j - 1] + 1, // substitution
+                    matrix[i - 1][j - 1] + 1, 
                     Math.min(
-                        matrix[i][j - 1] + 1, // insertion
-                        matrix[i - 1][j] + 1  // deletion
+                        matrix[i][j - 1] + 1, 
+                        matrix[i - 1][j] + 1  
                     )
                 );
             }
@@ -90,7 +96,6 @@ const levenshteinDistance = (a, b) => {
     return matrix[b.length][a.length];
 };
 
-// Returns a similarity score from 0 to 1 (1 being exact match)
 const getSimilarity = (s1, s2) => {
     const longer = s1.length > s2.length ? s1 : s2;
     const shorter = s1.length > s2.length ? s2 : s1;
@@ -144,13 +149,11 @@ const fetchLiveriesForAircraft = async (aircraftId) => {
 const lookupRegistration = (aircraftType, liveryName) => {
     if (!aircraftRegistry || !Array.isArray(aircraftRegistry)) return null;
 
-    // Intelligent Cleaner: Lowercase, remove special chars
     const clean = (str) => (str || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
     const targetType = clean(aircraftType);
     const targetLivery = clean(liveryName);
     
-    // If input is too short, fuzzy matching is dangerous, fallback to strict
     const useFuzzy = targetType.length > 3 && targetLivery.length > 3;
 
     let bestMatch = null;
@@ -164,41 +167,33 @@ const lookupRegistration = (aircraftType, liveryName) => {
         const jsonLivery = clean(entry.livery);
         const jsonFullPlane = jsonMan + jsonMod; 
 
-        // --- PHASE 1: LIVERY MATCH ---
         let liveryScore = 0;
         
-        // Exact or Includes check (High Confidence)
         if (targetLivery === jsonLivery) liveryScore = 20;
         else if (targetLivery.includes(jsonLivery) || jsonLivery.includes(targetLivery)) liveryScore = 15;
-        // Fuzzy check (Lower Confidence)
         else if (useFuzzy) {
             const sim = getSimilarity(targetLivery, jsonLivery);
             if (sim > 0.8) liveryScore = 10 * sim; 
         }
 
-        if (liveryScore < 5) continue; // If livery is totally wrong, skip
+        if (liveryScore < 5) continue; 
         score += liveryScore;
 
-        // --- PHASE 2: AIRCRAFT MATCH ---
         let aircraftScore = 0;
 
-        // Exact Matches (Highest Priority)
         if (targetType === jsonMod) aircraftScore = 50;
         else if (targetType === jsonFullPlane) aircraftScore = 60;
         
-        // Partial Inclusion (Medium Priority)
         else if (targetType.includes(jsonMod)) {
             aircraftScore = 40;
             if (targetType.includes(jsonMan)) aircraftScore += 10;
         }
         else if (jsonFullPlane.includes(targetType)) aircraftScore = 20;
 
-        // Fuzzy Matching (Low Priority - handling typos like "Boing 737")
         else if (useFuzzy) {
             const modSim = getSimilarity(targetType, jsonMod);
             const fullSim = getSimilarity(targetType, jsonFullPlane);
             
-            // We set a high threshold (0.85) to prevent "737-800" matching "737-900"
             if (modSim > 0.85) aircraftScore = 30 * modSim;
             else if (fullSim > 0.85) aircraftScore = 35 * fullSim;
         }
@@ -213,7 +208,6 @@ const lookupRegistration = (aircraftType, liveryName) => {
         }
     }
 
-    // Only return if confidence is reasonably high
     return (bestMatch && highestScore > 15) ? bestMatch.registration : null;
 };
 
@@ -222,21 +216,19 @@ const normalizeData = async (rawType, rawLivery) => {
     let finalLivery = rawLivery.trim();
     let aircraftId = null;
 
-    // 1. Try Exact/Include Match first
     let matchedAircraft = cachedAircraftData.find(a => a.name.toLowerCase() === finalType.toLowerCase());
     
     if (!matchedAircraft) {
         matchedAircraft = cachedAircraftData.find(a => a.name.toLowerCase().includes(finalType.toLowerCase()));
     }
 
-    // 2. Try Fuzzy Match if no exact found (Fixes spelling like "Airbus A320neo" -> "A320-200neo")
     if (!matchedAircraft && finalType.length > 4) {
         let bestFuzzy = null;
         let bestScore = 0;
         
         for (const ac of cachedAircraftData) {
             const sim = getSimilarity(finalType.toLowerCase(), ac.name.toLowerCase());
-            if (sim > 0.7 && sim > bestScore) { // 0.7 threshold
+            if (sim > 0.7 && sim > bestScore) { 
                 bestScore = sim;
                 bestFuzzy = ac;
             }
@@ -252,15 +244,12 @@ const normalizeData = async (rawType, rawLivery) => {
     if (aircraftId) {
         const validLiveries = await fetchLiveriesForAircraft(aircraftId);
         
-        // Strict match
         let matchedLivery = validLiveries.find(l => l.toLowerCase() === finalLivery.toLowerCase());
         
-        // Includes match
         if (!matchedLivery) {
             matchedLivery = validLiveries.find(l => l.toLowerCase().includes(finalLivery.toLowerCase()));
         }
 
-        // Fuzzy match for Livery
         if (!matchedLivery && finalLivery.length > 4) {
             let bestLiv = null;
             let bestScore = 0;
@@ -284,11 +273,10 @@ const normalizeData = async (rawType, rawLivery) => {
 
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) => {
 
-    // --- MEMORY FIX: CONFIGURE SWEEPERS ---
     const client = new Client({ 
         makeCache: Options.cacheEverything({
-            MessageManager: 50, // Only keep 50 messages per channel
-            UserManager: 100,   // Only keep 100 users in cache
+            MessageManager: 50, 
+            UserManager: 100,  
             GuildMemberManager: 100,
             ThreadManager: 10,
         }),
@@ -310,20 +298,15 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         ] 
     });
 
-    /**
-     * FIXED UPLOAD FUNCTION (DISK-BASED PROCESSING)
-     */
     const uploadImageToS3 = async (url, tailNumber) => {
         let tempInputPath = null;
         let tempOutputPath = null;
         
         try {
-            // Unique filenames for this operation
             const uniqueId = `${Date.now()}_${Math.random().toString(36).substring(7)}`;
             tempInputPath = path.join(os.tmpdir(), `raw_${uniqueId}.dat`);
             tempOutputPath = path.join(os.tmpdir(), `processed_${uniqueId}.webp`);
 
-            // 1. Download source to disk (Stream -> File)
             const response = await axios({
                 url,
                 method: 'GET',
@@ -331,20 +314,16 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             });
             await pipeline(response.data, fs.createWriteStream(tempInputPath));
 
-            // 2. Process with Sharp (File -> File)
             await sharp(tempInputPath)
                 .resize({ width: 1920, withoutEnlargement: true })
                 .webp({ quality: 80 })
                 .toFile(tempOutputPath);
 
-            // 3. Get file stats to provide Content-Length
             const stats = await fsPromises.stat(tempOutputPath);
 
-            // 4. Upload the processed file
             const cleanTail = (tailNumber || 'unknown').replace(/[^a-zA-Z0-9]/g, '');
             const fileName = `community-aircraft/${cleanTail}-${Date.now()}.webp`;
             
-            // Create a read stream of the *finished* processed file
             const fileStream = fs.createReadStream(tempOutputPath);
 
             const uploadCommand = new PutObjectCommand({
@@ -363,7 +342,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             console.error('S3 Upload Error:', error);
             throw new Error('Failed to upload image to storage.');
         } finally {
-            // 5. Robust Cleanup
             const cleanup = [];
             if (tempInputPath) cleanup.push(fsPromises.unlink(tempInputPath));
             if (tempOutputPath) cleanup.push(fsPromises.unlink(tempOutputPath));
@@ -459,14 +437,14 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 const typeInput = new TextInputBuilder()
                     .setCustomId('m_type')
                     .setLabel("Aircraft Type")
-                    .setPlaceholder("e.g. 737-8 MAX, 777-300ER, A321") // Added Placeholder
+                    .setPlaceholder("e.g. 737-8 MAX, 777-300ER, A321") 
                     .setValue(currentType)
                     .setStyle(TextInputStyle.Short);
                     
                 const liveryInput = new TextInputBuilder()
                     .setCustomId('m_livery')
                     .setLabel("Livery Name")
-                    .setPlaceholder("e.g. Delta Air Lines, Generic, Private") // Added Placeholder
+                    .setPlaceholder("e.g. Delta Air Lines, Generic, Private") 
                     .setValue(currentLivery)
                     .setStyle(TextInputStyle.Short);
 
@@ -557,7 +535,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         const comparisonEmbed = new EmbedBuilder()
                             .setTitle('📉 Current Database Image')
                             .setDescription(`**Current Contributor:** ${existingEntry.contributorName || 'Unknown'}\n**Tail:** ${existingEntry.tailNumber || 'Unknown'}`)
-                            .setColor(0x2B2D31) // Dark grey
+                            .setColor(0x2B2D31) 
                             .setImage(existingEntry.imageUrl)
                             .setFooter({ text: 'If you approve the new submission, this image will be deleted/overwritten.' });
                         
@@ -570,7 +548,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 
                 finalEmbed.setFooter({ text: `Pending | User: ${user.id} | Msg: ${publicMsg.id} | Ch: ${originChannelId}` });
 
-                // Send the main embed + the comparison embed (if it exists)
                 await adminChannel.send({ embeds: embedsToSend, components: [adminRow], files: [attachmentData] });
                 
                 userSessions.set(user.id, {
@@ -594,7 +571,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             }
         });
         
-        // Ensure cleanup of closure variables
         collector.on('end', () => {
              reply = null;
         });
@@ -634,7 +610,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 .setFooter({ text: 'Updated Daily • Submit photos to climb the ranks!' })
                 .setTimestamp();
 
-            // Fetch less messages to save RAM
             let lastMessage = (await channel.messages.fetch({ limit: 5 })).find(m => m.author.id === client.user.id);
             if (lastMessage) await lastMessage.edit({ embeds: [leaderboardEmbed] });
             else await channel.send({ embeds: [leaderboardEmbed] });
@@ -678,22 +653,20 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
         
         const commands = [
-            // Ensure permissions are public by default
             new SlashCommandBuilder().setName('lookup').setDescription('Find an aircraft by Tail, Livery, or Type (Public)').addStringOption(o => o.setName('query').setDescription('Tail/Livery/Type').setAutocomplete(true).setRequired(true)),
             new SlashCommandBuilder().setName('stats').setDescription('View stats'),
             new SlashCommandBuilder().setName('profile').setDescription('Check contribution stats').addUserOption(o => o.setName('user').setDescription('User to check')),
-            
-            // --- UPDATED PULL COMMAND (Matches Submit Style) ---
             new SlashCommandBuilder().setName('pull').setDescription('Fetch a specific aircraft image from the database')
                 .addStringOption(o => o.setName('aircraft_type').setDescription('Type (Start typing to search)').setAutocomplete(true).setRequired(true))
                 .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true)),
-            
             new SlashCommandBuilder().setName('submit').setDescription('Submit a new aircraft photo')
                 .addStringOption(o => o.setName('aircraft_type').setDescription('Type (Start typing to search)').setAutocomplete(true).setRequired(true))
                 .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true))
                 .addAttachmentOption(o => o.setName('photo').setDescription('Upload photo').setRequired(true)),
             new SlashCommandBuilder().setName('migrate_legacy').setDescription('[ADMIN] Auto-match legacy DB names to current Discord Users'),
             new SlashCommandBuilder().setName('links').setDescription('Get helpful resource links (Tracker, Forum, Liveries)'),
+            // --- NEW COMMAND: Setup Ticket System ---
+            new SlashCommandBuilder().setName('setup_tickets').setDescription('[ADMIN] Post the help ticket panel in the current channel'),
         ].map(c => c.toJSON());
 
         try {
@@ -776,12 +749,176 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
     client.on('interactionCreate', async interaction => {
         
+        // --- 1. TICKET SYSTEM: INITIAL BUTTON CLICK ---
+        if (interaction.isButton() && interaction.customId === 'create_ticket_start') {
+            const topicSelect = new StringSelectMenuBuilder()
+                .setCustomId('ticket_topic_select')
+                .setPlaceholder('Select a topic for your ticket')
+                .addOptions(
+                    new StringSelectMenuOptionBuilder().setLabel('Database Correction').setValue('db_correction').setDescription('Report incorrect info in the database').setEmoji('📝'),
+                    new StringSelectMenuOptionBuilder().setLabel('Submission Issue').setValue('submission_issue').setDescription('Problems uploading or submitting photos').setEmoji('📸'),
+                    new StringSelectMenuOptionBuilder().setLabel('Role/Account Help').setValue('role_help').setDescription('Questions about roles or your profile').setEmoji('👤'),
+                    new StringSelectMenuOptionBuilder().setLabel('Other Inquiry').setValue('other').setDescription('General questions or feedback').setEmoji('❓'),
+                );
+            
+            await interaction.reply({ 
+                content: 'Please select what you need help with:', 
+                components: [new ActionRowBuilder().addComponents(topicSelect)], 
+                ephemeral: true 
+            });
+            return;
+        }
+
+        // --- 2. TICKET SYSTEM: TOPIC SELECTION -> SHOW MODAL ---
+        if (interaction.isStringSelectMenu() && interaction.customId === 'ticket_topic_select') {
+            const selectedTopic = interaction.values[0];
+            
+            // We encode the topic into the modal ID to pass it to the next step
+            const modal = new ModalBuilder()
+                .setCustomId(`ticket_modal_${selectedTopic}`)
+                .setTitle('Ticket Details');
+
+            const descInput = new TextInputBuilder()
+                .setCustomId('ticket_desc')
+                .setLabel("Description (Optional)")
+                .setStyle(TextInputStyle.Paragraph)
+                .setPlaceholder("Please describe your issue here so we can help you faster.")
+                .setRequired(false);
+
+            modal.addComponents(new ActionRowBuilder().addComponents(descInput));
+            await interaction.showModal(modal);
+            return;
+        }
+
+        // --- 3. TICKET SYSTEM: MODAL SUBMIT -> CREATE THREAD ---
+        if (interaction.isModalSubmit() && interaction.customId.startsWith('ticket_modal_')) {
+            await interaction.deferReply({ ephemeral: true });
+            
+            const topicKey = interaction.customId.replace('ticket_modal_', '');
+            const description = interaction.fields.getTextInputValue('ticket_desc') || 'No description provided.';
+            
+            // Map keys to readable titles
+            const topicTitles = {
+                'db_correction': 'Database Correction',
+                'submission_issue': 'Submission Issue',
+                'role_help': 'Role/Account Help',
+                'other': 'Other Inquiry'
+            };
+            const topicTitle = topicTitles[topicKey] || 'Support Ticket';
+
+            try {
+                // Ensure we are in the ticket channel (or fetch it)
+                const ticketChannel = await client.channels.fetch(TICKET_PANEL_CHANNEL_ID);
+                if (!ticketChannel) throw new Error("Ticket channel not configured correctly.");
+
+                // Create Private Thread
+                const threadName = `ticket-${interaction.user.username}-${Date.now().toString().slice(-4)}`;
+                
+                const thread = await ticketChannel.threads.create({
+                    name: threadName,
+                    type: ChannelType.PrivateThread, 
+                    autoArchiveDuration: 1440, // 24 hours
+                    reason: `Support ticket for ${interaction.user.tag}`
+                });
+
+                // Add User
+                await thread.members.add(interaction.user.id);
+                
+                // Construct the initial message inside the thread
+                const ticketEmbed = new EmbedBuilder()
+                    .setTitle(`🎫 ${topicTitle}`)
+                    .setColor(0x00FF00)
+                    .addFields(
+                        { name: 'User', value: `<@${interaction.user.id}>`, inline: true },
+                        { name: 'Topic', value: topicTitle, inline: true },
+                        { name: 'Description', value: description }
+                    )
+                    .setTimestamp();
+
+                const closeButton = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder()
+                        .setCustomId('close_ticket_action')
+                        .setLabel('Close Ticket (Admin Only)')
+                        .setStyle(ButtonStyle.Danger)
+                        .setEmoji('🔒')
+                );
+
+                // Ping admins and send embed
+                await thread.send({ 
+                    content: `Welcome <@${interaction.user.id}>. Support will be with you shortly.\n<@&${ADMIN_ROLE_ID}>`, 
+                    embeds: [ticketEmbed], 
+                    components: [closeButton] 
+                });
+
+                await interaction.editReply({ content: `✅ Ticket created! Head over to <#${thread.id}>.` });
+
+            } catch (error) {
+                console.error("Ticket Creation Error:", error);
+                await interaction.editReply({ content: "❌ Failed to create ticket. Please contact an admin directly." });
+            }
+            return;
+        }
+
+        // --- 4. TICKET SYSTEM: CLOSE TICKET (ADMIN ONLY) ---
+        if (interaction.isButton() && interaction.customId === 'close_ticket_action') {
+            await interaction.deferReply({ ephemeral: true });
+
+            // Check Admin Permissions
+            if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID)) {
+                return interaction.editReply({ content: "❌ Only Admins can close tickets." });
+            }
+
+            const thread = interaction.channel;
+            if (!thread.isThread()) return interaction.editReply({ content: "This is not a thread." });
+
+            try {
+                // Generate Transcript
+                const messages = await thread.messages.fetch({ limit: 100 });
+                const reversed = Array.from(messages.values()).reverse();
+                
+                let transcriptText = `TRANSCRIPT FOR TICKET: ${thread.name}\nDATE: ${new Date().toISOString()}\n------------------------------------------------\n\n`;
+                
+                reversed.forEach(m => {
+                    const time = new Date(m.createdTimestamp).toLocaleString();
+                    const content = m.content || '[No Content]';
+                    const attachments = m.attachments.size > 0 ? ` [Attachments: ${m.attachments.map(a => a.url).join(', ')}]` : '';
+                    transcriptText += `[${time}] ${m.author.tag}: ${content}${attachments}\n`;
+                });
+
+                // Send to Transcript Channel
+                const transcriptChannel = await client.channels.fetch(TRANSCRIPT_CHANNEL_ID);
+                if (transcriptChannel) {
+                    const buffer = Buffer.from(transcriptText, 'utf-8');
+                    const attachment = new AttachmentBuilder(buffer, { name: `${thread.name}-transcript.txt` });
+                    
+                    const logEmbed = new EmbedBuilder()
+                        .setTitle('🔒 Ticket Closed')
+                        .setColor(0xFF0000)
+                        .addFields(
+                            { name: 'Ticket', value: thread.name, inline: true },
+                            { name: 'Closed By', value: interaction.user.tag, inline: true }
+                        )
+                        .setTimestamp();
+
+                    await transcriptChannel.send({ embeds: [logEmbed], files: [attachment] });
+                }
+
+                await interaction.editReply("Ticket closed. Deleting thread in 5 seconds...");
+                
+                setTimeout(async () => {
+                    try { await thread.delete(); } catch(e) {}
+                }, 5000);
+
+            } catch (error) {
+                console.error("Ticket Close Error:", error);
+                await interaction.editReply("❌ Error closing ticket.");
+            }
+            return;
+        }
+
         if (interaction.isAutocomplete()) {
             const focused = interaction.options.getFocused(true);
             
-            // --- UPDATED AUTOCOMPLETE: Handles both /pull, /submit and /lookup ---
-            
-            // For /lookup, we still support the generic "query"
             if (interaction.commandName === 'lookup' && focused.name === 'query') {
                 const list = await fetchAircraftMetadata();
                 const filtered = list.filter(a => a.name.toLowerCase().includes(focused.value.toLowerCase())).slice(0, 25);
@@ -789,7 +926,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 return;
             }
 
-            // For both /submit AND /pull, we handle 'aircraft_type' here
             if (focused.name === 'aircraft_type') {
                 const list = await fetchAircraftMetadata();
                 const filtered = list.filter(a => a.name.toLowerCase().includes(focused.value.toLowerCase())).slice(0, 25);
@@ -797,7 +933,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 return;
             }
 
-            // For both /submit AND /pull, we handle 'livery' dependent on the aircraft_type
             if (focused.name === 'livery') {
                 const selectedType = interaction.options.getString('aircraft_type');
                 if (!selectedType) return interaction.respond([{ name: "Select Aircraft Type first", value: "Unknown" }]);
@@ -833,7 +968,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 const tailInput = new TextInputBuilder()
                     .setCustomId('ae_tail')
                     .setLabel("Tail Number")
-                    .setPlaceholder("e.g. N12345") // Added Placeholder
+                    .setPlaceholder("e.g. N12345") 
                     .setValue(currentTail)
                     .setStyle(TextInputStyle.Short)
                     .setRequired(true);
@@ -841,7 +976,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 const typeInput = new TextInputBuilder()
                     .setCustomId('ae_type')
                     .setLabel("Aircraft Type")
-                    .setPlaceholder("e.g. 737-8 MAX") // Added Placeholder
+                    .setPlaceholder("e.g. 737-8 MAX") 
                     .setValue(currentType)
                     .setStyle(TextInputStyle.Short)
                     .setRequired(true);
@@ -849,7 +984,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 const liveryInput = new TextInputBuilder()
                     .setCustomId('ae_livery')
                     .setLabel("Livery")
-                    .setPlaceholder("e.g. Delta Air Lines") // Added Placeholder
+                    .setPlaceholder("e.g. Delta Air Lines") 
                     .setValue(currentLivery)
                     .setStyle(TextInputStyle.Short)
                     .setRequired(true);
@@ -875,14 +1010,14 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 const typeInput = new TextInputBuilder()
                     .setCustomId('i_type')
                     .setLabel("What aircraft is this?")
-                    .setPlaceholder("e.g. 737-8 MAX, 777-300ER") // Added Placeholder
+                    .setPlaceholder("e.g. 737-8 MAX, 777-300ER") 
                     .setStyle(TextInputStyle.Short)
                     .setRequired(true);
                     
                 const liveryInput = new TextInputBuilder()
                     .setCustomId('i_livery')
                     .setLabel("What livery is this?")
-                    .setPlaceholder("e.g. Delta Air Lines, Generic, Private") // Added Placeholder
+                    .setPlaceholder("e.g. Delta Air Lines, Generic, Private") 
                     .setStyle(TextInputStyle.Short)
                     .setRequired(true);
                 
@@ -1123,6 +1258,30 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         }
 
         if (!interaction.isChatInputCommand()) return;
+        
+        // --- NEW COMMAND: SETUP TICKETS ---
+        if (interaction.commandName === 'setup_tickets') {
+            if (!interaction.member.permissions.has(GatewayIntentBits.Administrator) && interaction.channelId !== ADMIN_CHANNEL_ID) {
+                return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
+            }
+
+            const ticketEmbed = new EmbedBuilder()
+                .setTitle('🎫 Inflight Support')
+                .setDescription('Click the button below to open a private support ticket.\n\nYou can ask about:\n• Database corrections\n• Submission issues\n• Role/Account help')
+                .setColor(0x0099FF)
+                .setFooter({ text: 'Our team will assist you as soon as possible.' });
+
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId('create_ticket_start')
+                    .setLabel('Open Ticket')
+                    .setEmoji('📩')
+                    .setStyle(ButtonStyle.Primary)
+            );
+
+            await interaction.channel.send({ embeds: [ticketEmbed], components: [row] });
+            await interaction.reply({ content: '✅ Ticket panel posted!', ephemeral: true });
+        }
 
         if (interaction.commandName === 'links') {
             const embed = new EmbedBuilder()
@@ -1213,7 +1372,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             await startSubmissionFlow(interaction, type, livery, tail, photo.url, interaction.user, interaction.channelId);
         }
 
-        // --- UPDATED LOOKUP (Maintained for legacy use) ---
         if (interaction.commandName === 'lookup') {
             const query = interaction.options.getString('query');
             await interaction.deferReply();
@@ -1234,7 +1392,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             } catch (e) { await interaction.editReply('⚠️ Search Error.'); }
         }
 
-        // --- NEW: PULL COMMAND HANDLER (Split Fields) ---
         if (interaction.commandName === 'pull') {
             const typeInput = interaction.options.getString('aircraft_type');
             const liveryInput = interaction.options.getString('livery');
@@ -1242,7 +1399,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             await interaction.deferReply();
             
             try {
-                // Strict search for Type AND Livery match
                 const result = await CommunityAircraftModel.findOne({
                     aircraftType: { $regex: new RegExp(`^${escapeRegex(typeInput)}$`, "i") }, 
                     liveryName: { $regex: new RegExp(`^${escapeRegex(liveryInput)}$`, "i") }
@@ -1253,10 +1409,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     return;
                 }
 
-                // --- Stylized Embed (Review Channel Look) ---
                 const pullEmbed = new EmbedBuilder()
                     .setTitle('🗃️ Aircraft Database Record')
-                    .setColor(0x00FF00) // Green for Live/Verified
+                    .setColor(0x00FF00) 
                     .setDescription(`**Status:** ✅ Verified / Live`) 
                     .addFields(
                         { name: 'Aircraft Type', value: result.aircraftType, inline: true },
