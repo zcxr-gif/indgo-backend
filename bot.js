@@ -1223,11 +1223,26 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             if (interaction.customId === 'admin_edit_modal') {
                 await interaction.deferUpdate();
                 
-                const newTail = interaction.fields.getTextInputValue('ae_tail');
+                // Let is used here so we can update the tail if auto-lookup finds a match
+                let newTail = interaction.fields.getTextInputValue('ae_tail');
                 const newType = interaction.fields.getTextInputValue('ae_type');
                 const newLivery = interaction.fields.getTextInputValue('ae_livery');
 
                 const oldEmbed = interaction.message.embeds[0];
+                const oldTail = oldEmbed.fields.find(f => f.name === 'Tail Number')?.value || 'UNKNOWN';
+
+                // --- AUTO REGISTRATION RE-LOOKUP LOGIC ---
+                // If the tail field hasn't been manually changed by the moderator (it equals the old value),
+                // OR if the current tail is simply 'UNKNOWN', we attempt to re-calculate the registration
+                // based on the newly edited Aircraft Type and Livery.
+                if (newTail === oldTail || newTail.toUpperCase() === 'UNKNOWN') {
+                    const reCheckReg = lookupRegistration(newType, newLivery);
+                    if (reCheckReg) {
+                        newTail = reCheckReg;
+                    }
+                }
+                // --- END LOGIC ---
+
                 const newEmbed = EmbedBuilder.from(oldEmbed);
 
                 const fields = newEmbed.data.fields;
