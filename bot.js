@@ -12,11 +12,12 @@ const {
     TextInputBuilder,
     TextInputStyle,
     SlashCommandBuilder,
-    StringSelectMenuBuilder, // Added for Ticket Dropdown
-    StringSelectMenuOptionBuilder, // Added for Ticket Dropdown
-    AttachmentBuilder, // Added for Transcripts
+    StringSelectMenuBuilder, 
+    StringSelectMenuOptionBuilder, 
+    AttachmentBuilder, 
     ComponentType,
     ChannelType,
+    PermissionsBitField, // Added for Mod Permissions
     Options 
 } = require('discord.js');
 const { PutObjectCommand } = require('@aws-sdk/client-s3');
@@ -51,11 +52,11 @@ const MEMBER_ROLE_ID = '1442472513849397248';
 const CONTRIBUTOR_ROLE_ID = '1442534816863223888';     
 const LEADERBOARD_CHANNEL_ID = '1448178846875521064';  
 const TOP_CONTRIBUTOR_ROLE_ID = '1448179466722611291'; 
-const ADMIN_ROLE_ID = '1442258765016469649'; // Added Admin Role
+const ADMIN_ROLE_ID = '1442258765016469649'; // Admin Role for Mod Commands
 
 // --- TICKET SYSTEM CONFIGURATION ---
 const TICKET_PANEL_CHANNEL_ID = '1442462474489299115';
-const TRANSCRIPT_CHANNEL_ID = '1442471030642966548';
+const TRANSCRIPT_CHANNEL_ID = '1442471030642966548'; // Used for Tickets AND Mod Logs
 
 const METADATA_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api/metadata';
 const BASE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api';
@@ -297,6 +298,43 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             GatewayIntentBits.MessageContent 
         ] 
     });
+
+    // --- HELPER: LOG MODERATION ACTION ---
+    const logModAction = async (actionType, executor, target, reason, details = '') => {
+        try {
+            const transcriptChannel = await client.channels.fetch(TRANSCRIPT_CHANNEL_ID);
+            if (!transcriptChannel) return;
+
+            const colorMap = {
+                'KICK': 0xFFA500, // Orange
+                'BAN': 0xFF0000, // Red
+                'UNBAN': 0x00FF00, // Green
+                'TIMEOUT': 0xFFFF00, // Yellow
+                'UNTIMEOUT': 0x00FF99, // Teal
+                'WARN': 0xFFD700, // Gold
+                'PURGE': 0x808080, // Grey
+                'LOCK': 0xFF0000, // Red
+                'UNLOCK': 0x00FF00, // Green
+                'ANNOUNCE': 0x0099FF // Blue
+            };
+
+            const logEmbed = new EmbedBuilder()
+                .setTitle(`🛡️ Admin Action: ${actionType}`)
+                .setColor(colorMap[actionType] || 0xFFFFFF)
+                .addFields(
+                    { name: 'Executor', value: `${executor.tag} (<@${executor.id}>)`, inline: true },
+                    { name: 'Target', value: target ? `${target.tag || target.user?.tag || target} (<@${target.id || target}>)` : 'N/A', inline: true },
+                    { name: 'Reason', value: reason || 'No reason provided', inline: false }
+                )
+                .setTimestamp();
+
+            if (details) logEmbed.addFields({ name: 'Additional Details', value: details });
+
+            await transcriptChannel.send({ embeds: [logEmbed] });
+        } catch (error) {
+            console.error('❌ Failed to log mod action:', error);
+        }
+    };
 
     const uploadImageToS3 = async (url, tailNumber) => {
         let tempInputPath = null;
@@ -653,6 +691,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
         
         const commands = [
+            // User Commands
             new SlashCommandBuilder().setName('lookup').setDescription('Find an aircraft by Tail, Livery, or Type (Public)').addStringOption(o => o.setName('query').setDescription('Tail/Livery/Type').setAutocomplete(true).setRequired(true)),
             new SlashCommandBuilder().setName('stats').setDescription('View stats'),
             new SlashCommandBuilder().setName('profile').setDescription('Check contribution stats').addUserOption(o => o.setName('user').setDescription('User to check')),
@@ -663,10 +702,54 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 .addStringOption(o => o.setName('aircraft_type').setDescription('Type (Start typing to search)').setAutocomplete(true).setRequired(true))
                 .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true))
                 .addAttachmentOption(o => o.setName('photo').setDescription('Upload photo').setRequired(true)),
-            new SlashCommandBuilder().setName('migrate_legacy').setDescription('[ADMIN] Auto-match legacy DB names to current Discord Users'),
             new SlashCommandBuilder().setName('links').setDescription('Get helpful resource links (Tracker, Forum, Liveries)'),
-            // --- NEW COMMAND: Setup Ticket System ---
-            new SlashCommandBuilder().setName('setup_tickets').setDescription('[ADMIN] Post the help ticket panel in the current channel'),
+            
+            // System Admin Commands
+            new SlashCommandBuilder().setName('migrate_legacy').setDescription('[SYSTEM] Auto-match legacy DB names to current Discord Users').setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
+            new SlashCommandBuilder().setName('setup_tickets').setDescription('[SYSTEM] Post the help ticket panel in the current channel').setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
+
+            // --- NEW MODERATOR COMMANDS ---
+            new SlashCommandBuilder().setName('mod_kick').setDescription('[MOD] Kick a user')
+                .addUserOption(o => o.setName('user').setDescription('User to kick').setRequired(true))
+                .addStringOption(o => o.setName('reason').setDescription('Reason for kick').setRequired(true))
+                .setDefaultMemberPermissions(PermissionsBitField.Flags.KickMembers),
+                
+            new SlashCommandBuilder().setName('mod_ban').setDescription('[MOD] Ban a user')
+                .addUserOption(o => o.setName('user').setDescription('User to ban').setRequired(true))
+                .addStringOption(o => o.setName('reason').setDescription('Reason for ban').setRequired(true))
+                .setDefaultMemberPermissions(PermissionsBitField.Flags.BanMembers),
+
+            new SlashCommandBuilder().setName('mod_timeout').setDescription('[MOD] Timeout a user')
+                .addUserOption(o => o.setName('user').setDescription('User to timeout').setRequired(true))
+                .addIntegerOption(o => o.setName('duration').setDescription('Duration in minutes').setRequired(true))
+                .addStringOption(o => o.setName('reason').setDescription('Reason for timeout').setRequired(true))
+                .setDefaultMemberPermissions(PermissionsBitField.Flags.ModerateMembers),
+
+            new SlashCommandBuilder().setName('mod_untimeout').setDescription('[MOD] Remove timeout')
+                .addUserOption(o => o.setName('user').setDescription('User to restore').setRequired(true))
+                .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(true))
+                .setDefaultMemberPermissions(PermissionsBitField.Flags.ModerateMembers),
+
+            new SlashCommandBuilder().setName('mod_warn').setDescription('[MOD] Warn a user (Logs to Transcript)')
+                .addUserOption(o => o.setName('user').setDescription('User to warn').setRequired(true))
+                .addStringOption(o => o.setName('reason').setDescription('Reason for warning').setRequired(true))
+                .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageMessages),
+
+            new SlashCommandBuilder().setName('mod_purge').setDescription('[MOD] Bulk delete messages')
+                .addIntegerOption(o => o.setName('amount').setDescription('Number of messages (1-100)').setRequired(true))
+                .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageMessages),
+
+            new SlashCommandBuilder().setName('mod_lock').setDescription('[MOD] Lock the current channel')
+                .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels),
+
+            new SlashCommandBuilder().setName('mod_unlock').setDescription('[MOD] Unlock the current channel')
+                .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels),
+
+            new SlashCommandBuilder().setName('mod_say').setDescription('[MOD] Make the bot say something')
+                .addStringOption(o => o.setName('message').setDescription('Message to send').setRequired(true))
+                .addChannelOption(o => o.setName('channel').setDescription('Channel to send in (optional)'))
+                .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageMessages),
+
         ].map(c => c.toJSON());
 
         try {
@@ -1258,6 +1341,100 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         }
 
         if (!interaction.isChatInputCommand()) return;
+
+        // --- HANDLER: MODERATION COMMANDS ---
+        if (interaction.commandName.startsWith('mod_')) {
+            // Permission Check specifically for the Admin Role ID for extra security
+            const hasAdminRole = interaction.member.roles.cache.has(ADMIN_ROLE_ID);
+            const isAdmin = interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
+            
+            if (!hasAdminRole && !isAdmin) {
+                return interaction.reply({ content: '❌ Access Denied: Missing Admin Privileges.', ephemeral: true });
+            }
+
+            const targetUser = interaction.options.getUser('user');
+            const targetMember = targetUser ? await interaction.guild.members.fetch(targetUser.id).catch(() => null) : null;
+            const reason = interaction.options.getString('reason') || 'No reason provided';
+
+            try {
+                if (interaction.commandName === 'mod_kick') {
+                    if (!targetMember) return interaction.reply({ content: 'User not found in server.', ephemeral: true });
+                    await targetMember.kick(reason);
+                    await interaction.reply({ content: `✅ Kicked ${targetUser.tag}.`, ephemeral: true });
+                    await logModAction('KICK', interaction.user, targetUser, reason);
+                }
+
+                if (interaction.commandName === 'mod_ban') {
+                    await interaction.guild.members.ban(targetUser, { reason });
+                    await interaction.reply({ content: `✅ Banned ${targetUser.tag}.`, ephemeral: true });
+                    await logModAction('BAN', interaction.user, targetUser, reason);
+                }
+
+                if (interaction.commandName === 'mod_timeout') {
+                    if (!targetMember) return interaction.reply({ content: 'User not found.', ephemeral: true });
+                    const minutes = interaction.options.getInteger('duration');
+                    await targetMember.timeout(minutes * 60 * 1000, reason);
+                    await interaction.reply({ content: `✅ Timed out ${targetUser.tag} for ${minutes} minutes.`, ephemeral: true });
+                    await logModAction('TIMEOUT', interaction.user, targetUser, reason, `Duration: ${minutes}m`);
+                }
+
+                if (interaction.commandName === 'mod_untimeout') {
+                    if (!targetMember) return interaction.reply({ content: 'User not found.', ephemeral: true });
+                    await targetMember.timeout(null, reason);
+                    await interaction.reply({ content: `✅ Removed timeout for ${targetUser.tag}.`, ephemeral: true });
+                    await logModAction('UNTIMEOUT', interaction.user, targetUser, reason);
+                }
+
+                if (interaction.commandName === 'mod_warn') {
+                    // DM the user
+                    let dmStatus = 'DM Sent';
+                    try {
+                        const warnEmbed = new EmbedBuilder()
+                            .setTitle('⚠️ Official Warning')
+                            .setColor(0xFFD700)
+                            .setDescription(`You have received a warning in **${interaction.guild.name}**.`)
+                            .addFields({ name: 'Reason', value: reason })
+                            .setFooter({ text: 'Please review our rules to avoid further action.' });
+                        await targetUser.send({ embeds: [warnEmbed] });
+                    } catch (e) { dmStatus = 'DM Failed (User has DMs off)'; }
+
+                    await interaction.reply({ content: `✅ Warned ${targetUser.tag}. (${dmStatus})`, ephemeral: true });
+                    await logModAction('WARN', interaction.user, targetUser, reason, `Status: ${dmStatus}`);
+                }
+
+                if (interaction.commandName === 'mod_purge') {
+                    const amount = interaction.options.getInteger('amount');
+                    const deleted = await interaction.channel.bulkDelete(amount, true);
+                    await interaction.reply({ content: `✅ Deleted ${deleted.size} messages.`, ephemeral: true });
+                    await logModAction('PURGE', interaction.user, interaction.channel, 'Bulk Delete', `Amount: ${deleted.size} messages`);
+                }
+
+                if (interaction.commandName === 'mod_lock') {
+                    await interaction.channel.permissionOverwrites.edit(interaction.guild.id, { SendMessages: false });
+                    await interaction.reply({ content: '🔒 Channel locked.', ephemeral: true });
+                    await logModAction('LOCK', interaction.user, interaction.channel, 'Channel Lockdown');
+                }
+
+                if (interaction.commandName === 'mod_unlock') {
+                    await interaction.channel.permissionOverwrites.edit(interaction.guild.id, { SendMessages: null });
+                    await interaction.reply({ content: '🔓 Channel unlocked.', ephemeral: true });
+                    await logModAction('UNLOCK', interaction.user, interaction.channel, 'Channel Unlock');
+                }
+
+                if (interaction.commandName === 'mod_say') {
+                    const msg = interaction.options.getString('message');
+                    const targetChannel = interaction.options.getChannel('channel') || interaction.channel;
+                    await targetChannel.send(msg);
+                    await interaction.reply({ content: '✅ Message sent.', ephemeral: true });
+                    await logModAction('ANNOUNCE', interaction.user, targetChannel, 'Bot Announcement', `Content: ${msg}`);
+                }
+
+            } catch (error) {
+                console.error('Mod Command Error:', error);
+                await interaction.reply({ content: '❌ Failed to execute action. Check bot permissions.', ephemeral: true }).catch(() => {});
+            }
+            return;
+        }
         
         // --- NEW COMMAND: SETUP TICKETS ---
         if (interaction.commandName === 'setup_tickets') {
