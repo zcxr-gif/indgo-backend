@@ -683,9 +683,10 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             new SlashCommandBuilder().setName('stats').setDescription('View stats'),
             new SlashCommandBuilder().setName('profile').setDescription('Check contribution stats').addUserOption(o => o.setName('user').setDescription('User to check')),
             
-            // --- NEW: PULL COMMAND ---
+            // --- UPDATED PULL COMMAND (Matches Submit Style) ---
             new SlashCommandBuilder().setName('pull').setDescription('Fetch a specific aircraft image from the database')
-                .addStringOption(o => o.setName('query').setDescription('Search by Tail, Type, or Livery').setAutocomplete(true).setRequired(true)),
+                .addStringOption(o => o.setName('aircraft_type').setDescription('Type (Start typing to search)').setAutocomplete(true).setRequired(true))
+                .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true)),
             
             new SlashCommandBuilder().setName('submit').setDescription('Submit a new aircraft photo')
                 .addStringOption(o => o.setName('aircraft_type').setDescription('Type (Start typing to search)').setAutocomplete(true).setRequired(true))
@@ -778,34 +779,25 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         if (interaction.isAutocomplete()) {
             const focused = interaction.options.getFocused(true);
             
-            // --- UPDATED AUTOCOMPLETE: Handles both /pull and /lookup ---
-            // If it's /pull, we search the actual DB for specific records.
-            if (interaction.commandName === 'pull' && focused.name === 'query') {
-                const search = focused.value || '';
-                
-                // Search the database for matches (Tail, Type, or Livery)
-                const matches = await CommunityAircraftModel.find({
-                    $or: [
-                        { tailNumber: { $regex: escapeRegex(search), $options: 'i' } },
-                        { aircraftType: { $regex: escapeRegex(search), $options: 'i' } },
-                        { liveryName: { $regex: escapeRegex(search), $options: 'i' } }
-                    ]
-                }).limit(25);
-
-                // Map results to a readable format: "[TAIL] Type (Livery)"
-                await interaction.respond(matches.map(m => ({
-                    name: `[${m.tailNumber}] ${m.aircraftType} (${m.liveryName})`.substring(0, 100),
-                    value: m.tailNumber // We use tailNumber as the lookup key
-                })));
-                return;
-            }
-
-            if (focused.name === 'aircraft_type' || (interaction.commandName === 'lookup' && focused.name === 'query')) {
+            // --- UPDATED AUTOCOMPLETE: Handles both /pull, /submit and /lookup ---
+            
+            // For /lookup, we still support the generic "query"
+            if (interaction.commandName === 'lookup' && focused.name === 'query') {
                 const list = await fetchAircraftMetadata();
                 const filtered = list.filter(a => a.name.toLowerCase().includes(focused.value.toLowerCase())).slice(0, 25);
                 await interaction.respond(filtered.map(a => ({ name: a.name, value: a.name })));
+                return;
             }
 
+            // For both /submit AND /pull, we handle 'aircraft_type' here
+            if (focused.name === 'aircraft_type') {
+                const list = await fetchAircraftMetadata();
+                const filtered = list.filter(a => a.name.toLowerCase().includes(focused.value.toLowerCase())).slice(0, 25);
+                await interaction.respond(filtered.map(a => ({ name: a.name, value: a.name })));
+                return;
+            }
+
+            // For both /submit AND /pull, we handle 'livery' dependent on the aircraft_type
             if (focused.name === 'livery') {
                 const selectedType = interaction.options.getString('aircraft_type');
                 if (!selectedType) return interaction.respond([{ name: "Select Aircraft Type first", value: "Unknown" }]);
@@ -1242,23 +1234,22 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             } catch (e) { await interaction.editReply('⚠️ Search Error.'); }
         }
 
-        // --- NEW: PULL COMMAND HANDLER ---
+        // --- NEW: PULL COMMAND HANDLER (Split Fields) ---
         if (interaction.commandName === 'pull') {
-            const query = interaction.options.getString('query');
+            const typeInput = interaction.options.getString('aircraft_type');
+            const liveryInput = interaction.options.getString('livery');
+            
             await interaction.deferReply();
+            
             try {
-                // Priority: Exact Tail -> Search Regex
+                // Strict search for Type AND Livery match
                 const result = await CommunityAircraftModel.findOne({
-                    $or: [
-                        { tailNumber: { $regex: new RegExp(`^${escapeRegex(query)}$`, "i") } }, 
-                        { tailNumber: { $regex: escapeRegex(query), $options: 'i' } },
-                        { liveryName: { $regex: escapeRegex(query), $options: 'i' } },
-                        { aircraftType: { $regex: escapeRegex(query), $options: 'i' } } 
-                    ]
+                    aircraftType: { $regex: new RegExp(`^${escapeRegex(typeInput)}$`, "i") }, 
+                    liveryName: { $regex: new RegExp(`^${escapeRegex(liveryInput)}$`, "i") }
                 });
 
                 if (!result) {
-                    await interaction.editReply(`❌ No record found matching "**${query}**".`);
+                    await interaction.editReply(`❌ No database record found for **${typeInput}** in **${liveryInput}** livery.`);
                     return;
                 }
 
