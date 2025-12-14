@@ -73,28 +73,39 @@ const escapeRegex = (string) => {
     return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 };
 
-// --- FUZZY MATCHING HELPERS ---
-const levenshteinDistance = (a, b) => {
-    const matrix = [];
-    for (let i = 0; i <= b.length; i++) matrix[i] = [i];
-    for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+// MEMORY FIX: Use TypedArrays to prevent heap fragmentation during high-volume lookups
+const levenshteinDistance = (s, t) => {
+    if (s === t) return 0;
+    if (s.length === 0) return t.length;
+    if (t.length === 0) return s.length;
 
-    for (let i = 1; i <= b.length; i++) {
-        for (let j = 1; j <= a.length; j++) {
-            if (b.charAt(i - 1) === a.charAt(j - 1)) {
-                matrix[i][j] = matrix[i - 1][j - 1];
-            } else {
-                matrix[i][j] = Math.min(
-                    matrix[i - 1][j - 1] + 1, 
-                    Math.min(
-                        matrix[i][j - 1] + 1, 
-                        matrix[i - 1][j] + 1  
-                    )
-                );
-            }
+    // Optimization: Always ensure we iterate over the shorter string to minimize array size
+    if (s.length > t.length) [s, t] = [t, s];
+
+    // Use TypedArray for fixed memory allocation (no object overhead)
+    const v0 = new Uint16Array(t.length + 1);
+    const v1 = new Uint16Array(t.length + 1);
+
+    // Initialize v0
+    for (let i = 0; i < v0.length; i++) v0[i] = i;
+
+    for (let i = 0; i < s.length; i++) {
+        v1[0] = i + 1;
+
+        for (let j = 0; j < t.length; j++) {
+            const cost = s[i] === t[j] ? 0 : 1;
+            v1[j + 1] = Math.min(
+                v1[j] + 1,       // Deletion
+                v0[j + 1] + 1,   // Insertion
+                v0[j] + cost     // Substitution
+            );
         }
+
+        // Swap arrays for next iteration (copy v1 to v0)
+        for (let j = 0; j < v0.length; j++) v0[j] = v1[j];
     }
-    return matrix[b.length][a.length];
+
+    return v1[t.length];
 };
 
 const getSimilarity = (s1, s2) => {
@@ -337,32 +348,41 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
     };
 
     const uploadImageToS3 = async (url, tailNumber) => {
-        let tempInputPath = null;
         let tempOutputPath = null;
+        let fileStream = null;
         
         try {
             const uniqueId = `${Date.now()}_${Math.random().toString(36).substring(7)}`;
-            tempInputPath = path.join(os.tmpdir(), `raw_${uniqueId}.dat`);
+            // We only need an output path. Input is processed in-memory via streams.
             tempOutputPath = path.join(os.tmpdir(), `processed_${uniqueId}.webp`);
 
+            // 1. Fetch the stream
             const response = await axios({
                 url,
                 method: 'GET',
                 responseType: 'stream'
             });
-            await pipeline(response.data, fs.createWriteStream(tempInputPath));
 
-            await sharp(tempInputPath)
+            // 2. Create the Sharp pipeline
+            // We pipe the Axios stream directly into Sharp, then to the file system.
+            // This prevents loading the full image into RAM and avoids writing a raw temp file.
+            const transformer = sharp()
                 .resize({ width: 1920, withoutEnlargement: true })
-                .webp({ quality: 80 })
-                .toFile(tempOutputPath);
+                .webp({ quality: 80 });
 
+            await pipeline(
+                response.data,
+                transformer,
+                fs.createWriteStream(tempOutputPath)
+            );
+
+            // 3. Prepare upload
             const stats = await fsPromises.stat(tempOutputPath);
-
             const cleanTail = (tailNumber || 'unknown').replace(/[^a-zA-Z0-9]/g, '');
             const fileName = `community-aircraft/${cleanTail}-${Date.now()}.webp`;
             
-            const fileStream = fs.createReadStream(tempOutputPath);
+            // Create the stream for S3
+            fileStream = fs.createReadStream(tempOutputPath);
 
             const uploadCommand = new PutObjectCommand({
                 Bucket: bucketName,
@@ -374,16 +394,25 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
             await s3Client.send(uploadCommand);
 
+            // MEMORY FIX: Explicitly trigger GC after heavy image processing if enabled.
+            // This cleans up the large Buffer objects immediately rather than waiting for the 10m timer.
+            if (global.gc) {
+                global.gc();
+            }
+
             return `https://${bucketName}.s3.${region}.amazonaws.com/${fileName}`;
 
         } catch (error) {
             console.error('S3 Upload Error:', error);
             throw new Error('Failed to upload image to storage.');
         } finally {
-            const cleanup = [];
-            if (tempInputPath) cleanup.push(fsPromises.unlink(tempInputPath));
-            if (tempOutputPath) cleanup.push(fsPromises.unlink(tempOutputPath));
-            await Promise.allSettled(cleanup);
+            // cleanup: Destroy stream explicitly to release file handle
+            if (fileStream) fileStream.destroy();
+            
+            // Delete the processed file
+            if (tempOutputPath) {
+                await fsPromises.unlink(tempOutputPath).catch(() => {});
+            }
         }
     };
 
@@ -393,6 +422,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         let currentLivery = rawLivery;
         let currentTail = 'UNKNOWN'; 
 
+        // Helper for initial checking (used for User Preview only)
         const checkDuplicate = async (t, l) => {
             try {
                 const existing = await CommunityAircraftModel.findOne({ 
@@ -413,6 +443,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         if (autoReg) currentTail = autoReg;
         else currentTail = 'UNKNOWN';
 
+        // Initial check for the User's Preview Embed
         let isDuplicate = await checkDuplicate(currentType, currentLivery);
 
         const createPreviewEmbed = (t, tp, l, imgUrl, isDup) => {
@@ -523,6 +554,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
                 const attachmentData = { attachment: finalPhotoUrl, name: 'aircraft.webp' };
 
+                // 1. Send to Public Feed (Pending Status)
                 const publicEmbed = new EmbedBuilder()
                     .setTitle('📸 New Aircraft Spotted! (Pending Review)')
                     .setColor(0xFFFF00) 
@@ -538,6 +570,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
                 const publicMsg = await feedChannel.send({ embeds: [publicEmbed], files: [attachmentData] });
 
+                // 2. Prepare Admin Embeds
                 const finalEmbed = new EmbedBuilder()
                     .addFields(
                         { name: 'Contributor', value: `<@${user.id}>`, inline: true },
@@ -556,20 +589,24 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
                 const embedsToSend = [finalEmbed];
 
-                if (isDuplicate) {
-                    let existingEntry = null;
-                    try {
-                        existingEntry = await CommunityAircraftModel.findOne({ 
-                            aircraftType: { $regex: new RegExp(`^${escapeRegex(currentType)}$`, "i") },
-                            liveryName: { $regex: new RegExp(`^${escapeRegex(currentLivery)}$`, "i") }
-                        });
-                    } catch(e) { console.error("Error fetching duplicate for comparison", e); }
+                // --- KEY FIX: Force Fresh Duplicate Check for Admins ---
+                // We do NOT rely on the previous 'isDuplicate' boolean here.
+                // We perform a real-time lookup right before sending to admin.
+                let existingEntry = null;
+                try {
+                    existingEntry = await CommunityAircraftModel.findOne({ 
+                        aircraftType: { $regex: new RegExp(`^${escapeRegex(currentType)}$`, "i") },
+                        liveryName: { $regex: new RegExp(`^${escapeRegex(currentLivery)}$`, "i") }
+                    });
+                } catch(e) { console.error("Error fetching duplicate for comparison", e); }
 
+                if (existingEntry) {
+                    // It IS a duplicate/replacement
                     finalEmbed.setTitle('⚠️ REPLACEMENT REQUEST');
                     finalEmbed.setColor(0xFFA500);
                     finalEmbed.setDescription(`**Admin Notice:** Matches existing **${currentType} / ${currentLivery}**.\nApproving this will **REPLACE** the old image (shown below).`);
-                    
-                    if (existingEntry && existingEntry.imageUrl) {
+
+                    if (existingEntry.imageUrl) {
                         const comparisonEmbed = new EmbedBuilder()
                             .setTitle('📉 Current Database Image')
                             .setDescription(`**Current Contributor:** ${existingEntry.contributorName || 'Unknown'}\n**Tail:** ${existingEntry.tailNumber || 'Unknown'}`)
@@ -580,6 +617,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         embedsToSend.push(comparisonEmbed);
                     }
                 } else {
+                    // It is NEW
                     finalEmbed.setTitle('📋 New Submission Request');
                     finalEmbed.setColor(0x00FF00);
                 }
@@ -704,6 +742,25 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 .addAttachmentOption(o => o.setName('photo').setDescription('Upload photo').setRequired(true)),
             new SlashCommandBuilder().setName('links').setDescription('Get helpful resource links (Tracker, Forum, Liveries)'),
             
+            // NEW: Live Flight Tracking
+            new SlashCommandBuilder()
+                .setName('track')
+                .setDescription('Track a live flight on the server')
+                .addStringOption(o => 
+                    o.setName('target')
+                     .setDescription('Username or Callsign (e.g., "Delta 101")')
+                     .setRequired(true)
+                ),
+
+            // NEW: Personal Hangar Stats
+            new SlashCommandBuilder()
+                .setName('hangar')
+                .setDescription('View detailed breakdown of a user\'s contributions')
+                .addUserOption(o => 
+                    o.setName('user')
+                     .setDescription('User to inspect')
+                ),
+
             // System Admin Commands
             new SlashCommandBuilder().setName('migrate_legacy').setDescription('[SYSTEM] Auto-match legacy DB names to current Discord Users').setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
             new SlashCommandBuilder().setName('setup_tickets').setDescription('[SYSTEM] Post the help ticket panel in the current channel').setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
@@ -806,7 +863,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         session.livery, 
                         null, 
                         photo.url, 
-                        message.author,
+                        message.author, 
                         message.channelId 
                     );
                     return;
@@ -1449,6 +1506,171 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 await interaction.reply({ content: '❌ Failed to execute action. Check bot permissions.', ephemeral: true }).catch(() => {});
             }
             return;
+        }
+        
+        // --- COMMAND: LIVE TRACKING (/track) ---
+        if (interaction.commandName === 'track') {
+            await interaction.deferReply();
+
+            // 1. Setup Configuration
+            const query = interaction.options.getString('target').toUpperCase().trim();
+            const LIVE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run'; // Your live backend
+            const targetServerName = 'Expert Server'; // Default to Expert
+
+            try {
+                // 2. Fetch Active Sessions to find the Server ID
+                // Endpoint: /if-sessions
+                const sessionsRes = await axios.get(`${LIVE_API_URL}/if-sessions`);
+                
+                if (!sessionsRes.data || !sessionsRes.data.sessions) {
+                    throw new Error("Invalid response from Live API (Sessions)");
+                }
+
+                // Fuzzy search for the server ID (e.g., "Expert Server")
+                const session = sessionsRes.data.sessions.find(s => s.name === targetServerName);
+                if (!session) {
+                    return interaction.editReply(`❌ Could not locate **${targetServerName}**. The server might be offline.`);
+                }
+
+                // 3. Fetch Flights for that Session
+                // Endpoint: /flights/:sessionId
+                const flightsRes = await axios.get(`${LIVE_API_URL}/flights/${session.id}`);
+                const flights = flightsRes.data.flights;
+
+                if (!flights) {
+                    return interaction.editReply("❌ Failed to retrieve flight data.");
+                }
+
+                // 4. Find the Pilot (Match Username OR Callsign)
+                const match = flights.find(f => 
+                    (f.username && f.username.toUpperCase().includes(query)) || 
+                    (f.callsign && f.callsign.toUpperCase().includes(query))
+                );
+
+                if (!match) {
+                    return interaction.editReply(`❌ No pilot found matching "**${query}**" on ${targetServerName}.`);
+                }
+
+                // 5. Build the Telemetry Embed
+                const trackEmbed = new EmbedBuilder()
+                    .setTitle(`📡 Live Flight: ${match.callsign}`)
+                    .setColor(0x00FF99) // Teal color for "Live"
+                    .setThumbnail(`https://site--acars-backend--6dmjph8ltlhv.code.run/images/radar_icon.png`) // Optional: You can use a static icon or remove
+                    .addFields(
+                        { name: '👤 Pilot', value: match.username || 'Unknown', inline: true },
+                        { name: '✈️ Aircraft', value: match.aircraft.aircraftName || 'Unknown', inline: true },
+                        { name: '🎨 Livery', value: match.aircraft.liveryName || 'Unknown', inline: true },
+                        
+                        { name: '📏 Altitude', value: match.position.alt_ft ? `${Math.round(match.position.alt_ft).toLocaleString()} ft` : 'N/A', inline: true },
+                        { name: '🚀 Ground Speed', value: match.position.gs_kt ? `${Math.round(match.position.gs_kt)} kts` : 'N/A', inline: true },
+                        { name: '↕️ Vertical Speed', value: match.position.vs_fpm ? `${Math.round(match.position.vs_fpm)} fpm` : 'N/A', inline: true },
+                        
+                        { name: '🧭 Heading', value: match.position.heading_deg ? `${Math.round(match.position.heading_deg)}°` : 'N/A', inline: true },
+                        { name: '🆔 Virtual Org', value: match.virtualOrganization || 'None', inline: true }
+                    )
+                    .setTimestamp(match.position.lastReportMs ? new Date(match.position.lastReportMs) : new Date())
+                    .setFooter({ text: `Server: ${targetServerName} • Status: ${match.pilotState === 0 ? 'On Ground' : 'Flying'}` });
+
+                // Add "View on Map" link if flightId exists
+                if (match.flightId) {
+                    trackEmbed.addFields({ name: '🌍 Live Map', value: `[View on Inflight.info](https://inflight.info/flight/${match.flightId})` });
+                }
+
+                await interaction.editReply({ embeds: [trackEmbed] });
+
+            } catch (error) {
+                console.error("Track Command Error:", error.message);
+                await interaction.editReply("❌ **Connection Failed:** Could not retrieve live flight data from the backend.");
+            }
+        }
+
+        // --- COMMAND: PERSONAL HANGAR (/hangar) ---
+        if (interaction.commandName === 'hangar') {
+            const targetUser = interaction.options.getUser('user') || interaction.user;
+            await interaction.deferReply();
+
+            try {
+                // 1. Perform MongoDB Aggregation
+                // This calculates stats directly in the database for speed
+                const stats = await CommunityAircraftModel.aggregate([
+                    { 
+                        $match: { 
+                            $or: [
+                                { contributorId: targetUser.id },
+                                { contributorName: targetUser.username } 
+                            ]
+                        } 
+                    },
+                    {
+                        $group: {
+                            _id: null,
+                            totalUploads: { $sum: 1 },
+                            // Collect unique values to count diversity
+                            uniqueTypes: { $addToSet: "$aircraftType" },
+                            uniqueLiveries: { $addToSet: "$liveryName" },
+                            // Push all types to an array to calculate the "favorite" later
+                            allTypes: { $push: "$aircraftType" }
+                        }
+                    }
+                ]);
+
+                if (!stats || stats.length === 0) {
+                    return interaction.editReply(`📂 **${targetUser.username}** has an empty hangar. No photos submitted yet!`);
+                }
+
+                const data = stats[0];
+
+                // 2. Calculate "Favorite Aircraft" (Mode of aircraft types)
+                const typeCounts = {};
+                let favoriteAircraft = "None";
+                let maxCount = 0;
+
+                data.allTypes.forEach(t => {
+                    typeCounts[t] = (typeCounts[t] || 0) + 1;
+                    if (typeCounts[t] > maxCount) {
+                        maxCount = typeCounts[t];
+                        favoriteAircraft = t;
+                    }
+                });
+
+                // 3. Fetch the MOST RECENT upload for the embed image
+                const latestUpload = await CommunityAircraftModel.findOne({ 
+                    $or: [{ contributorId: targetUser.id }, { contributorName: targetUser.username }] 
+                }).sort({ uploadedAt: -1 });
+
+                // 4. Determine Rank based on upload count
+                let rank = 'Spotter';
+                if (data.totalUploads >= 10) rank = 'Bronze Spotter 🥉';
+                if (data.totalUploads >= 25) rank = 'Silver Spotter 🥈';
+                if (data.totalUploads >= 50) rank = 'Gold Spotter 🥇';
+                if (data.totalUploads >= 100) rank = 'Diamond Spotter 💎';
+
+                // 5. Build Hangar Embed
+                const hangarEmbed = new EmbedBuilder()
+                    .setTitle(`✈️ ${targetUser.username}'s Hangar`)
+                    .setColor(0xFFD700) // Gold
+                    .setThumbnail(targetUser.displayAvatarURL())
+                    .setDescription(`**Rank:** ${rank}`)
+                    .addFields(
+                        { name: '📸 Total Photos', value: `${data.totalUploads}`, inline: true },
+                        { name: '🛩️ Unique Types', value: `${data.uniqueTypes.length}`, inline: true },
+                        { name: '🎨 Unique Liveries', value: `${data.uniqueLiveries.length}`, inline: true },
+                        { name: '❤️ Favorite Aircraft', value: `**${favoriteAircraft}** (${maxCount} spots)`, inline: false }
+                    )
+                    .setFooter({ text: `Hangar ID: ${targetUser.id}` });
+
+                // If they have a latest upload, set it as the big image
+                if (latestUpload) {
+                    hangarEmbed.setImage(latestUpload.imageUrl);
+                    hangarEmbed.setFooter({ text: `Latest Catch: ${latestUpload.tailNumber} (${latestUpload.aircraftType})` });
+                }
+
+                await interaction.editReply({ embeds: [hangarEmbed] });
+
+            } catch (error) {
+                console.error("Hangar Command Error:", error);
+                await interaction.editReply("❌ An error occurred while fetching hangar statistics.");
+            }
         }
         
         // --- NEW COMMAND: SETUP TICKETS ---
