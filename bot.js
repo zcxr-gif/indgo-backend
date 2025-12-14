@@ -1512,66 +1512,84 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         if (interaction.commandName === 'track') {
             await interaction.deferReply();
 
-            // 1. Setup Configuration
+            // 1. Configuration (Matched to flight.js)
             const query = interaction.options.getString('target').toUpperCase().trim();
-            const LIVE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run'; // Your live backend
-            const targetServerName = 'Expert Server'; // Default to Expert
+            const LIVE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run'; 
+            const targetServerName = 'Expert Server'; 
 
             try {
-                // 2. Fetch Active Sessions to find the Server ID
-                // Endpoint: /if-sessions
+                // 2. Fetch Sessions
                 const sessionsRes = await axios.get(`${LIVE_API_URL}/if-sessions`);
-                
                 if (!sessionsRes.data || !sessionsRes.data.sessions) {
                     throw new Error("Invalid response from Live API (Sessions)");
                 }
 
-                // Fuzzy search for the server ID (e.g., "Expert Server")
-                const session = sessionsRes.data.sessions.find(s => s.name === targetServerName);
+                // 3. Smart Session Lookup (Logic ported from flight.js)
+                // First try exact match, then fuzzy match (e.g. "Expert" in "Expert Server")
+                let session = sessionsRes.data.sessions.find(s => s.name === targetServerName);
+                if (!session) {
+                    session = sessionsRes.data.sessions.find(s => s.name.includes(targetServerName.split(' ')[0]));
+                }
+
                 if (!session) {
                     return interaction.editReply(`❌ Could not locate **${targetServerName}**. The server might be offline.`);
                 }
 
-                // 3. Fetch Flights for that Session
-                // Endpoint: /flights/:sessionId
+                // 4. Fetch Flights
                 const flightsRes = await axios.get(`${LIVE_API_URL}/flights/${session.id}`);
                 const flights = flightsRes.data.flights;
 
-                if (!flights) {
+                if (!flights || !Array.isArray(flights)) {
                     return interaction.editReply("❌ Failed to retrieve flight data.");
                 }
 
-                // 4. Find the Pilot (Match Username OR Callsign)
+                // 5. Find Pilot (Username OR Callsign)
                 const match = flights.find(f => 
                     (f.username && f.username.toUpperCase().includes(query)) || 
                     (f.callsign && f.callsign.toUpperCase().includes(query))
                 );
 
                 if (!match) {
-                    return interaction.editReply(`❌ No pilot found matching "**${query}**" on ${targetServerName}.`);
+                    return interaction.editReply(`❌ No pilot found matching "**${query}**" on ${session.name}.`);
                 }
 
-                // 5. Build the Telemetry Embed
+                // 6. Calculate Flight Phase (Ported from flight.js getLiteFlightPhase)
+                const calculatePhase = (pos) => {
+                    const vs = pos.vs_fpm || 0;
+                    const alt = pos.alt_ft || 0;
+                    const gs = pos.gs_kt || 0;
+                    
+                    if (alt < 1000 && gs < 40 && Math.abs(vs) < 150) return 'On Ground 🛑';
+                    if (vs > 350) return 'Climbing ↗️';
+                    if (vs < -500) return 'Descending ↘️';
+                    if (alt > 18000 && Math.abs(vs) < 500) return 'Cruising ✈️';
+                    return 'Enroute ➡️';
+                };
+
+                const phase = calculatePhase(match.position);
+
+                // 7. Build Embed
                 const trackEmbed = new EmbedBuilder()
-                    .setTitle(`📡 Live Flight: ${match.callsign}`)
-                    .setColor(0x00FF99) // Teal color for "Live"
-                    .setThumbnail(`https://site--acars-backend--6dmjph8ltlhv.code.run/images/radar_icon.png`) // Optional: You can use a static icon or remove
+                    .setTitle(`📡 Live Flight: ${match.callsign || 'No Callsign'}`)
+                    .setColor(0x00FF99)
+                    .setThumbnail(`${LIVE_API_URL}/images/radar_icon.png`) // Optional icon
                     .addFields(
                         { name: '👤 Pilot', value: match.username || 'Unknown', inline: true },
-                        { name: '✈️ Aircraft', value: match.aircraft.aircraftName || 'Unknown', inline: true },
-                        { name: '🎨 Livery', value: match.aircraft.liveryName || 'Unknown', inline: true },
+                        { name: '✈️ Aircraft', value: match.aircraft?.aircraftName || 'Unknown', inline: true },
+                        { name: '🎨 Livery', value: match.aircraft?.liveryName || 'Unknown', inline: true },
                         
-                        { name: '📏 Altitude', value: match.position.alt_ft ? `${Math.round(match.position.alt_ft).toLocaleString()} ft` : 'N/A', inline: true },
-                        { name: '🚀 Ground Speed', value: match.position.gs_kt ? `${Math.round(match.position.gs_kt)} kts` : 'N/A', inline: true },
-                        { name: '↕️ Vertical Speed', value: match.position.vs_fpm ? `${Math.round(match.position.vs_fpm)} fpm` : 'N/A', inline: true },
+                        // Use != null checks to fix the "0 altitude" bug
+                        { name: '📍 Altitude', value: match.position.alt_ft != null ? `${Math.round(match.position.alt_ft).toLocaleString()} ft` : 'N/A', inline: true },
+                        { name: '🚀 Ground Speed', value: match.position.gs_kt != null ? `${Math.round(match.position.gs_kt)} kts` : 'N/A', inline: true },
+                        { name: '↕️ Vertical Speed', value: match.position.vs_fpm != null ? `${Math.round(match.position.vs_fpm)} fpm` : 'N/A', inline: true },
                         
-                        { name: '🧭 Heading', value: match.position.heading_deg ? `${Math.round(match.position.heading_deg)}°` : 'N/A', inline: true },
-                        { name: '🆔 Virtual Org', value: match.virtualOrganization || 'None', inline: true }
+                        { name: '🧭 Heading', value: match.position.heading_deg != null ? `${Math.round(match.position.heading_deg)}°` : 'N/A', inline: true },
+                        { name: '🆔 Virtual Org', value: match.virtualOrganization || 'None', inline: true },
+                        { name: '📊 Status', value: phase, inline: true }
                     )
                     .setTimestamp(match.position.lastReportMs ? new Date(match.position.lastReportMs) : new Date())
-                    .setFooter({ text: `Server: ${targetServerName} • Status: ${match.pilotState === 0 ? 'On Ground' : 'Flying'}` });
+                    .setFooter({ text: `Server: ${session.name} • ${match.pilotState === 0 ? 'Active' : 'Paused/Away'}` });
 
-                // Add "View on Map" link if flightId exists
                 if (match.flightId) {
                     trackEmbed.addFields({ name: '🌍 Live Map', value: `[View on Inflight.info](https://inflight.info/flight/${match.flightId})` });
                 }
@@ -1580,7 +1598,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
             } catch (error) {
                 console.error("Track Command Error:", error.message);
-                await interaction.editReply("❌ **Connection Failed:** Could not retrieve live flight data from the backend.");
+                await interaction.editReply(`❌ **Connection Failed:** Could not connect to backend.\nEnsure \`${LIVE_API_URL}\` is reachable.`);
             }
         }
 
