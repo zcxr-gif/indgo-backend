@@ -1,5 +1,5 @@
 // server.js
-// A lightweight backend for Community Aircraft Contributions only.
+// A lightweight backend for Community Aircraft Contributions and Flight Trail Storage.
 
 const express = require('express');
 const mongoose = require('mongoose');
@@ -7,7 +7,13 @@ const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const axios = require('axios'); // Added for Webhook
-const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { 
+    S3Client, 
+    PutObjectCommand, 
+    DeleteObjectCommand, 
+    ListObjectsV2Command,  // <--- ADDED for listing trails
+    GetObjectCommand
+} = require('@aws-sdk/client-s3');
 const { CloudWatchClient, GetMetricStatisticsCommand } = require('@aws-sdk/client-cloudwatch');
 const sharp = require('sharp'); // Image processing library
 require('dotenv').config();
@@ -26,8 +32,9 @@ const PORT = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors()); // Allow all origins
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Increase limit for JSON body (trails can be large)
+app.use(express.json({ limit: '10mb' })); 
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // 2. CONNECT TO MONGODB
 mongoose.connect(process.env.MONGO_URI)
@@ -47,9 +54,6 @@ const CommunityAircraftSchema = new mongoose.Schema({
 const CommunityAircraft = mongoose.model('CommunityAircraft', CommunityAircraftSchema);
 
 // 4. CONFIGURE AWS CLIENTS
-// (Moved UP so they exist before the bot tries to use them)
-
-// S3 Client (Storage)
 const s3Client = new S3Client({
     region: process.env.AWS_REGION,
     credentials: {
@@ -102,6 +106,15 @@ const deleteS3Object = async (imageUrl) => {
     }
 };
 
+// Helper: Convert S3 Stream to String
+const streamToString = (stream) =>
+    new Promise((resolve, reject) => {
+        const chunks = [];
+        stream.on("data", (chunk) => chunks.push(chunk));
+        stream.on("error", reject);
+        stream.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    });
+
 // Helper: Send Discord Webhook Notification
 const sendDiscordWebhook = async (entry) => {
     if (!process.env.DISCORD_WEBHOOK_URL) return;
@@ -136,6 +149,156 @@ const sendDiscordWebhook = async (entry) => {
 app.get('/', (req, res) => {
     res.send('Community Aircraft Backend is Running.');
 });
+
+/* =========================
+ * NEW: FLIGHT TRAILS STORAGE
+ * ========================= */
+
+// GET: Fetch a user's trails
+app.get('/api/trails/:userId', async (req, res) => {
+    const { userId } = req.params;
+    try {
+        const prefix = `trails/${userId}/`;
+        const cmd = new ListObjectsV2Command({
+            Bucket: process.env.AWS_S3_BUCKET_NAME,
+            Prefix: prefix
+        });
+        const data = await s3Client.send(cmd);
+        
+        if (!data.Contents || data.Contents.length === 0) {
+            return res.json([]);
+        }
+
+        // Return list of trails with public URLs
+        const trails = data.Contents.map(f => ({
+            flightId: f.Key.split('/').pop().replace('.json', ''),
+            date: f.LastModified,
+            size: f.Size,
+            url: `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${f.Key}`
+        }));
+
+        // Sort Newest First
+        trails.sort((a, b) => b.date - a.date);
+
+        res.json(trails);
+    } catch (e) {
+        console.error("Trail Fetch Error:", e);
+        res.status(500).json({ message: "Failed to fetch trails" });
+    }
+});
+
+// POST: Save or Append to a completed flight trail
+app.post('/api/trails', async (req, res) => {
+    try {
+        const { userId, flightId, trail } = req.body;
+        
+        if (!userId || !flightId || !trail || !Array.isArray(trail)) {
+            return res.status(400).json({ message: 'Missing data or invalid trail format' });
+        }
+
+        const folderPrefix = `trails/${userId}/`;
+        const newFileKey = `${folderPrefix}${flightId}.json`;
+        
+        let finalTrail = trail;
+        let isUpdate = false;
+
+        // 1. CHECK & MERGE: Look for existing trail in S3
+        try {
+            console.log(`🔍 Checking for existing trail: ${newFileKey}`);
+            const getCmd = new GetObjectCommand({
+                Bucket: process.env.AWS_S3_BUCKET_NAME,
+                Key: newFileKey
+            });
+            
+            const { Body } = await s3Client.send(getCmd);
+            const existingData = await streamToString(Body);
+            const existingJson = JSON.parse(existingData);
+
+            if (Array.isArray(existingJson)) {
+                console.log(`🧩 Found existing trail (${existingJson.length} points). Merging...`);
+                
+                // Combine old + new
+                finalTrail = existingJson.concat(trail);
+
+                // OPTIONAL: Sort by timestamp to ensure correct order
+                finalTrail.sort((a, b) => a.t - b.t);
+
+                // OPTIONAL: Deduplicate (remove points with identical timestamps)
+                finalTrail = finalTrail.filter((item, index, self) => 
+                    index === 0 || item.t !== self[index - 1].t
+                );
+                
+                isUpdate = true;
+            }
+        } catch (err) {
+            // NoSuchKey means file doesn't exist yet, which is fine. We just create it.
+            if (err.name !== 'NoSuchKey') {
+                console.error("⚠️ Error checking S3 for existing trail:", err.message);
+            }
+        }
+
+        // 2. PRUNE: Remove files older than 48 hours (Only runs if this is a NEW file)
+        // We skip this heavy listing operation on mere updates to save performance
+        if (!isUpdate) {
+            const listCmd = new ListObjectsV2Command({
+                Bucket: process.env.AWS_S3_BUCKET_NAME,
+                Prefix: folderPrefix
+            });
+            
+            const existing = await s3Client.send(listCmd);
+            const files = existing.Contents || [];
+
+            const limitTime = new Date(Date.now() - 48 * 60 * 60 * 1000);
+            const keepFiles = [];
+            const deletePromises = [];
+
+            for (const file of files) {
+                if (file.LastModified < limitTime) {
+                    console.log(`🗑️ Expiring old trail: ${file.Key}`);
+                    deletePromises.push(s3Client.send(new DeleteObjectCommand({
+                        Bucket: process.env.AWS_S3_BUCKET_NAME, Key: file.Key
+                    })));
+                } else {
+                    keepFiles.push(file);
+                }
+            }
+
+            // LIMIT: Max 3 recent flights
+            keepFiles.sort((a, b) => a.LastModified - b.LastModified);
+            
+            // Check if we are accidentally creating a 4th file
+            // (Note: We already know this is not an update to an existing file key)
+            if (keepFiles.length >= 3) {
+                const oldest = keepFiles[0];
+                console.log(`🗑️ Max 3 reached. Deleting oldest: ${oldest.Key}`);
+                deletePromises.push(s3Client.send(new DeleteObjectCommand({
+                    Bucket: process.env.AWS_S3_BUCKET_NAME, Key: oldest.Key
+                })));
+            }
+
+            if (deletePromises.length > 0) await Promise.all(deletePromises);
+        }
+
+        // 3. SAVE FINAL TRAIL (Compressed JSON)
+        const bodyBuffer = Buffer.from(JSON.stringify(finalTrail));
+
+        await s3Client.send(new PutObjectCommand({
+            Bucket: process.env.AWS_S3_BUCKET_NAME,
+            Key: newFileKey,
+            Body: bodyBuffer,
+            ContentType: 'application/json',
+            CacheControl: 'no-cache' 
+        }));
+
+        console.log(`💾 Saved trail: ${newFileKey} (Total: ${finalTrail.length} points)`);
+        res.json({ ok: true, merged: isUpdate });
+
+    } catch (e) {
+        console.error("Trail Save Error:", e);
+        res.status(500).json({ message: "Failed to save trail" });
+    }
+});
+
 
 // GET: Fetch all aircraft contributions
 app.get('/api/aircraft', async (req, res) => {
