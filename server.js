@@ -151,6 +151,42 @@ app.get('/', (req, res) => {
 });
 
 /* =========================
+ * NEW: IMAGE PROXY FOR SCREENSHOTS
+ * ========================= */
+app.get('/api/image-proxy', async (req, res) => {
+    const imageUrl = req.query.url;
+    if (!imageUrl) {
+        return res.status(400).send('No URL provided');
+    }
+
+    try {
+        // Fetch the external image as a stream
+        const response = await axios({
+            method: 'get',
+            url: imageUrl,
+            responseType: 'stream'
+        });
+
+        // 1. Force Allow Origin * (The magic permission slip)
+        res.header("Access-Control-Allow-Origin", "*");
+        res.header("Access-Control-Allow-Methods", "GET, OPTIONS");
+        res.header("Access-Control-Allow-Headers", "Content-Type");
+
+        // 2. Forward the content type (png, jpg, webp, etc.)
+        if (response.headers['content-type']) {
+            res.header("Content-Type", response.headers['content-type']);
+        }
+
+        // 3. Pipe the image data straight to the frontend
+        response.data.pipe(res);
+
+    } catch (error) {
+        console.error("Image Proxy Error:", error.message);
+        res.status(500).send('Failed to fetch image');
+    }
+});
+
+/* =========================
  * NEW: FLIGHT TRAILS STORAGE
  * ========================= */
 
