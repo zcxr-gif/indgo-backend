@@ -7,11 +7,12 @@ const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const axios = require('axios'); // Added for Webhook
+const crypto = require('crypto'); // <--- ADDED for IP Hashing
 const { 
     S3Client, 
     PutObjectCommand, 
     DeleteObjectCommand, 
-    ListObjectsV2Command,  // <--- ADDED for listing trails
+    ListObjectsV2Command,
     GetObjectCommand
 } = require('@aws-sdk/client-s3');
 const { CloudWatchClient, GetMetricStatisticsCommand } = require('@aws-sdk/client-cloudwatch');
@@ -36,6 +37,9 @@ app.use(cors()); // Allow all origins
 app.use(express.json({ limit: '10mb' })); 
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
+// Trust Proxy (Required if behind Nginx/Heroku/Cloudflare to get real IPs)
+app.set('trust proxy', 1);
+
 // 2. CONNECT TO MONGODB
 mongoose.connect(process.env.MONGO_URI)
     .then(() => console.log('✅ MongoDB Connected'))
@@ -43,7 +47,7 @@ mongoose.connect(process.env.MONGO_URI)
 
 const CommunityAircraftSchema = new mongoose.Schema({
     contributorName: { type: String, required: true }, 
-    contributorId: { type: String, required: false }, // <--- THIS MUST BE ADDED
+    contributorId: { type: String, required: false },
     aircraftType: { type: String, required: true },    
     liveryName: { type: String, required: true },      
     tailNumber: { type: String, required: true },      
@@ -52,6 +56,23 @@ const CommunityAircraftSchema = new mongoose.Schema({
 });
 
 const CommunityAircraft = mongoose.model('CommunityAircraft', CommunityAircraftSchema);
+
+/* =========================
+ * NEW: LEADERBOARD SCHEMA
+ * ========================= */
+const DailyPilotStatsSchema = new mongoose.Schema({
+    date: { type: String, required: true }, // Format: YYYY-MM-DD
+    pilotUserId: { type: String, required: true },
+    pilotName: { type: String, required: true },
+    viewCount: { type: Number, default: 0 },
+    // We store hashed IPs to ensure unique views per day
+    uniqueViewers: { type: [String], default: [] } 
+});
+
+// Create a compound index for fast lookups
+DailyPilotStatsSchema.index({ date: 1, pilotUserId: 1 }, { unique: true });
+
+const DailyPilotStats = mongoose.model('DailyPilotStats', DailyPilotStatsSchema);
 
 // 4. CONFIGURE AWS CLIENTS
 const s3Client = new S3Client({
@@ -143,12 +164,92 @@ const sendDiscordWebhook = async (entry) => {
     }
 };
 
+/* =========================
+ * HELPER: DATE UTILS
+ * ========================= */
+const getTodayString = () => {
+    return new Date().toISOString().split('T')[0]; // Returns "YYYY-MM-DD"
+};
+
+const hashIp = (ip) => {
+    return crypto.createHash('sha256').update(ip || 'unknown').digest('hex');
+};
+
 // 5. API ROUTES
 
 // Health Check
 app.get('/', (req, res) => {
     res.send('Community Aircraft Backend is Running.');
 });
+
+/* =========================
+ * NEW: LEADERBOARD API
+ * ========================= */
+
+// POST: Track a view (Counts unique viewers per day)
+app.post('/api/leaderboard/track', async (req, res) => {
+    try {
+        const { pilotUserId, pilotName } = req.body;
+        if (!pilotUserId || !pilotName) {
+            return res.status(400).json({ message: 'Missing pilot info' });
+        }
+
+        const date = getTodayString();
+        const viewerIp = req.ip || req.connection.remoteAddress;
+        const viewerHash = hashIp(viewerIp);
+
+        // Find the record for this pilot today
+        const stats = await DailyPilotStats.findOne({ date, pilotUserId });
+
+        if (stats) {
+            // Check if this viewer has already viewed this pilot today
+            if (stats.uniqueViewers.includes(viewerHash)) {
+                // Already viewed, do not increment
+                return res.json({ success: true, counted: false });
+            }
+
+            // New unique viewer: Add hash and increment count
+            stats.uniqueViewers.push(viewerHash);
+            stats.viewCount += 1;
+            // Update name just in case they changed it mid-flight
+            stats.pilotName = pilotName; 
+            await stats.save();
+        } else {
+            // Create new record for today
+            await DailyPilotStats.create({
+                date,
+                pilotUserId,
+                pilotName,
+                viewCount: 1,
+                uniqueViewers: [viewerHash]
+            });
+        }
+
+        res.json({ success: true, counted: true });
+    } catch (error) {
+        console.error('Track View Error:', error);
+        res.status(500).json({ message: 'Error tracking view' });
+    }
+});
+
+// GET: Top 3 Most Tracked Pilots Today
+app.get('/api/leaderboard/top', async (req, res) => {
+    try {
+        const date = getTodayString();
+
+        const topPilots = await DailyPilotStats
+            .find({ date })
+            .sort({ viewCount: -1 }) // Highest views first
+            .limit(3) // Top 3
+            .select('pilotName viewCount -_id'); // Return clean data
+
+        res.json(topPilots);
+    } catch (error) {
+        console.error('Leaderboard Fetch Error:', error);
+        res.status(500).json({ message: 'Error fetching leaderboard' });
+    }
+});
+
 
 /* =========================
  * NEW: IMAGE PROXY FOR SCREENSHOTS
