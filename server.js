@@ -137,28 +137,46 @@ const streamToString = (stream) =>
     });
 
 // Helper: Send Discord Webhook Notification
-const sendDiscordWebhook = async (entry) => {
+const sendDiscordWebhook = async (entry, type = "aircraft") => {
     if (!process.env.DISCORD_WEBHOOK_URL) return;
 
     try {
-        const payload = {
-            embeds: [{
-                title: "✈️ New Aircraft Contribution!",
-                color: 5763719, // Greenish color
-                fields: [
-                    { name: "Aircraft Type", value: entry.aircraftType, inline: true },
-                    { name: "Livery", value: entry.liveryName, inline: true },
-                    { name: "Tail Number", value: entry.tailNumber, inline: true },
-                    { name: "Contributor", value: entry.contributorName, inline: false }
-                ],
-                image: { url: entry.imageUrl },
-                timestamp: new Date().toISOString(),
-                footer: { text: "Community Tracker Bot" }
-            }]
-        };
+        let payload = {};
+        
+        if (type === "aircraft") {
+            payload = {
+                embeds: [{
+                    title: "✈️ New Aircraft Contribution!",
+                    color: 5763719,
+                    fields: [
+                        { name: "Aircraft Type", value: entry.aircraftType, inline: true },
+                        { name: "Livery", value: entry.liveryName, inline: true },
+                        { name: "Tail Number", value: entry.tailNumber, inline: true },
+                        { name: "Contributor", value: entry.contributorName, inline: false }
+                    ],
+                    image: { url: entry.imageUrl },
+                    timestamp: new Date().toISOString(),
+                    footer: { text: "Community Tracker Bot" }
+                }]
+            };
+        } else if (type === "airport") {
+            payload = {
+                embeds: [{
+                    title: "🏢 New Airport Image!",
+                    color: 3447003, // Blueish
+                    fields: [
+                        { name: "ICAO", value: entry.icao, inline: true },
+                        { name: "Contributor", value: entry.contributorName, inline: true }
+                    ],
+                    image: { url: entry.imageUrl },
+                    timestamp: new Date().toISOString(),
+                    footer: { text: "Community Tracker Bot" }
+                }]
+            };
+        }
 
         await axios.post(process.env.DISCORD_WEBHOOK_URL, payload);
-        console.log(`🔔 Notification sent to Discord for ${entry.tailNumber}`);
+        console.log(`🔔 Discord notification sent for ${type}`);
     } catch (error) {
         console.error("❌ Failed to send Discord Webhook:", error.message);
     }
@@ -288,7 +306,109 @@ app.get('/api/image-proxy', async (req, res) => {
 });
 
 /* =========================
- * NEW: FLIGHT TRAILS STORAGE
+ * NEW: AIRPORT IMAGES (S3 ONLY - Metadata in Filenames)
+ * ========================= */
+
+// GET: Fetch images for a specific ICAO by parsing S3 Keys
+app.get('/api/airports/:icao', async (req, res) => {
+    try {
+        const { icao } = req.params;
+        const cleanIcao = icao.toUpperCase();
+        const prefix = `airports/${cleanIcao}/`;
+
+        const cmd = new ListObjectsV2Command({
+            Bucket: process.env.AWS_S3_BUCKET_NAME,
+            Prefix: prefix
+        });
+
+        const data = await s3Client.send(cmd);
+        
+        if (!data.Contents || data.Contents.length === 0) {
+            return res.json([]);
+        }
+
+        // Parse metadata out of the filename format: Name--Timestamp.webp
+        const images = data.Contents.map(file => {
+            const fullKey = file.Key; 
+            const fileName = fullKey.split('/').pop(); 
+            const [contributor, timestampPart] = fileName.split('--');
+            const timestamp = timestampPart ? timestampPart.replace('.webp', '') : Date.now();
+
+            return {
+                icao: cleanIcao,
+                contributorName: contributor.replace(/_/g, ' '), // Restore spaces
+                uploadedAt: new Date(parseInt(timestamp)),
+                url: `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fullKey}`,
+                id: fullKey // Useful for deletion
+            };
+        });
+
+        images.sort((a, b) => b.uploadedAt - a.uploadedAt);
+        res.json(images);
+    } catch (error) {
+        console.error('Airport Fetch Error:', error);
+        res.status(500).json({ message: 'Error fetching airport images.' });
+    }
+});
+
+// POST: Upload an airport image
+app.post('/api/airports', upload.single('image'), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ message: 'Image file is required.' });
+        
+        const { icao, contributorName } = req.body;
+        if (!icao || !contributorName) {
+            if (req.file) fs.unlink(req.file.path, () => {});
+            return res.status(400).json({ message: 'ICAO and Contributor Name are required.' });
+        }
+
+        const cleanIcao = icao.toUpperCase().replace(/[^A-Z0-9]/g, '');
+        const cleanName = contributorName.replace(/[^a-zA-Z0-9]/g, '_');
+        
+        const optimizedBuffer = await sharp(req.file.path)
+            .resize({ width: 1920, withoutEnlargement: true }) 
+            .webp({ quality: 80 }) 
+            .toBuffer();
+
+        const fileName = `airports/${cleanIcao}/${cleanName}--${Date.now()}.webp`;
+
+        await s3Client.send(new PutObjectCommand({
+            Bucket: process.env.AWS_S3_BUCKET_NAME,
+            Key: fileName,
+            Body: optimizedBuffer,
+            ContentType: 'image/webp',
+        }));
+
+        fs.unlink(req.file.path, () => {});
+
+        const fileUrl = `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileName}`;
+
+        await sendDiscordWebhook({ icao: cleanIcao, contributorName: cleanName.replace(/_/g, ' '), imageUrl: fileUrl }, "airport");
+
+        res.status(201).json({ message: 'Airport image uploaded!', url: fileUrl });
+    } catch (error) {
+        if (req.file && req.file.path) fs.unlink(req.file.path, () => {});
+        console.error('Airport Upload Error:', error);
+        res.status(500).json({ message: 'Server error during airport upload.' });
+    }
+});
+
+// DELETE: Remove an airport image (S3-only)
+app.delete('/api/airports', async (req, res) => {
+    try {
+        const { imageUrl } = req.body;
+        if (!imageUrl) return res.status(400).json({ message: 'Image URL is required for deletion.' });
+        
+        await deleteS3Object(imageUrl);
+        res.json({ message: 'Airport image deleted successfully.' });
+    } catch (error) {
+        console.error('Airport Delete Error:', error);
+        res.status(500).json({ message: 'Error deleting airport image.' });
+    }
+});
+
+/* =========================
+ * FLIGHT TRAILS STORAGE
  * ========================= */
 
 // GET: Fetch a user's trails
@@ -630,7 +750,6 @@ app.put('/api/aircraft/:id', upload.single('image'), async (req, res) => {
             console.log(`Processing new image for update: ${id}`);
             
             // FIX: Read from 'req.file.path' (Disk) instead of 'req.file.buffer' (Memory)
-            // Buffer is undefined here because Multer is using 'dest' (DiskStorage)
             const optimizedBuffer = await sharp(req.file.path)
                 .resize({ width: 1920, withoutEnlargement: true }) 
                 .webp({ quality: 80 }) 
