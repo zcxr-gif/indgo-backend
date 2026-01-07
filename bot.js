@@ -729,22 +729,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
         
         const commands = [
-
-            // --- MINI-MOD COMMANDS ---
-new SlashCommandBuilder().setName('mod_media_restrict').setDescription('Stop a user from sending GIFs/Memes').addUserOption(o => o.setName('user').setRequired(true)).addStringOption(o => o.setName('reason').setRequired(true)).setDefaultMemberPermissions(PermissionsBitField.Flags.ManageRoles),
-new SlashCommandBuilder().setName('mod_media_unrestrict').setDescription('Allow a user to send GIFs/Memes again').addUserOption(o => o.setName('user').setRequired(true)).setDefaultMemberPermissions(PermissionsBitField.Flags.ManageRoles),
-new SlashCommandBuilder().setName('mod_slowmode').setDescription('Set channel slowmode').addIntegerOption(o => o.setName('seconds').setRequired(true)).setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels),
-new SlashCommandBuilder().setName('mod_nick').setDescription('Change user nickname').addUserOption(o => o.setName('user').setRequired(true)).addStringOption(o => o.setName('nickname').setRequired(true)).setDefaultMemberPermissions(PermissionsBitField.Flags.ManageNicknames),
-
-// --- UTILITY & ENGAGEMENT ADD-INS ---
-new SlashCommandBuilder().setName('ping').setDescription('Check bot latency'),
-new SlashCommandBuilder().setName('uptime').setDescription('Check bot uptime'),
-new SlashCommandBuilder().setName('avatar').setDescription('Get user avatar').addUserOption(o => o.setName('user')),
-new SlashCommandBuilder().setName('serverinfo').setDescription('Get server stats'),
-new SlashCommandBuilder().setName('userinfo').setDescription('Get user details').addUserOption(o => o.setName('user')),
-new SlashCommandBuilder().setName('poll').setDescription('Create a simple poll').addStringOption(o => o.setName('question').setRequired(true)),
-new SlashCommandBuilder().setName('emergency').setDescription('Mental health and emergency resources')
-
             // User Commands
             new SlashCommandBuilder().setName('lookup').setDescription('Find an aircraft by Tail, Livery, or Type (Public)').addStringOption(o => o.setName('query').setDescription('Tail/Livery/Type').setAutocomplete(true).setRequired(true)),
             new SlashCommandBuilder().setName('stats').setDescription('View stats'),
@@ -903,950 +887,1010 @@ new SlashCommandBuilder().setName('emergency').setDescription('Mental health and
         }
     });
 
-    // bot.js - FULL interactionCreate replacement
-client.on('interactionCreate', async interaction => {
-    
-    // --- VARIABLE DEFINITIONS ---
-    // Extracting these here ensures they are available to all logic below
-    const { commandName, options, guild, user, member, channel } = interaction;
-
-    // --- 1. TICKET SYSTEM: INITIAL BUTTON CLICK ---
-    if (interaction.isButton() && interaction.customId === 'create_ticket_start') {
-        const topicSelect = new StringSelectMenuBuilder()
-            .setCustomId('ticket_topic_select')
-            .setPlaceholder('Select a topic for your ticket')
-            .addOptions(
-                new StringSelectMenuOptionBuilder().setLabel('Database Correction').setValue('db_correction').setDescription('Report incorrect info in the database').setEmoji('📝'),
-                new StringSelectMenuOptionBuilder().setLabel('Submission Issue').setValue('submission_issue').setDescription('Problems uploading or submitting photos').setEmoji('📸'),
-                new StringSelectMenuOptionBuilder().setLabel('Role/Account Help').setValue('role_help').setDescription('Questions about roles or your profile').setEmoji('👤'),
-                new StringSelectMenuOptionBuilder().setLabel('Other Inquiry').setValue('other').setDescription('General questions or feedback').setEmoji('❓'),
-            );
+    client.on('interactionCreate', async interaction => {
         
-        await interaction.reply({ 
-            content: 'Please select what you need help with:', 
-            components: [new ActionRowBuilder().addComponents(topicSelect)], 
-            ephemeral: true 
-        });
-        return;
-    }
-
-    // --- 2. TICKET SYSTEM: TOPIC SELECTION -> SHOW MODAL ---
-    if (interaction.isStringSelectMenu() && interaction.customId === 'ticket_topic_select') {
-        const selectedTopic = interaction.values[0];
-        
-        const modal = new ModalBuilder()
-            .setCustomId(`ticket_modal_${selectedTopic}`)
-            .setTitle('Ticket Details');
-
-        const descInput = new TextInputBuilder()
-            .setCustomId('ticket_desc')
-            .setLabel("Description (Optional)")
-            .setStyle(TextInputStyle.Paragraph)
-            .setPlaceholder("Please describe your issue here so we can help you faster.")
-            .setRequired(false);
-
-        modal.addComponents(new ActionRowBuilder().addComponents(descInput));
-        await interaction.showModal(modal);
-        return;
-    }
-
-    // --- 3. TICKET SYSTEM: MODAL SUBMIT -> CREATE THREAD ---
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('ticket_modal_')) {
-        await interaction.deferReply({ ephemeral: true });
-        
-        const topicKey = interaction.customId.replace('ticket_modal_', '');
-        const description = interaction.fields.getTextInputValue('ticket_desc') || 'No description provided.';
-        
-        const topicTitles = {
-            'db_correction': 'Database Correction',
-            'submission_issue': 'Submission Issue',
-            'role_help': 'Role/Account Help',
-            'other': 'Other Inquiry'
-        };
-        const topicTitle = topicTitles[topicKey] || 'Support Ticket';
-
-        try {
-            const ticketChannel = await client.channels.fetch(TICKET_PANEL_CHANNEL_ID);
-            if (!ticketChannel) throw new Error("Ticket channel not configured correctly.");
-
-            const threadName = `ticket-${interaction.user.username}-${Date.now().toString().slice(-4)}`;
+        // --- 1. TICKET SYSTEM: INITIAL BUTTON CLICK ---
+        if (interaction.isButton() && interaction.customId === 'create_ticket_start') {
+            const topicSelect = new StringSelectMenuBuilder()
+                .setCustomId('ticket_topic_select')
+                .setPlaceholder('Select a topic for your ticket')
+                .addOptions(
+                    new StringSelectMenuOptionBuilder().setLabel('Database Correction').setValue('db_correction').setDescription('Report incorrect info in the database').setEmoji('📝'),
+                    new StringSelectMenuOptionBuilder().setLabel('Submission Issue').setValue('submission_issue').setDescription('Problems uploading or submitting photos').setEmoji('📸'),
+                    new StringSelectMenuOptionBuilder().setLabel('Role/Account Help').setValue('role_help').setDescription('Questions about roles or your profile').setEmoji('👤'),
+                    new StringSelectMenuOptionBuilder().setLabel('Other Inquiry').setValue('other').setDescription('General questions or feedback').setEmoji('❓'),
+                );
             
-            const thread = await ticketChannel.threads.create({
-                name: threadName,
-                type: ChannelType.PrivateThread, 
-                autoArchiveDuration: 1440,
-                reason: `Support ticket for ${interaction.user.tag}`
+            await interaction.reply({ 
+                content: 'Please select what you need help with:', 
+                components: [new ActionRowBuilder().addComponents(topicSelect)], 
+                ephemeral: true 
             });
-
-            await thread.members.add(interaction.user.id);
-            
-            const ticketEmbed = new EmbedBuilder()
-                .setTitle(`🎫 ${topicTitle}`)
-                .setColor(0x00FF00)
-                .addFields(
-                    { name: 'User', value: `<@${interaction.user.id}>`, inline: true },
-                    { name: 'Topic', value: topicTitle, inline: true },
-                    { name: 'Description', value: description }
-                )
-                .setTimestamp();
-
-            const closeButton = new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId('close_ticket_action')
-                    .setLabel('Close Ticket (Admin Only)')
-                    .setStyle(ButtonStyle.Danger)
-                    .setEmoji('🔒')
-            );
-
-            await thread.send({ 
-                content: `Welcome <@${interaction.user.id}>. Support will be with you shortly.\n<@&${ADMIN_ROLE_ID}>`, 
-                embeds: [ticketEmbed], 
-                components: [closeButton] 
-            });
-
-            await interaction.editReply({ content: `✅ Ticket created! Head over to <#${thread.id}>.` });
-
-        } catch (error) {
-            console.error("Ticket Creation Error:", error);
-            await interaction.editReply({ content: "❌ Failed to create ticket. Please contact an admin directly." });
-        }
-        return;
-    }
-
-    // --- 4. TICKET SYSTEM: CLOSE TICKET (ADMIN ONLY) ---
-    if (interaction.isButton() && interaction.customId === 'close_ticket_action') {
-        await interaction.deferReply({ ephemeral: true });
-
-        if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID)) {
-            return interaction.editReply({ content: "❌ Only Admins can close tickets." });
+            return;
         }
 
-        const thread = interaction.channel;
-        if (!thread.isThread()) return interaction.editReply({ content: "This is not a thread." });
-
-        try {
-            const messages = await thread.messages.fetch({ limit: 100 });
-            const reversed = Array.from(messages.values()).reverse();
+        // --- 2. TICKET SYSTEM: TOPIC SELECTION -> SHOW MODAL ---
+        if (interaction.isStringSelectMenu() && interaction.customId === 'ticket_topic_select') {
+            const selectedTopic = interaction.values[0];
             
-            let transcriptText = `TRANSCRIPT FOR TICKET: ${thread.name}\nDATE: ${new Date().toISOString()}\n------------------------------------------------\n\n`;
-            
-            reversed.forEach(m => {
-                const time = new Date(m.createdTimestamp).toLocaleString();
-                const content = m.content || '[No Content]';
-                const attachments = m.attachments.size > 0 ? ` [Attachments: ${m.attachments.map(a => a.url).join(', ')}]` : '';
-                transcriptText += `[${time}] ${m.author.tag}: ${content}${attachments}\n`;
-            });
+            // We encode the topic into the modal ID to pass it to the next step
+            const modal = new ModalBuilder()
+                .setCustomId(`ticket_modal_${selectedTopic}`)
+                .setTitle('Ticket Details');
 
-            const transcriptChannel = await client.channels.fetch(TRANSCRIPT_CHANNEL_ID);
-            if (transcriptChannel) {
-                const buffer = Buffer.from(transcriptText, 'utf-8');
-                const attachment = new AttachmentBuilder(buffer, { name: `${thread.name}-transcript.txt` });
+            const descInput = new TextInputBuilder()
+                .setCustomId('ticket_desc')
+                .setLabel("Description (Optional)")
+                .setStyle(TextInputStyle.Paragraph)
+                .setPlaceholder("Please describe your issue here so we can help you faster.")
+                .setRequired(false);
+
+            modal.addComponents(new ActionRowBuilder().addComponents(descInput));
+            await interaction.showModal(modal);
+            return;
+        }
+
+        // --- 3. TICKET SYSTEM: MODAL SUBMIT -> CREATE THREAD ---
+        if (interaction.isModalSubmit() && interaction.customId.startsWith('ticket_modal_')) {
+            await interaction.deferReply({ ephemeral: true });
+            
+            const topicKey = interaction.customId.replace('ticket_modal_', '');
+            const description = interaction.fields.getTextInputValue('ticket_desc') || 'No description provided.';
+            
+            // Map keys to readable titles
+            const topicTitles = {
+                'db_correction': 'Database Correction',
+                'submission_issue': 'Submission Issue',
+                'role_help': 'Role/Account Help',
+                'other': 'Other Inquiry'
+            };
+            const topicTitle = topicTitles[topicKey] || 'Support Ticket';
+
+            try {
+                // Ensure we are in the ticket channel (or fetch it)
+                const ticketChannel = await client.channels.fetch(TICKET_PANEL_CHANNEL_ID);
+                if (!ticketChannel) throw new Error("Ticket channel not configured correctly.");
+
+                // Create Private Thread
+                const threadName = `ticket-${interaction.user.username}-${Date.now().toString().slice(-4)}`;
                 
-                const logEmbed = new EmbedBuilder()
-                    .setTitle('🔒 Ticket Closed')
-                    .setColor(0xFF0000)
+                const thread = await ticketChannel.threads.create({
+                    name: threadName,
+                    type: ChannelType.PrivateThread, 
+                    autoArchiveDuration: 1440, // 24 hours
+                    reason: `Support ticket for ${interaction.user.tag}`
+                });
+
+                // Add User
+                await thread.members.add(interaction.user.id);
+                
+                // Construct the initial message inside the thread
+                const ticketEmbed = new EmbedBuilder()
+                    .setTitle(`🎫 ${topicTitle}`)
+                    .setColor(0x00FF00)
                     .addFields(
-                        { name: 'Ticket', value: thread.name, inline: true },
-                        { name: 'Closed By', value: interaction.user.tag, inline: true }
+                        { name: 'User', value: `<@${interaction.user.id}>`, inline: true },
+                        { name: 'Topic', value: topicTitle, inline: true },
+                        { name: 'Description', value: description }
                     )
                     .setTimestamp();
 
-                await transcriptChannel.send({ embeds: [logEmbed], files: [attachment] });
+                const closeButton = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder()
+                        .setCustomId('close_ticket_action')
+                        .setLabel('Close Ticket (Admin Only)')
+                        .setStyle(ButtonStyle.Danger)
+                        .setEmoji('🔒')
+                );
+
+                // Ping admins and send embed
+                await thread.send({ 
+                    content: `Welcome <@${interaction.user.id}>. Support will be with you shortly.\n<@&${ADMIN_ROLE_ID}>`, 
+                    embeds: [ticketEmbed], 
+                    components: [closeButton] 
+                });
+
+                await interaction.editReply({ content: `✅ Ticket created! Head over to <#${thread.id}>.` });
+
+            } catch (error) {
+                console.error("Ticket Creation Error:", error);
+                await interaction.editReply({ content: "❌ Failed to create ticket. Please contact an admin directly." });
             }
-
-            await interaction.editReply("Ticket closed. Deleting thread in 5 seconds...");
-            
-            setTimeout(async () => {
-                try { await thread.delete(); } catch(e) {}
-            }, 5000);
-
-        } catch (error) {
-            console.error("Ticket Close Error:", error);
-            await interaction.editReply("❌ Error closing ticket.");
-        }
-        return;
-    }
-
-    if (interaction.isAutocomplete()) {
-        const focused = interaction.options.getFocused(true);
-        
-        if (interaction.commandName === 'lookup' && focused.name === 'query') {
-            const list = await fetchAircraftMetadata();
-            const filtered = list.filter(a => a.name.toLowerCase().includes(focused.value.toLowerCase())).slice(0, 25);
-            await interaction.respond(filtered.map(a => ({ name: a.name, value: a.name })));
             return;
         }
 
-        if (focused.name === 'aircraft_type') {
-            const list = await fetchAircraftMetadata();
-            const filtered = list.filter(a => a.name.toLowerCase().includes(focused.value.toLowerCase())).slice(0, 25);
-            await interaction.respond(filtered.map(a => ({ name: a.name, value: a.name })));
-            return;
-        }
+        // --- 4. TICKET SYSTEM: CLOSE TICKET (ADMIN ONLY) ---
+        if (interaction.isButton() && interaction.customId === 'close_ticket_action') {
+            await interaction.deferReply({ ephemeral: true });
 
-        if (focused.name === 'livery') {
-            const selectedType = interaction.options.getString('aircraft_type');
-            if (!selectedType) return interaction.respond([{ name: "Select Aircraft Type first", value: "Unknown" }]);
-
-            const list = await fetchAircraftMetadata();
-            const matched = list.find(a => a.name === selectedType);
-
-            if (matched) {
-                const liveries = await fetchLiveriesForAircraft(matched.id);
-                const filtered = liveries.filter(l => l.toLowerCase().includes(focused.value.toLowerCase())).slice(0, 24); 
-                const options = filtered.map(l => ({ name: l, value: l }));
-                if (focused.value && !liveries.includes(focused.value)) options.push({ name: `${focused.value} (Custom)`, value: focused.value });
-                await interaction.respond(options);
-            } else {
-                await interaction.respond([{ name: "Aircraft not found", value: "Unknown" }]);
-            }
-        }
-    }
-
-    if (interaction.isButton()) {
-        
-        if (interaction.customId.startsWith('edit_admin_')) {
-            const receivedEmbed = interaction.message.embeds[0];
-            
-            const currentTail = receivedEmbed.fields.find(f => f.name === 'Tail Number')?.value || 'UNKNOWN';
-            const currentType = receivedEmbed.fields.find(f => f.name === 'Aircraft Type')?.value || '';
-            const currentLivery = receivedEmbed.fields.find(f => f.name === 'Livery')?.value || '';
-
-            const modal = new ModalBuilder()
-                .setCustomId('admin_edit_modal')
-                .setTitle('Edit Submission Details');
-
-            const tailInput = new TextInputBuilder()
-                .setCustomId('ae_tail')
-                .setLabel("Tail Number")
-                .setPlaceholder("e.g. N12345") 
-                .setValue(currentTail)
-                .setStyle(TextInputStyle.Short)
-                .setRequired(true);
-
-            const typeInput = new TextInputBuilder()
-                .setCustomId('ae_type')
-                .setLabel("Aircraft Type")
-                .setPlaceholder("e.g. 737-8 MAX") 
-                .setValue(currentType)
-                .setStyle(TextInputStyle.Short)
-                .setRequired(true);
-
-            const liveryInput = new TextInputBuilder()
-                .setCustomId('ae_livery')
-                .setLabel("Livery")
-                .setPlaceholder("e.g. Delta Air Lines") 
-                .setValue(currentLivery)
-                .setStyle(TextInputStyle.Short)
-                .setRequired(true);
-
-            modal.addComponents(
-                new ActionRowBuilder().addComponents(tailInput),
-                new ActionRowBuilder().addComponents(typeInput),
-                new ActionRowBuilder().addComponents(liveryInput)
-            );
-
-            await interaction.showModal(modal);
-            return;
-        }
-
-        if (interaction.customId.startsWith('start_ident_')) {
-            const originalUserId = interaction.customId.split('_')[2];
-            if (interaction.user.id !== originalUserId) {
-                return interaction.reply({ content: "This is not your photo.", ephemeral: true });
+            // Check Admin Permissions
+            if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID)) {
+                return interaction.editReply({ content: "❌ Only Admins can close tickets." });
             }
 
-            const modal = new ModalBuilder().setCustomId('identify_modal').setTitle('Aircraft Details');
-            
-            const typeInput = new TextInputBuilder()
-                .setCustomId('i_type')
-                .setLabel("What aircraft is this?")
-                .setPlaceholder("e.g. 737-8 MAX, 777-300ER") 
-                .setStyle(TextInputStyle.Short)
-                .setRequired(true);
-                
-            const liveryInput = new TextInputBuilder()
-                .setCustomId('i_livery')
-                .setLabel("What livery is this?")
-                .setPlaceholder("e.g. Delta Air Lines, Generic, Private") 
-                .setStyle(TextInputStyle.Short)
-                .setRequired(true);
-            
-            modal.addComponents(new ActionRowBuilder().addComponents(typeInput), new ActionRowBuilder().addComponents(liveryInput));
-            await interaction.showModal(modal);
-            return;
-        }
-
-        if (interaction.customId.startsWith('approve_')) {
-            await interaction.deferUpdate();
-            
-            const [_, targetUserId] = interaction.customId.split('_');
-            let receivedEmbed = interaction.message.embeds[0];
-            
-            const tailField = receivedEmbed.fields.find(f => f.name === 'Tail Number').value;
-            const typeField = receivedEmbed.fields.find(f => f.name === 'Aircraft Type').value;
-            const liveryField = receivedEmbed.fields.find(f => f.name === 'Livery').value;
-            
-            let imageUrl = receivedEmbed.image?.url;
-            if (!imageUrl && interaction.message.attachments.size > 0) {
-                imageUrl = interaction.message.attachments.first().url;
-            }
-
-            const footerText = receivedEmbed.footer?.text || '';
-            const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
+            const thread = interaction.channel;
+            if (!thread.isThread()) return interaction.editReply({ content: "This is not a thread." });
 
             try {
-                const existingEntry = await CommunityAircraftModel.findOne({ 
-                    aircraftType: { $regex: new RegExp(`^${escapeRegex(typeField)}$`, "i") },
-                    liveryName: { $regex: new RegExp(`^${escapeRegex(liveryField)}$`, "i") }
+                // Generate Transcript
+                const messages = await thread.messages.fetch({ limit: 100 });
+                const reversed = Array.from(messages.values()).reverse();
+                
+                let transcriptText = `TRANSCRIPT FOR TICKET: ${thread.name}\nDATE: ${new Date().toISOString()}\n------------------------------------------------\n\n`;
+                
+                reversed.forEach(m => {
+                    const time = new Date(m.createdTimestamp).toLocaleString();
+                    const content = m.content || '[No Content]';
+                    const attachments = m.attachments.size > 0 ? ` [Attachments: ${m.attachments.map(a => a.url).join(', ')}]` : '';
+                    transcriptText += `[${time}] ${m.author.tag}: ${content}${attachments}\n`;
                 });
-                
-                const permanentUrl = await uploadImageToS3(imageUrl, tailField);
-                
-                let contributorName = "Unknown";
-                try { 
-                    const memberFetch = await interaction.guild.members.fetch(targetUserId); 
-                    contributorName = memberFetch.displayName;
-                } catch (e) {
-                    try {
-                        const cUser = await client.users.fetch(targetUserId);
-                        contributorName = cUser.username;
-                    } catch (err) {}
+
+                // Send to Transcript Channel
+                const transcriptChannel = await client.channels.fetch(TRANSCRIPT_CHANNEL_ID);
+                if (transcriptChannel) {
+                    const buffer = Buffer.from(transcriptText, 'utf-8');
+                    const attachment = new AttachmentBuilder(buffer, { name: `${thread.name}-transcript.txt` });
+                    
+                    const logEmbed = new EmbedBuilder()
+                        .setTitle('🔒 Ticket Closed')
+                        .setColor(0xFF0000)
+                        .addFields(
+                            { name: 'Ticket', value: thread.name, inline: true },
+                            { name: 'Closed By', value: interaction.user.tag, inline: true }
+                        )
+                        .setTimestamp();
+
+                    await transcriptChannel.send({ embeds: [logEmbed], files: [attachment] });
                 }
 
-                const updateData = {
-                    contributorName: contributorName,
-                    contributorId: targetUserId, 
-                    aircraftType: typeField,
-                    liveryName: liveryField,
-                    imageUrl: permanentUrl,
-                    uploadedAt: new Date()
-                };
-                if (tailField !== 'UNKNOWN') updateData.tailNumber = tailField.toUpperCase();
+                await interaction.editReply("Ticket closed. Deleting thread in 5 seconds...");
+                
+                setTimeout(async () => {
+                    try { await thread.delete(); } catch(e) {}
+                }, 5000);
 
-                if (existingEntry) {
-                    Object.assign(existingEntry, updateData);
-                    await existingEntry.save();
+            } catch (error) {
+                console.error("Ticket Close Error:", error);
+                await interaction.editReply("❌ Error closing ticket.");
+            }
+            return;
+        }
+
+        if (interaction.isAutocomplete()) {
+            const focused = interaction.options.getFocused(true);
+            
+            if (interaction.commandName === 'lookup' && focused.name === 'query') {
+                const list = await fetchAircraftMetadata();
+                const filtered = list.filter(a => a.name.toLowerCase().includes(focused.value.toLowerCase())).slice(0, 25);
+                await interaction.respond(filtered.map(a => ({ name: a.name, value: a.name })));
+                return;
+            }
+
+            if (focused.name === 'aircraft_type') {
+                const list = await fetchAircraftMetadata();
+                const filtered = list.filter(a => a.name.toLowerCase().includes(focused.value.toLowerCase())).slice(0, 25);
+                await interaction.respond(filtered.map(a => ({ name: a.name, value: a.name })));
+                return;
+            }
+
+            if (focused.name === 'livery') {
+                const selectedType = interaction.options.getString('aircraft_type');
+                if (!selectedType) return interaction.respond([{ name: "Select Aircraft Type first", value: "Unknown" }]);
+
+                const list = await fetchAircraftMetadata();
+                const matched = list.find(a => a.name === selectedType);
+
+                if (matched) {
+                    const liveries = await fetchLiveriesForAircraft(matched.id);
+                    const filtered = liveries.filter(l => l.toLowerCase().includes(focused.value.toLowerCase())).slice(0, 24); 
+                    const options = filtered.map(l => ({ name: l, value: l }));
+                    if (focused.value && !liveries.includes(focused.value)) options.push({ name: `${focused.value} (Custom)`, value: focused.value });
+                    await interaction.respond(options);
                 } else {
-                    await new CommunityAircraftModel(updateData).save();
+                    await interaction.respond([{ name: "Aircraft not found", value: "Unknown" }]);
                 }
+            }
+        }
+
+        if (interaction.isButton()) {
+            
+            if (interaction.customId.startsWith('edit_admin_')) {
+                const receivedEmbed = interaction.message.embeds[0];
+                
+                const currentTail = receivedEmbed.fields.find(f => f.name === 'Tail Number')?.value || 'UNKNOWN';
+                const currentType = receivedEmbed.fields.find(f => f.name === 'Aircraft Type')?.value || '';
+                const currentLivery = receivedEmbed.fields.find(f => f.name === 'Livery')?.value || '';
+
+                const modal = new ModalBuilder()
+                    .setCustomId('admin_edit_modal')
+                    .setTitle('Edit Submission Details');
+
+                const tailInput = new TextInputBuilder()
+                    .setCustomId('ae_tail')
+                    .setLabel("Tail Number")
+                    .setPlaceholder("e.g. N12345") 
+                    .setValue(currentTail)
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true);
+
+                const typeInput = new TextInputBuilder()
+                    .setCustomId('ae_type')
+                    .setLabel("Aircraft Type")
+                    .setPlaceholder("e.g. 737-8 MAX") 
+                    .setValue(currentType)
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true);
+
+                const liveryInput = new TextInputBuilder()
+                    .setCustomId('ae_livery')
+                    .setLabel("Livery")
+                    .setPlaceholder("e.g. Delta Air Lines") 
+                    .setValue(currentLivery)
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true);
+
+                modal.addComponents(
+                    new ActionRowBuilder().addComponents(tailInput),
+                    new ActionRowBuilder().addComponents(typeInput),
+                    new ActionRowBuilder().addComponents(liveryInput)
+                );
+
+                await interaction.showModal(modal);
+                return;
+            }
+
+            if (interaction.customId.startsWith('start_ident_')) {
+                const originalUserId = interaction.customId.split('_')[2];
+                if (interaction.user.id !== originalUserId) {
+                    return interaction.reply({ content: "This is not your photo.", ephemeral: true });
+                }
+
+                const modal = new ModalBuilder().setCustomId('identify_modal').setTitle('Aircraft Details');
+                
+                const typeInput = new TextInputBuilder()
+                    .setCustomId('i_type')
+                    .setLabel("What aircraft is this?")
+                    .setPlaceholder("e.g. 737-8 MAX, 777-300ER") 
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true);
+                    
+                const liveryInput = new TextInputBuilder()
+                    .setCustomId('i_livery')
+                    .setLabel("What livery is this?")
+                    .setPlaceholder("e.g. Delta Air Lines, Generic, Private") 
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true);
+                
+                modal.addComponents(new ActionRowBuilder().addComponents(typeInput), new ActionRowBuilder().addComponents(liveryInput));
+                await interaction.showModal(modal);
+                return;
+            }
+
+            if (interaction.customId.startsWith('approve_')) {
+                await interaction.deferUpdate();
+                
+                const [_, targetUserId] = interaction.customId.split('_');
+                let receivedEmbed = interaction.message.embeds[0];
+                
+                const tailField = receivedEmbed.fields.find(f => f.name === 'Tail Number').value;
+                const typeField = receivedEmbed.fields.find(f => f.name === 'Aircraft Type').value;
+                const liveryField = receivedEmbed.fields.find(f => f.name === 'Livery').value;
+                
+                let imageUrl = receivedEmbed.image?.url;
+                if (!imageUrl && interaction.message.attachments.size > 0) {
+                    imageUrl = interaction.message.attachments.first().url;
+                }
+
+                const footerText = receivedEmbed.footer?.text || '';
+                const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
 
                 try {
-                    const memberFetch = await interaction.guild.members.fetch(targetUserId);
-                    if (CONTRIBUTOR_ROLE_ID) await memberFetch.roles.add(CONTRIBUTOR_ROLE_ID);
-                } catch (e) {}
+                    const existingEntry = await CommunityAircraftModel.findOne({ 
+                        aircraftType: { $regex: new RegExp(`^${escapeRegex(typeField)}$`, "i") },
+                        liveryName: { $regex: new RegExp(`^${escapeRegex(liveryField)}$`, "i") }
+                    });
+                    
+                    const permanentUrl = await uploadImageToS3(imageUrl, tailField);
+                    
+                    let contributorName = "Unknown";
+                    try { 
+                        const member = await interaction.guild.members.fetch(targetUserId); 
+                        contributorName = member.displayName;
+                    } catch (e) {
+                        try {
+                            const cUser = await client.users.fetch(targetUserId);
+                            contributorName = cUser.username;
+                        } catch (err) {}
+                    }
 
-                const approveEmbed = EmbedBuilder.from(receivedEmbed)
-                    .setColor(0x00FF00)
-                    .setTitle('✅ Submission Approved')
-                    .setImage(null) 
-                    .setFooter({ text: `Approved by ${interaction.user.tag}` });
+                    const updateData = {
+                        contributorName: contributorName,
+                        contributorId: targetUserId, 
+                        aircraftType: typeField,
+                        liveryName: liveryField,
+                        imageUrl: permanentUrl,
+                        uploadedAt: new Date()
+                    };
+                    if (tailField !== 'UNKNOWN') updateData.tailNumber = tailField.toUpperCase();
+
+                    if (existingEntry) {
+                        Object.assign(existingEntry, updateData);
+                        await existingEntry.save();
+                    } else {
+                        await new CommunityAircraftModel(updateData).save();
+                    }
+
+                    try {
+                        const member = await interaction.guild.members.fetch(targetUserId);
+                        if (CONTRIBUTOR_ROLE_ID) await member.roles.add(CONTRIBUTOR_ROLE_ID);
+                    } catch (e) {}
+
+                    const approveEmbed = EmbedBuilder.from(receivedEmbed)
+                        .setColor(0x00FF00)
+                        .setTitle('✅ Submission Approved')
+                        .setImage(null) 
+                        .setFooter({ text: `Approved by ${interaction.user.tag}` });
+                    
+                    await interaction.editReply({ embeds: [approveEmbed], components: [] });
+
+                    if (publicMsgId) {
+                        try {
+                            const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
+                            const publicMsg = await feedChannel.messages.fetch(publicMsgId);
+                            const publicEmbed = EmbedBuilder.from(publicMsg.embeds[0])
+                                .setTitle('✅ Verified Aircraft Spotted!')
+                                .setColor(0x00FF00)
+                                .setDescription(`Verified and added to database.`)
+                                .setImage(null)
+                                .setFooter({ text: 'Verified by Staff' });
+                            
+                            await publicMsg.edit({ content: permanentUrl, embeds: [publicEmbed], files: [] });
+                        } catch (e) {}
+                    }
+                    
+                    try { 
+                        const user = await client.users.fetch(targetUserId);
+                        const userNotifyEmbed = new EmbedBuilder()
+                            .setTitle('✅ Submission Approved')
+                            .setColor(0x00FF00)
+                            .setDescription(`Your photo of **${typeField}** has been approved!`)
+                            .setImage(permanentUrl); 
+                        await user.send({ embeds: [userNotifyEmbed] }); 
+                    } catch (e) { }
+
+                    receivedEmbed = null;
+
+                } catch (error) {
+                    console.error(error);
+                    await interaction.followUp({ content: '❌ Error saving to database/S3.', ephemeral: true });
+                }
+            }
+
+            if (interaction.customId.startsWith('reject_')) {
+                const targetUserId = interaction.customId.split('_')[1];
+                const modal = new ModalBuilder().setCustomId(`rejectModal_${targetUserId}`).setTitle('Rejection Reason');
+                const reasonInput = new TextInputBuilder().setCustomId('reasonInput').setLabel("Why is this being rejected?").setStyle(TextInputStyle.Paragraph).setRequired(true);
+                modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
+                await interaction.showModal(modal);
+            }
+        }
+
+        if (interaction.isModalSubmit()) {
+
+            if (interaction.customId === 'admin_edit_modal') {
+                await interaction.deferUpdate();
                 
-                await interaction.editReply({ embeds: [approveEmbed], components: [] });
+                // Let is used here so we can update the tail if auto-lookup finds a match
+                let newTail = interaction.fields.getTextInputValue('ae_tail');
+                const newType = interaction.fields.getTextInputValue('ae_type');
+                const newLivery = interaction.fields.getTextInputValue('ae_livery');
+
+                const oldEmbed = interaction.message.embeds[0];
+                const oldTail = oldEmbed.fields.find(f => f.name === 'Tail Number')?.value || 'UNKNOWN';
+
+                // --- AUTO REGISTRATION RE-LOOKUP LOGIC ---
+                // If the tail field hasn't been manually changed by the moderator (it equals the old value),
+                // OR if the current tail is simply 'UNKNOWN', we attempt to re-calculate the registration
+                // based on the newly edited Aircraft Type and Livery.
+                if (newTail === oldTail || newTail.toUpperCase() === 'UNKNOWN') {
+                    const reCheckReg = lookupRegistration(newType, newLivery);
+                    if (reCheckReg) {
+                        newTail = reCheckReg;
+                    }
+                }
+                // --- END LOGIC ---
+
+                const newEmbed = EmbedBuilder.from(oldEmbed);
+
+                const fields = newEmbed.data.fields;
+                const tailIdx = fields.findIndex(f => f.name === 'Tail Number');
+                if (tailIdx >= 0) fields[tailIdx].value = newTail.toUpperCase();
+                
+                const typeIdx = fields.findIndex(f => f.name === 'Aircraft Type');
+                if (typeIdx >= 0) fields[typeIdx].value = newType;
+
+                const liveryIdx = fields.findIndex(f => f.name === 'Livery');
+                if (liveryIdx >= 0) fields[liveryIdx].value = newLivery;
+
+                newEmbed.setFields(fields);
+                
+                await interaction.editReply({ embeds: [newEmbed] });
+                return;
+            }
+
+            if (interaction.customId === 'identify_modal') {
+                await interaction.deferReply({ ephemeral: true });
+
+                const type = interaction.fields.getTextInputValue('i_type');
+                const livery = interaction.fields.getTextInputValue('i_livery');
+                let tail = null; 
+
+                let photoUrl = null;
+                try {
+                    if (interaction.message.reference && interaction.message.reference.messageId) {
+                        const originalMsg = await interaction.channel.messages.fetch(interaction.message.reference.messageId);
+                        if (originalMsg && originalMsg.attachments.size > 0) {
+                            photoUrl = originalMsg.attachments.first().url;
+                        }
+                    }
+                } catch (err) { 
+                    console.error("Could not fetch original image:", err); 
+                }
+
+                if (!photoUrl) {
+                    return interaction.editReply("❌ Could not find the original image. Please upload again.");
+                }
+
+                await startSubmissionFlow(interaction, type, livery, tail, photoUrl, interaction.user, interaction.channelId);
+                
+                try { await interaction.message.delete(); } catch(e) {}
+                return;
+            }
+
+            if (interaction.customId.startsWith('rejectModal_')) {
+                await interaction.deferUpdate(); 
+                const targetUserId = interaction.customId.split('_')[1];
+                const reason = interaction.fields.getTextInputValue('reasonInput');
+                
+                let originalEmbed = interaction.message.embeds[0];
+                const aircraftName = originalEmbed.fields.find(f => f.name === 'Aircraft Type')?.value || 'Unknown Aircraft';
+                
+                let thumbUrl = originalEmbed.image?.url;
+                if (!thumbUrl && interaction.message.attachments.size > 0) {
+                     thumbUrl = interaction.message.attachments.first().url;
+                }
+
+                const footerText = originalEmbed.footer?.text || '';
+                const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
+                const originChannelId = footerText.match(/Ch: (\d+)/)?.[1];
+
+                const rejectedEmbed = EmbedBuilder.from(originalEmbed)
+                    .setTitle('❌ Submission Rejected')
+                    .setColor(0xFF0000)
+                    .setDescription(`**Reason:** ${reason}`)
+                    .setImage(null) 
+                    .setFooter({ text: `Rejected by ${interaction.user.tag}` });
+                
+                await interaction.editReply({ embeds: [rejectedEmbed], components: [] }); 
 
                 if (publicMsgId) {
                     try {
                         const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
                         const publicMsg = await feedChannel.messages.fetch(publicMsgId);
-                        const publicEmbed = EmbedBuilder.from(publicMsg.embeds[0])
-                            .setTitle('✅ Verified Aircraft Spotted!')
-                            .setColor(0x00FF00)
-                            .setDescription(`Verified and added to database.`)
-                            .setImage(null)
-                            .setFooter({ text: 'Verified by Staff' });
-                        
-                        await publicMsg.edit({ content: permanentUrl, embeds: [publicEmbed], files: [] });
+                        if (publicMsg) {
+                            const publicRejectedEmbed = EmbedBuilder.from(publicMsg.embeds[0])
+                                .setTitle('❌ Submission Rejected')
+                                .setColor(0xFF0000) 
+                                .setDescription(`This submission was not accepted by the moderators.`)
+                                .setImage(null) 
+                                .setFooter({ text: `Reviewed by Staff` });
+                            await publicMsg.edit({ embeds: [publicRejectedEmbed] });
+                        }
                     } catch (e) {}
                 }
-                
-                try { 
-                    const userFetch = await client.users.fetch(targetUserId);
-                    const userNotifyEmbed = new EmbedBuilder()
-                        .setTitle('✅ Submission Approved')
-                        .setColor(0x00FF00)
-                        .setDescription(`Your photo of **${typeField}** has been approved!`)
-                        .setImage(permanentUrl); 
-                    await userFetch.send({ embeds: [userNotifyEmbed] }); 
-                } catch (e) { }
 
-                receivedEmbed = null;
+                if (originChannelId) {
+                    try {
+                        const originChannel = await client.channels.fetch(originChannelId);
+                        if (originChannel) {
+                            const rejectionNotifyEmbed = new EmbedBuilder()
+                                .setTitle('❌ Photo Rejected')
+                                .setColor(0xFF0000)
+                                .setDescription(`Hey <@${targetUserId}>, this specific photo was rejected.`)
+                                .addFields({ name: 'Reason', value: reason })
+                                .setThumbnail(thumbUrl) 
+                                .setFooter({ text: 'You can upload a different photo below to try again!' });
+
+                            await originChannel.send({ embeds: [rejectionNotifyEmbed] });
+                        }
+                    } catch (e) {
+                        try { (await client.users.fetch(targetUserId)).send(`❌ Your submission for **${aircraftName}** was rejected: ${reason}`); } catch (e) {}
+                    }
+                }
+                
+                originalEmbed = null;
+            }
+        }
+
+        if (!interaction.isChatInputCommand()) return;
+
+        // --- HANDLER: MODERATION COMMANDS ---
+        if (interaction.commandName.startsWith('mod_')) {
+            // Permission Check specifically for the Admin Role ID for extra security
+            const hasAdminRole = interaction.member.roles.cache.has(ADMIN_ROLE_ID);
+            const isAdmin = interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
+            
+            if (!hasAdminRole && !isAdmin) {
+                return interaction.reply({ content: '❌ Access Denied: Missing Admin Privileges.', ephemeral: true });
+            }
+
+            const targetUser = interaction.options.getUser('user');
+            const targetMember = targetUser ? await interaction.guild.members.fetch(targetUser.id).catch(() => null) : null;
+            const reason = interaction.options.getString('reason') || 'No reason provided';
+
+            try {
+                if (interaction.commandName === 'mod_kick') {
+                    if (!targetMember) return interaction.reply({ content: 'User not found in server.', ephemeral: true });
+                    await targetMember.kick(reason);
+                    await interaction.reply({ content: `✅ Kicked ${targetUser.tag}.`, ephemeral: true });
+                    await logModAction('KICK', interaction.user, targetUser, reason);
+                }
+
+                if (interaction.commandName === 'mod_ban') {
+                    await interaction.guild.members.ban(targetUser, { reason });
+                    await interaction.reply({ content: `✅ Banned ${targetUser.tag}.`, ephemeral: true });
+                    await logModAction('BAN', interaction.user, targetUser, reason);
+                }
+
+                if (interaction.commandName === 'mod_timeout') {
+                    if (!targetMember) return interaction.reply({ content: 'User not found.', ephemeral: true });
+                    const minutes = interaction.options.getInteger('duration');
+                    await targetMember.timeout(minutes * 60 * 1000, reason);
+                    await interaction.reply({ content: `✅ Timed out ${targetUser.tag} for ${minutes} minutes.`, ephemeral: true });
+                    await logModAction('TIMEOUT', interaction.user, targetUser, reason, `Duration: ${minutes}m`);
+                }
+
+                if (interaction.commandName === 'mod_untimeout') {
+                    if (!targetMember) return interaction.reply({ content: 'User not found.', ephemeral: true });
+                    await targetMember.timeout(null, reason);
+                    await interaction.reply({ content: `✅ Removed timeout for ${targetUser.tag}.`, ephemeral: true });
+                    await logModAction('UNTIMEOUT', interaction.user, targetUser, reason);
+                }
+
+                if (interaction.commandName === 'mod_warn') {
+                    // DM the user
+                    let dmStatus = 'DM Sent';
+                    try {
+                        const warnEmbed = new EmbedBuilder()
+                            .setTitle('⚠️ Official Warning')
+                            .setColor(0xFFD700)
+                            .setDescription(`You have received a warning in **${interaction.guild.name}**.`)
+                            .addFields({ name: 'Reason', value: reason })
+                            .setFooter({ text: 'Please review our rules to avoid further action.' });
+                        await targetUser.send({ embeds: [warnEmbed] });
+                    } catch (e) { dmStatus = 'DM Failed (User has DMs off)'; }
+
+                    await interaction.reply({ content: `✅ Warned ${targetUser.tag}. (${dmStatus})`, ephemeral: true });
+                    await logModAction('WARN', interaction.user, targetUser, reason, `Status: ${dmStatus}`);
+                }
+
+                if (interaction.commandName === 'mod_purge') {
+                    const amount = interaction.options.getInteger('amount');
+                    const deleted = await interaction.channel.bulkDelete(amount, true);
+                    await interaction.reply({ content: `✅ Deleted ${deleted.size} messages.`, ephemeral: true });
+                    await logModAction('PURGE', interaction.user, interaction.channel, 'Bulk Delete', `Amount: ${deleted.size} messages`);
+                }
+
+                if (interaction.commandName === 'mod_lock') {
+                    await interaction.channel.permissionOverwrites.edit(interaction.guild.id, { SendMessages: false });
+                    await interaction.reply({ content: '🔒 Channel locked.', ephemeral: true });
+                    await logModAction('LOCK', interaction.user, interaction.channel, 'Channel Lockdown');
+                }
+
+                if (interaction.commandName === 'mod_unlock') {
+                    await interaction.channel.permissionOverwrites.edit(interaction.guild.id, { SendMessages: null });
+                    await interaction.reply({ content: '🔓 Channel unlocked.', ephemeral: true });
+                    await logModAction('UNLOCK', interaction.user, interaction.channel, 'Channel Unlock');
+                }
+
+                if (interaction.commandName === 'mod_say') {
+                    const msg = interaction.options.getString('message');
+                    const targetChannel = interaction.options.getChannel('channel') || interaction.channel;
+                    await targetChannel.send(msg);
+                    await interaction.reply({ content: '✅ Message sent.', ephemeral: true });
+                    await logModAction('ANNOUNCE', interaction.user, targetChannel, 'Bot Announcement', `Content: ${msg}`);
+                }
 
             } catch (error) {
-                console.error(error);
-                await interaction.followUp({ content: '❌ Error saving to database/S3.', ephemeral: true });
+                console.error('Mod Command Error:', error);
+                await interaction.reply({ content: '❌ Failed to execute action. Check bot permissions.', ephemeral: true }).catch(() => {});
             }
-        }
-
-        if (interaction.customId.startsWith('reject_')) {
-            const targetUserId = interaction.customId.split('_')[1];
-            const modal = new ModalBuilder().setCustomId(`rejectModal_${targetUserId}`).setTitle('Rejection Reason');
-            const reasonInput = new TextInputBuilder().setCustomId('reasonInput').setLabel("Why is this being rejected?").setStyle(TextInputStyle.Paragraph).setRequired(true);
-            modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
-            await interaction.showModal(modal);
-        }
-    }
-
-    if (interaction.isModalSubmit()) {
-
-        if (interaction.customId === 'admin_edit_modal') {
-            await interaction.deferUpdate();
-            
-            let newTail = interaction.fields.getTextInputValue('ae_tail');
-            const newType = interaction.fields.getTextInputValue('ae_type');
-            const newLivery = interaction.fields.getTextInputValue('ae_livery');
-
-            const oldEmbed = interaction.message.embeds[0];
-            const oldTail = oldEmbed.fields.find(f => f.name === 'Tail Number')?.value || 'UNKNOWN';
-
-            if (newTail === oldTail || newTail.toUpperCase() === 'UNKNOWN') {
-                const reCheckReg = lookupRegistration(newType, newLivery);
-                if (reCheckReg) {
-                    newTail = reCheckReg;
-                }
-            }
-
-            const newEmbed = EmbedBuilder.from(oldEmbed);
-
-            const fields = newEmbed.data.fields;
-            const tailIdx = fields.findIndex(f => f.name === 'Tail Number');
-            if (tailIdx >= 0) fields[tailIdx].value = newTail.toUpperCase();
-            
-            const typeIdx = fields.findIndex(f => f.name === 'Aircraft Type');
-            if (typeIdx >= 0) fields[typeIdx].value = newType;
-
-            const liveryIdx = fields.findIndex(f => f.name === 'Livery');
-            if (liveryIdx >= 0) fields[liveryIdx].value = newLivery;
-
-            newEmbed.setFields(fields);
-            
-            await interaction.editReply({ embeds: [newEmbed] });
             return;
         }
+        
+        // --- COMMAND: LIVE TRACKING (/track) ---
+        if (interaction.commandName === 'track') {
+            await interaction.deferReply();
 
-        if (interaction.customId === 'identify_modal') {
-            await interaction.deferReply({ ephemeral: true });
+            // 1. Configuration (Matched to flight.js)
+            const query = interaction.options.getString('target').toUpperCase().trim();
+            const LIVE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run'; 
+            const targetServerName = 'Expert Server'; 
 
-            const type = interaction.fields.getTextInputValue('i_type');
-            const livery = interaction.fields.getTextInputValue('i_livery');
-            let tail = null; 
-
-            let photoUrl = null;
             try {
-                if (interaction.message.reference && interaction.message.reference.messageId) {
-                    const originalMsg = await interaction.channel.messages.fetch(interaction.message.reference.messageId);
-                    if (originalMsg && originalMsg.attachments.size > 0) {
-                        photoUrl = originalMsg.attachments.first().url;
-                    }
+                // 2. Fetch Sessions
+                const sessionsRes = await axios.get(`${LIVE_API_URL}/if-sessions`);
+                if (!sessionsRes.data || !sessionsRes.data.sessions) {
+                    throw new Error("Invalid response from Live API (Sessions)");
                 }
-            } catch (err) { 
-                console.error("Could not fetch original image:", err); 
-            }
 
-            if (!photoUrl) {
-                return interaction.editReply("❌ Could not find the original image. Please upload again.");
-            }
-
-            await startSubmissionFlow(interaction, type, livery, tail, photoUrl, interaction.user, interaction.channelId);
-            
-            try { await interaction.message.delete(); } catch(e) {}
-            return;
-        }
-
-        if (interaction.customId.startsWith('rejectModal_')) {
-            await interaction.deferUpdate(); 
-            const targetUserId = interaction.customId.split('_')[1];
-            const reason = interaction.fields.getTextInputValue('reasonInput');
-            
-            let originalEmbed = interaction.message.embeds[0];
-            const aircraftName = originalEmbed.fields.find(f => f.name === 'Aircraft Type')?.value || 'Unknown Aircraft';
-            
-            let thumbUrl = originalEmbed.image?.url;
-            if (!thumbUrl && interaction.message.attachments.size > 0) {
-                 thumbUrl = interaction.message.attachments.first().url;
-            }
-
-            const footerText = originalEmbed.footer?.text || '';
-            const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
-            const originChannelId = footerText.match(/Ch: (\d+)/)?.[1];
-
-            const rejectedEmbed = EmbedBuilder.from(originalEmbed)
-                .setTitle('❌ Submission Rejected')
-                .setColor(0xFF0000)
-                .setDescription(`**Reason:** ${reason}`)
-                .setImage(null) 
-                .setFooter({ text: `Rejected by ${interaction.user.tag}` });
-            
-            await interaction.editReply({ embeds: [rejectedEmbed], components: [] }); 
-
-            if (publicMsgId) {
-                try {
-                    const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
-                    const publicMsg = await feedChannel.messages.fetch(publicMsgId);
-                    if (publicMsg) {
-                        const publicRejectedEmbed = EmbedBuilder.from(publicMsg.embeds[0])
-                            .setTitle('❌ Submission Rejected')
-                            .setColor(0xFF0000) 
-                            .setDescription(`This submission was not accepted by the moderators.`)
-                            .setImage(null) 
-                            .setFooter({ text: `Reviewed by Staff` });
-                        await publicMsg.edit({ embeds: [publicRejectedEmbed] });
-                    }
-                } catch (e) {}
-            }
-
-            if (originChannelId) {
-                try {
-                    const originChannel = await client.channels.fetch(originChannelId);
-                    if (originChannel) {
-                        const rejectionNotifyEmbed = new EmbedBuilder()
-                            .setTitle('❌ Photo Rejected')
-                            .setColor(0xFF0000)
-                            .setDescription(`Hey <@${targetUserId}>, this specific photo was rejected.`)
-                            .addFields({ name: 'Reason', value: reason })
-                            .setThumbnail(thumbUrl) 
-                            .setFooter({ text: 'You can upload a different photo below to try again!' });
-
-                        await originChannel.send({ embeds: [rejectionNotifyEmbed] });
-                    }
-                } catch (e) {
-                    try { (await client.users.fetch(targetUserId)).send(`❌ Your submission for **${aircraftName}** was rejected: ${reason}`); } catch (e) {}
+                // 3. Smart Session Lookup (Logic ported from flight.js)
+                // First try exact match, then fuzzy match (e.g. "Expert" in "Expert Server")
+                let session = sessionsRes.data.sessions.find(s => s.name === targetServerName);
+                if (!session) {
+                    session = sessionsRes.data.sessions.find(s => s.name.includes(targetServerName.split(' ')[0]));
                 }
-            }
-            
-            originalEmbed = null;
-        }
-    }
 
-    if (!interaction.isChatInputCommand()) return;
-
-    // --- MINI-MOD COMMANDS ---
-    if (commandName === 'mod_media_restrict') {
-        const target = options.getMember('user');
-        const reason = options.getString('reason');
-        const restrictedRoleName = 'Media Restricted';
-        
-        let role = guild.roles.cache.find(r => r.name === restrictedRoleName);
-        if (!role) {
-            role = await guild.roles.create({
-                name: restrictedRoleName,
-                permissions: [],
-                reason: 'Auto-created for media restriction'
-            });
-            guild.channels.cache.forEach(async (ch) => {
-                await ch.permissionOverwrites.edit(role, { 
-                    AttachFiles: false, 
-                    EmbedLinks: false, 
-                    UseExternalStickers: false,
-                    SendVoiceMessages: false 
-                }).catch(() => {});
-            });
-        }
-        await target.roles.add(role);
-        await logModAction('RESTRICT', user, target, reason);
-        return interaction.reply({ content: `🚫 Restricted ${target} from sending media.`, ephemeral: true });
-    }
-
-    if (commandName === 'mod_media_unrestrict') {
-        const target = options.getMember('user');
-        const role = guild.roles.cache.find(r => r.name === 'Media Restricted');
-        if (role) await target.roles.remove(role);
-        return interaction.reply({ content: `✅ Restored media permissions for ${target}.`, ephemeral: true });
-    }
-
-    if (commandName === 'mod_slowmode') {
-        const sec = options.getInteger('seconds');
-        await channel.setRateLimitPerUser(sec);
-        return interaction.reply({ content: `⏲️ Slowmode set to ${sec} seconds.`, ephemeral: true });
-    }
-
-    if (commandName === 'mod_nick') {
-        const target = options.getMember('user');
-        const nick = options.getString('nickname');
-        await target.setNickname(nick);
-        return interaction.reply({ content: `📝 Updated nickname for ${target}.`, ephemeral: true });
-    }
-
-    if (commandName === 'ping') return interaction.reply(`🏓 Latency: **${client.ws.ping}ms**`);
-
-    if (commandName === 'uptime') {
-        const uptime = process.uptime();
-        const h = Math.floor(uptime / 3600), m = Math.floor((uptime % 3600) / 60), s = Math.floor(uptime % 60);
-        return interaction.reply(`⏱️ Bot Uptime: **${h}h ${m}m ${s}s**`);
-    }
-
-    if (commandName === 'avatar') {
-        const target = options.getUser('user') || user;
-        return interaction.reply({ embeds: [new EmbedBuilder().setTitle(`${target.username}'s Avatar`).setImage(target.displayAvatarURL({ size: 1024 }))] });
-    }
-
-    if (commandName === 'serverinfo') {
-        const embed = new EmbedBuilder().setTitle(guild.name).setThumbnail(guild.iconURL()).addFields(
-            { name: 'Members', value: `${guild.memberCount}`, inline: true },
-            { name: 'Created', value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:R>`, inline: true },
-            { name: 'Boosts', value: `${guild.premiumSubscriptionCount || 0}`, inline: true }
-        );
-        return interaction.reply({ embeds: [embed] });
-    }
-
-    if (commandName === 'userinfo') {
-        const targetMember = options.getMember('user') || member;
-        const embed = new EmbedBuilder().setTitle(`Info: ${targetMember.user.username}`).setThumbnail(targetMember.user.displayAvatarURL()).addFields(
-            { name: 'Joined Server', value: `<t:${Math.floor(targetMember.joinedTimestamp / 1000)}:R>`, inline: true },
-            { name: 'Joined Discord', value: `<t:${Math.floor(targetMember.user.createdTimestamp / 1000)}:R>`, inline: true },
-            { name: 'Roles', value: targetMember.roles.cache.map(r => r.name).slice(0, 10).join(', ') || 'None' }
-        );
-        return interaction.reply({ embeds: [embed] });
-    }
-
-    if (commandName === 'poll') {
-        const q = options.getString('question');
-        const msg = await interaction.reply({ embeds: [new EmbedBuilder().setTitle('📊 Poll').setDescription(q).setFooter({ text: `Asked by ${user.username}` })], fetchReply: true });
-        await msg.react('👍'); await msg.react('👎');
-        return;
-    }
-
-    if (commandName === 'emergency') {
-        return interaction.reply({ embeds: [new EmbedBuilder().setTitle('🆘 Emergency Resources').setDescription('If you or someone you know is struggling, please reach out for help.\n\n• **International:** [Find A Helpline](https://findahelpline.com/)\n• **US:** Dial 988\n• **UK/Ireland:** 111 or 999').setColor(0xFF0000)], ephemeral: true });
-    }
-
-    // --- HANDLER: MODERATION COMMANDS ---
-    if (interaction.commandName.startsWith('mod_')) {
-        const hasAdminRole = interaction.member.roles.cache.has(ADMIN_ROLE_ID);
-        const isAdmin = interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
-        
-        if (!hasAdminRole && !isAdmin) {
-            return interaction.reply({ content: '❌ Access Denied: Missing Admin Privileges.', ephemeral: true });
-        }
-
-        const targetUser = options.getUser('user');
-        const targetMember = targetUser ? await guild.members.fetch(targetUser.id).catch(() => null) : null;
-        const reason = options.getString('reason') || 'No reason provided';
-
-        try {
-            if (commandName === 'mod_kick') {
-                if (!targetMember) return interaction.reply({ content: 'User not found in server.', ephemeral: true });
-                await targetMember.kick(reason);
-                await interaction.reply({ content: `✅ Kicked ${targetUser.tag}.`, ephemeral: true });
-                await logModAction('KICK', user, targetUser, reason);
-            }
-
-            if (commandName === 'mod_ban') {
-                await guild.members.ban(targetUser, { reason });
-                await interaction.reply({ content: `✅ Banned ${targetUser.tag}.`, ephemeral: true });
-                await logModAction('BAN', user, targetUser, reason);
-            }
-
-            if (commandName === 'mod_timeout') {
-                if (!targetMember) return interaction.reply({ content: 'User not found.', ephemeral: true });
-                const minutes = options.getInteger('duration');
-                await targetMember.timeout(minutes * 60 * 1000, reason);
-                await interaction.reply({ content: `✅ Timed out ${targetUser.tag} for ${minutes} minutes.`, ephemeral: true });
-                await logModAction('TIMEOUT', user, targetUser, reason, `Duration: ${minutes}m`);
-            }
-
-            if (commandName === 'mod_untimeout') {
-                if (!targetMember) return interaction.reply({ content: 'User not found.', ephemeral: true });
-                await targetMember.timeout(null, reason);
-                await interaction.reply({ content: `✅ Removed timeout for ${targetUser.tag}.`, ephemeral: true });
-                await logModAction('UNTIMEOUT', user, targetUser, reason);
-            }
-
-            if (commandName === 'mod_warn') {
-                let dmStatus = 'DM Sent';
-                try {
-                    const warnEmbed = new EmbedBuilder()
-                        .setTitle('⚠️ Official Warning')
-                        .setColor(0xFFD700)
-                        .setDescription(`You have received a warning in **${guild.name}**.`)
-                        .addFields({ name: 'Reason', value: reason })
-                        .setFooter({ text: 'Please review our rules to avoid further action.' });
-                    await targetUser.send({ embeds: [warnEmbed] });
-                } catch (e) { dmStatus = 'DM Failed (User has DMs off)'; }
-
-                await interaction.reply({ content: `✅ Warned ${targetUser.tag}. (${dmStatus})`, ephemeral: true });
-                await logModAction('WARN', user, targetUser, reason, `Status: ${dmStatus}`);
-            }
-
-            if (commandName === 'mod_purge') {
-                const amount = options.getInteger('amount');
-                const deleted = await channel.bulkDelete(amount, true);
-                await interaction.reply({ content: `✅ Deleted ${deleted.size} messages.`, ephemeral: true });
-                await logModAction('PURGE', user, channel, 'Bulk Delete', `Amount: ${deleted.size} messages`);
-            }
-
-            if (commandName === 'mod_lock') {
-                await channel.permissionOverwrites.edit(guild.id, { SendMessages: false });
-                await interaction.reply({ content: '🔒 Channel locked.', ephemeral: true });
-                await logModAction('LOCK', user, channel, 'Channel Lockdown');
-            }
-
-            if (commandName === 'mod_unlock') {
-                await channel.permissionOverwrites.edit(guild.id, { SendMessages: null });
-                await interaction.reply({ content: '🔓 Channel unlocked.', ephemeral: true });
-                await logModAction('UNLOCK', user, channel, 'Channel Unlock');
-            }
-
-            if (commandName === 'mod_say') {
-                const msgText = options.getString('message');
-                const targetChannel = options.getChannel('channel') || channel;
-                await targetChannel.send(msgText);
-                await interaction.reply({ content: '✅ Message sent.', ephemeral: true });
-                await logModAction('ANNOUNCE', user, targetChannel, 'Bot Announcement', `Content: ${msgText}`);
-            }
-
-        } catch (error) {
-            console.error('Mod Command Error:', error);
-            await interaction.reply({ content: '❌ Failed to execute action. Check bot permissions.', ephemeral: true }).catch(() => {});
-        }
-        return;
-    }
-    
-    // --- COMMAND: LIVE TRACKING (/track) ---
-    if (commandName === 'track') {
-        await interaction.deferReply();
-        const targetQuery = options.getString('target').toUpperCase().trim();
-        const LIVE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run'; 
-        const targetServerName = 'Expert Server'; 
-
-        try {
-            const sessionsRes = await axios.get(`${LIVE_API_URL}/if-sessions`);
-            if (!sessionsRes.data || !sessionsRes.data.sessions) {
-                throw new Error("Invalid response from Live API (Sessions)");
-            }
-
-            let session = sessionsRes.data.sessions.find(s => s.name === targetServerName);
-            if (!session) {
-                session = sessionsRes.data.sessions.find(s => s.name.includes(targetServerName.split(' ')[0]));
-            }
-
-            if (!session) {
-                return interaction.editReply(`❌ Could not locate **${targetServerName}**. The server might be offline.`);
-            }
-
-            const flightsRes = await axios.get(`${LIVE_API_URL}/flights/${session.id}`);
-            const flights = flightsRes.data.flights;
-
-            if (!flights || !Array.isArray(flights)) {
-                return interaction.editReply("❌ Failed to retrieve flight data.");
-            }
-
-            const match = flights.find(f => 
-                (f.username && f.username.toUpperCase().includes(targetQuery)) || 
-                (f.callsign && f.callsign.toUpperCase().includes(targetQuery))
-            );
-
-            if (!match) {
-                return interaction.editReply(`❌ No pilot found matching "**${targetQuery}**" on ${session.name}.`);
-            }
-
-            const calculatePhase = (pos) => {
-                const vs = pos.vs_fpm || 0;
-                const alt = pos.alt_ft || 0;
-                const gs = pos.gs_kt || 0;
-                if (alt < 1000 && gs < 40 && Math.abs(vs) < 150) return 'On Ground 🛑';
-                if (vs > 350) return 'Climbing ↗️';
-                if (vs < -500) return 'Descending ↘️';
-                if (alt > 18000 && Math.abs(vs) < 500) return 'Cruising ✈️';
-                return 'Enroute ➡️';
-            };
-
-            const phase = calculatePhase(match.position);
-
-            const trackEmbed = new EmbedBuilder()
-                .setTitle(`📡 Live Flight: ${match.callsign || 'No Callsign'}`)
-                .setColor(0x00FF99)
-                .addFields(
-                    { name: '👤 Pilot', value: match.username || 'Unknown', inline: true },
-                    { name: '✈️ Aircraft', value: match.aircraft?.aircraftName || 'Unknown', inline: true },
-                    { name: '🎨 Livery', value: match.aircraft?.liveryName || 'Unknown', inline: true },
-                    { name: '📍 Altitude', value: match.position.alt_ft != null ? `${Math.round(match.position.alt_ft).toLocaleString()} ft` : 'N/A', inline: true },
-                    { name: '🚀 Ground Speed', value: match.position.gs_kt != null ? `${Math.round(match.position.gs_kt)} kts` : 'N/A', inline: true },
-                    { name: '📊 Status', value: phase, inline: true }
-                )
-                .setTimestamp()
-                .setFooter({ text: `Server: ${session.name}` });
-
-            if (match.flightId) {
-                trackEmbed.addFields({ name: '🌍 Live Map', value: `[View on Inflight.info](https://inflight.info/flight/${match.flightId})` });
-            }
-
-            await interaction.editReply({ embeds: [trackEmbed] });
-
-        } catch (error) {
-            console.error("Track Command Error:", error.message);
-            await interaction.editReply(`❌ **Connection Failed:** Could not connect to backend.`);
-        }
-    }
-
-    // --- COMMAND: PERSONAL HANGAR (/hangar) ---
-    if (commandName === 'hangar') {
-        const targetUser = options.getUser('user') || user;
-        await interaction.deferReply();
-
-        try {
-            const stats = await CommunityAircraftModel.aggregate([
-                { 
-                    $match: { 
-                        $or: [
-                            { contributorId: targetUser.id },
-                            { contributorName: targetUser.username } 
-                        ]
-                    } 
-                },
-                {
-                    $group: {
-                        _id: null,
-                        totalUploads: { $sum: 1 },
-                        uniqueTypes: { $addToSet: "$aircraftType" },
-                        uniqueLiveries: { $addToSet: "$liveryName" },
-                        allTypes: { $push: "$aircraftType" }
-                    }
+                if (!session) {
+                    return interaction.editReply(`❌ Could not locate **${targetServerName}**. The server might be offline.`);
                 }
-            ]);
 
-            if (!stats || stats.length === 0) {
-                return interaction.editReply(`📂 **${targetUser.username}** has an empty hangar.`);
-            }
+                // 4. Fetch Flights
+                const flightsRes = await axios.get(`${LIVE_API_URL}/flights/${session.id}`);
+                const flights = flightsRes.data.flights;
 
-            const data = stats[0];
-            const typeCounts = {};
-            let favoriteAircraft = "None";
-            let maxCount = 0;
-
-            data.allTypes.forEach(t => {
-                typeCounts[t] = (typeCounts[t] || 0) + 1;
-                if (typeCounts[t] > maxCount) {
-                    maxCount = typeCounts[t];
-                    favoriteAircraft = t;
+                if (!flights || !Array.isArray(flights)) {
+                    return interaction.editReply("❌ Failed to retrieve flight data.");
                 }
-            });
 
-            const latestUpload = await CommunityAircraftModel.findOne({ 
-                $or: [{ contributorId: targetUser.id }, { contributorName: targetUser.username }] 
-            }).sort({ uploadedAt: -1 });
-
-            let rank = 'Spotter';
-            if (data.totalUploads >= 10) rank = 'Bronze Spotter 🥉';
-            if (data.totalUploads >= 50) rank = 'Gold Spotter 🥇';
-
-            const hangarEmbed = new EmbedBuilder()
-                .setTitle(`✈️ ${targetUser.username}'s Hangar`)
-                .setColor(0xFFD700)
-                .setThumbnail(targetUser.displayAvatarURL())
-                .addFields(
-                    { name: '📸 Total Photos', value: `${data.totalUploads}`, inline: true },
-                    { name: '🛩️ Unique Types', value: `${data.uniqueTypes.length}`, inline: true },
-                    { name: '❤️ Favorite Aircraft', value: `**${favoriteAircraft}**`, inline: false }
+                // 5. Find Pilot (Username OR Callsign)
+                const match = flights.find(f => 
+                    (f.username && f.username.toUpperCase().includes(query)) || 
+                    (f.callsign && f.callsign.toUpperCase().includes(query))
                 );
 
-            if (latestUpload) hangarEmbed.setImage(latestUpload.imageUrl);
+                if (!match) {
+                    return interaction.editReply(`❌ No pilot found matching "**${query}**" on ${session.name}.`);
+                }
 
-            await interaction.editReply({ embeds: [hangarEmbed] });
+                // 6. Calculate Flight Phase (Ported from flight.js getLiteFlightPhase)
+                const calculatePhase = (pos) => {
+                    const vs = pos.vs_fpm || 0;
+                    const alt = pos.alt_ft || 0;
+                    const gs = pos.gs_kt || 0;
+                    
+                    if (alt < 1000 && gs < 40 && Math.abs(vs) < 150) return 'On Ground 🛑';
+                    if (vs > 350) return 'Climbing ↗️';
+                    if (vs < -500) return 'Descending ↘️';
+                    if (alt > 18000 && Math.abs(vs) < 500) return 'Cruising ✈️';
+                    return 'Enroute ➡️';
+                };
 
-        } catch (error) {
-            await interaction.editReply("❌ An error occurred.");
-        }
-    }
-    
-    // --- NEW COMMAND: SETUP TICKETS ---
-    if (commandName === 'setup_tickets') {
-        if (!member.permissions.has(GatewayIntentBits.Administrator) && interaction.channelId !== ADMIN_CHANNEL_ID) {
-            return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
-        }
+                const phase = calculatePhase(match.position);
 
-        const ticketEmbed = new EmbedBuilder()
-            .setTitle('🎫 Inflight Support')
-            .setDescription('Click the button below to open a private support ticket.')
-            .setColor(0x0099FF);
+                // 7. Build Embed
+                const trackEmbed = new EmbedBuilder()
+                    .setTitle(`📡 Live Flight: ${match.callsign || 'No Callsign'}`)
+                    .setColor(0x00FF99)
+                    .setThumbnail(`${LIVE_API_URL}/images/radar_icon.png`) // Optional icon
+                    .addFields(
+                        { name: '👤 Pilot', value: match.username || 'Unknown', inline: true },
+                        { name: '✈️ Aircraft', value: match.aircraft?.aircraftName || 'Unknown', inline: true },
+                        { name: '🎨 Livery', value: match.aircraft?.liveryName || 'Unknown', inline: true },
+                        
+                        // Use != null checks to fix the "0 altitude" bug
+                        { name: '📍 Altitude', value: match.position.alt_ft != null ? `${Math.round(match.position.alt_ft).toLocaleString()} ft` : 'N/A', inline: true },
+                        { name: '🚀 Ground Speed', value: match.position.gs_kt != null ? `${Math.round(match.position.gs_kt)} kts` : 'N/A', inline: true },
+                        { name: '↕️ Vertical Speed', value: match.position.vs_fpm != null ? `${Math.round(match.position.vs_fpm)} fpm` : 'N/A', inline: true },
+                        
+                        { name: '🧭 Heading', value: match.position.heading_deg != null ? `${Math.round(match.position.heading_deg)}°` : 'N/A', inline: true },
+                        { name: '🆔 Virtual Org', value: match.virtualOrganization || 'None', inline: true },
+                        { name: '📊 Status', value: phase, inline: true }
+                    )
+                    .setTimestamp(match.position.lastReportMs ? new Date(match.position.lastReportMs) : new Date())
+                    .setFooter({ text: `Server: ${session.name} • ${match.pilotState === 0 ? 'Active' : 'Paused/Away'}` });
 
-        const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-                .setCustomId('create_ticket_start')
-                .setLabel('Open Ticket')
-                .setEmoji('📩')
-                .setStyle(ButtonStyle.Primary)
-        );
+                if (match.flightId) {
+                    trackEmbed.addFields({ name: '🌍 Live Map', value: `[View on Inflight.info](https://inflight.info/flight/${match.flightId})` });
+                }
 
-        await interaction.channel.send({ embeds: [ticketEmbed], components: [row] });
-        await interaction.reply({ content: '✅ Ticket panel posted!', ephemeral: true });
-    }
+                await interaction.editReply({ embeds: [trackEmbed] });
 
-    if (commandName === 'links') {
-        const embed = new EmbedBuilder()
-            .setTitle('🔗 Useful Resources')
-            .setColor(0x0099FF)
-            .addFields(
-                { name: '📡 Flight Tracker', value: '[Inflight.info](https://inflight.info)', inline: true },
-                { name: '📢 Official Thread', value: '[Forum](https://community.infiniteflight.com/t/inflight-official-open-beta-infinite-flight-tracker-update/1114286/80)', inline: true }
-            );
-        await interaction.reply({ embeds: [embed] });
-    }
-
-    if (commandName === 'migrate_legacy') {
-        if (!member.permissions.has(GatewayIntentBits.Administrator)) {
-            return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
-        }
-        await interaction.deferReply();
-        // ... (Migration logic same as original but using defined variables)
-        await interaction.editReply("Migration check complete.");
-    }
-
-    if (commandName === 'submit') {
-        const type = options.getString('aircraft_type');
-        const livery = options.getString('livery');
-        const photo = options.getAttachment('photo');
-        if (!photo.contentType.startsWith('image/')) {
-            return interaction.reply({ content: '❌ Invalid image.', ephemeral: true });
-        }
-        await startSubmissionFlow(interaction, type, livery, null, photo.url, user, channel.id);
-    }
-
-    if (commandName === 'lookup') {
-        const queryLookup = options.getString('query');
-        await interaction.deferReply();
-        try {
-            const result = await CommunityAircraftModel.findOne({
-                $or: [
-                    { tailNumber: { $regex: new RegExp(`^${escapeRegex(queryLookup)}$`, "i") } }, 
-                    { liveryName: { $regex: escapeRegex(queryLookup), $options: 'i' } }
-                ]
-            });
-            if (!result) await interaction.editReply(`❌ No match.`);
-            else {
-                const embed = new EmbedBuilder().setTitle(`🔍 ${result.tailNumber}`).setImage(result.imageUrl);
-                await interaction.editReply({ embeds: [embed] });
+            } catch (error) {
+                console.error("Track Command Error:", error.message);
+                await interaction.editReply(`❌ **Connection Failed:** Could not connect to backend.\nEnsure \`${LIVE_API_URL}\` is reachable.`);
             }
-        } catch (e) { await interaction.editReply('⚠️ Search Error.'); }
-    }
+        }
 
-    if (commandName === 'pull') {
-        const typeInput = options.getString('aircraft_type');
-        const liveryInput = options.getString('livery');
-        await interaction.deferReply();
-        const result = await CommunityAircraftModel.findOne({
-            aircraftType: { $regex: new RegExp(`^${escapeRegex(typeInput)}$`, "i") }, 
-            liveryName: { $regex: new RegExp(`^${escapeRegex(liveryInput)}$`, "i") }
-        });
-        if (!result) return interaction.editReply(`❌ No record found.`);
-        const pullEmbed = new EmbedBuilder().setTitle('🗃️ Aircraft Record').setImage(result.imageUrl);
-        await interaction.editReply({ embeds: [pullEmbed] });
-    }
+        // --- COMMAND: PERSONAL HANGAR (/hangar) ---
+        if (interaction.commandName === 'hangar') {
+            const targetUser = interaction.options.getUser('user') || interaction.user;
+            await interaction.deferReply();
 
-    if (commandName === 'profile') {
-        const targetUser = options.getUser('user') || user;
-        await interaction.deferReply();
-        const count = await CommunityAircraftModel.countDocuments({
-            $or: [{ contributorId: targetUser.id }, { contributorName: targetUser.username }]
-        });
-        const embed = new EmbedBuilder().setTitle(`✈️ Pilot Profile: ${targetUser.username}`).addFields({ name: 'Total Contributions', value: `${count}` });
-        await interaction.editReply({ embeds: [embed] });
-    }
+            try {
+                // 1. Perform MongoDB Aggregation
+                // This calculates stats directly in the database for speed
+                const stats = await CommunityAircraftModel.aggregate([
+                    { 
+                        $match: { 
+                            $or: [
+                                { contributorId: targetUser.id },
+                                { contributorName: targetUser.username } 
+                            ]
+                        } 
+                    },
+                    {
+                        $group: {
+                            _id: null,
+                            totalUploads: { $sum: 1 },
+                            // Collect unique values to count diversity
+                            uniqueTypes: { $addToSet: "$aircraftType" },
+                            uniqueLiveries: { $addToSet: "$liveryName" },
+                            // Push all types to an array to calculate the "favorite" later
+                            allTypes: { $push: "$aircraftType" }
+                        }
+                    }
+                ]);
 
-    if (commandName === 'stats') {
-        const count = await CommunityAircraftModel.countDocuments();
-        await interaction.reply({ embeds: [new EmbedBuilder().setTitle('📊 Database Stats').setDescription(`Tracked **${count}** aircraft.`)] });
-    }
-});
+                if (!stats || stats.length === 0) {
+                    return interaction.editReply(`📂 **${targetUser.username}** has an empty hangar. No photos submitted yet!`);
+                }
+
+                const data = stats[0];
+
+                // 2. Calculate "Favorite Aircraft" (Mode of aircraft types)
+                const typeCounts = {};
+                let favoriteAircraft = "None";
+                let maxCount = 0;
+
+                data.allTypes.forEach(t => {
+                    typeCounts[t] = (typeCounts[t] || 0) + 1;
+                    if (typeCounts[t] > maxCount) {
+                        maxCount = typeCounts[t];
+                        favoriteAircraft = t;
+                    }
+                });
+
+                // 3. Fetch the MOST RECENT upload for the embed image
+                const latestUpload = await CommunityAircraftModel.findOne({ 
+                    $or: [{ contributorId: targetUser.id }, { contributorName: targetUser.username }] 
+                }).sort({ uploadedAt: -1 });
+
+                // 4. Determine Rank based on upload count
+                let rank = 'Spotter';
+                if (data.totalUploads >= 10) rank = 'Bronze Spotter 🥉';
+                if (data.totalUploads >= 25) rank = 'Silver Spotter 🥈';
+                if (data.totalUploads >= 50) rank = 'Gold Spotter 🥇';
+                if (data.totalUploads >= 100) rank = 'Diamond Spotter 💎';
+
+                // 5. Build Hangar Embed
+                const hangarEmbed = new EmbedBuilder()
+                    .setTitle(`✈️ ${targetUser.username}'s Hangar`)
+                    .setColor(0xFFD700) // Gold
+                    .setThumbnail(targetUser.displayAvatarURL())
+                    .setDescription(`**Rank:** ${rank}`)
+                    .addFields(
+                        { name: '📸 Total Photos', value: `${data.totalUploads}`, inline: true },
+                        { name: '🛩️ Unique Types', value: `${data.uniqueTypes.length}`, inline: true },
+                        { name: '🎨 Unique Liveries', value: `${data.uniqueLiveries.length}`, inline: true },
+                        { name: '❤️ Favorite Aircraft', value: `**${favoriteAircraft}** (${maxCount} spots)`, inline: false }
+                    )
+                    .setFooter({ text: `Hangar ID: ${targetUser.id}` });
+
+                // If they have a latest upload, set it as the big image
+                if (latestUpload) {
+                    hangarEmbed.setImage(latestUpload.imageUrl);
+                    hangarEmbed.setFooter({ text: `Latest Catch: ${latestUpload.tailNumber} (${latestUpload.aircraftType})` });
+                }
+
+                await interaction.editReply({ embeds: [hangarEmbed] });
+
+            } catch (error) {
+                console.error("Hangar Command Error:", error);
+                await interaction.editReply("❌ An error occurred while fetching hangar statistics.");
+            }
+        }
+        
+        // --- NEW COMMAND: SETUP TICKETS ---
+        if (interaction.commandName === 'setup_tickets') {
+            if (!interaction.member.permissions.has(GatewayIntentBits.Administrator) && interaction.channelId !== ADMIN_CHANNEL_ID) {
+                return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
+            }
+
+            const ticketEmbed = new EmbedBuilder()
+                .setTitle('🎫 Inflight Support')
+                .setDescription('Click the button below to open a private support ticket.\n\nYou can ask about:\n• Database corrections\n• Submission issues\n• Role/Account help')
+                .setColor(0x0099FF)
+                .setFooter({ text: 'Our team will assist you as soon as possible.' });
+
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId('create_ticket_start')
+                    .setLabel('Open Ticket')
+                    .setEmoji('📩')
+                    .setStyle(ButtonStyle.Primary)
+            );
+
+            await interaction.channel.send({ embeds: [ticketEmbed], components: [row] });
+            await interaction.reply({ content: '✅ Ticket panel posted!', ephemeral: true });
+        }
+
+        if (interaction.commandName === 'links') {
+            const embed = new EmbedBuilder()
+                .setTitle('🔗 Useful Resources')
+                .setColor(0x0099FF)
+                .setDescription('Here are the links to the flight tracker, forum thread, and livery database:')
+                .addFields(
+                    { name: '📡 Flight Tracker', value: '[Inflight.info](https://inflight.info)', inline: true },
+                    { name: '📢 Official Thread', value: '[Community Forum](https://community.infiniteflight.com/t/inflight-official-open-beta-infinite-flight-tracker-update/1114286/80)', inline: true },
+                    { name: '🎨 Livery Database', value: '[Livery Search](https://www.helpathand.nl/janpolet/infinite-flight-aircraft-liveries/)', inline: true }
+                )
+                .setFooter({ text: 'Use these to verify registrations!' });
+
+            await interaction.reply({ embeds: [embed] });
+        }
+
+        if (interaction.commandName === 'migrate_legacy') {
+            if (!interaction.member.permissions.has(GatewayIntentBits.Administrator) && interaction.channelId !== ADMIN_CHANNEL_ID) {
+                return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
+            }
+
+            await interaction.deferReply();
+
+            try {
+                const guildMembers = await interaction.guild.members.fetch();
+                
+                const legacyRecords = await CommunityAircraftModel.find({
+                    $or: [{ contributorId: { $exists: false } }, { contributorId: null }]
+                });
+
+                if (legacyRecords.length === 0) {
+                    return interaction.editReply("✅ Database is fully linked! No legacy records found.");
+                }
+
+                const uniqueNames = [...new Set(legacyRecords.map(r => r.contributorName))];
+                
+                let linkedCount = 0;
+                let failedCount = 0;
+                let log = [];
+
+                for (const name of uniqueNames) {
+                    const match = guildMembers.find(m => 
+                        m.user.username.toLowerCase() === name.toLowerCase() ||
+                        m.displayName.toLowerCase() === name.toLowerCase()
+                    );
+
+                    if (match) {
+                        const res = await CommunityAircraftModel.updateMany(
+                            { contributorName: name },
+                            { 
+                                $set: { 
+                                    contributorId: match.id,
+                                    contributorName: match.user.username 
+                                } 
+                            }
+                        );
+                        linkedCount += res.modifiedCount;
+                        log.push(`✅ Linked **${name}** → <@${match.id}> (${res.modifiedCount} docs)`);
+                    } else {
+                        failedCount++;
+                        log.push(`❌ Could not find user for: **${name}**`);
+                    }
+                }
+
+                const reportEmbed = new EmbedBuilder()
+                    .setTitle('🔄 Migration Report')
+                    .setDescription(`**Processed:** ${uniqueNames.length} unique names\n**Records Updated:** ${linkedCount}\n**Unmatched Users:** ${failedCount}\n\n${log.slice(0, 15).join('\n')}${log.length > 15 ? '\n...(and more)' : ''}`)
+                    .setColor(linkedCount > 0 ? 0x00FF00 : 0xFF0000);
+
+                await interaction.editReply({ embeds: [reportEmbed] });
+
+            } catch (error) {
+                console.error("Migration Error:", error);
+                await interaction.editReply("❌ Error running migration. Check console.");
+            }
+        }
+
+        if (interaction.commandName === 'submit') {
+            const type = interaction.options.getString('aircraft_type');
+            const livery = interaction.options.getString('livery');
+            const tail = null;
+            const photo = interaction.options.getAttachment('photo');
+
+            if (!photo.contentType.startsWith('image/')) {
+                return interaction.reply({ content: '❌ Invalid image.', ephemeral: true });
+            }
+
+            await startSubmissionFlow(interaction, type, livery, tail, photo.url, interaction.user, interaction.channelId);
+        }
+
+        if (interaction.commandName === 'lookup') {
+            const query = interaction.options.getString('query');
+            await interaction.deferReply();
+            try {
+                const result = await CommunityAircraftModel.findOne({
+                    $or: [
+                        { tailNumber: { $regex: new RegExp(`^${escapeRegex(query)}$`, "i") } }, 
+                        { tailNumber: { $regex: escapeRegex(query), $options: 'i' } },
+                        { liveryName: { $regex: escapeRegex(query), $options: 'i' } },
+                        { aircraftType: { $regex: escapeRegex(query), $options: 'i' } } 
+                    ]
+                });
+                if (!result) await interaction.editReply(`❌ No match for "**${query}**".`);
+                else {
+                    const embed = new EmbedBuilder().setTitle(`🔍 ${result.tailNumber}`).setColor(0x0099FF).addFields({ name: 'Aircraft', value: result.aircraftType, inline: true }, { name: 'Livery', value: result.liveryName, inline: true }, { name: 'Contributor', value: result.contributorName, inline: true }).setImage(result.imageUrl).setTimestamp(result.uploadedAt);
+                    await interaction.editReply({ embeds: [embed] });
+                }
+            } catch (e) { await interaction.editReply('⚠️ Search Error.'); }
+        }
+
+        if (interaction.commandName === 'pull') {
+            const typeInput = interaction.options.getString('aircraft_type');
+            const liveryInput = interaction.options.getString('livery');
+            
+            await interaction.deferReply();
+            
+            try {
+                const result = await CommunityAircraftModel.findOne({
+                    aircraftType: { $regex: new RegExp(`^${escapeRegex(typeInput)}$`, "i") }, 
+                    liveryName: { $regex: new RegExp(`^${escapeRegex(liveryInput)}$`, "i") }
+                });
+
+                if (!result) {
+                    await interaction.editReply(`❌ No database record found for **${typeInput}** in **${liveryInput}** livery.`);
+                    return;
+                }
+
+                const pullEmbed = new EmbedBuilder()
+                    .setTitle('🗃️ Aircraft Database Record')
+                    .setColor(0x00FF00) 
+                    .setDescription(`**Status:** ✅ Verified / Live`) 
+                    .addFields(
+                        { name: 'Aircraft Type', value: result.aircraftType, inline: true },
+                        { name: 'Livery', value: result.liveryName, inline: true },
+                        { name: 'Tail Number', value: result.tailNumber.toUpperCase(), inline: true },
+                        { name: 'Contributor', value: result.contributorName, inline: true },
+                        { name: 'Uploaded', value: `<t:${Math.floor(new Date(result.uploadedAt).getTime() / 1000)}:R>`, inline: true }
+                    )
+                    .setImage(result.imageUrl)
+                    .setFooter({ text: `Record ID: ${result._id}` });
+
+                await interaction.editReply({ embeds: [pullEmbed] });
+
+            } catch (e) { 
+                console.error(e);
+                await interaction.editReply('⚠️ Error retrieving record.'); 
+            }
+        }
+
+        if (interaction.commandName === 'profile') {
+            const targetUser = interaction.options.getUser('user') || interaction.user;
+            await interaction.deferReply();
+            try {
+                const count = await CommunityAircraftModel.countDocuments({
+                    $or: [
+                        { contributorId: targetUser.id },
+                        { contributorName: targetUser.username } 
+                    ]
+                });
+                
+                const recent = await CommunityAircraftModel.findOne({ 
+                    $or: [{ contributorId: targetUser.id }, { contributorName: targetUser.username }]
+                }).sort({ uploadedAt: -1 });
+
+                const embed = new EmbedBuilder().setTitle(`✈️ Pilot Profile: ${targetUser.username}`).setThumbnail(targetUser.displayAvatarURL()).setColor(0xFFD700).addFields({ name: 'Total Contributions', value: `${count}`, inline: true });
+                if (recent) { embed.addFields({ name: 'Last Spotted', value: `${recent.tailNumber}` }); embed.setImage(recent.imageUrl); }
+                await interaction.editReply({ embeds: [embed] });
+            } catch (e) { await interaction.editReply('Error.'); }
+        }
+
+        if (interaction.commandName === 'stats') {
+            try {
+                const count = await CommunityAircraftModel.countDocuments();
+                await interaction.reply({ embeds: [new EmbedBuilder().setTitle('📊 Database Stats').setColor(0x00FF99).setDescription(`Tracked **${count}** aircraft.`)] });
+            } catch (e) { await interaction.reply('Error.'); }
+        }
+    });
 
     if (process.env.DISCORD_BOT_TOKEN) {
         client.login(process.env.DISCORD_BOT_TOKEN);
