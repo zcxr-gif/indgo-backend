@@ -729,6 +729,22 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
         
         const commands = [
+
+            // --- MINI-MOD COMMANDS ---
+new SlashCommandBuilder().setName('mod_media_restrict').setDescription('Stop a user from sending GIFs/Memes').addUserOption(o => o.setName('user').setRequired(true)).addStringOption(o => o.setName('reason').setRequired(true)).setDefaultMemberPermissions(PermissionsBitField.Flags.ManageRoles),
+new SlashCommandBuilder().setName('mod_media_unrestrict').setDescription('Allow a user to send GIFs/Memes again').addUserOption(o => o.setName('user').setRequired(true)).setDefaultMemberPermissions(PermissionsBitField.Flags.ManageRoles),
+new SlashCommandBuilder().setName('mod_slowmode').setDescription('Set channel slowmode').addIntegerOption(o => o.setName('seconds').setRequired(true)).setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels),
+new SlashCommandBuilder().setName('mod_nick').setDescription('Change user nickname').addUserOption(o => o.setName('user').setRequired(true)).addStringOption(o => o.setName('nickname').setRequired(true)).setDefaultMemberPermissions(PermissionsBitField.Flags.ManageNicknames),
+
+// --- UTILITY & ENGAGEMENT ADD-INS ---
+new SlashCommandBuilder().setName('ping').setDescription('Check bot latency'),
+new SlashCommandBuilder().setName('uptime').setDescription('Check bot uptime'),
+new SlashCommandBuilder().setName('avatar').setDescription('Get user avatar').addUserOption(o => o.setName('user')),
+new SlashCommandBuilder().setName('serverinfo').setDescription('Get server stats'),
+new SlashCommandBuilder().setName('userinfo').setDescription('Get user details').addUserOption(o => o.setName('user')),
+new SlashCommandBuilder().setName('poll').setDescription('Create a simple poll').addStringOption(o => o.setName('question').setRequired(true)),
+new SlashCommandBuilder().setName('emergency').setDescription('Mental health and emergency resources')
+
             // User Commands
             new SlashCommandBuilder().setName('lookup').setDescription('Find an aircraft by Tail, Livery, or Type (Public)').addStringOption(o => o.setName('query').setDescription('Tail/Livery/Type').setAutocomplete(true).setRequired(true)),
             new SlashCommandBuilder().setName('stats').setDescription('View stats'),
@@ -1413,6 +1429,101 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         }
 
         if (!interaction.isChatInputCommand()) return;
+
+        // --- MEDIA RESTRICTION LOGIC ---
+if (commandName === 'mod_media_restrict') {
+    const target = options.getMember('user');
+    const reason = options.getString('reason');
+    const restrictedRoleName = 'Media Restricted';
+    
+    let role = guild.roles.cache.find(r => r.name === restrictedRoleName);
+    if (!role) {
+        role = await guild.roles.create({
+            name: restrictedRoleName,
+            permissions: [],
+            reason: 'Auto-created for media restriction'
+        });
+        // Apply overrides to all channels to ensure they can't bypass via specific channel permissions
+        guild.channels.cache.forEach(async (ch) => {
+            await ch.permissionOverwrites.edit(role, { 
+                AttachFiles: false, 
+                EmbedLinks: false, 
+                UseExternalStickers: false,
+                SendVoiceMessages: false 
+            }).catch(() => {});
+        });
+    }
+    await target.roles.add(role);
+    await logModAction('RESTRICT', user, target, reason);
+    return interaction.reply({ content: `🚫 Restricted ${target} from sending media.`, ephemeral: true });
+}
+
+if (commandName === 'mod_media_unrestrict') {
+    const target = options.getMember('user');
+    const role = guild.roles.cache.find(r => r.name === 'Media Restricted');
+    if (role) await target.roles.remove(role);
+    return interaction.reply({ content: `✅ Restored media permissions for ${target}.`, ephemeral: true });
+}
+
+// --- SLOWMODE & NICKNAMES ---
+if (commandName === 'mod_slowmode') {
+    const sec = options.getInteger('seconds');
+    await channel.setRateLimitPerUser(sec);
+    return interaction.reply({ content: `⏲️ Slowmode set to ${sec} seconds.`, ephemeral: true });
+}
+
+if (commandName === 'mod_nick') {
+    const target = options.getMember('user');
+    const nick = options.getString('nickname');
+    await target.setNickname(nick);
+    return interaction.reply({ content: `📝 Updated nickname for ${target}.`, ephemeral: true });
+}
+
+// --- PING & UPTIME ---
+if (commandName === 'ping') return interaction.reply(`🏓 Latency: **${client.ws.ping}ms**`);
+
+if (commandName === 'uptime') {
+    const uptime = process.uptime();
+    const h = Math.floor(uptime / 3600), m = Math.floor((uptime % 3600) / 60), s = Math.floor(uptime % 60);
+    return interaction.reply(`⏱️ Bot Uptime: **${h}h ${m}m ${s}s**`);
+}
+
+// --- INFO COMMANDS ---
+if (commandName === 'avatar') {
+    const target = options.getUser('user') || user;
+    return interaction.reply({ embeds: [new EmbedBuilder().setTitle(`${target.username}'s Avatar`).setImage(target.displayAvatarURL({ size: 1024 }))] });
+}
+
+if (commandName === 'serverinfo') {
+    const embed = new EmbedBuilder().setTitle(guild.name).setThumbnail(guild.iconURL()).addFields(
+        { name: 'Members', value: `${guild.memberCount}`, inline: true },
+        { name: 'Created', value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:R>`, inline: true },
+        { name: 'Boosts', value: `${guild.premiumSubscriptionCount || 0}`, inline: true }
+    );
+    return interaction.reply({ embeds: [embed] });
+}
+
+if (commandName === 'userinfo') {
+    const targetMember = options.getMember('user') || member;
+    const embed = new EmbedBuilder().setTitle(`Info: ${targetMember.user.username}`).setThumbnail(targetMember.user.displayAvatarURL()).addFields(
+        { name: 'Joined Server', value: `<t:${Math.floor(targetMember.joinedTimestamp / 1000)}:R>`, inline: true },
+        { name: 'Joined Discord', value: `<t:${Math.floor(targetMember.user.createdTimestamp / 1000)}:R>`, inline: true },
+        { name: 'Roles', value: targetMember.roles.cache.map(r => r.name).slice(0, 10).join(', ') || 'None' }
+    );
+    return interaction.reply({ embeds: [embed] });
+}
+
+// --- POLL & EMERGENCY ---
+if (commandName === 'poll') {
+    const q = options.getString('question');
+    const msg = await interaction.reply({ embeds: [new EmbedBuilder().setTitle('📊 Poll').setDescription(q).setFooter({ text: `Asked by ${user.username}` })], fetchReply: true });
+    await msg.react('👍'); await msg.react('👎');
+    return;
+}
+
+if (commandName === 'emergency') {
+    return interaction.reply({ embeds: [new EmbedBuilder().setTitle('🆘 Emergency Resources').setDescription('If you or someone you know is struggling, please reach out for help.\n\n• **International:** [Find A Helpline](https://findahelpline.com/)\n• **US:** Dial 988\n• **UK/Ireland:** 111 or 999').setColor(0xFF0000)], ephemeral: true });
+}
 
         // --- HANDLER: MODERATION COMMANDS ---
         if (interaction.commandName.startsWith('mod_')) {
