@@ -499,7 +499,7 @@
         "category": "C",
         "manufacturer": "Airbus",
         "model": "A319-100",
-        "livery": "Scandinavian Airlines - Retro",
+        "livery": "SAS - Retro",
         "registration": "OY-KBO",
         "image": "https://www.helpathand.nl/janpolet/wp-content/uploads/2023/05/Airbus-A319-100-Scandinavian-Airlines-Retro.png"
     },
@@ -1003,7 +1003,7 @@
         "category": "C",
         "manufacturer": "Airbus",
         "model": "A320-200",
-        "livery": "Scandinavian Airlines",
+        "livery": "SAS",
         "registration": "OY-KAR",
         "image": "https://www.helpathand.nl/janpolet/wp-content/uploads/2023/05/Airbus-A320-200-Scandinavian-Airlines.png"
     },
@@ -1683,7 +1683,7 @@
         "category": "E",
         "manufacturer": "Airbus",
         "model": "A330-300",
-        "livery": "Scandinavian Airlines",
+        "livery": "SAS",
         "registration": "LN-RKO",
         "image": "https://www.helpathand.nl/janpolet/wp-content/uploads/2023/05/Airbus-A330-300-Scandinavian-Airlines.png"
     },
@@ -2267,7 +2267,7 @@
         "category": "E",
         "manufacturer": "Airbus",
         "model": "A350-900",
-        "livery": "Scandinavian Airlines",
+        "livery": "SAS",
         "registration": "SE-RSA",
         "image": "https://www.helpathand.nl/janpolet/wp-content/uploads/2023/05/Airbus-A350-900-Scandinavian-Airlines.png"
     },
@@ -2771,7 +2771,7 @@
         "category": "C",
         "manufacturer": "Boeing",
         "model": "737-700",
-        "livery": "Scandinavian Airlines",
+        "livery": "SAS",
         "registration": "SE-RJX",
         "image": "https://www.helpathand.nl/janpolet/wp-content/uploads/2023/05/Boeing-737-700-Scandinavian-Airlines.png"
     },
@@ -3579,7 +3579,7 @@
         "category": "C",
         "manufacturer": "Boeing",
         "model": "737-800",
-        "livery": "Scandinavian Airlines",
+        "livery": "SAS",
         "registration": "LN-RGA",
         "image": "https://www.helpathand.nl/janpolet/wp-content/uploads/2023/05/Boeing-737-800-Scandinavian-Airlines.png"
     },
@@ -3979,7 +3979,7 @@
         "category": "E",
         "manufacturer": "Boeing",
         "model": "747-200",
-        "livery": "Scandinavian Airlines",
+        "livery": "SAS",
         "registration": "LN-AEO",
         "image": "https://www.helpathand.nl/janpolet/wp-content/uploads/2023/05/Boeing-747-200-Scandinavian-Airlines.png"
     },
@@ -6683,7 +6683,7 @@
         "category": "C",
         "manufacturer": "Bombardier",
         "model": "CRJ-900",
-        "livery": "Scandinavian Airlines",
+        "livery": "SAS",
         "registration": "OY-KFL",
         "image": "https://www.helpathand.nl/janpolet/wp-content/uploads/2023/05/Bombardier-CRJ-900-Scandinavian-Airlines.png"
     },

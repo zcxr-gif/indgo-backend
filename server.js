@@ -46,12 +46,12 @@ mongoose.connect(process.env.MONGO_URI)
     .catch(err => console.error('❌ MongoDB Connection Error:', err));
 
 const CommunityAircraftSchema = new mongoose.Schema({
-    contributorName: { type: String, required: true }, 
+    contributorName: { type: String, default: "System" }, // Default to system for pre-filled
     contributorId: { type: String, required: false },
     aircraftType: { type: String, required: true },    
     liveryName: { type: String, required: true },      
-    tailNumber: { type: String, required: true },      
-    imageUrl: { type: String, required: true },        
+    tailNumber: { type: String, required: true, unique: true }, // Ensure no duplicates
+    imageUrl: { type: String, required: false, default: null }, // Now optional
     uploadedAt: { type: Date, default: Date.now }
 });
 
@@ -448,50 +448,51 @@ app.get('/api/aircraft', async (req, res) => {
     }
 });
 
-// GET: Find aircraft by Type AND Livery (Prioritizes Exact & Word Matches)
+// GET: Find aircraft by Type AND Livery (or return a placeholder)
 app.get('/api/aircraft/lookup', async (req, res) => {
     try {
-        const { type, livery } = req.query;
+        const { type, livery, tail } = req.query; // Added 'tail' to query params
 
-        if (!type && !livery) {
+        if (!type && !livery && !tail) {
             return res.status(400).json({ message: 'At least one search parameter is required.' });
         }
 
         let query = {};
-
-        // Basic fuzzy query to gather all POTENTIAL candidates
         if (type) query.aircraftType = { $regex: type, $options: 'i' };
         if (livery) query.liveryName = { $regex: livery, $options: 'i' };
+        if (tail) query.tailNumber = tail.toUpperCase();
 
         const results = await CommunityAircraft.find(query);
 
+        // --- IF NO RESULTS FOUND: RETURN PLACEHOLDER ---
         if (results.length === 0) {
-            return res.status(404).json({ message: 'No matching aircraft found.' });
+            return res.json({
+                contributorName: "System",
+                aircraftType: type || "Unknown",
+                liveryName: livery || "Standard",
+                tailNumber: tail ? tail.toUpperCase() : "N/A",
+                imageUrl: null, // Frontend uses this to show a "No Image" placeholder
+                isPlaceholder: true, // Flag for frontend logic
+                uploadedAt: new Date()
+            });
         }
 
-        // --- INTELLIGENT SORTING LOGIC ---
+        // --- EXISTING INTELLIGENT SORTING LOGIC ---
         if (livery) {
             const searchLower = livery.toLowerCase();
-
-            // PRIORITY 1: Exact Match
             const exactMatch = results.find(
                 item => item.liveryName.toLowerCase() === searchLower
             );
             if (exactMatch) return res.json(exactMatch);
 
-            // PRIORITY 2: Word Boundary Match
             try {
                 const escapedLivery = livery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
                 const wordBoundaryRegex = new RegExp(`\\b${escapedLivery}\\b`, 'i');
-                
                 const boundaryMatch = results.find(item => wordBoundaryRegex.test(item.liveryName));
                 if (boundaryMatch) return res.json(boundaryMatch);
-            } catch (e) {
-                // If regex fails, continue
-            }
+            } catch (e) { /* fallback */ }
         }
 
-        // PRIORITY 3: Fallback
         res.json(results[0]); 
 
     } catch (error) {
@@ -610,6 +611,24 @@ app.post('/api/aircraft', upload.single('image'), async (req, res) => {
         res.status(500).json({ message: 'Server error during upload.' });
     }
 });
+
+const syncAircraftDatabase = async (jsonList) => {
+    for (const ac of jsonList) {
+        // Check if this tail number already exists in the DB
+        const exists = await CommunityAircraft.findOne({ tailNumber: ac.tailNumber.toUpperCase() });
+
+        if (!exists) {
+            console.log(`🆕 Pre-creating record for: ${ac.tailNumber}`);
+            await CommunityAircraft.create({
+                contributorName: "System",
+                aircraftType: ac.aircraftType,
+                liveryName: ac.liveryName || "Standard",
+                tailNumber: ac.tailNumber.toUpperCase(),
+                imageUrl: null // No image yet
+            });
+        }
+    }
+};
 
 // PUT: Update an existing aircraft
 app.put('/api/aircraft/:id', upload.single('image'), async (req, res) => {
