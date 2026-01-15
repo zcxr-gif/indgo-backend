@@ -558,22 +558,36 @@ app.post('/api/aircraft', upload.single('image'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ message: 'Image file is required.' });
         
-        const { contributorName, aircraftType, liveryName, tailNumber } = req.body;
-        if (!contributorName || !aircraftType || !liveryName || !tailNumber) {
+        // Destructure with mapping support for incoming external JSON keys
+        const { 
+            contributorName = "System", 
+            aircraftType, 
+            model,
+            liveryName, 
+            livery,
+            tailNumber,
+            registration
+        } = req.body;
+
+        // Resolve which values to use (internal names vs incoming json names)
+        const finalType = aircraftType || model;
+        const finalLivery = liveryName || livery;
+        const finalTail = (tailNumber || registration || "").toUpperCase();
+
+        if (!finalType || !finalLivery || !finalTail) {
             // Clean up temp file if validation fails
             if (req.file) fs.unlink(req.file.path, () => {});
-            return res.status(400).json({ message: 'All fields are required.' });
+            return res.status(400).json({ message: 'All fields (Type/Model, Livery, Tail/Registration) are required.' });
         }
 
         // 1. Process from DISK (req.file.path) instead of BUFFER
-        // Sharp can read directly from a file path, which is much more memory efficient
         const optimizedBuffer = await sharp(req.file.path)
             .resize({ width: 1920, withoutEnlargement: true }) 
             .webp({ quality: 80 }) 
             .toBuffer();
 
-        const cleanTail = tailNumber.replace(/[^a-zA-Z0-9]/g, '');
-        const fileName = `community-aircraft/${cleanTail}-${Date.now()}.webp`;
+        const cleanTailName = finalTail.replace(/[^a-zA-Z0-9]/g, '');
+        const fileName = `community-aircraft/${cleanTailName}-${Date.now()}.webp`;
 
         await s3Client.send(new PutObjectCommand({
             Bucket: process.env.AWS_S3_BUCKET_NAME,
@@ -591,9 +605,9 @@ app.post('/api/aircraft', upload.single('image'), async (req, res) => {
 
         const newEntry = new CommunityAircraft({
             contributorName,
-            aircraftType,
-            liveryName,
-            tailNumber: tailNumber.toUpperCase(),
+            aircraftType: finalType,
+            liveryName: finalLivery,
+            tailNumber: finalTail,
             imageUrl: fileUrl 
         });
 
@@ -643,7 +657,21 @@ const syncAircraftDatabase = async (jsonList) => {
 app.put('/api/aircraft/:id', upload.single('image'), async (req, res) => {
     try {
         const { id } = req.params;
-        const { contributorName, aircraftType, liveryName, tailNumber } = req.body;
+        
+        // Map mapping support for incoming external JSON keys
+        const { 
+            contributorName, 
+            aircraftType, 
+            model,
+            liveryName, 
+            livery,
+            tailNumber,
+            registration
+        } = req.body;
+
+        const finalType = aircraftType || model;
+        const finalLivery = liveryName || livery;
+        const finalTail = tailNumber || registration;
 
         const existingEntry = await CommunityAircraft.findById(id);
         if (!existingEntry) {
@@ -657,15 +685,14 @@ app.put('/api/aircraft/:id', upload.single('image'), async (req, res) => {
         if (req.file) {
             console.log(`Processing new image for update: ${id}`);
             
-            // FIX: Read from 'req.file.path' (Disk) instead of 'req.file.buffer' (Memory)
-            // Buffer is undefined here because Multer is using 'dest' (DiskStorage)
             const optimizedBuffer = await sharp(req.file.path)
                 .resize({ width: 1920, withoutEnlargement: true }) 
                 .webp({ quality: 80 }) 
                 .toBuffer();
 
-            const cleanTail = tailNumber.replace(/[^a-zA-Z0-9]/g, '');
-            const fileName = `community-aircraft/${cleanTail}-${Date.now()}.webp`;
+            // Safe use of tail number for clean filename
+            const cleanTailRef = (finalTail || existingEntry.tailNumber).replace(/[^a-zA-Z0-9]/g, '');
+            const fileName = `community-aircraft/${cleanTailRef}-${Date.now()}.webp`;
 
             await s3Client.send(new PutObjectCommand({
                 Bucket: process.env.AWS_S3_BUCKET_NAME,
@@ -686,10 +713,10 @@ app.put('/api/aircraft/:id', upload.single('image'), async (req, res) => {
             });
         }
 
-        existingEntry.contributorName = contributorName;
-        existingEntry.aircraftType = aircraftType;
-        existingEntry.liveryName = liveryName;
-        existingEntry.tailNumber = tailNumber.toUpperCase();
+        if (contributorName) existingEntry.contributorName = contributorName;
+        if (finalType) existingEntry.aircraftType = finalType;
+        if (finalLivery) existingEntry.liveryName = finalLivery;
+        if (finalTail) existingEntry.tailNumber = finalTail.toUpperCase();
         existingEntry.imageUrl = updatedImageUrl;
 
         await existingEntry.save();
