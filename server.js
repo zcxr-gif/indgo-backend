@@ -614,16 +614,25 @@ app.post('/api/aircraft', upload.single('image'), async (req, res) => {
 
 const syncAircraftDatabase = async (jsonList) => {
     for (const ac of jsonList) {
+        // Map the JSON "registration" field to your database "tailNumber"
+        const registration = ac.registration; 
+        const model = ac.model;
+        const livery = ac.livery;
+
+        // Skip if registration is missing to prevent errors
+        if (!registration) continue;
+
         // Check if this tail number already exists in the DB
-        const exists = await CommunityAircraft.findOne({ tailNumber: ac.tailNumber.toUpperCase() });
+        const exists = await CommunityAircraft.findOne({ tailNumber: registration.toUpperCase() });
 
         if (!exists) {
-            console.log(`🆕 Pre-creating record for: ${ac.tailNumber}`);
+            console.log(`🆕 Pre-creating record for: ${registration}`);
             await CommunityAircraft.create({
                 contributorName: "System",
-                aircraftType: ac.aircraftType,
-                liveryName: ac.liveryName || "Standard",
-                tailNumber: ac.tailNumber.toUpperCase(),
+                // Map the JSON keys correctly to your Mongoose Schema
+                aircraftType: model || "Unknown", 
+                liveryName: livery || "Standard",
+                tailNumber: registration.toUpperCase(),
                 imageUrl: null // No image yet
             });
         }
