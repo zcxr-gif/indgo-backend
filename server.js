@@ -451,46 +451,46 @@ app.get('/api/aircraft', async (req, res) => {
 // GET: Find aircraft by Type AND Livery (or return a placeholder)
 app.get('/api/aircraft/lookup', async (req, res) => {
     try {
-        const { type, livery, tail } = req.query; // Added 'tail' to query params
+        // 1. Support both internal names (type/tail) and JSON names (model/registration)
+        const { type, model, livery, liveryName, tail, registration } = req.query; 
 
-        if (!type && !livery && !tail) {
+        // 2. Normalize values: prioritize provided data, then fall back
+        const finalType = type || model;
+        const finalLivery = liveryName || livery;
+        const finalTail = (tail || registration || "").toUpperCase();
+
+        if (!finalType && !finalLivery && !finalTail) {
             return res.status(400).json({ message: 'At least one search parameter is required.' });
         }
 
+        // 3. Build the MongoDB Query
         let query = {};
-        if (type) query.aircraftType = { $regex: type, $options: 'i' };
-        if (livery) query.liveryName = { $regex: livery, $options: 'i' };
-        if (tail) query.tailNumber = tail.toUpperCase();
+        if (finalType) query.aircraftType = { $regex: finalType, $options: 'i' };
+        if (finalLivery) query.liveryName = { $regex: finalLivery, $options: 'i' };
+        if (finalTail) query.tailNumber = finalTail;
 
         const results = await CommunityAircraft.find(query);
 
-        // --- IF NO RESULTS FOUND: RETURN PLACEHOLDER ---
+        // 4. FIX: If no results found, return placeholder using the normalized 'finalTail'
         if (results.length === 0) {
             return res.json({
                 contributorName: "System",
-                aircraftType: type || "Unknown",
-                liveryName: livery || "Standard",
-                tailNumber: tail ? tail.toUpperCase() : "N/A",
-                imageUrl: null, // Frontend uses this to show a "No Image" placeholder
-                isPlaceholder: true, // Flag for frontend logic
+                aircraftType: finalType || "Unknown",
+                liveryName: finalLivery || "Standard",
+                tailNumber: finalTail || "N/A", // This will now correctly show "3B-NBP"
+                imageUrl: null, 
+                isPlaceholder: true, 
                 uploadedAt: new Date()
             });
         }
 
         // --- EXISTING INTELLIGENT SORTING LOGIC ---
-        if (livery) {
-            const searchLower = livery.toLowerCase();
+        if (finalLivery) {
+            const searchLower = finalLivery.toLowerCase();
             const exactMatch = results.find(
                 item => item.liveryName.toLowerCase() === searchLower
             );
             if (exactMatch) return res.json(exactMatch);
-
-            try {
-                const escapedLivery = livery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                const wordBoundaryRegex = new RegExp(`\\b${escapedLivery}\\b`, 'i');
-                const boundaryMatch = results.find(item => wordBoundaryRegex.test(item.liveryName));
-                if (boundaryMatch) return res.json(boundaryMatch);
-            } catch (e) { /* fallback */ }
         }
 
         res.json(results[0]); 
@@ -628,27 +628,45 @@ app.post('/api/aircraft', upload.single('image'), async (req, res) => {
 
 const syncAircraftDatabase = async (jsonList) => {
     for (const ac of jsonList) {
-        // Map the JSON "registration" field to your database "tailNumber"
-        const registration = ac.registration; 
-        const model = ac.model;
-        const livery = ac.livery;
+        // Map the JSON keys to your local variables
+        const registration = ac.registration ? ac.registration.toUpperCase() : null; 
+        const model = ac.model || "Unknown";
+        const livery = ac.livery || "Standard";
 
-        // Skip if registration is missing to prevent errors
-        if (!registration) continue;
+        if (!registration || registration === "N/A") continue;
 
-        // Check if this tail number already exists in the DB
-        const exists = await CommunityAircraft.findOne({ tailNumber: registration.toUpperCase() });
+        // 1. Check if a valid record already exists for this registration
+        const exists = await CommunityAircraft.findOne({ tailNumber: registration });
 
         if (!exists) {
-            console.log(`🆕 Pre-creating record for: ${registration}`);
-            await CommunityAircraft.create({
-                contributorName: "System",
-                // Map the JSON keys correctly to your Mongoose Schema
-                aircraftType: model || "Unknown", 
-                liveryName: livery || "Standard",
-                tailNumber: registration.toUpperCase(),
-                imageUrl: null // No image yet
+            // 2. SEARCH FOR "BROKEN" RECORDS: 
+            // Look for a record that matches this Type/Livery but has no valid Registration
+            const placeholder = await CommunityAircraft.findOne({
+                aircraftType: model,
+                liveryName: livery,
+                $or: [
+                    { tailNumber: "N/A" },
+                    { tailNumber: "" },
+                    { tailNumber: { $exists: false } },
+                    { tailNumber: null }
+                ]
             });
+
+            if (placeholder) {
+                console.log(`🔧 Patching placeholder for ${model} (${livery}) with Registration: ${registration}`);
+                placeholder.tailNumber = registration;
+                await placeholder.save();
+            } else {
+                // 3. If no placeholder exists, create a fresh record
+                console.log(`🆕 Pre-creating record for: ${registration}`);
+                await CommunityAircraft.create({
+                    contributorName: "System",
+                    aircraftType: model, 
+                    liveryName: livery,
+                    tailNumber: registration,
+                    imageUrl: null 
+                });
+            }
         }
     }
 };
