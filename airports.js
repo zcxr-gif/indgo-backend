@@ -122,4 +122,9 @@ const getAirportInfo = async (s3Client, icao) => {
     };
 };
 
-module.exports = { uploadAirportImage, getAirportInfo };
+module.exports = { 
+    uploadAirportImage, 
+    getAirportInfo, 
+    deleteAirportImages, 
+    updateAirportMetadata 
+};

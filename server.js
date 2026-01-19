@@ -1,8 +1,12 @@
 // server.js
 // A lightweight backend for Community Aircraft Contributions and Flight Trail Storage.
 
-const { uploadAirportImage, getAirportInfo } = require('./airports');
-const { deleteAirportImages, updateAirportMetadata } = require('./airports');
+const { 
+    uploadAirportImage, 
+    getAirportInfo, 
+    deleteAirportImages, 
+    updateAirportMetadata 
+} = require('./airports');
 
 const express = require('express');
 const mongoose = require('mongoose');
