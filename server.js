@@ -869,8 +869,7 @@ app.get('/airports', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'airports.html'));
 });
 
-// 3. THIS MUST BE LAST - The catch-all route for React
-app.get('*', (req, res) => {
+app.get('(.*)', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
