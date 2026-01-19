@@ -861,15 +861,16 @@ app.put('/api/airports/:icao', upload.single('image'), async (req, res) => {
         res.status(500).json({ message: 'Error updating airport data.' });
     }
 });
-// 1. Ensure this line exists to serve all your HTML files
+// 1. Serve static files (CSS, JS, Images)
 app.use(express.static(path.join(__dirname, 'public'))); 
 
-// 2. Add a specific route for the airports page
+// 2. Specific route for airports
 app.get('/airports', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'airports.html'));
 });
 
-app.get('(.*)', (req, res) => {
+// 3. The New Modern Catch-all
+app.get('/:path*', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
