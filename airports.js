@@ -90,8 +90,6 @@ const updateAirportMetadata = async (s3Client, icao, newContributor) => {
     return true;
 };
 
-module.exports = { uploadAirportImage, getAirportInfo, deleteAirportImages, updateAirportMetadata };
-
 /**
  * Fetches the most recent image for a specific ICAO.
  */
