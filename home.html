@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Airport Image Manager</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        .glass-panel {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(229, 231, 235, 1);
+        }
+        .preview-image {
+            max-height: 400px;
+            object-fit: cover;
+        }
+        .loading-spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #3498db;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            animation: spin 1s linear infinite;
+            display: inline-block;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen text-gray-800 font-sans">
+
+    <!-- Navigation Bar -->
+    <nav class="bg-white border-b border-gray-200 sticky top-0 z-50">
+        <div class="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between h-16 items-center">
+                <div class="flex items-center space-x-2">
+                    <i class="fas fa-tower-control text-blue-600 text-2xl"></i>
+                    <span class="text-xl font-bold tracking-tight text-gray-900">AirportManager</span>
+                </div>
+                <div class="flex items-center gap-4">
+                    <a href="/index.html" class="inline-flex items-center px-4 py-2 border border-blue-600 text-blue-600 font-medium rounded-lg hover:bg-blue-50 transition-colors">
+                        <i class="fas fa-plane-departure mr-2"></i>
+                        Aircraft Database
+                    </a>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-4xl mx-auto px-4 py-8">
+        
+        <!-- Search Section -->
+        <section class="glass-panel rounded-2xl p-6 shadow-sm mb-8">
+            <div class="flex justify-between items-center mb-4">
+                <h2 class="text-lg font-semibold flex items-center">
+                    <i class="fas fa-search mr-2 text-blue-500"></i>
+                    Lookup Airport
+                </h2>
+                <button onclick="resetForm()" class="text-xs text-gray-500 hover:text-blue-600 underline">
+                    Clear Search/Form
+                </button>
+            </div>
+            <div class="flex flex-col sm:flex-row gap-4">
+                <input 
+                    type="text" 
+                    id="icaoInput" 
+                    placeholder="Enter ICAO (e.g., EGLL, KJFK)" 
+                    class="flex-1 px-4 py-3 rounded-xl border border-gray-300 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none uppercase font-mono tracking-widest"
+                >
+                <button 
+                    onclick="lookupAirport()" 
+                    id="lookupBtn"
+                    class="bg-blue-600 text-white px-8 py-3 rounded-xl font-semibold hover:bg-blue-700 active:scale-95 transition-all shadow-md flex items-center justify-center gap-2"
+                >
+                    <span id="lookupBtnText">Lookup</span>
+                    <div id="lookupSpinner" class="loading-spinner hidden"></div>
+                </button>
+            </div>
+        </section>
+
+        <!-- Management & Preview Section -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            
+            <!-- Form Column -->
+            <section class="space-y-6">
+                <div class="glass-panel rounded-2xl p-6 shadow-sm">
+                    <h2 class="text-lg font-semibold mb-6 flex items-center">
+                        <i class="fas fa-edit mr-2 text-blue-500"></i>
+                        Data Management
+                    </h2>
+                    
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Contributor Name</label>
+                            <input 
+                                type="text" 
+                                id="contributorInput" 
+                                placeholder="System / Your Name" 
+                                class="w-full px-4 py-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-blue-500 outline-none"
+                            >
+                        </div>
+
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Upload/Replace Image</label>
+                            <div class="relative group">
+                                <input 
+                                    type="file" 
+                                    id="imageInput" 
+                                    accept="image/*"
+                                    onchange="handleFileSelect(event)"
+                                    class="hidden"
+                                >
+                                <label for="imageInput" class="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-gray-300 rounded-xl cursor-pointer bg-gray-50 hover:bg-gray-100 hover:border-blue-400 transition-all">
+                                    <i class="fas fa-cloud-upload-alt text-2xl text-gray-400 group-hover:text-blue-500 mb-2"></i>
+                                    <span class="text-sm text-gray-500" id="fileNameDisplay">Click to browse images</span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div id="actionButtons" class="pt-4 flex flex-col gap-3">
+                            <button onclick="saveAirportData(false)" class="w-full bg-green-600 text-white py-3 rounded-xl font-semibold hover:bg-green-700 transition-all shadow-lg flex items-center justify-center gap-2">
+                                <i class="fas fa-plus"></i> Upload New
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="statusMsg" class="hidden p-4 rounded-xl text-center font-medium border"></div>
+            </section>
+
+            <!-- Preview Column -->
+            <section class="glass-panel rounded-2xl p-6 shadow-sm min-h-[400px] flex flex-col">
+                <h2 class="text-lg font-semibold mb-4 flex items-center">
+                    <i class="fas fa-image mr-2 text-blue-500"></i>
+                    Live Preview
+                </h2>
+                
+                <div id="recordDisplay" class="flex-1 flex flex-col items-center justify-center text-center text-gray-400">
+                    <div id="previewContainer" class="w-full hidden">
+                        <img id="currentImage" src="" alt="Airport" class="w-full rounded-xl shadow-md preview-image mb-4">
+                        <div class="text-left space-y-1 bg-white p-3 rounded-lg border border-gray-100 shadow-inner">
+                            <p class="text-gray-900 font-bold text-xl uppercase tracking-wider" id="displayIcao"></p>
+                            <p class="text-sm"><span class="text-gray-500">Contributor:</span> <span id="displayContributor" class="text-gray-800 font-medium"></span></p>
+                            <p class="text-xs text-gray-400 italic" id="displayDate"></p>
+                        </div>
+                    </div>
+                    
+                    <div id="noRecordState">
+                        <i class="far fa-images text-5xl mb-4 opacity-20"></i>
+                        <p>Search for an airport or upload to see data</p>
+                    </div>
+                </div>
+            </section>
+
+        </div>
+    </main>
+
+    <script>
+        const API_BASE = "/api/airports";
+        let currentRecord = null;
+
+        // UI State Helpers
+        function showLoading(isLoading) {
+            const btn = document.getElementById('lookupBtn');
+            const text = document.getElementById('lookupBtnText');
+            const spinner = document.getElementById('lookupSpinner');
+            
+            btn.disabled = isLoading;
+            text.classList.toggle('hidden', isLoading);
+            spinner.classList.toggle('hidden', !isLoading);
+        }
+
+        function showStatus(msg, type = 'info') {
+            const el = document.getElementById('statusMsg');
+            el.textContent = msg;
+            
+            const classes = {
+                'error': 'bg-red-50 text-red-700 border-red-200',
+                'success': 'bg-green-50 text-green-700 border-green-200',
+                'info': 'bg-blue-50 text-blue-700 border-blue-200'
+            };
+
+            el.className = `p-4 rounded-xl text-center font-medium block ${classes[type] || classes.info}`;
+            setTimeout(() => {
+                el.classList.add('opacity-0');
+                setTimeout(() => el.className = 'hidden', 500);
+            }, 5000);
+        }
+
+        function handleFileSelect(event) {
+            const file = event.target.files[0];
+            if (file) {
+                document.getElementById('fileNameDisplay').textContent = file.name;
+            }
+        }
+
+        function resetForm() {
+            document.getElementById('icaoInput').value = '';
+            document.getElementById('contributorInput').value = '';
+            document.getElementById('imageInput').value = '';
+            document.getElementById('fileNameDisplay').textContent = "Click to browse images";
+            clearRecord();
+        }
+
+        // API Interactions
+        async function lookupAirport() {
+            const icao = document.getElementById('icaoInput').value.trim().toUpperCase();
+            if (!icao) return showStatus("Please enter an ICAO code", "error");
+
+            showLoading(true);
+            try {
+                const response = await fetch(`${API_BASE}/${icao}`);
+                if (response.status === 404) {
+                    clearRecord();
+                    showStatus("No image found for this airport.", "info");
+                    return;
+                }
+                if (!response.ok) throw new Error("Server error occurred.");
+                
+                const data = await response.json();
+                renderRecord(data);
+                showStatus(`Data loaded for ${icao}`, "success");
+            } catch (err) {
+                clearRecord();
+                showStatus(err.message, "error");
+            } finally {
+                showLoading(false);
+            }
+        }
+
+        function renderRecord(data) {
+            currentRecord = data;
+            document.getElementById('noRecordState').classList.add('hidden');
+            document.getElementById('previewContainer').classList.remove('hidden');
+            
+            document.getElementById('currentImage').src = data.imageUrl;
+            document.getElementById('displayIcao').textContent = data.icao;
+            document.getElementById('displayContributor').textContent = data.contributor || 'System';
+            document.getElementById('displayDate').textContent = `Last Modified: ${new Date(data.uploadedAt).toLocaleString()}`;
+            
+            // Pre-fill form
+            document.getElementById('contributorInput').value = data.contributor || '';
+            
+            updateButtons(true);
+        }
+
+        function clearRecord() {
+            currentRecord = null;
+            document.getElementById('noRecordState').classList.remove('hidden');
+            document.getElementById('previewContainer').classList.add('hidden');
+            updateButtons(false);
+        }
+
+        function updateButtons(hasRecord) {
+            const btnContainer = document.getElementById('actionButtons');
+            if (hasRecord) {
+                btnContainer.innerHTML = `
+                    <button onclick="saveAirportData(true)" class="w-full bg-blue-600 text-white py-3 rounded-xl font-semibold hover:bg-blue-700 transition-all shadow-lg flex items-center justify-center gap-2">
+                        <i class="fas fa-sync-alt"></i> Update / Replace
+                    </button>
+                    <button onclick="deleteAirport()" class="w-full bg-white text-red-600 border border-red-200 py-3 rounded-xl font-semibold hover:bg-red-50 transition-all flex items-center justify-center gap-2">
+                        <i class="fas fa-trash-alt"></i> Delete Airport Data
+                    </button>
+                `;
+            } else {
+                btnContainer.innerHTML = `
+                    <button onclick="saveAirportData(false)" class="w-full bg-green-600 text-white py-3 rounded-xl font-semibold hover:bg-green-700 transition-all shadow-lg flex items-center justify-center gap-2">
+                        <i class="fas fa-plus"></i> Upload New
+                    </button>
+                `;
+            }
+        }
+
+        async function saveAirportData(isUpdate) {
+            const icao = document.getElementById('icaoInput').value.trim().toUpperCase();
+            const contributor = document.getElementById('contributorInput').value.trim();
+            const imageFile = document.getElementById('imageInput').files[0];
+
+            if (!icao) return showStatus("ICAO code is required", "error");
+            if (!isUpdate && !imageFile) return showStatus("An image is required for new uploads", "error");
+
+            const formData = new FormData();
+            formData.append('icao', icao);
+            formData.append('contributorName', contributor || 'System');
+            if (imageFile) formData.append('image', imageFile);
+
+            try {
+                const url = isUpdate ? `${API_BASE}/${icao}` : API_BASE;
+                const method = isUpdate ? 'PUT' : 'POST';
+
+                const response = await fetch(url, {
+                    method: method,
+                    body: formData
+                });
+
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.message || "Operation failed");
+
+                showStatus(result.message, "success");
+                
+                // Clear file input
+                document.getElementById('imageInput').value = '';
+                document.getElementById('fileNameDisplay').textContent = "Click to browse images";
+                
+                // Refresh data
+                lookupAirport(); 
+            } catch (err) {
+                showStatus(err.message, "error");
+            }
+        }
+
+        async function deleteAirport() {
+            const icao = currentRecord?.icao;
+            if (!icao) return;
+            
+            if (!confirm(`Are you sure you want to delete all data and images for ${icao}? This cannot be undone.`)) return;
+
+            try {
+                const response = await fetch(`${API_BASE}/${icao}`, { method: 'DELETE' });
+                const result = await response.json();
+                
+                showStatus(result.message, "success");
+                resetForm();
+            } catch (err) {
+                showStatus("Failed to delete airport data", "error");
+            }
+        }
+    </script>
+</body>
+</html>

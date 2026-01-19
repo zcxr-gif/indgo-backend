@@ -1,6 +1,9 @@
 // server.js
 // A lightweight backend for Community Aircraft Contributions and Flight Trail Storage.
 
+const { uploadAirportImage, getAirportInfo } = require('./airports');
+const { deleteAirportImages, updateAirportMetadata } = require('./airports');
+
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
@@ -765,6 +768,93 @@ app.delete('/api/aircraft/:id', async (req, res) => {
     } catch (error) {
         console.error('Delete Error:', error);
         res.status(500).json({ message: 'Server error during deletion.' });
+    }
+});
+
+/* =========================
+ * NEW: AIRPORT IMAGES API
+ * ========================= */
+
+// POST: Upload Airport Image
+app.post('/api/airports', upload.single('image'), async (req, res) => {
+    try {
+        const { icao, contributorName } = req.body;
+
+        if (!req.file || !icao) {
+            if (req.file) fs.unlink(req.file.path, () => {});
+            return res.status(400).json({ message: 'ICAO and Image are required.' });
+        }
+
+        const imageUrl = await uploadAirportImage(s3Client, req.file, icao, contributorName);
+        
+        res.status(201).json({ 
+            message: 'Airport image uploaded!', 
+            url: imageUrl 
+        });
+    } catch (error) {
+        if (req.file) fs.unlink(req.file.path, () => {});
+        console.error('Airport Upload Error:', error);
+        res.status(500).json({ message: 'Error uploading airport image.' });
+    }
+});
+
+// GET: Lookup Airport Info
+app.get('/api/airports/:icao', async (req, res) => {
+    try {
+        const info = await getAirportInfo(s3Client, req.params.icao);
+        if (!info) {
+            return res.status(404).json({ message: 'No image found for this airport.' });
+        }
+        res.json(info);
+    } catch (error) {
+        console.error('Airport Lookup Error:', error);
+        res.status(500).json({ message: 'Error fetching airport info.' });
+    }
+});
+
+/**
+ * DELETE: Remove all images/data for an airport
+ */
+app.delete('/api/airports/:icao', async (req, res) => {
+    try {
+        const success = await deleteAirportImages(s3Client, req.params.icao);
+        if (!success) return res.status(404).json({ message: 'No images found for this ICAO.' });
+        
+        res.json({ message: `All data for ${req.params.icao.toUpperCase()} deleted successfully.` });
+    } catch (error) {
+        console.error('Airport Delete Error:', error);
+        res.status(500).json({ message: 'Error deleting airport data.' });
+    }
+});
+
+/**
+ * PUT: Update airport data or replace image
+ */
+app.put('/api/airports/:icao', upload.single('image'), async (req, res) => {
+    try {
+        const { icao } = req.params;
+        const { contributorName } = req.body;
+
+        // SCENARIO 1: Replacing the image
+        if (req.file) {
+            // Delete old images first to keep bucket clean
+            await deleteAirportImages(s3Client, icao);
+            // Upload new one
+            const newUrl = await uploadAirportImage(s3Client, req.file, icao, contributorName);
+            return res.json({ message: 'Airport image replaced!', url: newUrl });
+        }
+
+        // SCENARIO 2: Updating metadata only (Contributor name)
+        if (contributorName) {
+            await updateAirportMetadata(s3Client, icao, contributorName);
+            return res.json({ message: 'Airport contributor updated!' });
+        }
+
+        res.status(400).json({ message: 'Provide a new image or contributor name to update.' });
+    } catch (error) {
+        if (req.file) fs.unlink(req.file.path, () => {});
+        console.error('Airport Update Error:', error);
+        res.status(500).json({ message: 'Error updating airport data.' });
     }
 });
 
