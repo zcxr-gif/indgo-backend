@@ -861,6 +861,18 @@ app.put('/api/airports/:icao', upload.single('image'), async (req, res) => {
         res.status(500).json({ message: 'Error updating airport data.' });
     }
 });
+// 1. Ensure this line exists to serve all your HTML files
+app.use(express.static(path.join(__dirname, 'public'))); 
+
+// 2. Add a specific route for the airports page
+app.get('/airports', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'airports.html'));
+});
+
+// 3. THIS MUST BE LAST - The catch-all route for React
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
 // 6. START SERVER
 app.listen(PORT, () => {
