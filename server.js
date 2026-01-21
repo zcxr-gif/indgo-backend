@@ -879,9 +879,7 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// 4. The NEW Mandatory Wildcard Syntax for Express 5.0+
-// The asterisk MUST be preceded by a named parameter (e.g., ':path')
-app.get('/:path*', (req, res) => {
+app.get('/:path(.*)', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
