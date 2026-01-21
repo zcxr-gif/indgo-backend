@@ -1202,143 +1202,163 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             }
 
             if (interaction.customId.startsWith('approve_')) {
-    await interaction.deferUpdate();
-    
-    const customId = interaction.customId;
-    const receivedEmbed = interaction.message.embeds[0];
-    const footerText = receivedEmbed.footer?.text || '';
-    
-    // --- NEW: AIRPORT APPROVAL LOGIC ---
-    if (customId.startsWith('approve_airport_')) {
-        const targetUserId = customId.split('_')[2];
-        const icaoField = receivedEmbed.fields.find(f => f.name === 'ICAO')?.value;
-        
-        const approveEmbed = EmbedBuilder.from(receivedEmbed)
-            .setColor(0x00FF00)
-            .setTitle('✅ Airport Approved')
-            .setImage(null) 
-            .setFooter({ text: `Approved by ${interaction.user.tag}` });
-        
-        await interaction.editReply({ embeds: [approveEmbed], components: [] });
-
-        try { 
-            const user = await client.users.fetch(targetUserId);
-            const userNotifyEmbed = new EmbedBuilder()
-                .setTitle('✅ Airport Submission Approved')
-                .setColor(0x00FF00)
-                .setDescription(`Your photo for **${icaoField}** has been approved and added to the database!`)
-                .setTimestamp();
-            await user.send({ embeds: [userNotifyEmbed] }); 
-        } catch (e) { console.error("Could not DM user regarding airport approval."); }
-        return; // Exit here for airports
-    }
-
-    // --- EXISTING: AIRCRAFT APPROVAL LOGIC ---
-    const targetUserId = customId.split('_')[1];
-    const tailField = receivedEmbed.fields.find(f => f.name === 'Tail Number')?.value;
-    const typeField = receivedEmbed.fields.find(f => f.name === 'Aircraft Type')?.value;
-    const liveryField = receivedEmbed.fields.find(f => f.name === 'Livery')?.value;
-    
-    let imageUrl = receivedEmbed.image?.url;
-    if (!imageUrl && interaction.message.attachments.size > 0) {
-        imageUrl = interaction.message.attachments.first().url;
-    }
-
-    const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
-
-    try {
-        const existingEntry = await CommunityAircraftModel.findOne({ 
-            aircraftType: { $regex: new RegExp(`^${escapeRegex(typeField)}$`, "i") },
-            liveryName: { $regex: new RegExp(`^${escapeRegex(liveryField)}$`, "i") }
-        });
-        
-        const permanentUrl = await uploadImageToS3(imageUrl, tailField);
-        
-        let contributorName = "Unknown";
-        try { 
-            const member = await interaction.guild.members.fetch(targetUserId); 
-            contributorName = member.displayName;
-        } catch (e) {
-            try {
-                const cUser = await client.users.fetch(targetUserId);
-                contributorName = cUser.username;
-            } catch (err) {}
-        }
-
-        const updateData = {
-            contributorName: contributorName,
-            contributorId: targetUserId, 
-            aircraftType: typeField,
-            liveryName: liveryField,
-            imageUrl: permanentUrl,
-            uploadedAt: new Date()
-        };
-        if (tailField && tailField !== 'UNKNOWN') updateData.tailNumber = tailField.toUpperCase();
-
-        if (existingEntry) {
-            Object.assign(existingEntry, updateData);
-            await existingEntry.save();
-        } else {
-            await new CommunityAircraftModel(updateData).save();
-        }
-
-        const approveEmbed = EmbedBuilder.from(receivedEmbed)
-            .setColor(0x00FF00)
-            .setTitle('✅ Submission Approved')
-            .setImage(null) 
-            .setFooter({ text: `Approved by ${interaction.user.tag}` });
-        
-        await interaction.editReply({ embeds: [approveEmbed], components: [] });
-
-        if (publicMsgId) {
-            try {
-                const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
-                const publicMsg = await feedChannel.messages.fetch(publicMsgId);
-                const publicEmbed = EmbedBuilder.from(publicMsg.embeds[0])
-                    .setTitle('✅ Verified Aircraft Spotted!')
-                    .setColor(0x00FF00)
-                    .setDescription(`Verified and added to database.`)
-                    .setImage(null)
-                    .setFooter({ text: 'Verified by Staff' });
+                await interaction.deferUpdate();
                 
-                await publicMsg.edit({ content: permanentUrl, embeds: [publicEmbed], files: [] });
-            } catch (e) {}
-        }
-        
-        try { 
-            const user = await client.users.fetch(targetUserId);
-            const userNotifyEmbed = new EmbedBuilder()
-                .setTitle('✅ Submission Approved')
-                .setColor(0x00FF00)
-                .setDescription(`Your photo of **${typeField}** has been approved!`)
-                .setImage(permanentUrl); 
-            await user.send({ embeds: [userNotifyEmbed] }); 
-        } catch (e) { }
+                const [_, targetUserId] = interaction.customId.split('_');
+                let receivedEmbed = interaction.message.embeds[0];
+                
+                // Identify the type of submission based on fields or title
+                const isAirport = receivedEmbed.fields.some(f => f.name === 'ICAO') || 
+                                 receivedEmbed.title?.toLowerCase().includes('airport');
 
-    } catch (error) {
-        console.error(error);
-        await interaction.followUp({ content: '❌ Error processing approval.', ephemeral: true });
-    }
-}
+                // Helper to get image URL safely
+                let imageUrl = receivedEmbed.image?.url;
+                if (!imageUrl && interaction.message.attachments.size > 0) {
+                    imageUrl = interaction.message.attachments.first().url;
+                }
+
+                const footerText = receivedEmbed.footer?.text || '';
+                const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
+
+                try {
+                    // --- CASE 1: AIRPORT APPROVAL ---
+                    if (isAirport) {
+                        const icaoField = receivedEmbed.fields.find(f => f.name === 'ICAO')?.value || 'UNKNOWN';
+                        
+                        // Upload to S3 with airport-specific prefix
+                        const permanentUrl = await uploadImageToS3(imageUrl, `airport-${icaoField}`);
+
+                        /* NOTE: If you have an AirportModel, save it here. 
+                           Example:
+                           await AirportModel.findOneAndUpdate(
+                               { icao: icaoField }, 
+                               { imageUrl: permanentUrl, contributorId: targetUserId, ... }, 
+                               { upsert: true }
+                           );
+                        */
+
+                        const approveEmbed = EmbedBuilder.from(receivedEmbed)
+                            .setColor(0x00FF00)
+                            .setTitle('✅ Airport Approved')
+                            .setImage(null) 
+                            .setFooter({ text: `Approved by ${interaction.user.tag}` });
+                        
+                        await interaction.editReply({ embeds: [approveEmbed], components: [] });
+
+                        // Handle Public Feed Update
+                        if (publicMsgId) {
+                            try {
+                                const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
+                                const publicMsg = await feedChannel.messages.fetch(publicMsgId);
+                                const publicEmbed = EmbedBuilder.from(publicMsg.embeds[0])
+                                    .setTitle('✅ Airport Photo Verified!')
+                                    .setColor(0x00FF00)
+                                    .setDescription(`The photo for **${icaoField}** has been verified.`)
+                                    .setImage(null);
+                                await publicMsg.edit({ content: permanentUrl, embeds: [publicEmbed], files: [] });
+                            } catch (e) { console.error("Feed Update Error:", e); }
+                        }
+                        return; // Exit early as airport is handled
+                    }
+
+                    // --- CASE 2: AIRCRAFT APPROVAL (EXISTING LOGIC) ---
+                    const tailField = receivedEmbed.fields.find(f => f.name === 'Tail Number')?.value;
+                    const typeField = receivedEmbed.fields.find(f => f.name === 'Aircraft Type')?.value;
+                    const liveryField = receivedEmbed.fields.find(f => f.name === 'Livery')?.value;
+
+                    if (!typeField || !liveryField) {
+                        throw new Error("Missing aircraft details in embed.");
+                    }
+
+                    const existingEntry = await CommunityAircraftModel.findOne({ 
+                        aircraftType: { $regex: new RegExp(`^${escapeRegex(typeField)}$`, "i") },
+                        liveryName: { $regex: new RegExp(`^${escapeRegex(liveryField)}$`, "i") }
+                    });
+                    
+                    const permanentUrl = await uploadImageToS3(imageUrl, tailField || 'unknown');
+                    
+                    let contributorName = "Unknown";
+                    try { 
+                        const member = await interaction.guild.members.fetch(targetUserId); 
+                        contributorName = member.displayName;
+                    } catch (e) {
+                        try {
+                            const cUser = await client.users.fetch(targetUserId);
+                            contributorName = cUser.username;
+                        } catch (err) {}
+                    }
+
+                    const updateData = {
+                        contributorName: contributorName,
+                        contributorId: targetUserId, 
+                        aircraftType: typeField,
+                        liveryName: liveryField,
+                        imageUrl: permanentUrl,
+                        uploadedAt: new Date()
+                    };
+                    if (tailField && tailField !== 'UNKNOWN') updateData.tailNumber = tailField.toUpperCase();
+
+                    if (existingEntry) {
+                        Object.assign(existingEntry, updateData);
+                        await existingEntry.save();
+                    } else {
+                        await new CommunityAircraftModel(updateData).save();
+                    }
+
+                    // Add Contributor Role
+                    try {
+                        const member = await interaction.guild.members.fetch(targetUserId);
+                        if (CONTRIBUTOR_ROLE_ID) await member.roles.add(CONTRIBUTOR_ROLE_ID);
+                    } catch (e) {}
+
+                    const approveEmbed = EmbedBuilder.from(receivedEmbed)
+                        .setColor(0x00FF00)
+                        .setTitle('✅ Submission Approved')
+                        .setImage(null) 
+                        .setFooter({ text: `Approved by ${interaction.user.tag}` });
+                    
+                    await interaction.editReply({ embeds: [approveEmbed], components: [] });
+
+                    if (publicMsgId) {
+                        try {
+                            const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
+                            const publicMsg = await feedChannel.messages.fetch(publicMsgId);
+                            const publicEmbed = EmbedBuilder.from(publicMsg.embeds[0])
+                                .setTitle('✅ Verified Aircraft Spotted!')
+                                .setColor(0x00FF00)
+                                .setDescription(`Verified and added to database.`)
+                                .setImage(null)
+                                .setFooter({ text: 'Verified by Staff' });
+                            
+                            await publicMsg.edit({ content: permanentUrl, embeds: [publicEmbed], files: [] });
+                        } catch (e) {}
+                    }
+                    
+                    try { 
+                        const user = await client.users.fetch(targetUserId);
+                        const userNotifyEmbed = new EmbedBuilder()
+                            .setTitle('✅ Submission Approved')
+                            .setColor(0x00FF00)
+                            .setDescription(`Your photo of **${typeField}** has been approved!`)
+                            .setImage(permanentUrl); 
+                        await user.send({ embeds: [userNotifyEmbed] }); 
+                    } catch (e) { }
+
+                    receivedEmbed = null;
+
+                } catch (error) {
+                    console.error("Approval Error:", error);
+                    await interaction.followUp({ content: `❌ Approval Failed: ${error.message}`, ephemeral: true });
+                }
+            }
 
             if (interaction.customId.startsWith('reject_')) {
-    const parts = interaction.customId.split('_');
-    const isAirport = parts[1] === 'airport';
-    const targetUserId = isAirport ? parts[2] : parts[1];
-
-    const modal = new ModalBuilder()
-        .setCustomId(isAirport ? `rejectModal_airport_${targetUserId}` : `rejectModal_${targetUserId}`)
-        .setTitle('Rejection Reason');
-
-    const reasonInput = new TextInputBuilder()
-        .setCustomId('reasonInput')
-        .setLabel("Why is this being rejected?")
-        .setStyle(TextInputStyle.Paragraph)
-        .setRequired(true);
-
-    modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
-    await interaction.showModal(modal);
-}
+                const targetUserId = interaction.customId.split('_')[1];
+                const modal = new ModalBuilder().setCustomId(`rejectModal_${targetUserId}`).setTitle('Rejection Reason');
+                const reasonInput = new TextInputBuilder().setCustomId('reasonInput').setLabel("Why is this being rejected?").setStyle(TextInputStyle.Paragraph).setRequired(true);
+                modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
+                await interaction.showModal(modal);
+            }
         }
 
         if (interaction.isModalSubmit()) {
@@ -1414,31 +1434,30 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             }
 
             if (interaction.customId.startsWith('rejectModal_')) {
-    await interaction.deferUpdate(); 
-    const parts = interaction.customId.split('_');
-    const isAirport = parts[1] === 'airport';
-    const targetUserId = isAirport ? parts[2] : parts[1];
-    const reason = interaction.fields.getTextInputValue('reasonInput');
-    
-    let originalEmbed = interaction.message.embeds[0];
-    const subjectName = isAirport 
-        ? (originalEmbed.fields.find(f => f.name === 'ICAO')?.value || 'Unknown Airport')
-        : (originalEmbed.fields.find(f => f.name === 'Aircraft Type')?.value || 'Unknown Aircraft');
+                await interaction.deferUpdate(); 
+                const targetUserId = interaction.customId.split('_')[1];
+                const reason = interaction.fields.getTextInputValue('reasonInput');
+                
+                let originalEmbed = interaction.message.embeds[0];
+                const aircraftName = originalEmbed.fields.find(f => f.name === 'Aircraft Type')?.value || 'Unknown Aircraft';
+                
+                let thumbUrl = originalEmbed.image?.url;
+                if (!thumbUrl && interaction.message.attachments.size > 0) {
+                     thumbUrl = interaction.message.attachments.first().url;
+                }
 
-    const rejectedEmbed = EmbedBuilder.from(originalEmbed)
-        .setTitle('❌ Submission Rejected')
-        .setColor(0xFF0000)
-        .setDescription(`**Reason:** ${reason}`)
-        .setImage(null) 
-        .setFooter({ text: `Rejected by ${interaction.user.tag}` });
-    
-    await interaction.editReply({ embeds: [rejectedEmbed], components: [] }); 
+                const footerText = originalEmbed.footer?.text || '';
+                const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
+                const originChannelId = footerText.match(/Ch: (\d+)/)?.[1];
 
-    try {
-        const user = await client.users.fetch(targetUserId);
-        await user.send(`❌ Your submission for **${subjectName}** was rejected: ${reason}`);
-    } catch (e) { console.error("Could not DM user regarding rejection."); }
-}
+                const rejectedEmbed = EmbedBuilder.from(originalEmbed)
+                    .setTitle('❌ Submission Rejected')
+                    .setColor(0xFF0000)
+                    .setDescription(`**Reason:** ${reason}`)
+                    .setImage(null) 
+                    .setFooter({ text: `Rejected by ${interaction.user.tag}` });
+                
+                await interaction.editReply({ embeds: [rejectedEmbed], components: [] }); 
 
                 if (publicMsgId) {
                     try {
