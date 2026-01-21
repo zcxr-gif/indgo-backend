@@ -862,29 +862,25 @@ app.put('/api/airports/:icao', upload.single('image'), async (req, res) => {
     }
 });
 
-// --- UPDATED ROUTING LOGIC ---
+app.use(express.static(__dirname)); 
 
-// 1. Serve static assets (JS, CSS, Images)
-app.use(express.static(path.join(__dirname, 'public')));
-
-// 2. Explicitly serve the Airport Manager
-// This allows you to go to yoursite.com/airports
+// 2. Specific route for the Airport Manager
 app.get('/airports', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'airports.html'));
+    res.sendFile(path.join(__dirname, 'airports.html'));
 });
 
-// 3. Explicitly serve the main Aircraft Database at the root
+// 3. The Root Route
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+    res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// 4. Catch-all for React Router / Navigation
-// If the user types a random URL, it still sends index.html
-app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+// 4. Catch-all for React Router (Modern Syntax)
+// Using '(.*)' as a string prevents the "Missing parameter name" error
+app.get('(.*)', (req, res) => {
+    res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// 6. START SERVER
+// 5. START SERVER
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
 });
