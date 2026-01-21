@@ -862,21 +862,26 @@ app.put('/api/airports/:icao', upload.single('image'), async (req, res) => {
     }
 });
 
-app.use(express.static(__dirname)); 
+// server.js
+
+// 1. Serve static files from the root directory
+// This allows the browser to find airports.js, images, and CSS
+app.use(express.static(__dirname));
 
 // 2. Specific route for the Airport Manager
+// Accessible via yoursite.com/airports
 app.get('/airports', (req, res) => {
     res.sendFile(path.join(__dirname, 'airports.html'));
 });
 
-// 3. The Root Route
+// 3. Specific route for the Aircraft Database root
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// 4. Catch-all for React Router (Modern Syntax)
-// Using '(.*)' as a string prevents the "Missing parameter name" error
-app.get('(.*)', (req, res) => {
+// 4. The NEW Mandatory Wildcard Syntax for Express 5.0+
+// The asterisk MUST be preceded by a named parameter (e.g., ':path')
+app.get('/:path*', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
