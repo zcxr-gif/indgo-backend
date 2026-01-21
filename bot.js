@@ -733,6 +733,12 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
         
         const commands = [
+
+            new SlashCommandBuilder()
+                .setName('airport')
+                .setDescription('Submit a new airport/terminal photo')
+                .addStringOption(o => o.setName('icao').setDescription('Airport ICAO (e.g. KJFK, EGLL)').setRequired(true))
+                .addAttachmentOption(o => o.setName('photo').setDescription('Upload airport photo').setRequired(true)),
             // User Commands
             new SlashCommandBuilder().setName('lookup').setDescription('Find an aircraft by Tail, Livery, or Type (Public)').addStringOption(o => o.setName('query').setDescription('Tail/Livery/Type').setAutocomplete(true).setRequired(true)),
             new SlashCommandBuilder().setName('stats').setDescription('View stats'),
@@ -744,8 +750,14 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 .addStringOption(o => o.setName('aircraft_type').setDescription('Type (Start typing to search)').setAutocomplete(true).setRequired(true))
                 .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true))
                 .addAttachmentOption(o => o.setName('photo').setDescription('Upload photo').setRequired(true)),
-            new SlashCommandBuilder().setName('links').setDescription('Get helpful resource links (Tracker, Forum, Liveries)'),
             
+            new SlashCommandBuilder().setName('submit_airport').setDescription('Submit a new airport photo')
+        .addStringOption(o => o.setName('icao').setDescription('Airport ICAO (e.g. KLAX, EGLL)').setRequired(true))
+        .addAttachmentOption(o => o.setName('photo').setDescription('Upload airport photo').setRequired(true)),    
+
+                new SlashCommandBuilder().setName('links').setDescription('Get helpful resource links (Tracker, Forum, Liveries)'),
+            
+
             // NEW: Live Flight Tracking
             new SlashCommandBuilder()
                 .setName('track')
@@ -845,26 +857,25 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
     });
 
     client.on('messageCreate', async (message) => {
-    if (message.author.bot) return;
+        if (message.author.bot) return;
 
-    // Airport Channel Logic
-    if (message.channelId === AIRPORT_SUBMISSION_CHANNEL_ID) {
+        const isAirportChannel = message.channelId === AIRPORT_SUBMISSION_CHANNEL_ID || 
+                             (message.channel.isThread() && message.channel.parentId === AIRPORT_SUBMISSION_CHANNEL_ID);
+
+    if (isAirportChannel) {
         if (message.attachments.size > 0) {
             const photo = message.attachments.first();
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId(`start_airport_ident_${message.author.id}`)
-                    .setLabel('Identify Airport (ICAO)')
-                    .setEmoji('🏢')
-                    .setStyle(ButtonStyle.Primary)
-            );
+            const isImage = photo.contentType?.startsWith('image/') || /\.(png|jpe?g|webp|gif)$/i.test(photo.name);
 
-            await message.reply({ 
-                content: "Thanks for the airport photo! Please provide the ICAO code.", 
-                components: [row] 
-            });
+            if (!isImage) return;
+
+            // Use message text as ICAO; default to 'UNKNOWN' if empty
+            const rawIcao = message.content.trim() || "UNKNOWN";
+            
+            // Trigger the flow from airportHandler.js
+            await startAirportSubmissionFlow(message, rawIcao, photo.url, message.author);
+            return;
         }
-        return; // Prevent fallthrough to aircraft logic
     }
 
         const isSubmissionChannel = message.channelId === SUBMISSION_CHANNEL_ID || 
@@ -1117,43 +1128,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         }
 
         if (interaction.isButton()) {
-
-            if (interaction.customId.startsWith('start_airport_ident_')) {
-         const modal = new ModalBuilder().setCustomId('airport_ident_modal').setTitle('Airport Details');
-         const icaoInput = new TextInputBuilder()
-            .setCustomId('a_icao').setLabel("What is the ICAO code?").setPlaceholder("e.g. KJFK, EGLL").setStyle(TextInputStyle.Short).setRequired(true);
-         modal.addComponents(new ActionRowBuilder().addComponents(icaoInput));
-         await interaction.showModal(modal);
-    }
-
-    if (interaction.customId.startsWith('approve_airport_')) {
-        await interaction.deferUpdate();
-        const targetUserId = interaction.customId.split('_')[2];
-        const embed = interaction.message.embeds[0];
-        const icao = embed.fields.find(f => f.name === 'ICAO').value;
-        const imageUrl = interaction.message.attachments.first().url;
-
-        try {
-            // Post to your backend API
-            await axios.post(`${BASE_API_URL}/airports`, {
-                icao: icao,
-                contributorName: targetUserId, // You can fetch display name if preferred
-                // Note: Your backend expects a file upload, so you might need to adjust 
-                // the backend /api/airports route to accept a URL or handle S3 here.
-            });
-
-            await interaction.editReply({ content: `✅ Airport ${icao} Approved!`, embeds: [], components: [] });
-        } catch (err) {
-            await interaction.followUp({ content: '❌ API Error.', ephemeral: true });
-        }
-    }
-}
-
-if (interaction.isModalSubmit() && interaction.customId === 'airport_ident_modal') {
-    const icao = interaction.fields.getTextInputValue('a_icao');
-    const photoUrl = (await interaction.channel.messages.fetch(interaction.message.reference.messageId)).attachments.first().url;
-    await startAirportSubmissionFlow(interaction, icao, photoUrl, interaction.user);
-}
             
             if (interaction.customId.startsWith('edit_admin_')) {
                 const receivedEmbed = interaction.message.embeds[0];
@@ -1851,6 +1825,19 @@ if (interaction.isModalSubmit() && interaction.customId === 'airport_ident_modal
                 await interaction.editReply("❌ Error running migration. Check console.");
             }
         }
+
+        if (interaction.commandName === 'submit_airport') {
+    const icao = interaction.options.getString('icao');
+    const photo = interaction.options.getAttachment('photo');
+
+    if (!photo.contentType.startsWith('image/')) {
+        return interaction.reply({ content: '❌ Invalid image.', ephemeral: true });
+    }
+
+    // Call external airport handler
+    await startAirportSubmissionFlow(interaction, icao, photo.url, interaction.user);
+    return;
+}
 
         if (interaction.commandName === 'submit') {
             const type = interaction.options.getString('aircraft_type');
