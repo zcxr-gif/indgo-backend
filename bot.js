@@ -1,4 +1,7 @@
 // bot.js
+
+const { startAirportSubmissionFlow } = require('./airportHandler');
+
 const { 
     Client, 
     GatewayIntentBits, 
@@ -46,6 +49,7 @@ const ADMIN_CHANNEL_ID = '1448137363795742942';
 const PUBLIC_FEED_CHANNEL_ID = '1448138153335586988'; 
 const WELCOME_CHANNEL_ID = '1442462899451858975'; 
 const SUBMISSION_CHANNEL_ID = '1442461970371444880'; 
+const AIRPORT_SUBMISSION_CHANNEL_ID = '1463634001020325959';
 
 // --- NEW CONFIGURATION ---
 const MEMBER_ROLE_ID = '1442472513849397248';          
@@ -841,7 +845,27 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
     });
 
     client.on('messageCreate', async (message) => {
-        if (message.author.bot) return;
+    if (message.author.bot) return;
+
+    // Airport Channel Logic
+    if (message.channelId === AIRPORT_SUBMISSION_CHANNEL_ID) {
+        if (message.attachments.size > 0) {
+            const photo = message.attachments.first();
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`start_airport_ident_${message.author.id}`)
+                    .setLabel('Identify Airport (ICAO)')
+                    .setEmoji('🏢')
+                    .setStyle(ButtonStyle.Primary)
+            );
+
+            await message.reply({ 
+                content: "Thanks for the airport photo! Please provide the ICAO code.", 
+                components: [row] 
+            });
+        }
+        return; // Prevent fallthrough to aircraft logic
+    }
 
         const isSubmissionChannel = message.channelId === SUBMISSION_CHANNEL_ID || 
                                    (message.channel.isThread() && message.channel.parentId === SUBMISSION_CHANNEL_ID);
@@ -1093,6 +1117,43 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         }
 
         if (interaction.isButton()) {
+
+            if (interaction.customId.startsWith('start_airport_ident_')) {
+         const modal = new ModalBuilder().setCustomId('airport_ident_modal').setTitle('Airport Details');
+         const icaoInput = new TextInputBuilder()
+            .setCustomId('a_icao').setLabel("What is the ICAO code?").setPlaceholder("e.g. KJFK, EGLL").setStyle(TextInputStyle.Short).setRequired(true);
+         modal.addComponents(new ActionRowBuilder().addComponents(icaoInput));
+         await interaction.showModal(modal);
+    }
+
+    if (interaction.customId.startsWith('approve_airport_')) {
+        await interaction.deferUpdate();
+        const targetUserId = interaction.customId.split('_')[2];
+        const embed = interaction.message.embeds[0];
+        const icao = embed.fields.find(f => f.name === 'ICAO').value;
+        const imageUrl = interaction.message.attachments.first().url;
+
+        try {
+            // Post to your backend API
+            await axios.post(`${BASE_API_URL}/airports`, {
+                icao: icao,
+                contributorName: targetUserId, // You can fetch display name if preferred
+                // Note: Your backend expects a file upload, so you might need to adjust 
+                // the backend /api/airports route to accept a URL or handle S3 here.
+            });
+
+            await interaction.editReply({ content: `✅ Airport ${icao} Approved!`, embeds: [], components: [] });
+        } catch (err) {
+            await interaction.followUp({ content: '❌ API Error.', ephemeral: true });
+        }
+    }
+}
+
+if (interaction.isModalSubmit() && interaction.customId === 'airport_ident_modal') {
+    const icao = interaction.fields.getTextInputValue('a_icao');
+    const photoUrl = (await interaction.channel.messages.fetch(interaction.message.reference.messageId)).attachments.first().url;
+    await startAirportSubmissionFlow(interaction, icao, photoUrl, interaction.user);
+}
             
             if (interaction.customId.startsWith('edit_admin_')) {
                 const receivedEmbed = interaction.message.embeds[0];
