@@ -6,11 +6,15 @@
     <title>Airport Image Manager</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <script>
+        // Tailwind dark mode configuration
+        tailwind.config = {
+            darkMode: 'class',
+        }
+    </script>
     <style>
         .glass-panel {
-            background: rgba(255, 255, 255, 0.95);
             backdrop-filter: blur(10px);
-            border: 1px solid rgba(229, 231, 235, 1);
         }
         .preview-image {
             max-height: 400px;
@@ -29,83 +33,84 @@
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
+        /* Custom scrollbar for dark mode */
+        .dark ::-webkit-scrollbar { width: 8px; }
+        .dark ::-webkit-scrollbar-track { background: #1f2937; }
+        .dark ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
     </style>
 </head>
-<body class="bg-gray-100 min-h-screen text-gray-800 font-sans">
+<body class="bg-gray-100 dark:bg-gray-900 min-h-screen text-gray-800 dark:text-gray-200 font-sans transition-colors duration-200">
 
-    <!-- Navigation Bar -->
-    <nav class="bg-white border-b border-gray-200 sticky top-0 z-50">
+    <nav class="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 sticky top-0 z-50">
         <div class="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8">
             <div class="flex justify-between h-16 items-center">
                 <div class="flex items-center space-x-2">
-                    <i class="fas fa-tower-control text-blue-600 text-2xl"></i>
-                    <span class="text-xl font-bold tracking-tight text-gray-900">AirportManager</span>
+                    <i class="fas fa-tower-control text-blue-600 dark:text-blue-400 text-2xl"></i>
+                    <span class="text-xl font-bold tracking-tight text-gray-900 dark:text-white">AirportManager</span>
                 </div>
                 <div class="flex items-center gap-4">
-                    <a href="/index.html" class="inline-flex items-center px-4 py-2 border border-blue-600 text-blue-600 font-medium rounded-lg hover:bg-blue-50 transition-colors">
+                    <button onclick="toggleDarkMode()" class="p-2 rounded-lg bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors">
+                        <i id="themeIcon" class="fas fa-moon text-gray-600 dark:text-yellow-400"></i>
+                    </button>
+                    <a href="/index.html" class="inline-flex items-center px-4 py-2 border border-blue-600 text-blue-600 dark:text-blue-400 dark:border-blue-400 font-medium rounded-lg hover:bg-blue-50 dark:hover:bg-gray-700 transition-colors">
                         <i class="fas fa-plane-departure mr-2"></i>
-                        Aircraft Database
+                        Aircraft
                     </a>
                 </div>
             </div>
         </div>
     </nav>
 
-    <main class="max-w-4xl mx-auto px-4 py-8">
+    <main class="max-w-5xl mx-auto px-4 py-8">
         
-        <!-- Search Section -->
-        <section class="glass-panel rounded-2xl p-6 shadow-sm mb-8">
-            <div class="flex justify-between items-center mb-4">
-                <h2 class="text-lg font-semibold flex items-center">
-                    <i class="fas fa-search mr-2 text-blue-500"></i>
-                    Lookup Airport
-                </h2>
-                <button onclick="resetForm()" class="text-xs text-gray-500 hover:text-blue-600 underline">
-                    Clear Search/Form
-                </button>
-            </div>
-            <div class="flex flex-col sm:flex-row gap-4">
-                <input 
-                    type="text" 
-                    id="icaoInput" 
-                    placeholder="Enter ICAO (e.g., EGLL, KJFK)" 
-                    class="flex-1 px-4 py-3 rounded-xl border border-gray-300 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none uppercase font-mono tracking-widest"
-                >
-                <button 
-                    onclick="lookupAirport()" 
-                    id="lookupBtn"
-                    class="bg-blue-600 text-white px-8 py-3 rounded-xl font-semibold hover:bg-blue-700 active:scale-95 transition-all shadow-md flex items-center justify-center gap-2"
-                >
-                    <span id="lookupBtnText">Lookup</span>
-                    <div id="lookupSpinner" class="loading-spinner hidden"></div>
-                </button>
-            </div>
-        </section>
-
-        <!-- Management & Preview Section -->
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
             
-            <!-- Form Column -->
-            <section class="space-y-6">
-                <div class="glass-panel rounded-2xl p-6 shadow-sm">
-                    <h2 class="text-lg font-semibold mb-6 flex items-center">
-                        <i class="fas fa-edit mr-2 text-blue-500"></i>
-                        Data Management
-                    </h2>
+            <section class="lg:col-span-5 space-y-6">
+                <div class="glass-panel bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-2xl p-6 shadow-sm">
+                    <div class="flex justify-between items-center mb-6">
+                        <h2 class="text-lg font-semibold flex items-center">
+                            <i class="fas fa-edit mr-2 text-blue-500"></i>
+                            Airport Data
+                        </h2>
+                        <button onclick="resetForm()" class="text-xs text-gray-500 hover:text-blue-600 underline">
+                            Reset Form
+                        </button>
+                    </div>
                     
                     <div class="space-y-4">
                         <div>
-                            <label class="block text-sm font-medium text-gray-700 mb-1">Contributor Name</label>
+                            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Airport ICAO Code</label>
+                            <div class="flex gap-2">
+                                <input 
+                                    type="text" 
+                                    id="icaoInput" 
+                                    placeholder="e.g. KJFK" 
+                                    class="flex-1 px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 dark:bg-gray-700 focus:ring-2 focus:ring-blue-500 outline-none uppercase font-mono tracking-widest"
+                                >
+                                <button 
+                                    onclick="lookupAirport()" 
+                                    id="lookupBtn"
+                                    class="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition-all flex items-center justify-center"
+                                    title="Lookup existing data"
+                                >
+                                    <span id="lookupBtnText"><i class="fas fa-search"></i></span>
+                                    <div id="lookupSpinner" class="loading-spinner hidden"></div>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Contributor Name</label>
                             <input 
                                 type="text" 
                                 id="contributorInput" 
                                 placeholder="System / Your Name" 
-                                class="w-full px-4 py-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-blue-500 outline-none"
+                                class="w-full px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 dark:bg-gray-700 focus:ring-2 focus:ring-blue-500 outline-none"
                             >
                         </div>
 
                         <div>
-                            <label class="block text-sm font-medium text-gray-700 mb-1">Upload/Replace Image</label>
+                            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Airport Image</label>
                             <div class="relative group">
                                 <input 
                                     type="file" 
@@ -114,9 +119,9 @@
                                     onchange="handleFileSelect(event)"
                                     class="hidden"
                                 >
-                                <label for="imageInput" class="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-gray-300 rounded-xl cursor-pointer bg-gray-50 hover:bg-gray-100 hover:border-blue-400 transition-all">
+                                <label for="imageInput" class="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-gray-300 dark:border-gray-600 rounded-xl cursor-pointer bg-gray-50 dark:bg-gray-700 hover:bg-gray-100 dark:hover:bg-gray-600 hover:border-blue-400 transition-all">
                                     <i class="fas fa-cloud-upload-alt text-2xl text-gray-400 group-hover:text-blue-500 mb-2"></i>
-                                    <span class="text-sm text-gray-500" id="fileNameDisplay">Click to browse images</span>
+                                    <span class="text-sm text-gray-500 dark:text-gray-400 text-center px-4" id="fileNameDisplay">Click to browse or drag image here</span>
                                 </label>
                             </div>
                         </div>
@@ -129,29 +134,32 @@
                     </div>
                 </div>
 
-                <div id="statusMsg" class="hidden p-4 rounded-xl text-center font-medium border"></div>
+                <div id="statusMsg" class="hidden p-4 rounded-xl text-center font-medium border animate-pulse"></div>
             </section>
 
-            <!-- Preview Column -->
-            <section class="glass-panel rounded-2xl p-6 shadow-sm min-h-[400px] flex flex-col">
-                <h2 class="text-lg font-semibold mb-4 flex items-center">
-                    <i class="fas fa-image mr-2 text-blue-500"></i>
-                    Live Preview
-                </h2>
-                
-                <div id="recordDisplay" class="flex-1 flex flex-col items-center justify-center text-center text-gray-400">
-                    <div id="previewContainer" class="w-full hidden">
-                        <img id="currentImage" src="" alt="Airport" class="w-full rounded-xl shadow-md preview-image mb-4">
-                        <div class="text-left space-y-1 bg-white p-3 rounded-lg border border-gray-100 shadow-inner">
-                            <p class="text-gray-900 font-bold text-xl uppercase tracking-wider" id="displayIcao"></p>
-                            <p class="text-sm"><span class="text-gray-500">Contributor:</span> <span id="displayContributor" class="text-gray-800 font-medium"></span></p>
-                            <p class="text-xs text-gray-400 italic" id="displayDate"></p>
-                        </div>
-                    </div>
+            <section class="lg:col-span-7">
+                <div class="glass-panel bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-2xl p-6 shadow-sm min-h-[500px] flex flex-col">
+                    <h2 class="text-lg font-semibold mb-4 flex items-center">
+                        <i class="fas fa-image mr-2 text-blue-500"></i>
+                        Live Preview
+                    </h2>
                     
-                    <div id="noRecordState">
-                        <i class="far fa-images text-5xl mb-4 opacity-20"></i>
-                        <p>Search for an airport or upload to see data</p>
+                    <div id="recordDisplay" class="flex-1 flex flex-col items-center justify-center text-center text-gray-400">
+                        <div id="previewContainer" class="w-full hidden">
+                            <img id="currentImage" src="" alt="Airport" class="w-full rounded-xl shadow-md preview-image mb-4">
+                            <div class="text-left space-y-2 bg-gray-50 dark:bg-gray-700/50 p-4 rounded-xl border border-gray-100 dark:border-gray-600">
+                                <p class="text-gray-900 dark:text-white font-bold text-2xl uppercase tracking-wider" id="displayIcao"></p>
+                                <div class="flex flex-wrap gap-4 text-sm">
+                                    <p><span class="text-gray-500 dark:text-gray-400">Contributor:</span> <span id="displayContributor" class="text-gray-800 dark:text-gray-200 font-medium"></span></p>
+                                    <p id="displayDate" class="text-gray-400 italic"></p>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div id="noRecordState" class="space-y-4">
+                            <i class="far fa-images text-6xl opacity-20"></i>
+                            <p class="max-w-xs mx-auto">Enter an ICAO and click lookup, or upload a new image to see it here.</p>
+                        </div>
                     </div>
                 </div>
             </section>
@@ -163,7 +171,29 @@
         const API_BASE = "/api/airports";
         let currentRecord = null;
 
-        // UI State Helpers
+        // Dark Mode Logic
+        function toggleDarkMode() {
+            document.documentElement.classList.toggle('dark');
+            const isDark = document.documentElement.classList.contains('dark');
+            localStorage.setItem('theme', isDark ? 'dark' : 'light');
+            updateThemeIcon();
+        }
+
+        function updateThemeIcon() {
+            const isDark = document.documentElement.classList.contains('dark');
+            const icon = document.getElementById('themeIcon');
+            icon.className = isDark ? 'fas fa-sun text-yellow-400' : 'fas fa-moon text-gray-600';
+        }
+
+        // Init Theme
+        if (localStorage.theme === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+            document.documentElement.classList.add('dark');
+        } else {
+            document.documentElement.classList.remove('dark');
+        }
+        updateThemeIcon();
+
+        // UI Helpers
         function showLoading(isLoading) {
             const btn = document.getElementById('lookupBtn');
             const text = document.getElementById('lookupBtnText');
@@ -179,22 +209,24 @@
             el.textContent = msg;
             
             const classes = {
-                'error': 'bg-red-50 text-red-700 border-red-200',
-                'success': 'bg-green-50 text-green-700 border-green-200',
-                'info': 'bg-blue-50 text-blue-700 border-blue-200'
+                'error': 'bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400 border-red-200 dark:border-red-800',
+                'success': 'bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400 border-green-200 dark:border-green-800',
+                'info': 'bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-800'
             };
 
             el.className = `p-4 rounded-xl text-center font-medium block ${classes[type] || classes.info}`;
+            el.classList.remove('hidden', 'opacity-0');
+            
             setTimeout(() => {
-                el.classList.add('opacity-0');
-                setTimeout(() => el.className = 'hidden', 500);
+                el.classList.add('opacity-0', 'transition-opacity', 'duration-500');
+                setTimeout(() => el.classList.add('hidden'), 500);
             }, 5000);
         }
 
         function handleFileSelect(event) {
             const file = event.target.files[0];
             if (file) {
-                document.getElementById('fileNameDisplay').textContent = file.name;
+                document.getElementById('fileNameDisplay').textContent = `Ready: ${file.name}`;
             }
         }
 
@@ -202,7 +234,7 @@
             document.getElementById('icaoInput').value = '';
             document.getElementById('contributorInput').value = '';
             document.getElementById('imageInput').value = '';
-            document.getElementById('fileNameDisplay').textContent = "Click to browse images";
+            document.getElementById('fileNameDisplay').textContent = "Click to browse or drag image here";
             clearRecord();
         }
 
@@ -216,7 +248,7 @@
                 const response = await fetch(`${API_BASE}/${icao}`);
                 if (response.status === 404) {
                     clearRecord();
-                    showStatus("No image found for this airport.", "info");
+                    showStatus("No image found for this airport. You can upload one!", "info");
                     return;
                 }
                 if (!response.ok) throw new Error("Server error occurred.");
@@ -240,9 +272,10 @@
             document.getElementById('currentImage').src = data.imageUrl;
             document.getElementById('displayIcao').textContent = data.icao;
             document.getElementById('displayContributor').textContent = data.contributor || 'System';
-            document.getElementById('displayDate').textContent = `Last Modified: ${new Date(data.uploadedAt).toLocaleString()}`;
+            document.getElementById('displayDate').textContent = `Updated: ${new Date(data.uploadedAt).toLocaleDateString()}`;
             
             // Pre-fill form
+            document.getElementById('icaoInput').value = data.icao;
             document.getElementById('contributorInput').value = data.contributor || '';
             
             updateButtons(true);
@@ -262,8 +295,8 @@
                     <button onclick="saveAirportData(true)" class="w-full bg-blue-600 text-white py-3 rounded-xl font-semibold hover:bg-blue-700 transition-all shadow-lg flex items-center justify-center gap-2">
                         <i class="fas fa-sync-alt"></i> Update / Replace
                     </button>
-                    <button onclick="deleteAirport()" class="w-full bg-white text-red-600 border border-red-200 py-3 rounded-xl font-semibold hover:bg-red-50 transition-all flex items-center justify-center gap-2">
-                        <i class="fas fa-trash-alt"></i> Delete Airport Data
+                    <button onclick="deleteAirport()" class="w-full bg-white dark:bg-gray-700 text-red-600 dark:text-red-400 border border-red-200 dark:border-red-900/50 py-3 rounded-xl font-semibold hover:bg-red-50 dark:hover:bg-red-900/20 transition-all flex items-center justify-center gap-2">
+                        <i class="fas fa-trash-alt"></i> Delete Data
                     </button>
                 `;
             } else {
@@ -304,7 +337,7 @@
                 
                 // Clear file input
                 document.getElementById('imageInput').value = '';
-                document.getElementById('fileNameDisplay').textContent = "Click to browse images";
+                document.getElementById('fileNameDisplay').textContent = "Click to browse or drag image here";
                 
                 // Refresh data
                 lookupAirport(); 
@@ -317,7 +350,7 @@
             const icao = currentRecord?.icao;
             if (!icao) return;
             
-            if (!confirm(`Are you sure you want to delete all data and images for ${icao}? This cannot be undone.`)) return;
+            if (!confirm(`Are you sure you want to delete all data and images for ${icao}?`)) return;
 
             try {
                 const response = await fetch(`${API_BASE}/${icao}`, { method: 'DELETE' });
