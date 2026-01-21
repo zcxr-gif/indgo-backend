@@ -861,16 +861,26 @@ app.put('/api/airports/:icao', upload.single('image'), async (req, res) => {
         res.status(500).json({ message: 'Error updating airport data.' });
     }
 });
-// 1. Serve static files (CSS, JS, Images)
-app.use(express.static(path.join(__dirname, 'public'))); 
 
-// 2. Specific route for airports
+// --- UPDATED ROUTING LOGIC ---
+
+// 1. Serve static assets (JS, CSS, Images)
+app.use(express.static(path.join(__dirname, 'public')));
+
+// 2. Explicitly serve the Airport Manager
+// This allows you to go to yoursite.com/airports
 app.get('/airports', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'airports.html'));
 });
 
-// 3. The New Modern Catch-all
-app.get('/:path*', (req, res) => {
+// 3. Explicitly serve the main Aircraft Database at the root
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// 4. Catch-all for React Router / Navigation
+// If the user types a random URL, it still sends index.html
+app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
