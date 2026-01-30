@@ -447,59 +447,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         }
     };
 
-    // Add this near the top of startSubmissionFlow or as a helper
-const createAdminBatchEmbed = (user, type, livery, tail, images, currentIndex = 0) => {
-    const embed = new EmbedBuilder()
-        .setTitle('📦 Batch Submission Review')
-        .setColor(0x0099FF)
-        .setDescription(`**${user.tag}** uploaded **${images.length}** photos for this aircraft.\nUse the menu below to select the best one for the database.`)
-        .addFields(
-            { name: 'Aircraft', value: type, inline: true },
-            { name: 'Livery', value: livery, inline: true },
-            { name: 'Tail', value: tail.toUpperCase(), inline: true },
-            { name: 'Viewing', value: `Photo ${currentIndex + 1} of ${images.length}`, inline: false }
-        )
-        .setImage(images[currentIndex]) // Shows the currently selected image from the batch
-        .setFooter({ text: `User ID: ${user.id} | Batch Size: ${images.length}` });
-    
-    return embed;
-};
-
-// Inside the 'confirm_submission' block of startSubmissionFlow:
-if (images.length > 1) {
-    const adminChannel = await client.channels.fetch(ADMIN_CHANNEL_ID);
-    
-    // Create a select menu for the admin to pick the image
-    const selectionMenu = new StringSelectMenuBuilder()
-        .setCustomId(`admin_select_best_${user.id}`)
-        .setPlaceholder('Pick the best photo to approve')
-        .addOptions(images.map((url, index) => ({
-            label: `Photo #${index + 1}`,
-            description: `Click to preview this image`,
-            value: `${index}` // We store the index
-        })));
-
-    const adminRow = new ActionRowBuilder().addComponents(selectionMenu);
-    const actionRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`approve_batch_${user.id}`).setLabel('Approve Selected').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`reject_${user.id}`).setLabel('Reject All').setStyle(ButtonStyle.Danger)
-    );
-
-    // We store the full batch of image URLs in a temporary session so the bot remembers them
-    userSessions.set(`batch_${user.id}`, {
-        type: currentType,
-        livery: currentLivery,
-        tail: currentTail,
-        images: images, // Array of all attachment URLs
-        selectedIndex: 0
-    });
-
-    await adminChannel.send({ 
-        embeds: [createAdminBatchEmbed(user, currentType, currentLivery, currentTail, images)], 
-        components: [adminRow, actionRow] 
-    });
-
-
     const startSubmissionFlow = async (source, rawType, rawLivery, ignoredTail, photoUrl, user, originChannelId) => {
         
         let currentType = rawType;
@@ -934,56 +881,46 @@ if (images.length > 1) {
         const isAirportChannel = message.channelId === AIRPORT_SUBMISSION_CHANNEL_ID ||
                                  (message.channel.isThread() && message.channel.parentId === AIRPORT_SUBMISSION_CHANNEL_ID);
 
+        // --- HANDLER: AIRCRAFT SUBMISSIONS ---
+        if (isAircraftChannel) {
+            if (message.attachments.size > 0) {
+                const photo = message.attachments.first();
+                const isImage = photo.contentType?.startsWith('image/') || /\.(png|jpe?g|webp|gif)$/i.test(photo.name);
 
-        // --- HANDLER: AIRCRAFT SUBMISSIONS (BATCH SUPPORT) ---
-if (isAircraftChannel) {
-    if (message.attachments.size > 0) {
-        // Filter out non-image attachments
-        const images = message.attachments.filter(a => 
-            a.contentType?.startsWith('image/') || /\.(png|jpe?g|webp|gif)$/i.test(a.name)
-        );
+                if (!isImage) return;
 
-        if (images.size === 0) return;
+                const session = userSessions.get(message.author.id);
+                if (session && Date.now() < session.expiresAt) {
+                    session.expiresAt = Date.now() + 300000;
+                    userSessions.set(message.author.id, session);
+                    await startSubmissionFlow(
+                        message, 
+                        session.type, 
+                        session.livery, 
+                        null, 
+                        photo.url, 
+                        message.author, 
+                        message.channelId 
+                    );
+                    return;
+                }
 
-        const session = userSessions.get(message.author.id);
-        
-        // If they have an active session (just identified a previous plane),
-        // we apply those details to ALL images in this drop automatically.
-        if (session && Date.now() < session.expiresAt) {
-            session.expiresAt = Date.now() + 300000;
-            userSessions.set(message.author.id, session);
+                const row = new ActionRowBuilder()
+                    .addComponents(
+                        new ButtonBuilder()
+                            .setCustomId(`start_ident_${message.author.id}`)
+                            .setLabel('Identify Aircraft')
+                            .setEmoji('✈️')
+                            .setStyle(ButtonStyle.Primary)
+                    );
 
-            for (const [id, photo] of images) {
-                await startSubmissionFlow(
-                    message, 
-                    session.type, 
-                    session.livery, 
-                    null, 
-                    photo.url, 
-                    message.author, 
-                    message.channelId 
-                );
+                const promptEmbed = new EmbedBuilder()
+                    .setColor(0x0099FF)
+                    .setDescription(`**Thanks for the photo!**\nPlease click the button below to enter the **Aircraft** and **Livery** details.`);
+
+                await message.reply({ embeds: [promptEmbed], components: [row] });
             }
-            return;
         }
-
-        // If no session, ask them to identify the batch
-        const row = new ActionRowBuilder()
-            .addComponents(
-                new ButtonBuilder()
-                    .setCustomId(`start_ident_${message.author.id}`)
-                    .setLabel(images.size > 1 ? `Identify ${images.size} Photos` : 'Identify Aircraft')
-                    .setEmoji('✈️')
-                    .setStyle(ButtonStyle.Primary)
-            );
-
-        const promptEmbed = new EmbedBuilder()
-            .setColor(0x0099FF)
-            .setDescription(`**${images.size} photos detected!**\nClick the button to set the Aircraft and Livery for this batch.`);
-
-        await message.reply({ embeds: [promptEmbed], components: [row] });
-    }
-}
 
         // --- HANDLER: AIRPORT SUBMISSIONS ---
         if (isAirportChannel) {
@@ -1011,394 +948,11 @@ if (isAircraftChannel) {
         }
     });
 
-    client.on('interactionCreate', async interaction => {
-
-        // --- AIRPORT FLOW HANDLERS ---
-
-// --- UPDATED ADMIN APPROVAL ACTION FOR AIRPORTS ---
-if (interaction.isButton() && interaction.customId.startsWith('approve_apt_')) {
-    if (interaction.deferred || interaction.replied) return; 
-    
-    await interaction.deferUpdate();
-    const [_, __, targetUserId, icao] = interaction.customId.split('_');
-    
-    // Get the image URL from the current embed
-    const imageUrl = interaction.message.embeds[0].image?.url;
-
-    try {
-        const member = await interaction.guild.members.fetch(targetUserId).catch(() => null);
-        const rawName = member ? member.displayName : "Unknown";
-        const contributorName = sanitizeMetadata(rawName);
-
-        // Fetch image and upload to S3
-        const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
-        const mockFile = { buffer: Buffer.from(response.data) };
-
-        if (typeof deleteAirportImages === 'function') {
-            await deleteAirportImages(s3Client, icao);
-        }
-        
-        const finalUrl = await uploadAirportImage(s3Client, mockFile, icao, contributorName);
-
-        // UI FIX: Transform the existing embed into the "Approved" state
-        const successEmbed = EmbedBuilder.from(interaction.message.embeds[0])
-            .setTitle(`✅ Airport Approved: ${icao}`)
-            .setColor(0x00FF00) // Green
-            .setImage(finalUrl) // Keep the new permanent S3 image visible
-            .setFooter({ text: `Approved by ${interaction.user.tag} | ICAO: ${icao}` })
-            .setTimestamp();
-
-        // Update the message, removing the buttons
-        await interaction.editReply({ embeds: [successEmbed], components: [] });
-
-        // Notify Contributor
-        try {
-            const user = await client.users.fetch(targetUserId);
-            await user.send(`✅ Your photo for **${icao}** has been approved and is now live!`);
-        } catch(e) { console.log("Could not DM user."); }
-
-    } catch (err) {
-        console.error("Airport Approval Error:", err);
-        if (interaction.deferred || interaction.replied) {
-            await interaction.followUp({ content: `❌ Error: ${err.message}`, ephemeral: true }).catch(() => {});
-        }
-    }
-}
-
-// 2. Process Modal -> Send to Admin AND Public Feed
-if (interaction.isModalSubmit() && interaction.customId === 'airport_modal') {
-    await interaction.deferReply({ ephemeral: true });
-    
-    const icao = interaction.fields.getTextInputValue('a_icao').toUpperCase().trim();
-    
-    // Fetch image from the original message
-    const originalMsg = await interaction.channel.messages.fetch(interaction.message.reference.messageId);
-    const photoUrl = originalMsg.attachments.first().url;
-
-    const adminChannel = await client.channels.fetch(AIRPORT_ADMIN_CHANNEL_ID);
-    const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID); // Use existing public feed
-    
-    // --- 1. SEND TO PUBLIC FEED (PENDING STATUS) ---
-    const publicEmbed = new EmbedBuilder()
-        .setTitle('🏢 New Airport Spotted! (Pending Review)')
-        .setColor(0xFFFF00) // Yellow for Pending
-        .setDescription(`A user has submitted a new airport photo! Status: **Under Review**`)
-        .addFields(
-            { name: 'ICAO Code', value: icao, inline: true },
-            { name: 'Spotted By', value: `<@${interaction.user.id}>`, inline: true }
-        )
-        .setImage(photoUrl)
-        .setFooter({ text: 'Submissions are reviewed by admins before being finalized.' })
-        .setTimestamp();
-
-    const publicMsg = await feedChannel.send({ embeds: [publicEmbed] });
-
-    // --- 2. PREPARE ADMIN SUBMISSION ---
-    const embedsToSend = [];
-
-    const adminEmbed = new EmbedBuilder()
-        .setTitle('🏢 New Airport Submission')
-        .setColor(0x0099FF)
-        .addFields(
-            { name: 'ICAO', value: icao, inline: true },
-            { name: 'Contributor', value: `<@${interaction.user.id}>`, inline: true }
-        )
-        .setImage(photoUrl)
-        // KEY FIX: Added Msg ID so the bot can update the public post later
-        .setFooter({ text: `User ID: ${interaction.user.id} | ICAO: ${icao} | Msg: ${publicMsg.id} | Ch: ${interaction.channelId}` });
-
-    embedsToSend.push(adminEmbed);
-
-    // Check for existing image for comparison
-    try {
-        const existingInfo = await getAirportInfo(s3Client, icao);
-        if (existingInfo) {
-            adminEmbed.setTitle('⚠️ AIRPORT REPLACEMENT REQUEST');
-            adminEmbed.setColor(0xFFA500); 
-            
-            const comparisonEmbed = new EmbedBuilder()
-                .setTitle('📉 Current Database Image')
-                .setDescription(`**Current Contributor:** ${existingInfo.contributor || 'Unknown'}`)
-                .setColor(0x2B2D31) 
-                .setImage(existingInfo.imageUrl)
-                .setFooter({ text: 'If you approve, this image will be replaced.' });
-            
-            embedsToSend.push(comparisonEmbed);
-        }
-    } catch (err) {
-        console.error("Error fetching existing airport info:", err);
-    }
-
-    const adminRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId(`approve_apt_${interaction.user.id}_${icao}`)
-            .setLabel(embedsToSend.length > 1 ? 'Approve & Replace' : 'Approve & Save')
-            .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-            .setCustomId(`reject_apt_${interaction.user.id}`)
-            .setLabel('Reject')
-            .setStyle(ButtonStyle.Danger)
-    );
-
-    await adminChannel.send({ 
-        embeds: embedsToSend, 
-        components: [adminRow] 
-    });
-
-    await interaction.editReply("✅ Sent to staff for review and posted to public feed!");
-    try { await interaction.message.delete(); } catch(e) {}
-}
-
-// --- UPDATED AIRPORT REJECT MODAL SUBMIT ---
-if (interaction.isModalSubmit() && interaction.customId.startsWith('rejectAptModal_')) {
-    await interaction.deferUpdate(); 
-    const targetUserId = interaction.customId.split('_')[1];
-    const reason = interaction.fields.getTextInputValue('reasonInput');
-    
-    let originalEmbed = interaction.message.embeds[0];
-    const icao = originalEmbed.fields.find(f => f.name === 'ICAO')?.value || 'Unknown Airport';
-    const thumbUrl = originalEmbed.image?.url;
-    
-    // Extract metadata from footer
-    const footerText = originalEmbed.footer?.text || '';
-    const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
-    const originChannelId = footerText.match(/Ch: (\d+)/)?.[1];
-
-    // Update Admin View
-    const rejectedEmbed = EmbedBuilder.from(originalEmbed)
-        .setTitle('❌ Airport Submission Rejected')
-        .setColor(0xFF0000)
-        .setDescription(`**Reason:** ${reason}`)
-        .setImage(thumbUrl)
-        .setFooter({ text: `Rejected by ${interaction.user.tag} | ICAO: ${icao}` })
-        .setTimestamp();
-    
-    await interaction.editReply({ embeds: [rejectedEmbed], components: [] }); 
-
-    // --- UPDATE PUBLIC FEED ---
-    if (publicMsgId) {
-        try {
-            const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
-            const publicMsg = await feedChannel.messages.fetch(publicMsgId);
-            const publicRejectedEmbed = EmbedBuilder.from(publicMsg.embeds[0])
-                .setTitle('❌ Submission Rejected')
-                .setColor(0xFF0000)
-                .setDescription(`This submission was not accepted by the moderators.`)
-                .setImage(null) // Hide the photo on rejection in public feed if preferred
-                .setFooter({ text: `Reviewed by Staff` });
-            
-            await publicMsg.edit({ embeds: [publicRejectedEmbed] });
-        } catch (e) { console.log("Could not update public feed for rejection."); }
-    }
-
-    // Send notification back to submission channel
-    if (originChannelId) {
-        try {
-            const originChannel = await client.channels.fetch(originChannelId);
-            if (originChannel) {
-                const rejectionNotifyEmbed = new EmbedBuilder()
-                    .setTitle('❌ Airport Photo Rejected')
-                    .setColor(0xFF0000)
-                    .setDescription(`Hey <@${targetUserId}>, your photo for **${icao}** was rejected.`)
-                    .addFields({ name: 'Reason', value: reason })
-                    .setThumbnail(thumbUrl) 
-                    .setFooter({ text: 'Check the rules and try again!' });
-
-                await originChannel.send({ embeds: [rejectionNotifyEmbed] });
-            }
-        } catch (e) { console.error("Could not notify channel."); }
-    }
-}
-
-        
-        // --- 1. TICKET SYSTEM: INITIAL BUTTON CLICK ---
-        if (interaction.isButton() && interaction.customId === 'create_ticket_start') {
-            const topicSelect = new StringSelectMenuBuilder()
-                .setCustomId('ticket_topic_select')
-                .setPlaceholder('Select a topic for your ticket')
-                .addOptions(
-                    new StringSelectMenuOptionBuilder().setLabel('Database Correction').setValue('db_correction').setDescription('Report incorrect info in the database').setEmoji('📝'),
-                    new StringSelectMenuOptionBuilder().setLabel('Submission Issue').setValue('submission_issue').setDescription('Problems uploading or submitting photos').setEmoji('📸'),
-                    new StringSelectMenuOptionBuilder().setLabel('Role/Account Help').setValue('role_help').setDescription('Questions about roles or your profile').setEmoji('👤'),
-                    new StringSelectMenuOptionBuilder().setLabel('Other Inquiry').setValue('other').setDescription('General questions or feedback').setEmoji('❓'),
-                );
-            
-            await interaction.reply({ 
-                content: 'Please select what you need help with:', 
-                components: [new ActionRowBuilder().addComponents(topicSelect)], 
-                ephemeral: true 
-            });
-            return;
-        }
-
-
-        // --- 2. TICKET SYSTEM: TOPIC SELECTION -> SHOW MODAL ---
-        if (interaction.isStringSelectMenu() && interaction.customId === 'ticket_topic_select') {
-            const selectedTopic = interaction.values[0];
-            
-            // We encode the topic into the modal ID to pass it to the next step
-            const modal = new ModalBuilder()
-                .setCustomId(`ticket_modal_${selectedTopic}`)
-                .setTitle('Ticket Details');
-
-            const descInput = new TextInputBuilder()
-                .setCustomId('ticket_desc')
-                .setLabel("Description (Optional)")
-                .setStyle(TextInputStyle.Paragraph)
-                .setPlaceholder("Please describe your issue here so we can help you faster.")
-                .setRequired(false);
-
-            modal.addComponents(new ActionRowBuilder().addComponents(descInput));
-            await interaction.showModal(modal);
-            return;
-        }
-
-        // --- NEW: BATCH PREVIEW HANDLER ---
-if (interaction.isStringSelectMenu() && interaction.customId.startsWith('admin_select_best_')) {
-    const targetUserId = interaction.customId.split('_')[3];
-    const batchData = userSessions.get(`batch_${targetUserId}`);
-    
-    if (!batchData) return interaction.reply({ content: "Batch session expired.", ephemeral: true });
-
-    const selectedIndex = parseInt(interaction.values[0]);
-    batchData.selectedIndex = selectedIndex; // Update the session with current choice
-    userSessions.set(`batch_${targetUserId}`, batchData);
-
-    // Re-use the helper to update the embed with the new photo preview
-    const targetUser = await client.users.fetch(targetUserId);
-    const updatedEmbed = createAdminBatchEmbed(
-        targetUser,
-        batchData.type,
-        batchData.livery,
-        batchData.tail,
-        batchData.images,
-        selectedIndex
-    );
-
-    await interaction.update({ embeds: [updatedEmbed] });
-}
-
-        // --- UPDATED AIRPORT REJECT MODAL SUBMIT ---
-if (interaction.isModalSubmit() && interaction.customId.startsWith('rejectAptModal_')) {
-    await interaction.deferUpdate(); 
-    const targetUserId = interaction.customId.split('_')[1];
-    const reason = interaction.fields.getTextInputValue('reasonInput');
-    
-    let originalEmbed = interaction.message.embeds[0];
-    const icao = originalEmbed.fields.find(f => f.name === 'ICAO')?.value || 'Unknown Airport';
-    const thumbUrl = originalEmbed.image?.url;
-    
-    // Extract metadata from footer
-    const footerText = originalEmbed.footer?.text || '';
-    const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
-    const originChannelId = footerText.match(/Ch: (\d+)/)?.[1];
-
-    // Update Admin View
-    const rejectedEmbed = EmbedBuilder.from(originalEmbed)
-        .setTitle('❌ Airport Submission Rejected')
-        .setColor(0xFF0000)
-        .setDescription(`**Reason:** ${reason}`)
-        .setImage(thumbUrl)
-        .setFooter({ text: `Rejected by ${interaction.user.tag} | ICAO: ${icao}` })
-        .setTimestamp();
-    
-    await interaction.editReply({ embeds: [rejectedEmbed], components: [] }); 
-
-    // --- UPDATE PUBLIC FEED ---
-    if (publicMsgId) {
-        try {
-            const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
-            const publicMsg = await feedChannel.messages.fetch(publicMsgId);
-            const publicRejectedEmbed = EmbedBuilder.from(publicMsg.embeds[0])
-                .setTitle('❌ Submission Rejected')
-                .setColor(0xFF0000)
-                .setDescription(`This submission was not accepted by the moderators.`)
-                .setImage(null) // Hide the photo on rejection in public feed if preferred
-                .setFooter({ text: `Reviewed by Staff` });
-            
-            await publicMsg.edit({ embeds: [publicRejectedEmbed] });
-        } catch (e) { console.log("Could not update public feed for rejection."); }
-    }
-
-    // Send notification back to submission channel
-    if (originChannelId) {
-        try {
-            const originChannel = await client.channels.fetch(originChannelId);
-            if (originChannel) {
-                const rejectionNotifyEmbed = new EmbedBuilder()
-                    .setTitle('❌ Airport Photo Rejected')
-                    .setColor(0xFF0000)
-                    .setDescription(`Hey <@${targetUserId}>, your photo for **${icao}** was rejected.`)
-                    .addFields({ name: 'Reason', value: reason })
-                    .setThumbnail(thumbUrl) 
-                    .setFooter({ text: 'Check the rules and try again!' });
-
-                await originChannel.send({ embeds: [rejectionNotifyEmbed] });
-            }
-        } catch (e) { console.error("Could not notify channel."); }
-    }
-}
-
-        // --- 4. TICKET SYSTEM: CLOSE TICKET (ADMIN ONLY) ---
-        if (interaction.isButton() && interaction.customId === 'close_ticket_action') {
-            await interaction.deferReply({ ephemeral: true });
-
-            // Check Admin Permissions
-            if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID)) {
-                return interaction.editReply({ content: "❌ Only Admins can close tickets." });
-            }
-
-            const thread = interaction.channel;
-            if (!thread.isThread()) return interaction.editReply({ content: "This is not a thread." });
-
-            try {
-                // Generate Transcript
-                const messages = await thread.messages.fetch({ limit: 100 });
-                const reversed = Array.from(messages.values()).reverse();
-                
-                let transcriptText = `TRANSCRIPT FOR TICKET: ${thread.name}\nDATE: ${new Date().toISOString()}\n------------------------------------------------\n\n`;
-                
-                reversed.forEach(m => {
-                    const time = new Date(m.createdTimestamp).toLocaleString();
-                    const content = m.content || '[No Content]';
-                    const attachments = m.attachments.size > 0 ? ` [Attachments: ${m.attachments.map(a => a.url).join(', ')}]` : '';
-                    transcriptText += `[${time}] ${m.author.tag}: ${content}${attachments}\n`;
-                });
-
-                // Send to Transcript Channel
-                const transcriptChannel = await client.channels.fetch(TRANSCRIPT_CHANNEL_ID);
-                if (transcriptChannel) {
-                    const buffer = Buffer.from(transcriptText, 'utf-8');
-                    const attachment = new AttachmentBuilder(buffer, { name: `${thread.name}-transcript.txt` });
-                    
-                    const logEmbed = new EmbedBuilder()
-                        .setTitle('🔒 Ticket Closed')
-                        .setColor(0xFF0000)
-                        .addFields(
-                            { name: 'Ticket', value: thread.name, inline: true },
-                            { name: 'Closed By', value: interaction.user.tag, inline: true }
-                        )
-                        .setTimestamp();
-
-                    await transcriptChannel.send({ embeds: [logEmbed], files: [attachment] });
-                }
-
-                await interaction.editReply("Ticket closed. Deleting thread in 5 seconds...");
-                
-                setTimeout(async () => {
-                    try { await thread.delete(); } catch(e) {}
-                }, 5000);
-
-            } catch (error) {
-                console.error("Ticket Close Error:", error);
-                await interaction.editReply("❌ Error closing ticket.");
-            }
-            return;
-        }
-
+client.on('interactionCreate', async (interaction) => {
+        // --- 1. AUTOCOMPLETE HANDLERS ---
         if (interaction.isAutocomplete()) {
             const focused = interaction.options.getFocused(true);
-            
+
             if (interaction.commandName === 'lookup' && focused.name === 'query') {
                 const list = await fetchAircraftMetadata();
                 const filtered = list.filter(a => a.name.toLowerCase().includes(focused.value.toLowerCase())).slice(0, 25);
@@ -1422,761 +976,362 @@ if (interaction.isModalSubmit() && interaction.customId.startsWith('rejectAptMod
 
                 if (matched) {
                     const liveries = await fetchLiveriesForAircraft(matched.id);
-                    const filtered = liveries.filter(l => l.toLowerCase().includes(focused.value.toLowerCase())).slice(0, 24); 
+                    const filtered = liveries.filter(l => l.toLowerCase().includes(focused.value.toLowerCase())).slice(0, 24);
                     const options = filtered.map(l => ({ name: l, value: l }));
                     if (focused.value && !liveries.includes(focused.value)) options.push({ name: `${focused.value} (Custom)`, value: focused.value });
                     await interaction.respond(options);
                 } else {
                     await interaction.respond([{ name: "Aircraft not found", value: "Unknown" }]);
                 }
-            }
-        }
-
-        if (interaction.isButton()) {
-            
-            if (interaction.customId.startsWith('edit_admin_')) {
-                const receivedEmbed = interaction.message.embeds[0];
-                
-                const currentTail = receivedEmbed.fields.find(f => f.name === 'Tail Number')?.value || 'UNKNOWN';
-                const currentType = receivedEmbed.fields.find(f => f.name === 'Aircraft Type')?.value || '';
-                const currentLivery = receivedEmbed.fields.find(f => f.name === 'Livery')?.value || '';
-
-                const modal = new ModalBuilder()
-                    .setCustomId('admin_edit_modal')
-                    .setTitle('Edit Submission Details');
-
-                const tailInput = new TextInputBuilder()
-                    .setCustomId('ae_tail')
-                    .setLabel("Tail Number")
-                    .setPlaceholder("e.g. N12345") 
-                    .setValue(currentTail)
-                    .setStyle(TextInputStyle.Short)
-                    .setRequired(true);
-
-                const typeInput = new TextInputBuilder()
-                    .setCustomId('ae_type')
-                    .setLabel("Aircraft Type")
-                    .setPlaceholder("e.g. 737-8 MAX") 
-                    .setValue(currentType)
-                    .setStyle(TextInputStyle.Short)
-                    .setRequired(true);
-
-                const liveryInput = new TextInputBuilder()
-                    .setCustomId('ae_livery')
-                    .setLabel("Livery")
-                    .setPlaceholder("e.g. Delta Air Lines") 
-                    .setValue(currentLivery)
-                    .setStyle(TextInputStyle.Short)
-                    .setRequired(true);
-
-                modal.addComponents(
-                    new ActionRowBuilder().addComponents(tailInput),
-                    new ActionRowBuilder().addComponents(typeInput),
-                    new ActionRowBuilder().addComponents(liveryInput)
-                );
-
-                await interaction.showModal(modal);
                 return;
             }
+            return;
+        }
 
-            if (interaction.customId.startsWith('start_ident_')) {
-                const originalUserId = interaction.customId.split('_')[2];
-                if (interaction.user.id !== originalUserId) {
-                    return interaction.reply({ content: "This is not your photo.", ephemeral: true });
-                }
+        // --- 2. BUTTON HANDLERS ---
+        if (interaction.isButton()) {
+            const customId = interaction.customId;
+
+            // --- AIRCRAFT BUTTONS ---
+            if (customId.startsWith('start_ident_')) {
+                const originalUserId = customId.split('_')[2];
+                if (interaction.user.id !== originalUserId) return interaction.reply({ content: "This is not your photo.", ephemeral: true });
 
                 const modal = new ModalBuilder().setCustomId('identify_modal').setTitle('Aircraft Details');
-                
-                const typeInput = new TextInputBuilder()
-                    .setCustomId('i_type')
-                    .setLabel("What aircraft is this?")
-                    .setPlaceholder("e.g. 737-8 MAX, 777-300ER") 
-                    .setStyle(TextInputStyle.Short)
-                    .setRequired(true);
-                    
-                const liveryInput = new TextInputBuilder()
-                    .setCustomId('i_livery')
-                    .setLabel("What livery is this?")
-                    .setPlaceholder("e.g. Delta Air Lines, Generic, Private") 
-                    .setStyle(TextInputStyle.Short)
-                    .setRequired(true);
-                
+                const typeInput = new TextInputBuilder().setCustomId('i_type').setLabel("What aircraft is this?").setPlaceholder("e.g. 737-8 MAX").setStyle(TextInputStyle.Short).setRequired(true);
+                const liveryInput = new TextInputBuilder().setCustomId('i_livery').setLabel("What livery is this?").setPlaceholder("e.g. Delta Air Lines").setStyle(TextInputStyle.Short).setRequired(true);
                 modal.addComponents(new ActionRowBuilder().addComponents(typeInput), new ActionRowBuilder().addComponents(liveryInput));
                 await interaction.showModal(modal);
                 return;
             }
 
-            // --- NEW: AIRPORT REJECT BUTTON HANDLER ---
-if (interaction.customId.startsWith('reject_apt_')) {
-    const targetUserId = interaction.customId.split('_')[2];
-    const modal = new ModalBuilder()
-        .setCustomId(`rejectAptModal_${targetUserId}`)
-        .setTitle('Airport Rejection Reason');
+            if (customId.startsWith('edit_admin_')) {
+                const receivedEmbed = interaction.message.embeds[0];
+                const currentTail = receivedEmbed.fields.find(f => f.name === 'Tail Number')?.value || 'UNKNOWN';
+                const currentType = receivedEmbed.fields.find(f => f.name === 'Aircraft Type')?.value || '';
+                const currentLivery = receivedEmbed.fields.find(f => f.name === 'Livery')?.value || '';
 
-    const reasonInput = new TextInputBuilder()
-        .setCustomId('reasonInput')
-        .setLabel("Why is this being rejected?")
-        .setStyle(TextInputStyle.Paragraph)
-        .setRequired(true);
+                const modal = new ModalBuilder().setCustomId('admin_edit_modal').setTitle('Edit Submission Details');
+                const tailInput = new TextInputBuilder().setCustomId('ae_tail').setLabel("Tail Number").setValue(currentTail).setStyle(TextInputStyle.Short).setRequired(true);
+                const typeInput = new TextInputBuilder().setCustomId('ae_type').setLabel("Aircraft Type").setValue(currentType).setStyle(TextInputStyle.Short).setRequired(true);
+                const liveryInput = new TextInputBuilder().setCustomId('ae_livery').setLabel("Livery").setValue(currentLivery).setStyle(TextInputStyle.Short).setRequired(true);
 
-    modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
-    await interaction.showModal(modal);
-    return;
-}
+                modal.addComponents(new ActionRowBuilder().addComponents(tailInput), new ActionRowBuilder().addComponents(typeInput), new ActionRowBuilder().addComponents(liveryInput));
+                await interaction.showModal(modal);
+                return;
+            }
 
-            if (interaction.isButton() && interaction.customId.startsWith('start_airport_ident_')) {
-    const originalUserId = interaction.customId.split('_')[3]; 
-    
-    if (interaction.user.id !== originalUserId) {
-        return interaction.reply({ content: "This is not your photo.", ephemeral: true });
-    }
-
-    const modal = new ModalBuilder()
-        .setCustomId('airport_modal')
-        .setTitle('Airport Details');
-
-    const icaoInput = new TextInputBuilder()
-        .setCustomId('a_icao')
-        .setLabel("What is the ICAO code?")
-        .setPlaceholder("e.g. KJFK, EGLL, OMDB")
-        .setStyle(TextInputStyle.Short)
-        .setMinLength(4)
-        .setMaxLength(4)
-        .setRequired(true);
-
-    modal.addComponents(new ActionRowBuilder().addComponents(icaoInput));
-    
-    await interaction.showModal(modal);
-    return;
-}
-
-            if (interaction.customId.startsWith('approve_')) {
+            if (customId.startsWith('approve_')) {
                 await interaction.deferUpdate();
-                
-                const [_, targetUserId] = interaction.customId.split('_');
-                let receivedEmbed = interaction.message.embeds[0];
-                
+                const [_, targetUserId] = customId.split('_');
+                const receivedEmbed = interaction.message.embeds[0];
                 const tailField = receivedEmbed.fields.find(f => f.name === 'Tail Number').value;
                 const typeField = receivedEmbed.fields.find(f => f.name === 'Aircraft Type').value;
                 const liveryField = receivedEmbed.fields.find(f => f.name === 'Livery').value;
-                
-                let imageUrl = receivedEmbed.image?.url;
-                if (!imageUrl && interaction.message.attachments.size > 0) {
-                    imageUrl = interaction.message.attachments.first().url;
-                }
-
-                const footerText = receivedEmbed.footer?.text || '';
-                const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
+                let imageUrl = receivedEmbed.image?.url || interaction.message.attachments.first()?.url;
+                const publicMsgId = (receivedEmbed.footer?.text || '').match(/Msg: (\d+)/)?.[1];
 
                 try {
-                    const existingEntry = await CommunityAircraftModel.findOne({ 
-                        aircraftType: { $regex: new RegExp(`^${escapeRegex(typeField)}$`, "i") },
-                        liveryName: { $regex: new RegExp(`^${escapeRegex(liveryField)}$`, "i") }
-                    });
-                    
                     const permanentUrl = await uploadImageToS3(imageUrl, tailField);
-                    
-                    let contributorName = "Unknown";
-                    try { 
-                        const member = await interaction.guild.members.fetch(targetUserId); 
-                        contributorName = member.displayName;
-                    } catch (e) {
-                        try {
-                            const cUser = await client.users.fetch(targetUserId);
-                            contributorName = cUser.username;
-                        } catch (err) {}
-                    }
+                    const member = await interaction.guild.members.fetch(targetUserId).catch(() => null);
+                    const contributorName = member ? member.displayName : (await client.users.fetch(targetUserId)).username;
 
-                    const updateData = {
-                        contributorName: contributorName,
-                        contributorId: targetUserId, 
-                        aircraftType: typeField,
-                        liveryName: liveryField,
-                        imageUrl: permanentUrl,
-                        uploadedAt: new Date()
-                    };
+                    const updateData = { contributorName, contributorId: targetUserId, aircraftType: typeField, liveryName: liveryField, imageUrl: permanentUrl, uploadedAt: new Date() };
                     if (tailField !== 'UNKNOWN') updateData.tailNumber = tailField.toUpperCase();
 
-                    if (existingEntry) {
-                        Object.assign(existingEntry, updateData);
-                        await existingEntry.save();
-                    } else {
-                        await new CommunityAircraftModel(updateData).save();
-                    }
+                    await CommunityAircraftModel.findOneAndUpdate(
+                        { aircraftType: { $regex: new RegExp(`^${escapeRegex(typeField)}$`, "i") }, liveryName: { $regex: new RegExp(`^${escapeRegex(liveryField)}$`, "i") } },
+                        updateData, { upsert: true }
+                    );
 
-                    try {
-                        const member = await interaction.guild.members.fetch(targetUserId);
-                        if (CONTRIBUTOR_ROLE_ID) await member.roles.add(CONTRIBUTOR_ROLE_ID);
-                    } catch (e) {}
+                    if (CONTRIBUTOR_ROLE_ID && member) await member.roles.add(CONTRIBUTOR_ROLE_ID).catch(() => {});
 
-                    const approveEmbed = EmbedBuilder.from(receivedEmbed)
-                        .setColor(0x00FF00)
-                        .setTitle('✅ Submission Approved')
-                        .setImage(null) 
-                        .setFooter({ text: `Approved by ${interaction.user.tag}` });
-                    
-                    await interaction.editReply({ embeds: [approveEmbed], components: [] });
+                    await interaction.editReply({ embeds: [EmbedBuilder.from(receivedEmbed).setColor(0x00FF00).setTitle('✅ Approved').setImage(null)], components: [] });
 
                     if (publicMsgId) {
                         try {
                             const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
                             const publicMsg = await feedChannel.messages.fetch(publicMsgId);
-                            const publicEmbed = EmbedBuilder.from(publicMsg.embeds[0])
-                                .setTitle('✅ Verified Aircraft Spotted!')
-                                .setColor(0x00FF00)
-                                .setDescription(`Verified and added to database.`)
-                                .setImage(null)
-                                .setFooter({ text: 'Verified by Staff' });
-                            
-                            await publicMsg.edit({ content: permanentUrl, embeds: [publicEmbed], files: [] });
+                            await publicMsg.edit({ content: permanentUrl, embeds: [EmbedBuilder.from(publicMsg.embeds[0]).setTitle('✅ Verified').setColor(0x00FF00).setImage(null)], files: [] });
                         } catch (e) {}
                     }
-                    
-                    try { 
-                        const user = await client.users.fetch(targetUserId);
-                        const userNotifyEmbed = new EmbedBuilder()
-                            .setTitle('✅ Submission Approved')
-                            .setColor(0x00FF00)
-                            .setDescription(`Your photo of **${typeField}** has been approved!`)
-                            .setImage(permanentUrl); 
-                        await user.send({ embeds: [userNotifyEmbed] }); 
-                    } catch (e) { }
-
-                    receivedEmbed = null;
-
-                } catch (error) {
-                    console.error(error);
-                    await interaction.followUp({ content: '❌ Error saving to database/S3.', ephemeral: true });
-                }
-            }
-
-            // --- NEW: BATCH APPROVAL HANDLER ---
-if (interaction.customId.startsWith('approve_batch_')) {
-    await interaction.deferUpdate();
-    const targetUserId = interaction.customId.split('_')[2];
-    const batchData = userSessions.get(`batch_${targetUserId}`);
-
-    if (!batchData) return interaction.followUp({ content: "Error: Could not find batch data.", ephemeral: true });
-
-    // Pick the URL the admin selected from the preview menu
-    const winningImageUrl = batchData.images[batchData.selectedIndex];
-
-    try {
-        // Upload ONLY the winning photo to S3
-        const permanentUrl = await uploadImageToS3(winningImageUrl, batchData.tail);
-        
-        // Save to Database (re-using your existing logic pattern)
-        const updateData = {
-            contributorName: "Batch Contributor", // You can fetch real name here like your other approve block
-            contributorId: targetUserId,
-            aircraftType: batchData.type,
-            liveryName: batchData.livery,
-            imageUrl: permanentUrl,
-            tailNumber: batchData.tail.toUpperCase(),
-            uploadedAt: new Date()
-        };
-
-        // Check for existing to replace or create new
-        const existingEntry = await CommunityAircraftModel.findOne({ 
-            aircraftType: batchData.type, 
-            liveryName: batchData.livery 
-        });
-
-        if (existingEntry) {
-            Object.assign(existingEntry, updateData);
-            await existingEntry.save();
-        } else {
-            await new CommunityAircraftModel(updateData).save();
-        }
-
-        await interaction.editReply({ 
-            content: `✅ Batch Approved! Saved Photo #${batchData.selectedIndex + 1} to the database.`, 
-            embeds: [], 
-            components: [] 
-        });
-
-        userSessions.delete(`batch_${targetUserId}`); // Clean up memory
-
-    } catch (error) {
-        console.error("Batch Approval Error:", error);
-        await interaction.followUp({ content: "❌ Failed to save batch selection.", ephemeral: true });
-    }
-}
-
-            if (interaction.customId.startsWith('reject_')) {
-                const targetUserId = interaction.customId.split('_')[1];
-                const modal = new ModalBuilder().setCustomId(`rejectModal_${targetUserId}`).setTitle('Rejection Reason');
-                const reasonInput = new TextInputBuilder().setCustomId('reasonInput').setLabel("Why is this being rejected?").setStyle(TextInputStyle.Paragraph).setRequired(true);
-                modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
-                await interaction.showModal(modal);
-            }
-        }
-
-        if (interaction.isModalSubmit()) {
-
-            // --- NEW: AIRPORT REJECT MODAL SUBMIT ---
-if (interaction.customId.startsWith('rejectAptModal_')) {
-    await interaction.deferUpdate(); 
-    const targetUserId = interaction.customId.split('_')[1];
-    const reason = interaction.fields.getTextInputValue('reasonInput');
-    
-    let originalEmbed = interaction.message.embeds[0];
-    const icao = originalEmbed.fields.find(f => f.name === 'ICAO')?.value || 'Unknown Airport';
-    
-    let thumbUrl = originalEmbed.image?.url;
-    const footerText = originalEmbed.footer?.text || '';
-    
-    // Extract the origin channel ID from the footer we updated in Step 1
-    const originChannelId = footerText.match(/Ch: (\d+)/)?.[1];
-
-    const rejectedEmbed = EmbedBuilder.from(originalEmbed)
-        .setTitle('❌ Airport Submission Rejected')
-        .setColor(0xFF0000)
-        .setDescription(`**Reason:** ${reason}`)
-        .setImage(null) 
-        .setFooter({ text: `Rejected by ${interaction.user.tag}` });
-    
-    await interaction.editReply({ embeds: [rejectedEmbed], components: [] }); 
-
-    // Send notification back to the original submission channel
-    if (originChannelId) {
-        try {
-            const originChannel = await client.channels.fetch(originChannelId);
-            if (originChannel) {
-                const rejectionNotifyEmbed = new EmbedBuilder()
-                    .setTitle('❌ Airport Photo Rejected')
-                    .setColor(0xFF0000)
-                    .setDescription(`Hey <@${targetUserId}>, your photo for **${icao}** was rejected.`)
-                    .addFields({ name: 'Reason', value: reason })
-                    .setThumbnail(thumbUrl) 
-                    .setFooter({ text: 'You can upload a clearer photo to try again!' });
-
-                await originChannel.send({ embeds: [rejectionNotifyEmbed] });
-            }
-        } catch (e) {
-            // Fallback to DM if channel is inaccessible
-            try { 
-                const user = await client.users.fetch(targetUserId);
-                await user.send(`❌ Your airport submission for **${icao}** was rejected: ${reason}`); 
-            } catch (err) { console.error("Could not notify user of rejection."); }
-        }
-    }
-}
-
-            if (interaction.customId === 'admin_edit_modal') {
-                await interaction.deferUpdate();
-                
-                // Let is used here so we can update the tail if auto-lookup finds a match
-                let newTail = interaction.fields.getTextInputValue('ae_tail');
-                const newType = interaction.fields.getTextInputValue('ae_type');
-                const newLivery = interaction.fields.getTextInputValue('ae_livery');
-
-                const oldEmbed = interaction.message.embeds[0];
-                const oldTail = oldEmbed.fields.find(f => f.name === 'Tail Number')?.value || 'UNKNOWN';
-
-                // --- AUTO REGISTRATION RE-LOOKUP LOGIC ---
-                // If the tail field hasn't been manually changed by the moderator (it equals the old value),
-                // OR if the current tail is simply 'UNKNOWN', we attempt to re-calculate the registration
-                // based on the newly edited Aircraft Type and Livery.
-                if (newTail === oldTail || newTail.toUpperCase() === 'UNKNOWN') {
-                    const reCheckReg = lookupRegistration(newType, newLivery);
-                    if (reCheckReg) {
-                        newTail = reCheckReg;
-                    }
-                }
-                // --- END LOGIC ---
-
-                const newEmbed = EmbedBuilder.from(oldEmbed);
-
-                const fields = newEmbed.data.fields;
-                const tailIdx = fields.findIndex(f => f.name === 'Tail Number');
-                if (tailIdx >= 0) fields[tailIdx].value = newTail.toUpperCase();
-                
-                const typeIdx = fields.findIndex(f => f.name === 'Aircraft Type');
-                if (typeIdx >= 0) fields[typeIdx].value = newType;
-
-                const liveryIdx = fields.findIndex(f => f.name === 'Livery');
-                if (liveryIdx >= 0) fields[liveryIdx].value = newLivery;
-
-                newEmbed.setFields(fields);
-                
-                await interaction.editReply({ embeds: [newEmbed] });
+                } catch (err) { console.error(err); }
                 return;
             }
 
-            if (interaction.customId === 'identify_modal') {
-    await interaction.deferReply({ ephemeral: true });
+            if (customId.startsWith('reject_')) {
+                // Shared rejection logic for aircraft
+                const targetUserId = customId.split('_')[1];
+                const modal = new ModalBuilder().setCustomId(`rejectModal_${targetUserId}`).setTitle('Rejection Reason');
+                const reasonInput = new TextInputBuilder().setCustomId('reasonInput').setLabel("Why?").setStyle(TextInputStyle.Paragraph).setRequired(true);
+                modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
+                await interaction.showModal(modal);
+                return;
+            }
 
-    const type = interaction.fields.getTextInputValue('i_type');
-    const livery = interaction.fields.getTextInputValue('i_livery');
+            // --- AIRPORT BUTTONS ---
+            if (customId.startsWith('start_airport_ident_')) {
+                const originalUserId = customId.split('_')[3];
+                if (interaction.user.id !== originalUserId) return interaction.reply({ content: "Not your photo.", ephemeral: true });
+                const modal = new ModalBuilder().setCustomId('airport_modal').setTitle('Airport Details');
+                const icaoInput = new TextInputBuilder().setCustomId('a_icao').setLabel("ICAO Code").setPlaceholder("e.g. KJFK").setStyle(TextInputStyle.Short).setMinLength(4).setMaxLength(4).setRequired(true);
+                modal.addComponents(new ActionRowBuilder().addComponents(icaoInput));
+                await interaction.showModal(modal);
+                return;
+            }
 
-    let images = [];
-    try {
-        if (interaction.message.reference && interaction.message.reference.messageId) {
-            const originalMsg = await interaction.channel.messages.fetch(interaction.message.reference.messageId);
-            // Get ALL image attachments
-            images = originalMsg.attachments.filter(a => 
-                a.contentType?.startsWith('image/') || /\.(png|jpe?g|webp|gif)$/i.test(a.name)
-            );
+            if (customId.startsWith('approve_apt_')) {
+                await interaction.deferUpdate();
+                const [_, __, targetUserId, icao] = customId.split('_');
+                const imageUrl = interaction.message.embeds[0].image?.url;
+                try {
+                    const member = await interaction.guild.members.fetch(targetUserId).catch(() => null);
+                    const contributorName = sanitizeMetadata(member ? member.displayName : "Unknown");
+                    const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
+                    if (typeof deleteAirportImages === 'function') await deleteAirportImages(s3Client, icao);
+                    const finalUrl = await uploadAirportImage(s3Client, { buffer: Buffer.from(response.data) }, icao, contributorName);
+                    await interaction.editReply({ embeds: [EmbedBuilder.from(interaction.message.embeds[0]).setTitle(`✅ Airport Approved: ${icao}`).setColor(0x00FF00).setImage(finalUrl)], components: [] });
+                } catch (err) { console.error(err); }
+                return;
+            }
+
+            if (customId.startsWith('reject_apt_')) {
+                const targetUserId = customId.split('_')[2];
+                const modal = new ModalBuilder().setCustomId(`rejectAptModal_${targetUserId}`).setTitle('Airport Rejection Reason');
+                const reasonInput = new TextInputBuilder().setCustomId('reasonInput').setLabel("Why?").setStyle(TextInputStyle.Paragraph).setRequired(true);
+                modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
+                await interaction.showModal(modal);
+                return;
+            }
+
+            // --- TICKET BUTTONS ---
+            if (customId === 'create_ticket_start') {
+                const topicSelect = new StringSelectMenuBuilder().setCustomId('ticket_topic_select').setPlaceholder('Select a topic')
+                    .addOptions(
+                        { label: 'Database Correction', value: 'db_correction', emoji: '📝' },
+                        { label: 'Submission Issue', value: 'submission_issue', emoji: '📸' },
+                        { label: 'Other Inquiry', value: 'other', emoji: '❓' }
+                    );
+                await interaction.reply({ content: 'Select a topic:', components: [new ActionRowBuilder().addComponents(topicSelect)], ephemeral: true });
+                return;
+            }
+
+            if (customId === 'close_ticket_action') {
+                if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID)) return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
+                await interaction.deferReply({ ephemeral: true });
+                const thread = interaction.channel;
+                try {
+                    const messages = await thread.messages.fetch({ limit: 100 });
+                    const transcript = Array.from(messages.values()).reverse().map(m => `[${new Date(m.createdTimestamp).toLocaleString()}] ${m.author.tag}: ${m.content}`).join('\n');
+                    const transcriptChannel = await client.channels.fetch(TRANSCRIPT_CHANNEL_ID);
+                    if (transcriptChannel) {
+                        await transcriptChannel.send({ embeds: [new EmbedBuilder().setTitle('🔒 Ticket Closed').setDescription(`Ticket: ${thread.name}`).setColor(0xFF0000)], files: [new AttachmentBuilder(Buffer.from(transcript), { name: `${thread.name}-transcript.txt` })] });
+                    }
+                    await interaction.editReply("Closing in 5s...");
+                    setTimeout(() => thread.delete().catch(() => {}), 5000);
+                } catch (e) { console.error(e); }
+                return;
+            }
         }
-    } catch (err) { 
-        console.error("Could not fetch original images:", err); 
-    }
 
-    if (images.size === 0) {
-        return interaction.editReply("❌ Could not find the original images. Please upload again.");
-    }
+        // --- 3. SELECT MENU HANDLERS ---
+        if (interaction.isStringSelectMenu()) {
+            if (interaction.customId === 'ticket_topic_select') {
+                const modal = new ModalBuilder().setCustomId(`ticket_modal_${interaction.values[0]}`).setTitle('Ticket Details');
+                modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('ticket_desc').setLabel("Description").setStyle(TextInputStyle.Paragraph).setRequired(false)));
+                await interaction.showModal(modal);
+                return;
+            }
+        }
 
-    // Process every image found in that message
-    for (const [id, photo] of images) {
-        await startSubmissionFlow(interaction, type, livery, null, photo.url, interaction.user, interaction.channelId);
-    }
-    
-    try { await interaction.message.delete(); } catch(e) {}
-    return;
-}
+        // --- 4. MODAL SUBMIT HANDLERS ---
+        if (interaction.isModalSubmit()) {
+            const customId = interaction.customId;
 
-            if (interaction.customId.startsWith('rejectModal_')) {
-                await interaction.deferUpdate(); 
-                const targetUserId = interaction.customId.split('_')[1];
-                const reason = interaction.fields.getTextInputValue('reasonInput');
-                
-                let originalEmbed = interaction.message.embeds[0];
-                const aircraftName = originalEmbed.fields.find(f => f.name === 'Aircraft Type')?.value || 'Unknown Aircraft';
-                
-                let thumbUrl = originalEmbed.image?.url;
-                if (!thumbUrl && interaction.message.attachments.size > 0) {
-                     thumbUrl = interaction.message.attachments.first().url;
+            if (customId === 'identify_modal') {
+                await interaction.deferReply({ ephemeral: true });
+                const type = interaction.fields.getTextInputValue('i_type');
+                const livery = interaction.fields.getTextInputValue('i_livery');
+                const originalMsg = await interaction.channel.messages.fetch(interaction.message.reference.messageId).catch(() => null);
+                if (!originalMsg?.attachments.first()) return interaction.editReply("❌ Image not found.");
+                await startSubmissionFlow(interaction, type, livery, null, originalMsg.attachments.first().url, interaction.user, interaction.channelId);
+                try { await interaction.message.delete(); } catch(e) {}
+                return;
+            }
+
+            if (customId === 'admin_edit_modal') {
+                await interaction.deferUpdate();
+                let newTail = interaction.fields.getTextInputValue('ae_tail');
+                const newType = interaction.fields.getTextInputValue('ae_type');
+                const newLivery = interaction.fields.getTextInputValue('ae_livery');
+                const oldEmbed = interaction.message.embeds[0];
+                const oldTail = oldEmbed.fields.find(f => f.name === 'Tail Number')?.value || 'UNKNOWN';
+
+                if (newTail === oldTail || newTail.toUpperCase() === 'UNKNOWN') {
+                    newTail = lookupRegistration(newType, newLivery) || newTail;
                 }
 
-                const footerText = originalEmbed.footer?.text || '';
-                const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
-                const originChannelId = footerText.match(/Ch: (\d+)/)?.[1];
+                const newEmbed = EmbedBuilder.from(oldEmbed);
+                const fields = newEmbed.data.fields;
+                fields.find(f => f.name === 'Tail Number').value = newTail.toUpperCase();
+                fields.find(f => f.name === 'Aircraft Type').value = newType;
+                fields.find(f => f.name === 'Livery').value = newLivery;
+                await interaction.editReply({ embeds: [newEmbed.setFields(fields)] });
+                return;
+            }
 
-                const rejectedEmbed = EmbedBuilder.from(originalEmbed)
-                    .setTitle('❌ Submission Rejected')
-                    .setColor(0xFF0000)
-                    .setDescription(`**Reason:** ${reason}`)
-                    .setImage(null) 
-                    .setFooter({ text: `Rejected by ${interaction.user.tag}` });
+            if (customId.startsWith('rejectModal_')) {
+                await interaction.deferUpdate();
+                const targetUserId = customId.split('_')[1];
+                const reason = interaction.fields.getTextInputValue('reasonInput');
+                const oldEmbed = interaction.message.embeds[0];
+                const publicMsgId = (oldEmbed.footer?.text || '').match(/Msg: (\d+)/)?.[1];
+                const originChannelId = (oldEmbed.footer?.text || '').match(/Ch: (\d+)/)?.[1];
+
+                await interaction.editReply({ embeds: [EmbedBuilder.from(oldEmbed).setTitle('❌ Rejected').setColor(0xFF0000).setDescription(`Reason: ${reason}`).setImage(null)], components: [] });
                 
-                await interaction.editReply({ embeds: [rejectedEmbed], components: [] }); 
-
                 if (publicMsgId) {
                     try {
-                        const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
-                        const publicMsg = await feedChannel.messages.fetch(publicMsgId);
-                        if (publicMsg) {
-                            const publicRejectedEmbed = EmbedBuilder.from(publicMsg.embeds[0])
-                                .setTitle('❌ Submission Rejected')
-                                .setColor(0xFF0000) 
-                                .setDescription(`This submission was not accepted by the moderators.`)
-                                .setImage(null) 
-                                .setFooter({ text: `Reviewed by Staff` });
-                            await publicMsg.edit({ embeds: [publicRejectedEmbed] });
-                        }
-                    } catch (e) {}
-                }
-
-                if (originChannelId) {
-                    try {
-                        const originChannel = await client.channels.fetch(originChannelId);
-                        if (originChannel) {
-                            const rejectionNotifyEmbed = new EmbedBuilder()
-                                .setTitle('❌ Photo Rejected')
-                                .setColor(0xFF0000)
-                                .setDescription(`Hey <@${targetUserId}>, this specific photo was rejected.`)
-                                .addFields({ name: 'Reason', value: reason })
-                                .setThumbnail(thumbUrl) 
-                                .setFooter({ text: 'You can upload a different photo below to try again!' });
-
-                            await originChannel.send({ embeds: [rejectionNotifyEmbed] });
-                        }
-                    } catch (e) {
-                        try { (await client.users.fetch(targetUserId)).send(`❌ Your submission for **${aircraftName}** was rejected: ${reason}`); } catch (e) {}
-                    }
+                        const feed = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
+                        const msg = await feed.messages.fetch(publicMsgId);
+                        await msg.edit({ embeds: [EmbedBuilder.from(msg.embeds[0]).setTitle('❌ Rejected').setColor(0xFF0000).setImage(null)] });
+                    } catch(e) {}
                 }
                 
-                originalEmbed = null;
-            }
-        }
-
-        if (!interaction.isChatInputCommand()) return;
-
-        // --- HANDLER: MODERATION COMMANDS ---
-        if (interaction.commandName.startsWith('mod_')) {
-            // Permission Check specifically for the Admin Role ID for extra security
-            const hasAdminRole = interaction.member.roles.cache.has(ADMIN_ROLE_ID);
-            const isAdmin = interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
-            
-            if (!hasAdminRole && !isAdmin) {
-                return interaction.reply({ content: '❌ Access Denied: Missing Admin Privileges.', ephemeral: true });
+                if (originChannelId) {
+                    const channel = await client.channels.fetch(originChannelId).catch(() => null);
+                    if (channel) await channel.send({ content: `<@${targetUserId}>`, embeds: [new EmbedBuilder().setTitle('❌ Photo Rejected').setDescription(`Reason: ${reason}`).setColor(0xFF0000)] });
+                }
+                return;
             }
 
-            const targetUser = interaction.options.getUser('user');
-            const targetMember = targetUser ? await interaction.guild.members.fetch(targetUser.id).catch(() => null) : null;
-            const reason = interaction.options.getString('reason') || 'No reason provided';
+            if (customId === 'airport_modal') {
+                await interaction.deferReply({ ephemeral: true });
+                const icao = interaction.fields.getTextInputValue('a_icao').toUpperCase().trim();
+                const originalMsg = await interaction.channel.messages.fetch(interaction.message.reference.messageId);
+                const photoUrl = originalMsg.attachments.first().url;
+                const publicMsg = await (await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID)).send({ embeds: [new EmbedBuilder().setTitle('🏢 New Airport Submission').setColor(0xFFFF00).setImage(photoUrl).addFields({ name: 'ICAO', value: icao })] });
+                
+                const adminEmbed = new EmbedBuilder().setTitle('🏢 Airport Review').setColor(0x0099FF).setImage(photoUrl).addFields({ name: 'ICAO', value: icao }).setFooter({ text: `User: ${interaction.user.id} | Msg: ${publicMsg.id} | Ch: ${interaction.channelId}` });
+                const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`approve_apt_${interaction.user.id}_${icao}`).setLabel('Approve').setStyle(ButtonStyle.Success), new ButtonBuilder().setCustomId(`reject_apt_${interaction.user.id}`).setLabel('Reject').setStyle(ButtonStyle.Danger));
+                await (await client.channels.fetch(AIRPORT_ADMIN_CHANNEL_ID)).send({ embeds: [adminEmbed], components: [row] });
+                await interaction.editReply("✅ Sent for review.");
+                try { await interaction.message.delete(); } catch(e) {}
+                return;
+            }
 
-            try {
-                if (interaction.commandName === 'mod_kick') {
-                    if (!targetMember) return interaction.reply({ content: 'User not found in server.', ephemeral: true });
-                    await targetMember.kick(reason);
-                    await interaction.reply({ content: `✅ Kicked ${targetUser.tag}.`, ephemeral: true });
-                    await logModAction('KICK', interaction.user, targetUser, reason);
-                }
+            if (customId.startsWith('rejectAptModal_')) {
+                await interaction.deferUpdate();
+                const targetUserId = customId.split('_')[1];
+                const reason = interaction.fields.getTextInputValue('reasonInput');
+                const oldEmbed = interaction.message.embeds[0];
+                const publicMsgId = (oldEmbed.footer?.text || '').match(/Msg: (\d+)/)?.[1];
+                const originChannelId = (oldEmbed.footer?.text || '').match(/Ch: (\d+)/)?.[1];
 
-                if (interaction.commandName === 'mod_ban') {
-                    await interaction.guild.members.ban(targetUser, { reason });
-                    await interaction.reply({ content: `✅ Banned ${targetUser.tag}.`, ephemeral: true });
-                    await logModAction('BAN', interaction.user, targetUser, reason);
-                }
-
-                if (interaction.commandName === 'mod_timeout') {
-                    if (!targetMember) return interaction.reply({ content: 'User not found.', ephemeral: true });
-                    const minutes = interaction.options.getInteger('duration');
-                    await targetMember.timeout(minutes * 60 * 1000, reason);
-                    await interaction.reply({ content: `✅ Timed out ${targetUser.tag} for ${minutes} minutes.`, ephemeral: true });
-                    await logModAction('TIMEOUT', interaction.user, targetUser, reason, `Duration: ${minutes}m`);
-                }
-
-                if (interaction.commandName === 'mod_untimeout') {
-                    if (!targetMember) return interaction.reply({ content: 'User not found.', ephemeral: true });
-                    await targetMember.timeout(null, reason);
-                    await interaction.reply({ content: `✅ Removed timeout for ${targetUser.tag}.`, ephemeral: true });
-                    await logModAction('UNTIMEOUT', interaction.user, targetUser, reason);
-                }
-
-                if (interaction.commandName === 'mod_warn') {
-                    // DM the user
-                    let dmStatus = 'DM Sent';
+                await interaction.editReply({ embeds: [EmbedBuilder.from(oldEmbed).setTitle('❌ Airport Rejected').setColor(0xFF0000).setDescription(`Reason: ${reason}`).setImage(null)], components: [] });
+                if (publicMsgId) {
                     try {
-                        const warnEmbed = new EmbedBuilder()
-                            .setTitle('⚠️ Official Warning')
-                            .setColor(0xFFD700)
-                            .setDescription(`You have received a warning in **${interaction.guild.name}**.`)
-                            .addFields({ name: 'Reason', value: reason })
-                            .setFooter({ text: 'Please review our rules to avoid further action.' });
-                        await targetUser.send({ embeds: [warnEmbed] });
-                    } catch (e) { dmStatus = 'DM Failed (User has DMs off)'; }
-
-                    await interaction.reply({ content: `✅ Warned ${targetUser.tag}. (${dmStatus})`, ephemeral: true });
-                    await logModAction('WARN', interaction.user, targetUser, reason, `Status: ${dmStatus}`);
+                        const feed = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
+                        const msg = await feed.messages.fetch(publicMsgId);
+                        await msg.edit({ embeds: [EmbedBuilder.from(msg.embeds[0]).setTitle('❌ Rejected').setColor(0xFF0000).setImage(null)] });
+                    } catch(e) {}
                 }
-
-                if (interaction.commandName === 'mod_purge') {
-                    const amount = interaction.options.getInteger('amount');
-                    const deleted = await interaction.channel.bulkDelete(amount, true);
-                    await interaction.reply({ content: `✅ Deleted ${deleted.size} messages.`, ephemeral: true });
-                    await logModAction('PURGE', interaction.user, interaction.channel, 'Bulk Delete', `Amount: ${deleted.size} messages`);
+                if (originChannelId) {
+                    const ch = await client.channels.fetch(originChannelId).catch(() => null);
+                    if (ch) await ch.send({ content: `<@${targetUserId}>`, embeds: [new EmbedBuilder().setTitle('❌ Airport Photo Rejected').setDescription(`Reason: ${reason}`).setColor(0xFF0000)] });
                 }
-
-                if (interaction.commandName === 'mod_lock') {
-                    await interaction.channel.permissionOverwrites.edit(interaction.guild.id, { SendMessages: false });
-                    await interaction.reply({ content: '🔒 Channel locked.', ephemeral: true });
-                    await logModAction('LOCK', interaction.user, interaction.channel, 'Channel Lockdown');
-                }
-
-                if (interaction.commandName === 'mod_unlock') {
-                    await interaction.channel.permissionOverwrites.edit(interaction.guild.id, { SendMessages: null });
-                    await interaction.reply({ content: '🔓 Channel unlocked.', ephemeral: true });
-                    await logModAction('UNLOCK', interaction.user, interaction.channel, 'Channel Unlock');
-                }
-
-                if (interaction.commandName === 'mod_say') {
-                    const msg = interaction.options.getString('message');
-                    const targetChannel = interaction.options.getChannel('channel') || interaction.channel;
-                    await targetChannel.send(msg);
-                    await interaction.reply({ content: '✅ Message sent.', ephemeral: true });
-                    await logModAction('ANNOUNCE', interaction.user, targetChannel, 'Bot Announcement', `Content: ${msg}`);
-                }
-
-            } catch (error) {
-                console.error('Mod Command Error:', error);
-                await interaction.reply({ content: '❌ Failed to execute action. Check bot permissions.', ephemeral: true }).catch(() => {});
+                return;
             }
-            return;
+
+            if (customId.startsWith('ticket_modal_')) {
+                await interaction.deferReply({ ephemeral: true });
+                const topic = customId.replace('ticket_modal_', '');
+                const desc = interaction.fields.getTextInputValue('ticket_desc') || 'No description';
+                const thread = await interaction.channel.threads.create({ name: `ticket-${interaction.user.username}-${topic}`, type: ChannelType.PrivateThread, reason: 'Support Ticket' });
+                await thread.members.add(interaction.user.id);
+                const embed = new EmbedBuilder().setTitle('🎫 Support Ticket').addFields({ name: 'Topic', value: topic }, { name: 'Description', value: desc }).setColor(0x0099FF);
+                const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('close_ticket_action').setLabel('Close Ticket').setStyle(ButtonStyle.Danger));
+                await thread.send({ content: `<@&${ADMIN_ROLE_ID}>`, embeds: [embed], components: [row] });
+                await interaction.editReply(`Ticket created: <#${thread.id}>`);
+                return;
+            }
         }
-        
-        // --- COMMAND: LIVE TRACKING (/track) ---
-        if (interaction.commandName === 'track') {
-            await interaction.deferReply();
 
-            // 1. Configuration (Matched to flight.js)
-            const query = interaction.options.getString('target').toUpperCase().trim();
-            const LIVE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run'; 
-            const targetServerName = 'Expert Server'; 
+        // --- 5. SLASH COMMAND HANDLERS ---
+        if (interaction.isChatInputCommand()) {
+            const { commandName } = interaction;
 
-            try {
-                // 2. Fetch Sessions
-                const sessionsRes = await axios.get(`${LIVE_API_URL}/if-sessions`);
-                if (!sessionsRes.data || !sessionsRes.data.sessions) {
-                    throw new Error("Invalid response from Live API (Sessions)");
+            if (commandName.startsWith('mod_')) {
+                if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID) && !interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+                    return interaction.reply({ content: '❌ Access Denied.', ephemeral: true });
                 }
+                const targetUser = interaction.options.getUser('user');
+                const targetMember = targetUser ? await interaction.guild.members.fetch(targetUser.id).catch(() => null) : null;
+                const reason = interaction.options.getString('reason') || 'No reason provided';
 
-                // 3. Smart Session Lookup (Logic ported from flight.js)
-                // First try exact match, then fuzzy match (e.g. "Expert" in "Expert Server")
-                let session = sessionsRes.data.sessions.find(s => s.name === targetServerName);
-                if (!session) {
-                    session = sessionsRes.data.sessions.find(s => s.name.includes(targetServerName.split(' ')[0]));
-                }
+                try {
+                    if (commandName === 'mod_kick' && targetMember) {
+                        await targetMember.kick(reason);
+                        await interaction.reply({ content: `✅ Kicked ${targetUser.tag}.`, ephemeral: true });
+                        await logModAction('KICK', interaction.user, targetUser, reason);
+                    } else if (commandName === 'mod_ban') {
+                        await interaction.guild.members.ban(targetUser, { reason });
+                        await interaction.reply({ content: `✅ Banned ${targetUser.tag}.`, ephemeral: true });
+                        await logModAction('BAN', interaction.user, targetUser, reason);
+                    } else if (commandName === 'mod_timeout' && targetMember) {
+                        const duration = interaction.options.getInteger('duration');
+                        await targetMember.timeout(duration * 60 * 1000, reason);
+                        await interaction.reply({ content: `✅ Timed out ${targetUser.tag}.`, ephemeral: true });
+                        await logModAction('TIMEOUT', interaction.user, targetUser, reason, `Duration: ${duration}m`);
+                    } else if (commandName === 'mod_purge') {
+                        const amount = interaction.options.getInteger('amount');
+                        const deleted = await interaction.channel.bulkDelete(amount, true);
+                        await interaction.reply({ content: `✅ Deleted ${deleted.size} msgs.`, ephemeral: true });
+                        await logModAction('PURGE', interaction.user, interaction.channel, 'Bulk Delete', `Count: ${deleted.size}`);
+                    } else if (commandName === 'mod_lock') {
+                        await interaction.channel.permissionOverwrites.edit(interaction.guild.id, { SendMessages: false });
+                        await interaction.reply({ content: '🔒 Locked.', ephemeral: true });
+                        await logModAction('LOCK', interaction.user, interaction.channel, 'Lockdown');
+                    } else if (commandName === 'mod_unlock') {
+                        await interaction.channel.permissionOverwrites.edit(interaction.guild.id, { SendMessages: null });
+                        await interaction.reply({ content: '🔓 Unlocked.', ephemeral: true });
+                        await logModAction('UNLOCK', interaction.user, interaction.channel, 'Unlock');
+                    }
+                } catch (e) { console.error(e); }
+                return;
+            }
 
-                if (!session) {
-                    return interaction.editReply(`❌ Could not locate **${targetServerName}**. The server might be offline.`);
-                }
-
-                // 4. Fetch Flights
-                const flightsRes = await axios.get(`${LIVE_API_URL}/flights/${session.id}`);
-                const flights = flightsRes.data.flights;
-
-                if (!flights || !Array.isArray(flights)) {
-                    return interaction.editReply("❌ Failed to retrieve flight data.");
-                }
-
-                // 5. Find Pilot (Username OR Callsign)
-                const match = flights.find(f => 
-                    (f.username && f.username.toUpperCase().includes(query)) || 
-                    (f.callsign && f.callsign.toUpperCase().includes(query))
-                );
-
-                if (!match) {
-                    return interaction.editReply(`❌ No pilot found matching "**${query}**" on ${session.name}.`);
-                }
-
-                // 6. Calculate Flight Phase (Ported from flight.js getLiteFlightPhase)
-                const calculatePhase = (pos) => {
-                    const vs = pos.vs_fpm || 0;
-                    const alt = pos.alt_ft || 0;
-                    const gs = pos.gs_kt || 0;
+            if (commandName === 'track') {
+                await interaction.deferReply();
+                const query = interaction.options.getString('target').toUpperCase().trim();
+                const LIVE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run';
+                try {
+                    const sessionsRes = await axios.get(`${LIVE_API_URL}/if-sessions`);
+                    const session = sessionsRes.data.sessions.find(s => s.name === 'Expert Server');
+                    if (!session) return interaction.editReply("❌ Expert Server offline.");
+                    const flightsRes = await axios.get(`${LIVE_API_URL}/flights/${session.id}`);
+                    const match = flightsRes.data.flights.find(f => f.username?.toUpperCase().includes(query) || f.callsign?.toUpperCase().includes(query));
+                    if (!match) return interaction.editReply(`❌ Pilot "${query}" not found.`);
                     
-                    if (alt < 1000 && gs < 40 && Math.abs(vs) < 150) return 'On Ground 🛑';
-                    if (vs > 350) return 'Climbing ↗️';
-                    if (vs < -500) return 'Descending ↘️';
-                    if (alt > 18000 && Math.abs(vs) < 500) return 'Cruising ✈️';
-                    return 'Enroute ➡️';
-                };
-
-                const phase = calculatePhase(match.position);
-
-                // 7. Build Embed
-                const trackEmbed = new EmbedBuilder()
-                    .setTitle(`📡 Live Flight: ${match.callsign || 'No Callsign'}`)
-                    .setColor(0x00FF99)
-                    .setThumbnail(`${LIVE_API_URL}/images/radar_icon.png`) // Optional icon
-                    .addFields(
-                        { name: '👤 Pilot', value: match.username || 'Unknown', inline: true },
-                        { name: '✈️ Aircraft', value: match.aircraft?.aircraftName || 'Unknown', inline: true },
-                        { name: '🎨 Livery', value: match.aircraft?.liveryName || 'Unknown', inline: true },
-                        
-                        // Use != null checks to fix the "0 altitude" bug
-                        { name: '📍 Altitude', value: match.position.alt_ft != null ? `${Math.round(match.position.alt_ft).toLocaleString()} ft` : 'N/A', inline: true },
-                        { name: '🚀 Ground Speed', value: match.position.gs_kt != null ? `${Math.round(match.position.gs_kt)} kts` : 'N/A', inline: true },
-                        { name: '↕️ Vertical Speed', value: match.position.vs_fpm != null ? `${Math.round(match.position.vs_fpm)} fpm` : 'N/A', inline: true },
-                        
-                        { name: '🧭 Heading', value: match.position.heading_deg != null ? `${Math.round(match.position.heading_deg)}°` : 'N/A', inline: true },
-                        { name: '🆔 Virtual Org', value: match.virtualOrganization || 'None', inline: true },
-                        { name: '📊 Status', value: phase, inline: true }
-                    )
-                    .setTimestamp(match.position.lastReportMs ? new Date(match.position.lastReportMs) : new Date())
-                    .setFooter({ text: `Server: ${session.name} • ${match.pilotState === 0 ? 'Active' : 'Paused/Away'}` });
-
-                if (match.flightId) {
-                    trackEmbed.addFields({ name: '🌍 Live Map', value: `[View on Inflight.info](https://inflight.info/flight/${match.flightId})` });
-                }
-
-                await interaction.editReply({ embeds: [trackEmbed] });
-
-            } catch (error) {
-                console.error("Track Command Error:", error.message);
-                await interaction.editReply(`❌ **Connection Failed:** Could not connect to backend.\nEnsure \`${LIVE_API_URL}\` is reachable.`);
+                    const phase = match.position.alt_ft < 1000 && match.position.gs_kt < 40 ? 'On Ground' : 'Flying';
+                    const embed = new EmbedBuilder().setTitle(`📡 Tracking: ${match.callsign}`).setColor(0x00FF99).addFields({ name: 'Pilot', value: match.username || 'Unknown', inline: true }, { name: 'Aircraft', value: match.aircraft?.aircraftName || 'Unknown', inline: true }, { name: 'Altitude', value: `${Math.round(match.position.alt_ft).toLocaleString()} ft`, inline: true }, { name: 'Status', value: phase, inline: true });
+                    await interaction.editReply({ embeds: [embed] });
+                } catch (e) { await interaction.editReply("❌ API Connection Failed."); }
+                return;
             }
-        }
 
-        // --- COMMAND: PERSONAL HANGAR (/hangar) ---
-        if (interaction.commandName === 'hangar') {
-            const targetUser = interaction.options.getUser('user') || interaction.user;
-            await interaction.deferReply();
-
-            try {
-                // 1. Perform MongoDB Aggregation
-                // This calculates stats directly in the database for speed
-                const stats = await CommunityAircraftModel.aggregate([
-                    { 
-                        $match: { 
-                            $or: [
-                                { contributorId: targetUser.id },
-                                { contributorName: targetUser.username } 
-                            ]
-                        } 
-                    },
-                    {
-                        $group: {
-                            _id: null,
-                            totalUploads: { $sum: 1 },
-                            // Collect unique values to count diversity
-                            uniqueTypes: { $addToSet: "$aircraftType" },
-                            uniqueLiveries: { $addToSet: "$liveryName" },
-                            // Push all types to an array to calculate the "favorite" later
-                            allTypes: { $push: "$aircraftType" }
-                        }
-                    }
-                ]);
-
-                if (!stats || stats.length === 0) {
-                    return interaction.editReply(`📂 **${targetUser.username}** has an empty hangar. No photos submitted yet!`);
-                }
-
-                const data = stats[0];
-
-                // 2. Calculate "Favorite Aircraft" (Mode of aircraft types)
-                const typeCounts = {};
-                let favoriteAircraft = "None";
-                let maxCount = 0;
-
-                data.allTypes.forEach(t => {
-                    typeCounts[t] = (typeCounts[t] || 0) + 1;
-                    if (typeCounts[t] > maxCount) {
-                        maxCount = typeCounts[t];
-                        favoriteAircraft = t;
-                    }
-                });
-
-                // 3. Fetch the MOST RECENT upload for the embed image
-                const latestUpload = await CommunityAircraftModel.findOne({ 
-                    $or: [{ contributorId: targetUser.id }, { contributorName: targetUser.username }] 
-                }).sort({ uploadedAt: -1 });
-
-                // 4. Determine Rank based on upload count
-                let rank = 'Spotter';
-                if (data.totalUploads >= 10) rank = 'Bronze Spotter 🥉';
-                if (data.totalUploads >= 25) rank = 'Silver Spotter 🥈';
-                if (data.totalUploads >= 50) rank = 'Gold Spotter 🥇';
-                if (data.totalUploads >= 100) rank = 'Diamond Spotter 💎';
-
-                // 5. Build Hangar Embed
-                const hangarEmbed = new EmbedBuilder()
-                    .setTitle(`✈️ ${targetUser.username}'s Hangar`)
-                    .setColor(0xFFD700) // Gold
-                    .setThumbnail(targetUser.displayAvatarURL())
-                    .setDescription(`**Rank:** ${rank}`)
-                    .addFields(
-                        { name: '📸 Total Photos', value: `${data.totalUploads}`, inline: true },
-                        { name: '🛩️ Unique Types', value: `${data.uniqueTypes.length}`, inline: true },
-                        { name: '🎨 Unique Liveries', value: `${data.uniqueLiveries.length}`, inline: true },
-                        { name: '❤️ Favorite Aircraft', value: `**${favoriteAircraft}** (${maxCount} spots)`, inline: false }
-                    )
-                    .setFooter({ text: `Hangar ID: ${targetUser.id}` });
-
-                // If they have a latest upload, set it as the big image
-                if (latestUpload) {
-                    hangarEmbed.setImage(latestUpload.imageUrl);
-                    hangarEmbed.setFooter({ text: `Latest Catch: ${latestUpload.tailNumber} (${latestUpload.aircraftType})` });
-                }
-
-                await interaction.editReply({ embeds: [hangarEmbed] });
-
-            } catch (error) {
-                console.error("Hangar Command Error:", error);
-                await interaction.editReply("❌ An error occurred while fetching hangar statistics.");
+            if (commandName === 'hangar') {
+                await interaction.deferReply();
+                const target = interaction.options.getUser('user') || interaction.user;
+                try {
+                    const stats = await CommunityAircraftModel.aggregate([{ $match: { $or: [{ contributorId: target.id }, { contributorName: target.username }] } }, { $group: { _id: null, total: { $sum: 1 }, types: { $addToSet: "$aircraftType" }, liveries: { $addToSet: "$liveryName" } } }]);
+                    if (!stats.length) return interaction.editReply(`📂 ${target.username}'s hangar is empty.`);
+                    const embed = new EmbedBuilder().setTitle(`✈️ ${target.username}'s Hangar`).setColor(0xFFD700).addFields({ name: 'Total Photos', value: `${stats[0].total}`, inline: true }, { name: 'Unique Types', value: `${stats[0].types.length}`, inline: true });
+                    const latest = await CommunityAircraftModel.findOne({ $or: [{ contributorId: target.id }, { contributorName: target.username }] }).sort({ uploadedAt: -1 });
+                    if (latest) embed.setImage(latest.imageUrl);
+                    await interaction.editReply({ embeds: [embed] });
+                } catch (e) { await interaction.editReply("❌ Database Error."); }
+                return;
             }
         }
         
