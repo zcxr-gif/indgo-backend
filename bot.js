@@ -1610,68 +1610,73 @@ if (interaction.isButton() && interaction.customId.startsWith('approve_apt_')) {
             }
 
             if (interaction.customId.startsWith('rejectModal_')) {
-                await interaction.deferUpdate(); 
-                const targetUserId = interaction.customId.split('_')[1];
-                const reason = interaction.fields.getTextInputValue('reasonInput');
-                
-                let originalEmbed = interaction.message.embeds[0];
-                const aircraftName = originalEmbed.fields.find(f => f.name === 'Aircraft Type')?.value || 'Unknown Aircraft';
-                
-                let thumbUrl = originalEmbed.image?.url;
-                if (!thumbUrl && interaction.message.attachments.size > 0) {
-                     thumbUrl = interaction.message.attachments.first().url;
-                }
+    await interaction.deferUpdate(); 
+    const targetUserId = interaction.customId.split('_')[1];
+    const reason = interaction.fields.getTextInputValue('reasonInput');
+    
+    let originalEmbed = interaction.message.embeds[0];
+    const isAirport = originalEmbed.title?.includes('Airport'); // Check if it's an airport
+    const aircraftName = originalEmbed.fields.find(f => f.name === 'Aircraft Type')?.value || 'Unknown Aircraft';
+    const icaoName = originalEmbed.fields.find(f => f.name === 'ICAO')?.value || 'Unknown Airport';
+    
+    let thumbUrl = originalEmbed.image?.url;
+    if (!thumbUrl && interaction.message.attachments.size > 0) {
+         thumbUrl = interaction.message.attachments.first().url;
+    }
 
-                const footerText = originalEmbed.footer?.text || '';
-                const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
-                const originChannelId = footerText.match(/Ch: (\d+)/)?.[1];
+    const footerText = originalEmbed.footer?.text || '';
+    const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
+    
+    // --- KEY CHANGE: DETECT CHANNEL ---
+    // If it's an airport, we send it to the Airport Submission channel
+    // Otherwise, we use the ID stored in the footer for aircraft
+    let originChannelId = isAirport ? AIRPORT_SUBMISSION_CHANNEL_ID : footerText.match(/Ch: (\d+)/)?.[1];
 
-                const rejectedEmbed = EmbedBuilder.from(originalEmbed)
+    const rejectedEmbed = new EmbedBuilder()
+        .setTitle('❌ Submission Rejected')
+        .setColor(0xFF0000)
+        .setDescription(`**Reason:** ${reason}`)
+        .setFooter({ text: `Rejected by ${interaction.user.tag}` });
+    
+    await interaction.editReply({ embeds: [rejectedEmbed], components: [] }); 
+
+    // Handle Public Feed update if applicable
+    if (publicMsgId) {
+        try {
+            const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
+            const publicMsg = await feedChannel.messages.fetch(publicMsgId);
+            if (publicMsg) {
+                const publicRejectedEmbed = EmbedBuilder.from(publicMsg.embeds[0])
                     .setTitle('❌ Submission Rejected')
-                    .setColor(0xFF0000)
-                    .setDescription(`**Reason:** ${reason}`)
+                    .setColor(0xFF0000) 
+                    .setDescription(`This submission was not accepted by the moderators.`)
                     .setImage(null) 
-                    .setFooter({ text: `Rejected by ${interaction.user.tag}` });
-                
-                await interaction.editReply({ embeds: [rejectedEmbed], components: [] }); 
-
-                if (publicMsgId) {
-                    try {
-                        const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
-                        const publicMsg = await feedChannel.messages.fetch(publicMsgId);
-                        if (publicMsg) {
-                            const publicRejectedEmbed = EmbedBuilder.from(publicMsg.embeds[0])
-                                .setTitle('❌ Submission Rejected')
-                                .setColor(0xFF0000) 
-                                .setDescription(`This submission was not accepted by the moderators.`)
-                                .setImage(null) 
-                                .setFooter({ text: `Reviewed by Staff` });
-                            await publicMsg.edit({ embeds: [publicRejectedEmbed] });
-                        }
-                    } catch (e) {}
-                }
-
-                if (originChannelId) {
-                    try {
-                        const originChannel = await client.channels.fetch(originChannelId);
-                        if (originChannel) {
-                            const rejectionNotifyEmbed = new EmbedBuilder()
-                                .setTitle('❌ Photo Rejected')
-                                .setColor(0xFF0000)
-                                .setDescription(`Hey <@${targetUserId}>, this specific photo was rejected.`)
-                                .addFields({ name: 'Reason', value: reason })
-                                .setThumbnail(thumbUrl) 
-                                .setFooter({ text: 'You can upload a different photo below to try again!' });
-
-                            await originChannel.send({ embeds: [rejectionNotifyEmbed] });
-                        }
-                    } catch (e) {
-                        try { (await client.users.fetch(targetUserId)).send(`❌ Your submission for **${aircraftName}** was rejected: ${reason}`); } catch (e) {}
-                    }
-                }
-                
-                originalEmbed = null;
+                    .setFooter({ text: `Reviewed by Staff` });
+                await publicMsg.edit({ embeds: [publicRejectedEmbed] });
             }
+        } catch (e) {}
+    }
+
+    // --- SEND NOTIFICATION TO ORIGINAL CHANNEL/THREAD ---
+    if (originChannelId) {
+        try {
+            const originChannel = await client.channels.fetch(originChannelId);
+            if (originChannel) {
+                const rejectionNotifyEmbed = new EmbedBuilder()
+                    .setTitle(isAirport ? '🏢 Airport Photo Rejected' : '❌ Photo Rejected')
+                    .setColor(0xFF0000)
+                    .setDescription(`Hey <@${targetUserId}>, your photo for **${isAirport ? icaoName : aircraftName}** was rejected.`)
+                    .addFields({ name: 'Reason', value: reason })
+                    .setThumbnail(thumbUrl) 
+                    .setFooter({ text: 'You can upload a different photo below to try again!' });
+
+                await originChannel.send({ content: `<@${targetUserId}>`, embeds: [rejectionNotifyEmbed] });
+            }
+        } catch (e) {
+            // Fallback to DM if channel notification fails
+            try { (await client.users.fetch(targetUserId)).send(`❌ Your submission for **${isAirport ? icaoName : aircraftName}** was rejected: ${reason}`); } catch (e) {}
+        }
+    }
         }
 
         if (!interaction.isChatInputCommand()) return;
