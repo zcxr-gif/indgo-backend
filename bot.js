@@ -75,6 +75,11 @@ let cachedLiveries = {};
 // --- SESSION MANAGEMENT ---
 const userSessions = new Map(); 
 
+// Helper to strip non-ASCII characters for AWS S3 Metadata
+const sanitizeMetadata = (str) => {
+    return str.replace(/[^\x00-\x7F]/g, "").trim() || "User";
+};
+
 const escapeRegex = (string) => {
     return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 };
@@ -979,7 +984,7 @@ if (interaction.isModalSubmit() && interaction.customId === 'airport_modal') {
 
 // --- ADMIN APPROVAL ACTION FOR AIRPORTS ---
 if (interaction.isButton() && interaction.customId.startsWith('approve_apt_')) {
-    // Check if already replied to prevent the crash you saw
+    // 1. Guard against double-clicks
     if (interaction.deferred || interaction.replied) return; 
     
     await interaction.deferUpdate();
@@ -988,26 +993,28 @@ if (interaction.isButton() && interaction.customId.startsWith('approve_apt_')) {
 
     try {
         const member = await interaction.guild.members.fetch(targetUserId).catch(() => null);
-        const contributorName = member ? member.displayName : "Unknown Contributor";
+        
+        // FIX: Sanitize the name to prevent ERR_INVALID_CHAR in S3 headers
+        const rawName = member ? member.displayName : "Unknown";
+        const contributorName = sanitizeMetadata(rawName);
 
         // Fetch image as a buffer
         const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
         const mockFile = { buffer: Buffer.from(response.data) };
 
         // 1. Delete existing images for this ICAO
-        // Ensure deleteAirportImages is defined or imported!
         if (typeof deleteAirportImages === 'function') {
             await deleteAirportImages(s3Client, icao);
         }
         
-        // 2. Upload the new verified photo
+        // 2. Upload the new verified photo (contributorName is now S3-safe)
         const finalUrl = await uploadAirportImage(s3Client, mockFile, icao, contributorName);
 
         const successEmbed = EmbedBuilder.from(interaction.message.embeds[0])
             .setTitle(`✅ Airport Approved: ${icao}`)
             .setColor(0x00FF00)
             .setFooter({ text: `Approved by ${interaction.user.tag}` })
-            .setImage(finalUrl); // Update to the new permanent S3 URL
+            .setImage(finalUrl); 
 
         await interaction.editReply({ embeds: [successEmbed], components: [] });
 
@@ -1016,15 +1023,18 @@ if (interaction.isButton() && interaction.customId.startsWith('approve_apt_')) {
             const user = await client.users.fetch(targetUserId);
             await user.send(`✅ Your photo for **${icao}** has been approved and is now live!`);
         } catch(e) {
-            console.log("Could not DM user, they likely have DMs off.");
+            console.log("Could not DM user.");
         }
 
     } catch (err) {
         console.error("Airport Approval Error:", err);
-        // Use followUp here because we already deferred
-        await interaction.followUp({ content: `❌ Error during airport upload: ${err.message}`, ephemeral: true });
+        // Use followUp and check if we can actually send it
+        if (interaction.replied || interaction.deferred) {
+            await interaction.followUp({ content: `❌ Error: ${err.message}`, ephemeral: true }).catch(() => {});
+        }
     }
 }
+
         
         // --- 1. TICKET SYSTEM: INITIAL BUTTON CLICK ---
         if (interaction.isButton() && interaction.customId === 'create_ticket_start') {
