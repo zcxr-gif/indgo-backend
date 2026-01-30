@@ -977,22 +977,28 @@ if (interaction.isModalSubmit() && interaction.customId === 'airport_modal') {
     try { await interaction.message.delete(); } catch(e) {}
 }
 
-        // --- ADMIN APPROVAL ACTION FOR AIRPORTS ---
+// --- ADMIN APPROVAL ACTION FOR AIRPORTS ---
 if (interaction.isButton() && interaction.customId.startsWith('approve_apt_')) {
+    // Check if already replied to prevent the crash you saw
+    if (interaction.deferred || interaction.replied) return; 
+    
     await interaction.deferUpdate();
     const [_, __, targetUserId, icao] = interaction.customId.split('_');
     const imageUrl = interaction.message.embeds[0].image.url;
 
     try {
-        const member = await interaction.guild.members.fetch(targetUserId);
-        const contributorName = member.displayName;
+        const member = await interaction.guild.members.fetch(targetUserId).catch(() => null);
+        const contributorName = member ? member.displayName : "Unknown Contributor";
 
-        // Fetch image as a buffer for the modified airports.js helper
+        // Fetch image as a buffer
         const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
         const mockFile = { buffer: Buffer.from(response.data) };
 
-        // 1. Delete existing images for this ICAO to prevent clutter
-        await deleteAirportImages(s3Client, icao);
+        // 1. Delete existing images for this ICAO
+        // Ensure deleteAirportImages is defined or imported!
+        if (typeof deleteAirportImages === 'function') {
+            await deleteAirportImages(s3Client, icao);
+        }
         
         // 2. Upload the new verified photo
         const finalUrl = await uploadAirportImage(s3Client, mockFile, icao, contributorName);
@@ -1000,19 +1006,23 @@ if (interaction.isButton() && interaction.customId.startsWith('approve_apt_')) {
         const successEmbed = EmbedBuilder.from(interaction.message.embeds[0])
             .setTitle(`✅ Airport Approved: ${icao}`)
             .setColor(0x00FF00)
-            .setFooter({ text: `Approved by ${interaction.user.tag}` });
+            .setFooter({ text: `Approved by ${interaction.user.tag}` })
+            .setImage(finalUrl); // Update to the new permanent S3 URL
 
         await interaction.editReply({ embeds: [successEmbed], components: [] });
 
         // Notify Contributor
         try {
             const user = await client.users.fetch(targetUserId);
-            await user.send(`✅ Your photo for **${icao}** has been approved!`);
-        } catch(e) {}
+            await user.send(`✅ Your photo for **${icao}** has been approved and is now live!`);
+        } catch(e) {
+            console.log("Could not DM user, they likely have DMs off.");
+        }
 
     } catch (err) {
         console.error("Airport Approval Error:", err);
-        await interaction.followUp({ content: "❌ Error during airport upload.", ephemeral: true });
+        // Use followUp here because we already deferred
+        await interaction.followUp({ content: `❌ Error during airport upload: ${err.message}`, ephemeral: true });
     }
 }
         
