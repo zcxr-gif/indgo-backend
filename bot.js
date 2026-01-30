@@ -37,7 +37,7 @@ const AIRPORT_SUBMISSION_CHANNEL_ID = '1463634001020325959';
 const AIRPORT_ADMIN_CHANNEL_ID = '1463636133685628989';
 
 // Import airport helpers (Ensure these are exported in airports.js)
-const { uploadAirportImage } = require('./airports');
+const { uploadAirportImage, getAirportInfo, deleteAirportImages } = require('./airports');
 
 // Promisify pipeline for efficient stream handling
 const pipeline = util.promisify(stream.pipeline);
@@ -75,9 +75,29 @@ let cachedLiveries = {};
 // --- SESSION MANAGEMENT ---
 const userSessions = new Map(); 
 
-// Helper to strip non-ASCII characters for AWS S3 Metadata
+// Helper to strip non-ASCII characters for AWS S3 Metadata compatibility
 const sanitizeMetadata = (str) => {
-    return str.replace(/[^\x00-\x7F]/g, "").trim() || "User";
+    // Removes emojis, special fonts, and non-standard symbols
+    const sanitized = str.replace(/[^\x00-\x7F]/g, "").trim();
+    // Fallback to 'User' if the entire name was special characters
+    return sanitized || "User";
+};
+
+/**
+ * Converts fancy stylized fonts (NFKC normalization) to standard letters
+ * and strips any remaining non-ASCII characters for S3.
+ */
+const normalizeContributorName = (str) => {
+    if (!str) return "User";
+    
+    // 1. Convert fancy fonts (like 𝑺 -> S) to normal compatibility characters
+    const normal = str.normalize('NFKC');
+    
+    // 2. Strip everything except standard printable ASCII (A-Z, 0-9, space, etc.)
+    const clean = normal.replace(/[^\x20-\x7E]/g, "").trim();
+    
+    // 3. Fallback if the name was entirely symbols
+    return clean || "User";
 };
 
 const escapeRegex = (string) => {
@@ -932,38 +952,71 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
         // --- AIRPORT FLOW HANDLERS ---
 
-// 1. Show ICAO Modal
-if (interaction.isButton() && interaction.customId.startsWith('start_airport_ident_')) {
-    const originalUserId = interaction.customId.split('_')[3];
-    if (interaction.user.id !== originalUserId) return interaction.reply({ content: "Not your photo!", ephemeral: true });
+// --- ADMIN APPROVAL ACTION FOR AIRPORTS ---
+if (interaction.isButton() && interaction.customId.startsWith('approve_apt_')) {
+    if (interaction.deferred || interaction.replied) return; 
+    
+    await interaction.deferUpdate();
+    const [_, __, targetUserId, icao] = interaction.customId.split('_');
+    const imageUrl = interaction.message.embeds[0].image.url;
 
-    const modal = new ModalBuilder().setCustomId('airport_modal').setTitle('Airport Details');
-    const icaoInput = new TextInputBuilder()
-        .setCustomId('a_icao')
-        .setLabel("Airport ICAO Code")
-        .setPlaceholder("e.g. KLAX, VHHH, OMDB")
-        .setMinLength(4)
-        .setMaxLength(4)
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true);
+    try {
+        const member = await interaction.guild.members.fetch(targetUserId).catch(() => null);
+        
+        // Use the new helper to turn "𝑺𝒆𝒓𝒗𝒆𝒓𝑵𝒐𝒐𝒃" into "ServerNoob"
+        const rawName = member ? member.displayName : "Unknown";
+        const cleanName = normalizeContributorName(rawName);
 
-    modal.addComponents(new ActionRowBuilder().addComponents(icaoInput));
-    await interaction.showModal(modal);
+        const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
+        const mockFile = { buffer: Buffer.from(response.data) };
+
+        // Ensure deleteAirportImages is imported in bot.js if not already!
+        if (typeof deleteAirportImages === 'function') {
+            await deleteAirportImages(s3Client, icao);
+        }
+        
+        // Upload with the "simple format" name
+        const finalUrl = await uploadAirportImage(s3Client, mockFile, icao, cleanName);
+
+        const successEmbed = EmbedBuilder.from(interaction.message.embeds[0])
+            .setTitle(`✅ Airport Approved: ${icao}`)
+            .setColor(0x00FF00)
+            .setFooter({ text: `Approved by ${interaction.user.tag}` })
+            .setImage(finalUrl);
+
+        await interaction.editReply({ embeds: [successEmbed], components: [] });
+
+        try {
+            const user = await client.users.fetch(targetUserId);
+            await user.send(`✅ Your photo for **${icao}** has been approved and is now live!`);
+        } catch(e) { console.log("Could not DM user."); }
+
+    } catch (err) {
+        console.error("Airport Approval Error:", err);
+        if (interaction.deferred || interaction.replied) {
+            await interaction.followUp({ content: `❌ Error: ${err.message}`, ephemeral: true }).catch(() => {});
+        }
+    }
 }
 
 // 2. Process Modal -> Send to Admin
 if (interaction.isModalSubmit() && interaction.customId === 'airport_modal') {
     await interaction.deferReply({ ephemeral: true });
-    const icao = interaction.fields.getTextInputValue('a_icao').toUpperCase();
     
-    // Fetch image from the replied message
+    const icao = interaction.fields.getTextInputValue('a_icao').toUpperCase().trim();
+    
+    // Fetch image from the original message (the one the user clicked 'Identify' on)
     const originalMsg = await interaction.channel.messages.fetch(interaction.message.reference.messageId);
     const photoUrl = originalMsg.attachments.first().url;
 
     const adminChannel = await client.channels.fetch(AIRPORT_ADMIN_CHANNEL_ID);
     
+    // --- START: COMPARISON LOGIC ---
+    const embedsToSend = [];
+
+    // 1. Create the New Submission Embed
     const adminEmbed = new EmbedBuilder()
-        .setTitle('🏢 Airport Submission')
+        .setTitle('🏢 New Airport Submission')
         .setColor(0x0099FF)
         .addFields(
             { name: 'ICAO', value: icao, inline: true },
@@ -972,12 +1025,48 @@ if (interaction.isModalSubmit() && interaction.customId === 'airport_modal') {
         .setImage(photoUrl)
         .setFooter({ text: `User ID: ${interaction.user.id} | ICAO: ${icao}` });
 
+    embedsToSend.push(adminEmbed);
+
+    // 2. Check for existing image in the database
+    try {
+        const existingInfo = await getAirportInfo(s3Client, icao);
+        
+        if (existingInfo) {
+            // Update the title of the first embed to warn admins
+            adminEmbed.setTitle('⚠️ AIRPORT REPLACEMENT REQUEST');
+            adminEmbed.setColor(0xFFA500); // Orange for warning
+            
+            // Create the Comparison Embed (The "Current" photo)
+            const comparisonEmbed = new EmbedBuilder()
+                .setTitle('📉 Current Database Image')
+                .setDescription(`**Current Contributor:** ${existingInfo.contributor || 'Unknown'}\n**Uploaded:** <t:${Math.floor(new Date(existingInfo.uploadedAt).getTime() / 1000)}:R>`)
+                .setColor(0x2B2D31) 
+                .setImage(existingInfo.imageUrl)
+                .setFooter({ text: 'If you approve, this image will be replaced.' });
+            
+            embedsToSend.push(comparisonEmbed);
+        }
+    } catch (err) {
+        console.error("Error fetching existing airport info:", err);
+    }
+    // --- END: COMPARISON LOGIC ---
+
     const adminRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`approve_apt_${interaction.user.id}_${icao}`).setLabel('Approve & Replace').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`reject_apt_${interaction.user.id}`).setLabel('Reject').setStyle(ButtonStyle.Danger)
+        new ButtonBuilder()
+            .setCustomId(`approve_apt_${interaction.user.id}_${icao}`)
+            .setLabel(embedsToSend.length > 1 ? 'Approve & Replace' : 'Approve & Save')
+            .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+            .setCustomId(`reject_apt_${interaction.user.id}`)
+            .setLabel('Reject')
+            .setStyle(ButtonStyle.Danger)
     );
 
-    await adminChannel.send({ embeds: [adminEmbed], components: [adminRow] });
+    await adminChannel.send({ 
+        embeds: embedsToSend, 
+        components: [adminRow] 
+    });
+
     await interaction.editReply("✅ Sent to staff for review!");
     try { await interaction.message.delete(); } catch(e) {}
 }
