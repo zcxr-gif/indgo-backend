@@ -1402,6 +1402,32 @@ if (interaction.isButton() && interaction.customId.startsWith('approve_apt_')) {
                 return;
             }
 
+            if (interaction.isButton() && interaction.customId.startsWith('start_airport_ident_')) {
+    const originalUserId = interaction.customId.split('_')[3]; 
+    
+    if (interaction.user.id !== originalUserId) {
+        return interaction.reply({ content: "This is not your photo.", ephemeral: true });
+    }
+
+    const modal = new ModalBuilder()
+        .setCustomId('airport_modal')
+        .setTitle('Airport Details');
+
+    const icaoInput = new TextInputBuilder()
+        .setCustomId('a_icao')
+        .setLabel("What is the ICAO code?")
+        .setPlaceholder("e.g. KJFK, EGLL, OMDB")
+        .setStyle(TextInputStyle.Short)
+        .setMinLength(4)
+        .setMaxLength(4)
+        .setRequired(true);
+
+    modal.addComponents(new ActionRowBuilder().addComponents(icaoInput));
+    
+    await interaction.showModal(modal);
+    return;
+}
+
             if (interaction.customId.startsWith('approve_')) {
                 await interaction.deferUpdate();
                 
