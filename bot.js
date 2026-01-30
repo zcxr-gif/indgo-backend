@@ -952,40 +952,43 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
 
         // --- AIRPORT FLOW HANDLERS ---
 
-// --- ADMIN APPROVAL ACTION FOR AIRPORTS ---
+// --- UPDATED ADMIN APPROVAL ACTION FOR AIRPORTS ---
 if (interaction.isButton() && interaction.customId.startsWith('approve_apt_')) {
     if (interaction.deferred || interaction.replied) return; 
     
     await interaction.deferUpdate();
     const [_, __, targetUserId, icao] = interaction.customId.split('_');
-    const imageUrl = interaction.message.embeds[0].image.url;
+    
+    // Get the image URL from the current embed
+    const imageUrl = interaction.message.embeds[0].image?.url;
 
     try {
         const member = await interaction.guild.members.fetch(targetUserId).catch(() => null);
-        
-        // Use the new helper to turn "𝑺𝒆𝒓𝒗𝒆𝒓𝑵𝒐𝒐𝒃" into "ServerNoob"
         const rawName = member ? member.displayName : "Unknown";
-        const cleanName = normalizeContributorName(rawName);
+        const contributorName = sanitizeMetadata(rawName);
 
+        // Fetch image and upload to S3
         const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
         const mockFile = { buffer: Buffer.from(response.data) };
 
-        // Ensure deleteAirportImages is imported in bot.js if not already!
         if (typeof deleteAirportImages === 'function') {
             await deleteAirportImages(s3Client, icao);
         }
         
-        // Upload with the "simple format" name
-        const finalUrl = await uploadAirportImage(s3Client, mockFile, icao, cleanName);
+        const finalUrl = await uploadAirportImage(s3Client, mockFile, icao, contributorName);
 
+        // UI FIX: Transform the existing embed into the "Approved" state
         const successEmbed = EmbedBuilder.from(interaction.message.embeds[0])
             .setTitle(`✅ Airport Approved: ${icao}`)
-            .setColor(0x00FF00)
-            .setFooter({ text: `Approved by ${interaction.user.tag}` })
-            .setImage(finalUrl);
+            .setColor(0x00FF00) // Green
+            .setImage(finalUrl) // Keep the new permanent S3 image visible
+            .setFooter({ text: `Approved by ${interaction.user.tag} | ICAO: ${icao}` })
+            .setTimestamp();
 
+        // Update the message, removing the buttons
         await interaction.editReply({ embeds: [successEmbed], components: [] });
 
+        // Notify Contributor
         try {
             const user = await client.users.fetch(targetUserId);
             await user.send(`✅ Your photo for **${icao}** has been approved and is now live!`);
@@ -999,49 +1002,60 @@ if (interaction.isButton() && interaction.customId.startsWith('approve_apt_')) {
     }
 }
 
-// 2. Process Modal -> Send to Admin
+// 2. Process Modal -> Send to Admin AND Public Feed
 if (interaction.isModalSubmit() && interaction.customId === 'airport_modal') {
     await interaction.deferReply({ ephemeral: true });
     
     const icao = interaction.fields.getTextInputValue('a_icao').toUpperCase().trim();
     
-    // Fetch image from the original message (the one the user clicked 'Identify' on)
+    // Fetch image from the original message
     const originalMsg = await interaction.channel.messages.fetch(interaction.message.reference.messageId);
     const photoUrl = originalMsg.attachments.first().url;
 
     const adminChannel = await client.channels.fetch(AIRPORT_ADMIN_CHANNEL_ID);
+    const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID); // Use existing public feed
     
-    // --- START: COMPARISON LOGIC ---
+    // --- 1. SEND TO PUBLIC FEED (PENDING STATUS) ---
+    const publicEmbed = new EmbedBuilder()
+        .setTitle('🏢 New Airport Spotted! (Pending Review)')
+        .setColor(0xFFFF00) // Yellow for Pending
+        .setDescription(`A user has submitted a new airport photo! Status: **Under Review**`)
+        .addFields(
+            { name: 'ICAO Code', value: icao, inline: true },
+            { name: 'Spotted By', value: `<@${interaction.user.id}>`, inline: true }
+        )
+        .setImage(photoUrl)
+        .setFooter({ text: 'Submissions are reviewed by admins before being finalized.' })
+        .setTimestamp();
+
+    const publicMsg = await feedChannel.send({ embeds: [publicEmbed] });
+
+    // --- 2. PREPARE ADMIN SUBMISSION ---
     const embedsToSend = [];
 
-    // 1. Create the New Submission Embed
-// --- UPDATED AIRPORT SUBMISSION FOOTER ---
-const adminEmbed = new EmbedBuilder()
-    .setTitle('🏢 New Airport Submission')
-    .setColor(0x0099FF)
-    .addFields(
-        { name: 'ICAO', value: icao, inline: true },
-        { name: 'Contributor', value: `<@${interaction.user.id}>`, inline: true }
-    )
-    .setImage(photoUrl)
-    // Add "| Ch: ${interaction.channelId}" to the footer so the bot remembers where it came from
-    .setFooter({ text: `User ID: ${interaction.user.id} | ICAO: ${icao} | Ch: ${interaction.channelId}` });
+    const adminEmbed = new EmbedBuilder()
+        .setTitle('🏢 New Airport Submission')
+        .setColor(0x0099FF)
+        .addFields(
+            { name: 'ICAO', value: icao, inline: true },
+            { name: 'Contributor', value: `<@${interaction.user.id}>`, inline: true }
+        )
+        .setImage(photoUrl)
+        // KEY FIX: Added Msg ID so the bot can update the public post later
+        .setFooter({ text: `User ID: ${interaction.user.id} | ICAO: ${icao} | Msg: ${publicMsg.id} | Ch: ${interaction.channelId}` });
 
     embedsToSend.push(adminEmbed);
 
-    // 2. Check for existing image in the database
+    // Check for existing image for comparison
     try {
         const existingInfo = await getAirportInfo(s3Client, icao);
-        
         if (existingInfo) {
-            // Update the title of the first embed to warn admins
             adminEmbed.setTitle('⚠️ AIRPORT REPLACEMENT REQUEST');
-            adminEmbed.setColor(0xFFA500); // Orange for warning
+            adminEmbed.setColor(0xFFA500); 
             
-            // Create the Comparison Embed (The "Current" photo)
             const comparisonEmbed = new EmbedBuilder()
                 .setTitle('📉 Current Database Image')
-                .setDescription(`**Current Contributor:** ${existingInfo.contributor || 'Unknown'}\n**Uploaded:** <t:${Math.floor(new Date(existingInfo.uploadedAt).getTime() / 1000)}:R>`)
+                .setDescription(`**Current Contributor:** ${existingInfo.contributor || 'Unknown'}`)
                 .setColor(0x2B2D31) 
                 .setImage(existingInfo.imageUrl)
                 .setFooter({ text: 'If you approve, this image will be replaced.' });
@@ -1051,7 +1065,6 @@ const adminEmbed = new EmbedBuilder()
     } catch (err) {
         console.error("Error fetching existing airport info:", err);
     }
-    // --- END: COMPARISON LOGIC ---
 
     const adminRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
@@ -1069,60 +1082,68 @@ const adminEmbed = new EmbedBuilder()
         components: [adminRow] 
     });
 
-    await interaction.editReply("✅ Sent to staff for review!");
+    await interaction.editReply("✅ Sent to staff for review and posted to public feed!");
     try { await interaction.message.delete(); } catch(e) {}
 }
 
-// --- ADMIN APPROVAL ACTION FOR AIRPORTS ---
-if (interaction.isButton() && interaction.customId.startsWith('approve_apt_')) {
-    // 1. Guard against double-clicks
-    if (interaction.deferred || interaction.replied) return; 
+// --- UPDATED AIRPORT REJECT MODAL SUBMIT ---
+if (interaction.isModalSubmit() && interaction.customId.startsWith('rejectAptModal_')) {
+    await interaction.deferUpdate(); 
+    const targetUserId = interaction.customId.split('_')[1];
+    const reason = interaction.fields.getTextInputValue('reasonInput');
     
-    await interaction.deferUpdate();
-    const [_, __, targetUserId, icao] = interaction.customId.split('_');
-    const imageUrl = interaction.message.embeds[0].image.url;
+    let originalEmbed = interaction.message.embeds[0];
+    const icao = originalEmbed.fields.find(f => f.name === 'ICAO')?.value || 'Unknown Airport';
+    const thumbUrl = originalEmbed.image?.url;
+    
+    // Extract metadata from footer
+    const footerText = originalEmbed.footer?.text || '';
+    const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
+    const originChannelId = footerText.match(/Ch: (\d+)/)?.[1];
 
-    try {
-        const member = await interaction.guild.members.fetch(targetUserId).catch(() => null);
-        
-        // FIX: Sanitize the name to prevent ERR_INVALID_CHAR in S3 headers
-        const rawName = member ? member.displayName : "Unknown";
-        const contributorName = sanitizeMetadata(rawName);
+    // Update Admin View
+    const rejectedEmbed = EmbedBuilder.from(originalEmbed)
+        .setTitle('❌ Airport Submission Rejected')
+        .setColor(0xFF0000)
+        .setDescription(`**Reason:** ${reason}`)
+        .setImage(thumbUrl)
+        .setFooter({ text: `Rejected by ${interaction.user.tag} | ICAO: ${icao}` })
+        .setTimestamp();
+    
+    await interaction.editReply({ embeds: [rejectedEmbed], components: [] }); 
 
-        // Fetch image as a buffer
-        const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
-        const mockFile = { buffer: Buffer.from(response.data) };
-
-        // 1. Delete existing images for this ICAO
-        if (typeof deleteAirportImages === 'function') {
-            await deleteAirportImages(s3Client, icao);
-        }
-        
-        // 2. Upload the new verified photo (contributorName is now S3-safe)
-        const finalUrl = await uploadAirportImage(s3Client, mockFile, icao, contributorName);
-
-        const successEmbed = EmbedBuilder.from(interaction.message.embeds[0])
-            .setTitle(`✅ Airport Approved: ${icao}`)
-            .setColor(0x00FF00)
-            .setFooter({ text: `Approved by ${interaction.user.tag}` })
-            .setImage(finalUrl); 
-
-        await interaction.editReply({ embeds: [successEmbed], components: [] });
-
-        // Notify Contributor
+    // --- UPDATE PUBLIC FEED ---
+    if (publicMsgId) {
         try {
-            const user = await client.users.fetch(targetUserId);
-            await user.send(`✅ Your photo for **${icao}** has been approved and is now live!`);
-        } catch(e) {
-            console.log("Could not DM user.");
-        }
+            const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
+            const publicMsg = await feedChannel.messages.fetch(publicMsgId);
+            const publicRejectedEmbed = EmbedBuilder.from(publicMsg.embeds[0])
+                .setTitle('❌ Submission Rejected')
+                .setColor(0xFF0000)
+                .setDescription(`This submission was not accepted by the moderators.`)
+                .setImage(null) // Hide the photo on rejection in public feed if preferred
+                .setFooter({ text: `Reviewed by Staff` });
+            
+            await publicMsg.edit({ embeds: [publicRejectedEmbed] });
+        } catch (e) { console.log("Could not update public feed for rejection."); }
+    }
 
-    } catch (err) {
-        console.error("Airport Approval Error:", err);
-        // Use followUp and check if we can actually send it
-        if (interaction.replied || interaction.deferred) {
-            await interaction.followUp({ content: `❌ Error: ${err.message}`, ephemeral: true }).catch(() => {});
-        }
+    // Send notification back to submission channel
+    if (originChannelId) {
+        try {
+            const originChannel = await client.channels.fetch(originChannelId);
+            if (originChannel) {
+                const rejectionNotifyEmbed = new EmbedBuilder()
+                    .setTitle('❌ Airport Photo Rejected')
+                    .setColor(0xFF0000)
+                    .setDescription(`Hey <@${targetUserId}>, your photo for **${icao}** was rejected.`)
+                    .addFields({ name: 'Reason', value: reason })
+                    .setThumbnail(thumbUrl) 
+                    .setFooter({ text: 'Check the rules and try again!' });
+
+                await originChannel.send({ embeds: [rejectionNotifyEmbed] });
+            }
+        } catch (e) { console.error("Could not notify channel."); }
     }
 }
 
@@ -1168,74 +1189,66 @@ if (interaction.isButton() && interaction.customId.startsWith('approve_apt_')) {
             return;
         }
 
-        // --- 3. TICKET SYSTEM: MODAL SUBMIT -> CREATE THREAD ---
-        if (interaction.isModalSubmit() && interaction.customId.startsWith('ticket_modal_')) {
-            await interaction.deferReply({ ephemeral: true });
+        // --- UPDATED AIRPORT REJECT MODAL SUBMIT ---
+if (interaction.isModalSubmit() && interaction.customId.startsWith('rejectAptModal_')) {
+    await interaction.deferUpdate(); 
+    const targetUserId = interaction.customId.split('_')[1];
+    const reason = interaction.fields.getTextInputValue('reasonInput');
+    
+    let originalEmbed = interaction.message.embeds[0];
+    const icao = originalEmbed.fields.find(f => f.name === 'ICAO')?.value || 'Unknown Airport';
+    const thumbUrl = originalEmbed.image?.url;
+    
+    // Extract metadata from footer
+    const footerText = originalEmbed.footer?.text || '';
+    const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
+    const originChannelId = footerText.match(/Ch: (\d+)/)?.[1];
+
+    // Update Admin View
+    const rejectedEmbed = EmbedBuilder.from(originalEmbed)
+        .setTitle('❌ Airport Submission Rejected')
+        .setColor(0xFF0000)
+        .setDescription(`**Reason:** ${reason}`)
+        .setImage(thumbUrl)
+        .setFooter({ text: `Rejected by ${interaction.user.tag} | ICAO: ${icao}` })
+        .setTimestamp();
+    
+    await interaction.editReply({ embeds: [rejectedEmbed], components: [] }); 
+
+    // --- UPDATE PUBLIC FEED ---
+    if (publicMsgId) {
+        try {
+            const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
+            const publicMsg = await feedChannel.messages.fetch(publicMsgId);
+            const publicRejectedEmbed = EmbedBuilder.from(publicMsg.embeds[0])
+                .setTitle('❌ Submission Rejected')
+                .setColor(0xFF0000)
+                .setDescription(`This submission was not accepted by the moderators.`)
+                .setImage(null) // Hide the photo on rejection in public feed if preferred
+                .setFooter({ text: `Reviewed by Staff` });
             
-            const topicKey = interaction.customId.replace('ticket_modal_', '');
-            const description = interaction.fields.getTextInputValue('ticket_desc') || 'No description provided.';
-            
-            // Map keys to readable titles
-            const topicTitles = {
-                'db_correction': 'Database Correction',
-                'submission_issue': 'Submission Issue',
-                'role_help': 'Role/Account Help',
-                'other': 'Other Inquiry'
-            };
-            const topicTitle = topicTitles[topicKey] || 'Support Ticket';
+            await publicMsg.edit({ embeds: [publicRejectedEmbed] });
+        } catch (e) { console.log("Could not update public feed for rejection."); }
+    }
 
-            try {
-                // Ensure we are in the ticket channel (or fetch it)
-                const ticketChannel = await client.channels.fetch(TICKET_PANEL_CHANNEL_ID);
-                if (!ticketChannel) throw new Error("Ticket channel not configured correctly.");
+    // Send notification back to submission channel
+    if (originChannelId) {
+        try {
+            const originChannel = await client.channels.fetch(originChannelId);
+            if (originChannel) {
+                const rejectionNotifyEmbed = new EmbedBuilder()
+                    .setTitle('❌ Airport Photo Rejected')
+                    .setColor(0xFF0000)
+                    .setDescription(`Hey <@${targetUserId}>, your photo for **${icao}** was rejected.`)
+                    .addFields({ name: 'Reason', value: reason })
+                    .setThumbnail(thumbUrl) 
+                    .setFooter({ text: 'Check the rules and try again!' });
 
-                // Create Private Thread
-                const threadName = `ticket-${interaction.user.username}-${Date.now().toString().slice(-4)}`;
-                
-                const thread = await ticketChannel.threads.create({
-                    name: threadName,
-                    type: ChannelType.PrivateThread, 
-                    autoArchiveDuration: 1440, // 24 hours
-                    reason: `Support ticket for ${interaction.user.tag}`
-                });
-
-                // Add User
-                await thread.members.add(interaction.user.id);
-                
-                // Construct the initial message inside the thread
-                const ticketEmbed = new EmbedBuilder()
-                    .setTitle(`🎫 ${topicTitle}`)
-                    .setColor(0x00FF00)
-                    .addFields(
-                        { name: 'User', value: `<@${interaction.user.id}>`, inline: true },
-                        { name: 'Topic', value: topicTitle, inline: true },
-                        { name: 'Description', value: description }
-                    )
-                    .setTimestamp();
-
-                const closeButton = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder()
-                        .setCustomId('close_ticket_action')
-                        .setLabel('Close Ticket (Admin Only)')
-                        .setStyle(ButtonStyle.Danger)
-                        .setEmoji('🔒')
-                );
-
-                // Ping admins and send embed
-                await thread.send({ 
-                    content: `Welcome <@${interaction.user.id}>. Support will be with you shortly.\n<@&${ADMIN_ROLE_ID}>`, 
-                    embeds: [ticketEmbed], 
-                    components: [closeButton] 
-                });
-
-                await interaction.editReply({ content: `✅ Ticket created! Head over to <#${thread.id}>.` });
-
-            } catch (error) {
-                console.error("Ticket Creation Error:", error);
-                await interaction.editReply({ content: "❌ Failed to create ticket. Please contact an admin directly." });
+                await originChannel.send({ embeds: [rejectionNotifyEmbed] });
             }
-            return;
-        }
+        } catch (e) { console.error("Could not notify channel."); }
+    }
+}
 
         // --- 4. TICKET SYSTEM: CLOSE TICKET (ADMIN ONLY) ---
         if (interaction.isButton() && interaction.customId === 'close_ticket_action') {
