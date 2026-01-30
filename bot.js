@@ -447,6 +447,59 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         }
     };
 
+    // Add this near the top of startSubmissionFlow or as a helper
+const createAdminBatchEmbed = (user, type, livery, tail, images, currentIndex = 0) => {
+    const embed = new EmbedBuilder()
+        .setTitle('📦 Batch Submission Review')
+        .setColor(0x0099FF)
+        .setDescription(`**${user.tag}** uploaded **${images.length}** photos for this aircraft.\nUse the menu below to select the best one for the database.`)
+        .addFields(
+            { name: 'Aircraft', value: type, inline: true },
+            { name: 'Livery', value: livery, inline: true },
+            { name: 'Tail', value: tail.toUpperCase(), inline: true },
+            { name: 'Viewing', value: `Photo ${currentIndex + 1} of ${images.length}`, inline: false }
+        )
+        .setImage(images[currentIndex]) // Shows the currently selected image from the batch
+        .setFooter({ text: `User ID: ${user.id} | Batch Size: ${images.length}` });
+    
+    return embed;
+};
+
+// Inside the 'confirm_submission' block of startSubmissionFlow:
+if (images.length > 1) {
+    const adminChannel = await client.channels.fetch(ADMIN_CHANNEL_ID);
+    
+    // Create a select menu for the admin to pick the image
+    const selectionMenu = new StringSelectMenuBuilder()
+        .setCustomId(`admin_select_best_${user.id}`)
+        .setPlaceholder('Pick the best photo to approve')
+        .addOptions(images.map((url, index) => ({
+            label: `Photo #${index + 1}`,
+            description: `Click to preview this image`,
+            value: `${index}` // We store the index
+        })));
+
+    const adminRow = new ActionRowBuilder().addComponents(selectionMenu);
+    const actionRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`approve_batch_${user.id}`).setLabel('Approve Selected').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`reject_${user.id}`).setLabel('Reject All').setStyle(ButtonStyle.Danger)
+    );
+
+    // We store the full batch of image URLs in a temporary session so the bot remembers them
+    userSessions.set(`batch_${user.id}`, {
+        type: currentType,
+        livery: currentLivery,
+        tail: currentTail,
+        images: images, // Array of all attachment URLs
+        selectedIndex: 0
+    });
+
+    await adminChannel.send({ 
+        embeds: [createAdminBatchEmbed(user, currentType, currentLivery, currentTail, images)], 
+        components: [adminRow, actionRow] 
+    });
+
+
     const startSubmissionFlow = async (source, rawType, rawLivery, ignoredTail, photoUrl, user, originChannelId) => {
         
         let currentType = rawType;
@@ -881,46 +934,56 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         const isAirportChannel = message.channelId === AIRPORT_SUBMISSION_CHANNEL_ID ||
                                  (message.channel.isThread() && message.channel.parentId === AIRPORT_SUBMISSION_CHANNEL_ID);
 
-        // --- HANDLER: AIRCRAFT SUBMISSIONS ---
-        if (isAircraftChannel) {
-            if (message.attachments.size > 0) {
-                const photo = message.attachments.first();
-                const isImage = photo.contentType?.startsWith('image/') || /\.(png|jpe?g|webp|gif)$/i.test(photo.name);
 
-                if (!isImage) return;
+        // --- HANDLER: AIRCRAFT SUBMISSIONS (BATCH SUPPORT) ---
+if (isAircraftChannel) {
+    if (message.attachments.size > 0) {
+        // Filter out non-image attachments
+        const images = message.attachments.filter(a => 
+            a.contentType?.startsWith('image/') || /\.(png|jpe?g|webp|gif)$/i.test(a.name)
+        );
 
-                const session = userSessions.get(message.author.id);
-                if (session && Date.now() < session.expiresAt) {
-                    session.expiresAt = Date.now() + 300000;
-                    userSessions.set(message.author.id, session);
-                    await startSubmissionFlow(
-                        message, 
-                        session.type, 
-                        session.livery, 
-                        null, 
-                        photo.url, 
-                        message.author, 
-                        message.channelId 
-                    );
-                    return;
-                }
+        if (images.size === 0) return;
 
-                const row = new ActionRowBuilder()
-                    .addComponents(
-                        new ButtonBuilder()
-                            .setCustomId(`start_ident_${message.author.id}`)
-                            .setLabel('Identify Aircraft')
-                            .setEmoji('✈️')
-                            .setStyle(ButtonStyle.Primary)
-                    );
+        const session = userSessions.get(message.author.id);
+        
+        // If they have an active session (just identified a previous plane),
+        // we apply those details to ALL images in this drop automatically.
+        if (session && Date.now() < session.expiresAt) {
+            session.expiresAt = Date.now() + 300000;
+            userSessions.set(message.author.id, session);
 
-                const promptEmbed = new EmbedBuilder()
-                    .setColor(0x0099FF)
-                    .setDescription(`**Thanks for the photo!**\nPlease click the button below to enter the **Aircraft** and **Livery** details.`);
-
-                await message.reply({ embeds: [promptEmbed], components: [row] });
+            for (const [id, photo] of images) {
+                await startSubmissionFlow(
+                    message, 
+                    session.type, 
+                    session.livery, 
+                    null, 
+                    photo.url, 
+                    message.author, 
+                    message.channelId 
+                );
             }
+            return;
         }
+
+        // If no session, ask them to identify the batch
+        const row = new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`start_ident_${message.author.id}`)
+                    .setLabel(images.size > 1 ? `Identify ${images.size} Photos` : 'Identify Aircraft')
+                    .setEmoji('✈️')
+                    .setStyle(ButtonStyle.Primary)
+            );
+
+        const promptEmbed = new EmbedBuilder()
+            .setColor(0x0099FF)
+            .setDescription(`**${images.size} photos detected!**\nClick the button to set the Aircraft and Livery for this batch.`);
+
+        await message.reply({ embeds: [promptEmbed], components: [row] });
+    }
+}
 
         // --- HANDLER: AIRPORT SUBMISSIONS ---
         if (isAirportChannel) {
@@ -1168,6 +1231,7 @@ if (interaction.isModalSubmit() && interaction.customId.startsWith('rejectAptMod
             return;
         }
 
+
         // --- 2. TICKET SYSTEM: TOPIC SELECTION -> SHOW MODAL ---
         if (interaction.isStringSelectMenu() && interaction.customId === 'ticket_topic_select') {
             const selectedTopic = interaction.values[0];
@@ -1188,6 +1252,31 @@ if (interaction.isModalSubmit() && interaction.customId.startsWith('rejectAptMod
             await interaction.showModal(modal);
             return;
         }
+
+        // --- NEW: BATCH PREVIEW HANDLER ---
+if (interaction.isStringSelectMenu() && interaction.customId.startsWith('admin_select_best_')) {
+    const targetUserId = interaction.customId.split('_')[3];
+    const batchData = userSessions.get(`batch_${targetUserId}`);
+    
+    if (!batchData) return interaction.reply({ content: "Batch session expired.", ephemeral: true });
+
+    const selectedIndex = parseInt(interaction.values[0]);
+    batchData.selectedIndex = selectedIndex; // Update the session with current choice
+    userSessions.set(`batch_${targetUserId}`, batchData);
+
+    // Re-use the helper to update the embed with the new photo preview
+    const targetUser = await client.users.fetch(targetUserId);
+    const updatedEmbed = createAdminBatchEmbed(
+        targetUser,
+        batchData.type,
+        batchData.livery,
+        batchData.tail,
+        batchData.images,
+        selectedIndex
+    );
+
+    await interaction.update({ embeds: [updatedEmbed] });
+}
 
         // --- UPDATED AIRPORT REJECT MODAL SUBMIT ---
 if (interaction.isModalSubmit() && interaction.customId.startsWith('rejectAptModal_')) {
@@ -1561,6 +1650,59 @@ if (interaction.customId.startsWith('reject_apt_')) {
                 }
             }
 
+            // --- NEW: BATCH APPROVAL HANDLER ---
+if (interaction.customId.startsWith('approve_batch_')) {
+    await interaction.deferUpdate();
+    const targetUserId = interaction.customId.split('_')[2];
+    const batchData = userSessions.get(`batch_${targetUserId}`);
+
+    if (!batchData) return interaction.followUp({ content: "Error: Could not find batch data.", ephemeral: true });
+
+    // Pick the URL the admin selected from the preview menu
+    const winningImageUrl = batchData.images[batchData.selectedIndex];
+
+    try {
+        // Upload ONLY the winning photo to S3
+        const permanentUrl = await uploadImageToS3(winningImageUrl, batchData.tail);
+        
+        // Save to Database (re-using your existing logic pattern)
+        const updateData = {
+            contributorName: "Batch Contributor", // You can fetch real name here like your other approve block
+            contributorId: targetUserId,
+            aircraftType: batchData.type,
+            liveryName: batchData.livery,
+            imageUrl: permanentUrl,
+            tailNumber: batchData.tail.toUpperCase(),
+            uploadedAt: new Date()
+        };
+
+        // Check for existing to replace or create new
+        const existingEntry = await CommunityAircraftModel.findOne({ 
+            aircraftType: batchData.type, 
+            liveryName: batchData.livery 
+        });
+
+        if (existingEntry) {
+            Object.assign(existingEntry, updateData);
+            await existingEntry.save();
+        } else {
+            await new CommunityAircraftModel(updateData).save();
+        }
+
+        await interaction.editReply({ 
+            content: `✅ Batch Approved! Saved Photo #${batchData.selectedIndex + 1} to the database.`, 
+            embeds: [], 
+            components: [] 
+        });
+
+        userSessions.delete(`batch_${targetUserId}`); // Clean up memory
+
+    } catch (error) {
+        console.error("Batch Approval Error:", error);
+        await interaction.followUp({ content: "❌ Failed to save batch selection.", ephemeral: true });
+    }
+}
+
             if (interaction.customId.startsWith('reject_')) {
                 const targetUserId = interaction.customId.split('_')[1];
                 const modal = new ModalBuilder().setCustomId(`rejectModal_${targetUserId}`).setTitle('Rejection Reason');
@@ -1663,33 +1805,36 @@ if (interaction.customId.startsWith('rejectAptModal_')) {
             }
 
             if (interaction.customId === 'identify_modal') {
-                await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ ephemeral: true });
 
-                const type = interaction.fields.getTextInputValue('i_type');
-                const livery = interaction.fields.getTextInputValue('i_livery');
-                let tail = null; 
+    const type = interaction.fields.getTextInputValue('i_type');
+    const livery = interaction.fields.getTextInputValue('i_livery');
 
-                let photoUrl = null;
-                try {
-                    if (interaction.message.reference && interaction.message.reference.messageId) {
-                        const originalMsg = await interaction.channel.messages.fetch(interaction.message.reference.messageId);
-                        if (originalMsg && originalMsg.attachments.size > 0) {
-                            photoUrl = originalMsg.attachments.first().url;
-                        }
-                    }
-                } catch (err) { 
-                    console.error("Could not fetch original image:", err); 
-                }
+    let images = [];
+    try {
+        if (interaction.message.reference && interaction.message.reference.messageId) {
+            const originalMsg = await interaction.channel.messages.fetch(interaction.message.reference.messageId);
+            // Get ALL image attachments
+            images = originalMsg.attachments.filter(a => 
+                a.contentType?.startsWith('image/') || /\.(png|jpe?g|webp|gif)$/i.test(a.name)
+            );
+        }
+    } catch (err) { 
+        console.error("Could not fetch original images:", err); 
+    }
 
-                if (!photoUrl) {
-                    return interaction.editReply("❌ Could not find the original image. Please upload again.");
-                }
+    if (images.size === 0) {
+        return interaction.editReply("❌ Could not find the original images. Please upload again.");
+    }
 
-                await startSubmissionFlow(interaction, type, livery, tail, photoUrl, interaction.user, interaction.channelId);
-                
-                try { await interaction.message.delete(); } catch(e) {}
-                return;
-            }
+    // Process every image found in that message
+    for (const [id, photo] of images) {
+        await startSubmissionFlow(interaction, type, livery, null, photo.url, interaction.user, interaction.channelId);
+    }
+    
+    try { await interaction.message.delete(); } catch(e) {}
+    return;
+}
 
             if (interaction.customId.startsWith('rejectModal_')) {
                 await interaction.deferUpdate(); 
