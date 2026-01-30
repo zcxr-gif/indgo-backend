@@ -849,10 +849,15 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
     client.on('messageCreate', async (message) => {
         if (message.author.bot) return;
 
-        const isSubmissionChannel = message.channelId === SUBMISSION_CHANNEL_ID || 
+        // --- CHECK CHANNELS ---
+        const isAircraftChannel = message.channelId === SUBMISSION_CHANNEL_ID || 
                                    (message.channel.isThread() && message.channel.parentId === SUBMISSION_CHANNEL_ID);
+        
+        const isAirportChannel = message.channelId === AIRPORT_SUBMISSION_CHANNEL_ID ||
+                                 (message.channel.isThread() && message.channel.parentId === AIRPORT_SUBMISSION_CHANNEL_ID);
 
-        if (isSubmissionChannel) {
+        // --- HANDLER: AIRCRAFT SUBMISSIONS ---
+        if (isAircraftChannel) {
             if (message.attachments.size > 0) {
                 const photo = message.attachments.first();
                 const isImage = photo.contentType?.startsWith('image/') || /\.(png|jpe?g|webp|gif)$/i.test(photo.name);
@@ -887,6 +892,31 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 const promptEmbed = new EmbedBuilder()
                     .setColor(0x0099FF)
                     .setDescription(`**Thanks for the photo!**\nPlease click the button below to enter the **Aircraft** and **Livery** details.`);
+
+                await message.reply({ embeds: [promptEmbed], components: [row] });
+            }
+        }
+
+        // --- HANDLER: AIRPORT SUBMISSIONS ---
+        if (isAirportChannel) {
+            if (message.attachments.size > 0) {
+                const photo = message.attachments.first();
+                const isImage = photo.contentType?.startsWith('image/') || /\.(png|jpe?g|webp|gif)$/i.test(photo.name);
+
+                if (!isImage) return;
+
+                const row = new ActionRowBuilder()
+                    .addComponents(
+                        new ButtonBuilder()
+                            .setCustomId(`start_airport_ident_${message.author.id}`)
+                            .setLabel('Identify Airport')
+                            .setEmoji('🏢')
+                            .setStyle(ButtonStyle.Primary)
+                    );
+
+                const promptEmbed = new EmbedBuilder()
+                    .setColor(0x0099FF)
+                    .setDescription(`**Thanks for the airport photo!**\nPlease click the button below to enter the **ICAO Code** for this airport.`);
 
                 await message.reply({ embeds: [promptEmbed], components: [row] });
             }
