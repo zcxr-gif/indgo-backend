@@ -999,22 +999,39 @@ if (interaction.isButton() && interaction.customId.startsWith('approve_apt_')) {
     }
 }
 
-// 2. Process Modal -> Send to Admin
+// 2. Process Modal -> Send to Admin & Public Feed
 if (interaction.isModalSubmit() && interaction.customId === 'airport_modal') {
     await interaction.deferReply({ ephemeral: true });
     
     const icao = interaction.fields.getTextInputValue('a_icao').toUpperCase().trim();
     
-    // Fetch image from the original message (the one the user clicked 'Identify' on)
+    // Fetch image from the original message reference
     const originalMsg = await interaction.channel.messages.fetch(interaction.message.reference.messageId);
     const photoUrl = originalMsg.attachments.first().url;
 
     const adminChannel = await client.channels.fetch(AIRPORT_ADMIN_CHANNEL_ID);
+    const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID); // Sending to public feed
     
-    // --- START: COMPARISON LOGIC ---
+    // 1. Send "Pending" message to Public Feed (Matches Aircraft Flow)
+    const publicEmbed = new EmbedBuilder()
+        .setTitle('🏢 New Airport Spotted! (Pending Review)')
+        .setColor(0xFFFF00) 
+        .setDescription(`A user has submitted a new airport photo! Status: **Under Review**`)
+        .addFields(
+            { name: 'ICAO', value: icao, inline: true },
+            { name: 'Spotted By', value: `<@${interaction.user.id}>`, inline: true }
+        )
+        .setFooter({ text: 'Submissions are reviewed by admins before database entry.' })
+        .setTimestamp();
+
+    const publicMsg = await feedChannel.send({ 
+        embeds: [publicEmbed], 
+        files: [{ attachment: photoUrl, name: 'airport_review.webp' }] 
+    });
+
     const embedsToSend = [];
 
-    // 1. Create the New Submission Embed
+    // 2. Create the Admin Review Embed
     const adminEmbed = new EmbedBuilder()
         .setTitle('🏢 New Airport Submission')
         .setColor(0x0099FF)
@@ -1023,20 +1040,18 @@ if (interaction.isModalSubmit() && interaction.customId === 'airport_modal') {
             { name: 'Contributor', value: `<@${interaction.user.id}>`, inline: true }
         )
         .setImage(photoUrl)
-        .setFooter({ text: `User ID: ${interaction.user.id} | ICAO: ${icao}` });
+        // CRITICAL: We add Msg ID and Ch ID to the footer so the rejection/approval logic can find them later
+        .setFooter({ text: `Pending | User: ${interaction.user.id} | Msg: ${publicMsg.id} | Ch: ${interaction.channelId}` });
 
     embedsToSend.push(adminEmbed);
 
-    // 2. Check for existing image in the database
+    // 3. Check for existing image (Comparison Logic)
     try {
         const existingInfo = await getAirportInfo(s3Client, icao);
-        
         if (existingInfo) {
-            // Update the title of the first embed to warn admins
             adminEmbed.setTitle('⚠️ AIRPORT REPLACEMENT REQUEST');
-            adminEmbed.setColor(0xFFA500); // Orange for warning
+            adminEmbed.setColor(0xFFA500); 
             
-            // Create the Comparison Embed (The "Current" photo)
             const comparisonEmbed = new EmbedBuilder()
                 .setTitle('📉 Current Database Image')
                 .setDescription(`**Current Contributor:** ${existingInfo.contributor || 'Unknown'}\n**Uploaded:** <t:${Math.floor(new Date(existingInfo.uploadedAt).getTime() / 1000)}:R>`)
@@ -1049,7 +1064,6 @@ if (interaction.isModalSubmit() && interaction.customId === 'airport_modal') {
     } catch (err) {
         console.error("Error fetching existing airport info:", err);
     }
-    // --- END: COMPARISON LOGIC ---
 
     const adminRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
@@ -1057,7 +1071,7 @@ if (interaction.isModalSubmit() && interaction.customId === 'airport_modal') {
             .setLabel(embedsToSend.length > 1 ? 'Approve & Replace' : 'Approve & Save')
             .setStyle(ButtonStyle.Success),
         new ButtonBuilder()
-            .setCustomId(`reject_apt_${interaction.user.id}`)
+            .setCustomId(`reject_apt_${interaction.user.id}`) // Ensure your rejection button matches your handler
             .setLabel('Reject')
             .setStyle(ButtonStyle.Danger)
     );
@@ -1068,6 +1082,8 @@ if (interaction.isModalSubmit() && interaction.customId === 'airport_modal') {
     });
 
     await interaction.editReply("✅ Sent to staff for review!");
+    
+    // Cleanup: Delete the "Identify Airport" prompt message
     try { await interaction.message.delete(); } catch(e) {}
 }
 
