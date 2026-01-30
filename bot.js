@@ -1,7 +1,4 @@
 // bot.js
-
-const { startAirportSubmissionFlow } = require('./airportHandler');
-
 const { 
     Client, 
     GatewayIntentBits, 
@@ -35,6 +32,12 @@ const util = require('util');
 
 // Import the local aircraft registry for auto-registration lookup
 const aircraftRegistry = require('./aircraft.json');
+// --- NEW AIRPORT CONFIGURATION ---
+const AIRPORT_SUBMISSION_CHANNEL_ID = '1463634001020325959';
+const AIRPORT_ADMIN_CHANNEL_ID = '1463636133685628989';
+
+// Import airport helpers (Ensure these are exported in airports.js)
+const { uploadAirportImage } = require('./airports');
 
 // Promisify pipeline for efficient stream handling
 const pipeline = util.promisify(stream.pipeline);
@@ -49,7 +52,6 @@ const ADMIN_CHANNEL_ID = '1448137363795742942';
 const PUBLIC_FEED_CHANNEL_ID = '1448138153335586988'; 
 const WELCOME_CHANNEL_ID = '1442462899451858975'; 
 const SUBMISSION_CHANNEL_ID = '1442461970371444880'; 
-const AIRPORT_SUBMISSION_CHANNEL_ID = '1463634001020325959';
 
 // --- NEW CONFIGURATION ---
 const MEMBER_ROLE_ID = '1442472513849397248';          
@@ -733,12 +735,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
         
         const commands = [
-
-            new SlashCommandBuilder()
-                .setName('airport')
-                .setDescription('Submit a new airport/terminal photo')
-                .addStringOption(o => o.setName('icao').setDescription('Airport ICAO (e.g. KJFK, EGLL)').setRequired(true))
-                .addAttachmentOption(o => o.setName('photo').setDescription('Upload airport photo').setRequired(true)),
             // User Commands
             new SlashCommandBuilder().setName('lookup').setDescription('Find an aircraft by Tail, Livery, or Type (Public)').addStringOption(o => o.setName('query').setDescription('Tail/Livery/Type').setAutocomplete(true).setRequired(true)),
             new SlashCommandBuilder().setName('stats').setDescription('View stats'),
@@ -750,14 +746,8 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 .addStringOption(o => o.setName('aircraft_type').setDescription('Type (Start typing to search)').setAutocomplete(true).setRequired(true))
                 .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true))
                 .addAttachmentOption(o => o.setName('photo').setDescription('Upload photo').setRequired(true)),
+            new SlashCommandBuilder().setName('links').setDescription('Get helpful resource links (Tracker, Forum, Liveries)'),
             
-            new SlashCommandBuilder().setName('submit_airport').setDescription('Submit a new airport photo')
-        .addStringOption(o => o.setName('icao').setDescription('Airport ICAO (e.g. KLAX, EGLL)').setRequired(true))
-        .addAttachmentOption(o => o.setName('photo').setDescription('Upload airport photo').setRequired(true)),    
-
-                new SlashCommandBuilder().setName('links').setDescription('Get helpful resource links (Tracker, Forum, Liveries)'),
-            
-
             // NEW: Live Flight Tracking
             new SlashCommandBuilder()
                 .setName('track')
@@ -859,25 +849,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
     client.on('messageCreate', async (message) => {
         if (message.author.bot) return;
 
-        const isAirportChannel = message.channelId === AIRPORT_SUBMISSION_CHANNEL_ID || 
-                             (message.channel.isThread() && message.channel.parentId === AIRPORT_SUBMISSION_CHANNEL_ID);
-
-    if (isAirportChannel) {
-        if (message.attachments.size > 0) {
-            const photo = message.attachments.first();
-            const isImage = photo.contentType?.startsWith('image/') || /\.(png|jpe?g|webp|gif)$/i.test(photo.name);
-
-            if (!isImage) return;
-
-            // Use message text as ICAO; default to 'UNKNOWN' if empty
-            const rawIcao = message.content.trim() || "UNKNOWN";
-            
-            // Trigger the flow from airportHandler.js
-            await startAirportSubmissionFlow(message, rawIcao, photo.url, message.author);
-            return;
-        }
-    }
-
         const isSubmissionChannel = message.channelId === SUBMISSION_CHANNEL_ID || 
                                    (message.channel.isThread() && message.channel.parentId === SUBMISSION_CHANNEL_ID);
 
@@ -923,6 +894,97 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
     });
 
     client.on('interactionCreate', async interaction => {
+
+        // --- AIRPORT FLOW HANDLERS ---
+
+// 1. Show ICAO Modal
+if (interaction.isButton() && interaction.customId.startsWith('start_airport_ident_')) {
+    const originalUserId = interaction.customId.split('_')[3];
+    if (interaction.user.id !== originalUserId) return interaction.reply({ content: "Not your photo!", ephemeral: true });
+
+    const modal = new ModalBuilder().setCustomId('airport_modal').setTitle('Airport Details');
+    const icaoInput = new TextInputBuilder()
+        .setCustomId('a_icao')
+        .setLabel("Airport ICAO Code")
+        .setPlaceholder("e.g. KLAX, VHHH, OMDB")
+        .setMinLength(4)
+        .setMaxLength(4)
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true);
+
+    modal.addComponents(new ActionRowBuilder().addComponents(icaoInput));
+    await interaction.showModal(modal);
+}
+
+// 2. Process Modal -> Send to Admin
+if (interaction.isModalSubmit() && interaction.customId === 'airport_modal') {
+    await interaction.deferReply({ ephemeral: true });
+    const icao = interaction.fields.getTextInputValue('a_icao').toUpperCase();
+    
+    // Fetch image from the replied message
+    const originalMsg = await interaction.channel.messages.fetch(interaction.message.reference.messageId);
+    const photoUrl = originalMsg.attachments.first().url;
+
+    const adminChannel = await client.channels.fetch(AIRPORT_ADMIN_CHANNEL_ID);
+    
+    const adminEmbed = new EmbedBuilder()
+        .setTitle('🏢 Airport Submission')
+        .setColor(0x0099FF)
+        .addFields(
+            { name: 'ICAO', value: icao, inline: true },
+            { name: 'Contributor', value: `<@${interaction.user.id}>`, inline: true }
+        )
+        .setImage(photoUrl)
+        .setFooter({ text: `User ID: ${interaction.user.id} | ICAO: ${icao}` });
+
+    const adminRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`approve_apt_${interaction.user.id}_${icao}`).setLabel('Approve & Replace').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`reject_apt_${interaction.user.id}`).setLabel('Reject').setStyle(ButtonStyle.Danger)
+    );
+
+    await adminChannel.send({ embeds: [adminEmbed], components: [adminRow] });
+    await interaction.editReply("✅ Sent to staff for review!");
+    try { await interaction.message.delete(); } catch(e) {}
+}
+
+        // --- ADMIN APPROVAL ACTION FOR AIRPORTS ---
+if (interaction.isButton() && interaction.customId.startsWith('approve_apt_')) {
+    await interaction.deferUpdate();
+    const [_, __, targetUserId, icao] = interaction.customId.split('_');
+    const imageUrl = interaction.message.embeds[0].image.url;
+
+    try {
+        const member = await interaction.guild.members.fetch(targetUserId);
+        const contributorName = member.displayName;
+
+        // Fetch image as a buffer for the modified airports.js helper
+        const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
+        const mockFile = { buffer: Buffer.from(response.data) };
+
+        // 1. Delete existing images for this ICAO to prevent clutter
+        await deleteAirportImages(s3Client, icao);
+        
+        // 2. Upload the new verified photo
+        const finalUrl = await uploadAirportImage(s3Client, mockFile, icao, contributorName);
+
+        const successEmbed = EmbedBuilder.from(interaction.message.embeds[0])
+            .setTitle(`✅ Airport Approved: ${icao}`)
+            .setColor(0x00FF00)
+            .setFooter({ text: `Approved by ${interaction.user.tag}` });
+
+        await interaction.editReply({ embeds: [successEmbed], components: [] });
+
+        // Notify Contributor
+        try {
+            const user = await client.users.fetch(targetUserId);
+            await user.send(`✅ Your photo for **${icao}** has been approved!`);
+        } catch(e) {}
+
+    } catch (err) {
+        console.error("Airport Approval Error:", err);
+        await interaction.followUp({ content: "❌ Error during airport upload.", ephemeral: true });
+    }
+}
         
         // --- 1. TICKET SYSTEM: INITIAL BUTTON CLICK ---
         if (interaction.isButton() && interaction.customId === 'create_ticket_start') {
@@ -1207,11 +1269,10 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 const [_, targetUserId] = interaction.customId.split('_');
                 let receivedEmbed = interaction.message.embeds[0];
                 
-                // Identify the type of submission based on fields or title
-                const isAirport = receivedEmbed.fields.some(f => f.name === 'ICAO') || 
-                                 receivedEmbed.title?.toLowerCase().includes('airport');
-
-                // Helper to get image URL safely
+                const tailField = receivedEmbed.fields.find(f => f.name === 'Tail Number').value;
+                const typeField = receivedEmbed.fields.find(f => f.name === 'Aircraft Type').value;
+                const liveryField = receivedEmbed.fields.find(f => f.name === 'Livery').value;
+                
                 let imageUrl = receivedEmbed.image?.url;
                 if (!imageUrl && interaction.message.attachments.size > 0) {
                     imageUrl = interaction.message.attachments.first().url;
@@ -1221,61 +1282,12 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
 
                 try {
-                    // --- CASE 1: AIRPORT APPROVAL ---
-                    if (isAirport) {
-                        const icaoField = receivedEmbed.fields.find(f => f.name === 'ICAO')?.value || 'UNKNOWN';
-                        
-                        // Upload to S3 with airport-specific prefix
-                        const permanentUrl = await uploadImageToS3(imageUrl, `airport-${icaoField}`);
-
-                        /* NOTE: If you have an AirportModel, save it here. 
-                           Example:
-                           await AirportModel.findOneAndUpdate(
-                               { icao: icaoField }, 
-                               { imageUrl: permanentUrl, contributorId: targetUserId, ... }, 
-                               { upsert: true }
-                           );
-                        */
-
-                        const approveEmbed = EmbedBuilder.from(receivedEmbed)
-                            .setColor(0x00FF00)
-                            .setTitle('✅ Airport Approved')
-                            .setImage(null) 
-                            .setFooter({ text: `Approved by ${interaction.user.tag}` });
-                        
-                        await interaction.editReply({ embeds: [approveEmbed], components: [] });
-
-                        // Handle Public Feed Update
-                        if (publicMsgId) {
-                            try {
-                                const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
-                                const publicMsg = await feedChannel.messages.fetch(publicMsgId);
-                                const publicEmbed = EmbedBuilder.from(publicMsg.embeds[0])
-                                    .setTitle('✅ Airport Photo Verified!')
-                                    .setColor(0x00FF00)
-                                    .setDescription(`The photo for **${icaoField}** has been verified.`)
-                                    .setImage(null);
-                                await publicMsg.edit({ content: permanentUrl, embeds: [publicEmbed], files: [] });
-                            } catch (e) { console.error("Feed Update Error:", e); }
-                        }
-                        return; // Exit early as airport is handled
-                    }
-
-                    // --- CASE 2: AIRCRAFT APPROVAL (EXISTING LOGIC) ---
-                    const tailField = receivedEmbed.fields.find(f => f.name === 'Tail Number')?.value;
-                    const typeField = receivedEmbed.fields.find(f => f.name === 'Aircraft Type')?.value;
-                    const liveryField = receivedEmbed.fields.find(f => f.name === 'Livery')?.value;
-
-                    if (!typeField || !liveryField) {
-                        throw new Error("Missing aircraft details in embed.");
-                    }
-
                     const existingEntry = await CommunityAircraftModel.findOne({ 
                         aircraftType: { $regex: new RegExp(`^${escapeRegex(typeField)}$`, "i") },
                         liveryName: { $regex: new RegExp(`^${escapeRegex(liveryField)}$`, "i") }
                     });
                     
-                    const permanentUrl = await uploadImageToS3(imageUrl, tailField || 'unknown');
+                    const permanentUrl = await uploadImageToS3(imageUrl, tailField);
                     
                     let contributorName = "Unknown";
                     try { 
@@ -1296,7 +1308,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         imageUrl: permanentUrl,
                         uploadedAt: new Date()
                     };
-                    if (tailField && tailField !== 'UNKNOWN') updateData.tailNumber = tailField.toUpperCase();
+                    if (tailField !== 'UNKNOWN') updateData.tailNumber = tailField.toUpperCase();
 
                     if (existingEntry) {
                         Object.assign(existingEntry, updateData);
@@ -1305,7 +1317,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                         await new CommunityAircraftModel(updateData).save();
                     }
 
-                    // Add Contributor Role
                     try {
                         const member = await interaction.guild.members.fetch(targetUserId);
                         if (CONTRIBUTOR_ROLE_ID) await member.roles.add(CONTRIBUTOR_ROLE_ID);
@@ -1347,8 +1358,8 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     receivedEmbed = null;
 
                 } catch (error) {
-                    console.error("Approval Error:", error);
-                    await interaction.followUp({ content: `❌ Approval Failed: ${error.message}`, ephemeral: true });
+                    console.error(error);
+                    await interaction.followUp({ content: '❌ Error saving to database/S3.', ephemeral: true });
                 }
             }
 
@@ -1876,19 +1887,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 await interaction.editReply("❌ Error running migration. Check console.");
             }
         }
-
-        if (interaction.commandName === 'submit_airport') {
-    const icao = interaction.options.getString('icao');
-    const photo = interaction.options.getAttachment('photo');
-
-    if (!photo.contentType.startsWith('image/')) {
-        return interaction.reply({ content: '❌ Invalid image.', ephemeral: true });
-    }
-
-    // Call external airport handler
-    await startAirportSubmissionFlow(interaction, icao, photo.url, interaction.user);
-    return;
-}
 
         if (interaction.commandName === 'submit') {
             const type = interaction.options.getString('aircraft_type');

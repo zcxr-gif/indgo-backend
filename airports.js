@@ -5,13 +5,17 @@ const fs = require('fs');
 
 /**
  * Uploads an airport image to S3 and attaches ICAO/Contributor as metadata.
+ * Supports both disk paths (from Multer) and raw buffers (from Discord/Axios).
  */
 const uploadAirportImage = async (s3Client, file, icao, contributor) => {
     const bucketName = process.env.AWS_S3_BUCKET_NAME;
     const cleanIcao = icao.toUpperCase().trim();
     
+    // Determine input source (Path for Web Dashboard, Buffer for Discord Bot)
+    const inputSource = file.path ? file.path : file.buffer;
+
     // Process image: Convert to WebP for storage efficiency
-    const optimizedBuffer = await sharp(file.path)
+    const optimizedBuffer = await sharp(inputSource)
         .resize({ width: 1920, height: 1080, fit: 'inside',  withoutEnlargement: true })
         .webp({ quality: 80 })
         .toBuffer();
@@ -23,7 +27,6 @@ const uploadAirportImage = async (s3Client, file, icao, contributor) => {
         Key: fileName,
         Body: optimizedBuffer,
         ContentType: 'image/webp',
-        // We store the text data here instead of MongoDB
         Metadata: {
             'icao': cleanIcao,
             'contributor': contributor || 'System'
@@ -32,8 +35,10 @@ const uploadAirportImage = async (s3Client, file, icao, contributor) => {
 
     await s3Client.send(command);
 
-    // Clean up local temp file
-    fs.unlink(file.path, () => {});
+    // Only attempt to clean up if a physical file path was provided
+    if (file.path) {
+        fs.unlink(file.path, () => {});
+    }
 
     return `https://${bucketName}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileName}`;
 };
