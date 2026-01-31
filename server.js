@@ -831,6 +831,42 @@ app.delete('/api/airports/:icao', async (req, res) => {
     }
 });
 
+// GET: Fetch all airports that have images
+app.get('/api/airports', async (req, res) => {
+    try {
+        const command = new ListObjectsV2Command({
+            Bucket: process.env.AWS_S3_BUCKET_NAME,
+            Prefix: 'airports/', // Look in the airports folder
+        });
+
+        const data = await s3Client.send(command);
+        
+        if (!data.Contents) return res.json([]);
+
+        // Filter for .webp or .png files and extract ICAO from filename
+        // Filename format: airports/icao-timestamp.webp
+        const airportList = data.Contents
+            .filter(item => item.Key.includes('-'))
+            .map(item => {
+                const filename = item.Key.split('/').pop();
+                const icao = filename.split('-')[0].toUpperCase();
+                return {
+                    icao: icao,
+                    imageUrl: `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${item.Key}`,
+                    lastUpdated: item.LastModified
+                };
+            });
+
+        // Remove duplicates (if multiple images exist for one ICAO)
+        const uniqueAirports = Array.from(new Map(airportList.map(item => [item.icao, item])).values());
+
+        res.json(uniqueAirports);
+    } catch (error) {
+        console.error('Error fetching airport list:', error);
+        res.status(500).json({ message: 'Error fetching gallery.' });
+    }
+});
+
 /**
  * PUT: Update airport data or replace image
  */
