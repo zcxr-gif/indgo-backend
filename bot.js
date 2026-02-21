@@ -755,7 +755,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             }
             
             // Pagination Logic
-            const itemsPerPage = 10;
+            const itemsPerPage = 5; // Reduced from 10 to 5 for a much cleaner look
             const totalPages = Math.ceil(enriched.length / itemsPerPage) || 1;
             const safePage = Math.max(0, Math.min(page, totalPages - 1));
             const start = safePage * itemsPerPage;
@@ -763,7 +763,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             
             const embed = new EmbedBuilder()
                 .setTitle('🎯 Aircraft Photo Update Bounties')
-                .setDescription(`These aircraft need new or better photos! Submit a photo to update the database.\n\n**Total Needed:** ${enriched.length}`)
                 .setColor(0xFF8C00)
                 .setFooter({ text: `Page ${safePage + 1} of ${totalPages} • Real-time live data` })
                 .setTimestamp();
@@ -771,13 +770,25 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             if (pageData.length === 0) {
                 embed.setDescription('🎉 All good! No aircraft currently need photo updates.');
             } else {
-                pageData.forEach((ac) => {
-                    embed.addFields({
-                        name: `${ac.manufacturer !== 'Unknown' ? ac.manufacturer + ' ' : ''}${ac.aircraftType} - ${ac.liveryName}`,
-                        value: `**Tail:** ${ac.tailNumber} | [View Current Picture](${ac.imageUrl || '#'})`,
-                        inline: false
-                    });
+                // Build a clean markdown description instead of using clunky fields
+                let boardDescription = `These aircraft need new or better photos! Submit a photo to update the database.\n\n**Total Needed:** ${enriched.length}\n\n`;
+
+                pageData.forEach((ac, index) => {
+                    const listNumber = start + index + 1;
+                    const mfg = ac.manufacturer !== 'Unknown' ? ac.manufacturer + ' ' : '';
+                    
+                    boardDescription += `**${listNumber}. ${mfg}${ac.aircraftType}**\n`;
+                    boardDescription += `> 🎨 **Livery:** ${ac.liveryName}\n`;
+                    boardDescription += `> 🆔 **Tail:** ${ac.tailNumber || 'Unknown'}\n`;
+                    boardDescription += `> 🖼️ [**Click to View Current Picture**](${ac.imageUrl || '#'})\n\n`;
                 });
+
+                embed.setDescription(boardDescription);
+
+                // Make the image easier to see by setting the first item's image as the embed thumbnail
+                if (pageData[0] && pageData[0].imageUrl) {
+                    embed.setThumbnail(pageData[0].imageUrl);
+                }
             }
             
             // Interaction Buttons
@@ -1155,7 +1166,17 @@ client.on('interactionCreate', async (interaction) => {
                     const member = await interaction.guild.members.fetch(targetUserId).catch(() => null);
                     const contributorName = member ? member.displayName : (await client.users.fetch(targetUserId)).username;
 
-                    const updateData = { contributorName, contributorId: targetUserId, aircraftType: typeField, liveryName: liveryField, imageUrl: permanentUrl, uploadedAt: new Date() };
+                    // Automatically remove the 'needsUpdate' flag upon approval
+                    const updateData = { 
+                        contributorName, 
+                        contributorId: targetUserId, 
+                        aircraftType: typeField, 
+                        liveryName: liveryField, 
+                        imageUrl: permanentUrl, 
+                        uploadedAt: new Date(),
+                        needsUpdate: false 
+                    };
+                    
                     if (tailField !== 'UNKNOWN') updateData.tailNumber = tailField.toUpperCase();
 
                     await CommunityAircraftModel.findOneAndUpdate(
