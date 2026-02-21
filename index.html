@@ -66,7 +66,7 @@
           Plane, Upload, Search, X, Info, Camera, User, Tag, Hash, Trash2,
           AlertCircle, CheckCircle2, Loader2, Edit, Pencil, Moon, Sun,
           Filter, SlidersHorizontal, Settings, Shield, BarChart3, ChevronDown,
-          Database, Cloud, Server, HardDrive, LayoutGrid, ListChecks
+          Database, Cloud, Server, HardDrive, LayoutGrid, ListChecks, Flag
         } from 'lucide-react';
 
         const IS_LOCALHOST = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
@@ -277,6 +277,27 @@
             }
           };
 
+          const handleToggleFlag = async (id, e) => {
+            if(e) e.stopPropagation();
+
+            if (isDemoMode) {
+              setAircrafts(prev => prev.map(a => a._id === id ? { ...a, needsUpdate: !a.needsUpdate } : a));
+              return;
+            }
+
+            try {
+              const res = await fetch(`${API_URL}/${id}/flag`, { method: 'PATCH' });
+              if (res.ok) {
+                fetchAircraft(); // Refresh the grid to show the updated flag state
+              } else {
+                alert('Failed to toggle flag');
+              }
+            } catch (error) {
+              console.error("Error toggling flag", error);
+              alert('Error toggling update flag');
+            }
+          };
+
           return (
             <div className="min-h-screen flex flex-col font-sans selection:bg-blue-200 dark:selection:bg-blue-900">
               
@@ -475,6 +496,7 @@
                             onClick={() => setSelectedAircraft(aircraft)}
                             onDelete={handleDelete}
                             onEdit={handleEdit}
+                            onToggleFlag={handleToggleFlag}
                           />
                         ))}
                       </div>
@@ -741,11 +763,11 @@
             );
         }
 
-        function AircraftCard({ data, onClick, onDelete, onEdit, adminMode }) {
+function AircraftCard({ data, onClick, onDelete, onEdit, onToggleFlag, adminMode }) {
           return (
             <div 
               onClick={onClick}
-              className="group bg-white dark:bg-slate-900 rounded-2xl shadow-sm border border-slate-200 dark:border-slate-800 overflow-hidden hover:shadow-xl hover:-translate-y-1 hover:border-blue-200 dark:hover:border-blue-900 transition-all duration-300 cursor-pointer relative flex flex-col h-full fade-in"
+              className={`group bg-white dark:bg-slate-900 rounded-2xl shadow-sm border overflow-hidden hover:shadow-xl hover:-translate-y-1 transition-all duration-300 cursor-pointer relative flex flex-col h-full fade-in ${data.needsUpdate ? 'border-amber-400 dark:border-amber-600' : 'border-slate-200 dark:border-slate-800 hover:border-blue-200 dark:hover:border-blue-900'}`}
             >
               {/* Image Container */}
               <div className="relative aspect-[4/3] bg-slate-100 dark:bg-slate-800 overflow-hidden">
@@ -757,9 +779,17 @@
                 />
                 <div className="absolute inset-0 bg-gradient-to-t from-slate-900/60 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300"></div>
                 
-                <div className="absolute top-3 right-3 bg-white/90 dark:bg-slate-950/90 backdrop-blur-sm px-2.5 py-1 rounded-md text-xs font-bold shadow-sm border border-white/50 dark:border-slate-800/50 text-slate-800 dark:text-slate-200">
+                <div className="absolute top-3 right-3 bg-white/90 dark:bg-slate-950/90 backdrop-blur-sm px-2.5 py-1 rounded-md text-xs font-bold shadow-sm border border-white/50 dark:border-slate-800/50 text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                  {data.needsUpdate && <AlertCircle size={14} className="text-amber-500" />}
                   {data.tailNumber}
                 </div>
+
+                {/* Flag Badge on Image */}
+                {data.needsUpdate && (
+                  <div className="absolute top-3 left-3 bg-amber-500/90 backdrop-blur-sm px-2.5 py-1 rounded-md text-xs font-bold shadow-sm text-white flex items-center gap-1">
+                    <Flag size={12} fill="currentColor" /> Needs Update
+                  </div>
+                )}
               </div>
 
               {/* Content */}
@@ -785,6 +815,13 @@
                   {/* Admin Actions */}
                   {adminMode && (
                       <div className="flex items-center gap-1 animate-in slide-in-from-right-4 duration-200">
+                        <button 
+                            onClick={(e) => onToggleFlag(data._id, e)}
+                            className={`transition-colors p-1.5 rounded-full ${data.needsUpdate ? 'text-amber-500 bg-amber-50 dark:bg-amber-900/20 hover:bg-amber-100 dark:hover:bg-amber-900/40' : 'text-slate-400 hover:text-amber-500 dark:hover:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20'}`}
+                            title={data.needsUpdate ? "Remove Update Flag" : "Flag for Update"}
+                        >
+                            <Flag size={16} />
+                        </button>
                         <button 
                             onClick={(e) => onEdit(data, e)}
                             className="text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 transition-colors p-1.5 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-full"

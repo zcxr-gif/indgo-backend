@@ -59,6 +59,7 @@ const CommunityAircraftSchema = new mongoose.Schema({
     liveryName: { type: String, required: true },      
     tailNumber: { type: String, required: true, unique: true }, // Ensure no duplicates
     imageUrl: { type: String, required: false, default: null }, // Now optional
+    needsUpdate: { type: Boolean, default: false }, // NEW: Flag for image updates
     uploadedAt: { type: Date, default: Date.now }
 });
 
@@ -695,6 +696,25 @@ const syncAircraftDatabase = async (jsonList) => {
     }
 };
 
+// PATCH: Toggle the "needs update" flag
+app.patch('/api/aircraft/:id/flag', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const entry = await CommunityAircraft.findById(id);
+
+        if (!entry) return res.status(404).json({ message: 'Aircraft not found.' });
+
+        // Flip the boolean
+        entry.needsUpdate = !entry.needsUpdate;
+        await entry.save();
+
+        res.json({ message: 'Update flag toggled successfully.', data: entry });
+    } catch (error) {
+        console.error('Flag Toggle Error:', error);
+        res.status(500).json({ message: 'Server error during flag toggle.' });
+    }
+});
+
 // PUT: Update an existing aircraft
 app.put('/api/aircraft/:id', upload.single('image'), async (req, res) => {
     try {
@@ -753,6 +773,9 @@ app.put('/api/aircraft/:id', upload.single('image'), async (req, res) => {
             fs.unlink(req.file.path, (err) => {
                 if (err) console.error("Failed to clean up temp file:", err);
             });
+
+            // CLEAR THE FLAG: A new image was uploaded, so it no longer needs an update
+            existingEntry.needsUpdate = false;
         }
 
         if (contributorName) existingEntry.contributorName = contributorName;
