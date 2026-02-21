@@ -179,8 +179,9 @@
               }
           };
 
-          const fetchAircraft = async () => {
-            setLoading(true);
+          const fetchAircraft = async (silent = false) => {
+            // Only show the loading spinner if we aren't doing a silent background refresh
+            if (!silent) setLoading(true); 
             try {
               const response = await fetch(API_URL);
               if (!response.ok) throw new Error('Failed to connect');
@@ -189,10 +190,12 @@
               setIsDemoMode(false);
             } catch (error) {
               console.warn("Backend unreachable, switching to Demo Mode.");
-              setAircrafts(DEMO_DATA);
-              setIsDemoMode(true);
+              if (!silent) {
+                 setAircrafts(DEMO_DATA);
+                 setIsDemoMode(true);
+              }
             } finally {
-              setLoading(false);
+              if (!silent) setLoading(false);
             }
           };
 
@@ -269,8 +272,8 @@
 
             try {
               await fetch(`${API_URL}/${id}`, { method: 'DELETE' });
-              fetchAircraft();
-              fetchStats(); // Update storage stats after delete
+              fetchAircraft(true); // Passing true triggers a silent update to save your scroll position
+              fetchStats(); 
               if (selectedAircraft && selectedAircraft._id === id) setSelectedAircraft(null);
             } catch (error) {
               alert('Error deleting aircraft');
@@ -285,15 +288,22 @@
               return;
             }
 
+            // Optimistically update the local state immediately for instant UI feedback (no lag)
+            setAircrafts(prev => prev.map(a => a._id === id ? { ...a, needsUpdate: !a.needsUpdate } : a));
+
             try {
               const res = await fetch(`${API_URL}/${id}/flag`, { method: 'PATCH' });
               if (res.ok) {
-                fetchAircraft(); // Refresh the grid to show the updated flag state
+                fetchAircraft(true); // Silently sync with backend to ensure everything matches
               } else {
+                // Revert UI if the server request failed
+                setAircrafts(prev => prev.map(a => a._id === id ? { ...a, needsUpdate: !a.needsUpdate } : a));
                 alert('Failed to toggle flag');
               }
             } catch (error) {
               console.error("Error toggling flag", error);
+              // Revert UI if the server request failed
+              setAircrafts(prev => prev.map(a => a._id === id ? { ...a, needsUpdate: !a.needsUpdate } : a));
               alert('Error toggling update flag');
             }
           };
@@ -527,8 +537,8 @@
                   onClose={() => setShowFormModal(false)} 
                   onSuccess={() => {
                     setShowFormModal(false);
-                    fetchAircraft();
-                    fetchStats(); // Update stats on success
+                    fetchAircraft(true); // Silent update on create/edit to prevent jumping
+                    fetchStats(); 
                   }}
                   isDemoMode={isDemoMode}
                   initialData={editingAircraft}
