@@ -724,6 +724,94 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
         } catch (error) { console.error('❌ Error updating leaderboard:', error); }
     };
 
+    const generateBountyBoard = async (page = 0, sortBy = 'type') => {
+        try {
+            // Fetch all aircraft flagged as needing an update
+            const flagged = await CommunityAircraftModel.find({ needsUpdate: true });
+            
+            // Enrich with manufacturer from your local registry for sorting
+            const enriched = flagged.map(doc => {
+                const ac = doc.toObject ? doc.toObject() : doc;
+                let manufacturer = 'Unknown';
+                if (aircraftRegistry && Array.isArray(aircraftRegistry)) {
+                    const match = aircraftRegistry.find(r => 
+                        (ac.aircraftType || '').toLowerCase().includes((r.model || '').toLowerCase()) ||
+                        (r.model || '').toLowerCase().includes((ac.aircraftType || '').toLowerCase())
+                    );
+                    if (match && match.manufacturer) manufacturer = match.manufacturer;
+                }
+                return { ...ac, manufacturer };
+            });
+
+            // Apply Sorting
+            if (sortBy === 'type') {
+                enriched.sort((a, b) => (a.aircraftType || '').localeCompare(b.aircraftType || ''));
+            } else if (sortBy === 'livery') {
+                enriched.sort((a, b) => (a.liveryName || '').localeCompare(b.liveryName || ''));
+            } else if (sortBy === 'manufacturer') {
+                enriched.sort((a, b) => a.manufacturer.localeCompare(b.manufacturer) || (a.aircraftType || '').localeCompare(b.aircraftType || ''));
+            } else if (sortBy === 'date') {
+                enriched.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
+            }
+            
+            // Pagination Logic
+            const itemsPerPage = 10;
+            const totalPages = Math.ceil(enriched.length / itemsPerPage) || 1;
+            const safePage = Math.max(0, Math.min(page, totalPages - 1));
+            const start = safePage * itemsPerPage;
+            const pageData = enriched.slice(start, start + itemsPerPage);
+            
+            const embed = new EmbedBuilder()
+                .setTitle('🎯 Aircraft Photo Update Bounties')
+                .setDescription(`These aircraft need new or better photos! Submit a photo to update the database.\n\n**Total Needed:** ${enriched.length}`)
+                .setColor(0xFF8C00)
+                .setFooter({ text: `Page ${safePage + 1} of ${totalPages} • Real-time live data` })
+                .setTimestamp();
+                
+            if (pageData.length === 0) {
+                embed.setDescription('🎉 All good! No aircraft currently need photo updates.');
+            } else {
+                pageData.forEach((ac) => {
+                    embed.addFields({
+                        name: `${ac.manufacturer !== 'Unknown' ? ac.manufacturer + ' ' : ''}${ac.aircraftType} - ${ac.liveryName}`,
+                        value: `**Tail:** ${ac.tailNumber} | [View Current Picture](${ac.imageUrl || '#'})`,
+                        inline: false
+                    });
+                });
+            }
+            
+            // Interaction Buttons
+            const row1 = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(`bnty_prev_${safePage}_${sortBy}`).setLabel('◀️ Prev').setStyle(ButtonStyle.Primary).setDisabled(safePage === 0),
+                new ButtonBuilder().setCustomId(`bnty_ref_${safePage}_${sortBy}`).setLabel('🔄 Refresh').setStyle(ButtonStyle.Success),
+                new ButtonBuilder().setCustomId(`bnty_next_${safePage}_${sortBy}`).setLabel('Next ▶️').setStyle(ButtonStyle.Primary).setDisabled(safePage >= totalPages - 1)
+            );
+            
+            // Sorting Dropdown
+            const row2 = new ActionRowBuilder().addComponents(
+                new StringSelectMenuBuilder()
+                    .setCustomId(`bnty_sort_${safePage}`)
+                    .setPlaceholder(`Sorted by: ${sortBy.charAt(0).toUpperCase() + sortBy.slice(1)}`)
+                    .addOptions(
+                        { label: 'Sort by Manufacturer', value: 'manufacturer', emoji: '🏭' },
+                        { label: 'Sort by Aircraft Type', value: 'type', emoji: '✈️' },
+                        { label: 'Sort by Livery', value: 'livery', emoji: '🎨' },
+                        { label: 'Sort by Date Flagged', value: 'date', emoji: '📅' }
+                    )
+            );
+            
+            // Only show dropdown/pagination if items exist
+            if (enriched.length > 0) {
+                return { embeds: [embed], components: [row2, row1] };
+            } else {
+                return { embeds: [embed], components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`bnty_ref_0_${sortBy}`).setLabel('🔄 Refresh').setStyle(ButtonStyle.Success))] };
+            }
+        } catch (error) {
+            console.error('Bounty Board Error:', error);
+            throw error;
+        }
+    };
+
     client.once('ready', async () => {
         console.log(`🤖 Discord Bot Online as ${client.user.tag}`);
         await fetchAircraftMetadata();
@@ -768,7 +856,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 .addStringOption(o => o.setName('aircraft_type').setDescription('Type (Start typing to search)').setAutocomplete(true).setRequired(true))
                 .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true)),
             
-            // NEW: Pull Airport Command
             new SlashCommandBuilder().setName('pull_airport').setDescription('Fetch a specific airport image by ICAO code')
                 .addStringOption(o => o.setName('icao').setDescription('4-letter ICAO code').setRequired(true).setMinLength(4).setMaxLength(4)),
 
@@ -778,7 +865,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 .addAttachmentOption(o => o.setName('photo').setDescription('Upload photo').setRequired(true)),
             new SlashCommandBuilder().setName('links').setDescription('Get helpful resource links (Tracker, Forum, Liveries)'),
             
-            // NEW: Live Flight Tracking
             new SlashCommandBuilder()
                 .setName('track')
                 .setDescription('Track a live flight on the server')
@@ -788,7 +874,6 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                      .setRequired(true)
                 ),
 
-            // NEW: Personal Hangar Stats
             new SlashCommandBuilder()
                 .setName('hangar')
                 .setDescription('View detailed breakdown of a user\'s contributions')
@@ -796,12 +881,17 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     o.setName('user')
                      .setDescription('User to inspect')
                 ),
+                
+            // NEW: The Live Bounty Board 
+            new SlashCommandBuilder()
+                .setName('bounty_board')
+                .setDescription('View the live, sortable list of aircraft pictures needing updates'),
 
             // System Admin Commands
             new SlashCommandBuilder().setName('migrate_legacy').setDescription('[SYSTEM] Auto-match legacy DB names to current Discord Users').setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
             new SlashCommandBuilder().setName('setup_tickets').setDescription('[SYSTEM] Post the help ticket panel in the current channel').setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
 
-            // --- NEW MODERATOR COMMANDS ---
+            // Moderator Commands
             new SlashCommandBuilder().setName('mod_kick').setDescription('[MOD] Kick a user')
                 .addUserOption(o => o.setName('user').setDescription('User to kick').setRequired(true))
                 .addStringOption(o => o.setName('reason').setDescription('Reason for kick').setRequired(true))
@@ -997,6 +1087,26 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.isButton()) {
             const customId = interaction.customId;
 
+            // --- BOUNTY BOARD PAGINATION BUTTONS ---
+            if (customId.startsWith('bnty_')) {
+                await interaction.deferUpdate();
+                const parts = customId.split('_');
+                const action = parts[1]; // prev, next, ref
+                let page = parseInt(parts[2], 10);
+                const sortBy = parts[3];
+                
+                if (action === 'prev') page--;
+                if (action === 'next') page++;
+                
+                try {
+                    const payload = await generateBountyBoard(page, sortBy);
+                    await interaction.editReply(payload);
+                } catch (e) {
+                    await interaction.followUp({ content: 'Error updating board.', ephemeral: true });
+                }
+                return;
+            }
+
             // --- AIRCRAFT BUTTONS ---
             if (customId.startsWith('start_ident_')) {
                 const originalUserId = customId.split('_')[2];
@@ -1146,6 +1256,21 @@ client.on('interactionCreate', async (interaction) => {
 
         // --- 3. SELECT MENU HANDLERS ---
         if (interaction.isStringSelectMenu()) {
+            
+            // --- BOUNTY BOARD SORTING MENU ---
+            if (interaction.customId.startsWith('bnty_sort_')) {
+                await interaction.deferUpdate();
+                const sortBy = interaction.values[0];
+                try {
+                    // Reset to page 0 whenever the sort method changes
+                    const payload = await generateBountyBoard(0, sortBy);
+                    await interaction.editReply(payload);
+                } catch (e) {
+                    await interaction.followUp({ content: 'Error changing sort order.', ephemeral: true });
+                }
+                return;
+            }
+
             if (interaction.customId === 'ticket_topic_select') {
                 const modal = new ModalBuilder().setCustomId(`ticket_modal_${interaction.values[0]}`).setTitle('Ticket Details');
                 modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('ticket_desc').setLabel("Description").setStyle(TextInputStyle.Paragraph).setRequired(false)));
@@ -1270,6 +1395,19 @@ client.on('interactionCreate', async (interaction) => {
         // --- 5. SLASH COMMAND HANDLERS ---
         if (interaction.isChatInputCommand()) {
             const { commandName } = interaction;
+
+            // --- BOUNTY BOARD COMMAND ---
+            if (commandName === 'bounty_board') {
+                await interaction.deferReply();
+                try {
+                    const payload = await generateBountyBoard(0, 'type');
+                    await interaction.editReply(payload);
+                } catch (e) {
+                    console.error(e);
+                    await interaction.editReply('❌ Error generating the board. Ensure database connection is active.');
+                }
+                return;
+            }
 
             if (commandName.startsWith('mod_')) {
                 if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID) && !interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
@@ -1516,7 +1654,6 @@ client.on('interactionCreate', async (interaction) => {
             }
         }
         
-        // --- NEW COMMAND: PULL AIRPORT ---
         if (interaction.commandName === 'pull_airport') {
             const icaoInput = interaction.options.getString('icao').toUpperCase().trim();
             await interaction.deferReply();
