@@ -218,18 +218,35 @@ app.post('/api/leaderboard/track', async (req, res) => {
             // New unique viewer: Add hash and increment count
             stats.uniqueViewers.push(viewerHash);
             stats.viewCount += 1;
-            // Update name just in case they changed it mid-flight
             stats.pilotName = pilotName; 
             await stats.save();
         } else {
-            // Create new record for today
-            await DailyPilotStats.create({
-                date,
-                pilotUserId,
-                pilotName,
-                viewCount: 1,
-                uniqueViewers: [viewerHash]
-            });
+            // No record found. Try to create a new one for today!
+            try {
+                await DailyPilotStats.create({
+                    date,
+                    pilotUserId,
+                    pilotName,
+                    viewCount: 1,
+                    uniqueViewers: [viewerHash]
+                });
+            } catch (createError) {
+                // RACE CONDITION CATCH: Code 11000 means another request just created it!
+                if (createError.code === 11000) {
+                    console.log(`Race condition avoided for pilot ${pilotUserId}`);
+                    // Fetch the newly created document and try updating it instead
+                    const retryStats = await DailyPilotStats.findOne({ date, pilotUserId });
+                    if (retryStats && !retryStats.uniqueViewers.includes(viewerHash)) {
+                        retryStats.uniqueViewers.push(viewerHash);
+                        retryStats.viewCount += 1;
+                        retryStats.pilotName = pilotName;
+                        await retryStats.save();
+                    }
+                } else {
+                    // If it's a different error, throw it so the outer catch handles it
+                    throw createError;
+                }
+            }
         }
 
         res.json({ success: true, counted: true });

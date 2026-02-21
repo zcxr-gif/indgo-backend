@@ -767,6 +767,11 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
             new SlashCommandBuilder().setName('pull').setDescription('Fetch a specific aircraft image from the database')
                 .addStringOption(o => o.setName('aircraft_type').setDescription('Type (Start typing to search)').setAutocomplete(true).setRequired(true))
                 .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true)),
+            
+            // NEW: Pull Airport Command
+            new SlashCommandBuilder().setName('pull_airport').setDescription('Fetch a specific airport image by ICAO code')
+                .addStringOption(o => o.setName('icao').setDescription('4-letter ICAO code').setRequired(true).setMinLength(4).setMaxLength(4)),
+
             new SlashCommandBuilder().setName('submit').setDescription('Submit a new aircraft photo')
                 .addStringOption(o => o.setName('aircraft_type').setDescription('Type (Start typing to search)').setAutocomplete(true).setRequired(true))
                 .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true))
@@ -1021,17 +1026,21 @@ client.on('interactionCreate', async (interaction) => {
                 return;
             }
 
-            if (customId.startsWith('approve_')) {
+            if (customId.startsWith('approve_') && !customId.startsWith('approve_apt_')) {
                 await interaction.deferUpdate();
                 const [_, targetUserId] = customId.split('_');
                 const receivedEmbed = interaction.message.embeds[0];
-                const tailField = receivedEmbed.fields.find(f => f.name === 'Tail Number').value;
-                const typeField = receivedEmbed.fields.find(f => f.name === 'Aircraft Type').value;
-                const liveryField = receivedEmbed.fields.find(f => f.name === 'Livery').value;
-                let imageUrl = receivedEmbed.image?.url || interaction.message.attachments.first()?.url;
-                const publicMsgId = (receivedEmbed.footer?.text || '').match(/Msg: (\d+)/)?.[1];
 
                 try {
+                    const tailField = receivedEmbed.fields.find(f => f.name === 'Tail Number')?.value;
+                    const typeField = receivedEmbed.fields.find(f => f.name === 'Aircraft Type')?.value;
+                    const liveryField = receivedEmbed.fields.find(f => f.name === 'Livery')?.value;
+                    
+                    if (!tailField || !typeField || !liveryField) throw new Error("Missing required aircraft embed fields.");
+
+                    let imageUrl = receivedEmbed.image?.url || interaction.message.attachments.first()?.url;
+                    const publicMsgId = (receivedEmbed.footer?.text || '').match(/Msg: (\d+)/)?.[1];
+
                     const permanentUrl = await uploadImageToS3(imageUrl, tailField);
                     const member = await interaction.guild.members.fetch(targetUserId).catch(() => null);
                     const contributorName = member ? member.displayName : (await client.users.fetch(targetUserId)).username;
@@ -1055,12 +1064,13 @@ client.on('interactionCreate', async (interaction) => {
                             await publicMsg.edit({ content: permanentUrl, embeds: [EmbedBuilder.from(publicMsg.embeds[0]).setTitle('✅ Verified').setColor(0x00FF00).setImage(null)], files: [] });
                         } catch (e) {}
                     }
-                } catch (err) { console.error(err); }
+                } catch (err) { 
+                    console.error("Aircraft Approval Error:", err); 
+                }
                 return;
             }
 
-            if (customId.startsWith('reject_')) {
-                // Shared rejection logic for aircraft
+            if (customId.startsWith('reject_') && !customId.startsWith('reject_apt_')) {
                 const targetUserId = customId.split('_')[1];
                 const modal = new ModalBuilder().setCustomId(`rejectModal_${targetUserId}`).setTitle('Rejection Reason');
                 const reasonInput = new TextInputBuilder().setCustomId('reasonInput').setLabel("Why?").setStyle(TextInputStyle.Paragraph).setRequired(true);
@@ -1091,7 +1101,7 @@ client.on('interactionCreate', async (interaction) => {
                     if (typeof deleteAirportImages === 'function') await deleteAirportImages(s3Client, icao);
                     const finalUrl = await uploadAirportImage(s3Client, { buffer: Buffer.from(response.data) }, icao, contributorName);
                     await interaction.editReply({ embeds: [EmbedBuilder.from(interaction.message.embeds[0]).setTitle(`✅ Airport Approved: ${icao}`).setColor(0x00FF00).setImage(finalUrl)], components: [] });
-                } catch (err) { console.error(err); }
+                } catch (err) { console.error("Airport Approval Error:", err); }
                 return;
             }
 
@@ -1335,7 +1345,6 @@ client.on('interactionCreate', async (interaction) => {
             }
         }
         
-        // --- NEW COMMAND: SETUP TICKETS ---
         if (interaction.commandName === 'setup_tickets') {
             if (!interaction.member.permissions.has(GatewayIntentBits.Administrator) && interaction.channelId !== ADMIN_CHANNEL_ID) {
                 return interaction.reply({ content: '❌ Admin only.', ephemeral: true });
@@ -1504,6 +1513,49 @@ client.on('interactionCreate', async (interaction) => {
             } catch (e) { 
                 console.error(e);
                 await interaction.editReply('⚠️ Error retrieving record.'); 
+            }
+        }
+        
+        // --- NEW COMMAND: PULL AIRPORT ---
+        if (interaction.commandName === 'pull_airport') {
+            const icaoInput = interaction.options.getString('icao').toUpperCase().trim();
+            await interaction.deferReply();
+            
+            try {
+                const airportData = await getAirportInfo(s3Client, icaoInput);
+                
+                const imageUrl = typeof airportData === 'string' ? airportData : (airportData?.url || airportData?.imageUrl);
+                const contributor = airportData?.contributor || airportData?.contributorName || 'Unknown';
+
+                if (!airportData || !imageUrl) {
+                    const noPicEmbed = new EmbedBuilder()
+                        .setTitle(`🏢 Airport: ${icaoInput}`)
+                        .setColor(0x808080)
+                        .setDescription(`❌ No picture submitted yet for **${icaoInput}**.`);
+                    
+                    return interaction.editReply({ embeds: [noPicEmbed] });
+                }
+
+                const pullEmbed = new EmbedBuilder()
+                    .setTitle(`🏢 Airport Database Record`)
+                    .setColor(0x00FF00) 
+                    .setDescription(`**Status:** ✅ Verified / Live`) 
+                    .addFields(
+                        { name: 'ICAO Code', value: icaoInput, inline: true },
+                        { name: 'Contributor', value: contributor, inline: true }
+                    )
+                    .setImage(imageUrl);
+
+                await interaction.editReply({ embeds: [pullEmbed] });
+
+            } catch (e) { 
+                console.error("Airport Pull Error:", e);
+                const noPicEmbed = new EmbedBuilder()
+                    .setTitle(`🏢 Airport: ${icaoInput}`)
+                    .setColor(0x808080)
+                    .setDescription(`❌ No picture submitted yet for **${icaoInput}**.`);
+                
+                await interaction.editReply({ embeds: [noPicEmbed] });
             }
         }
 
