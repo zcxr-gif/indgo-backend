@@ -41,8 +41,8 @@ const PORT = process.env.PORT || 5000;
 // Middleware
 app.use(cors()); // Allow all origins
 // Increase limit for JSON body (trails can be large)
-app.use(express.json({ limit: '10mb' })); 
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.json({ limit: '100mb' })); 
+app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
 // Trust Proxy (Required if behind Nginx/Heroku/Cloudflare to get real IPs)
 app.set('trust proxy', 1);
@@ -114,7 +114,7 @@ const cloudWatchClient = new CloudWatchClient({
 // Configure Multer to store file in MEMORY temporarily
 const upload = multer({
     dest: os.tmpdir(), 
-    limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+    limits: { fileSize: 100 * 1024 * 1024 } // 10MB limit
 });
 
 // --- START THE BOT ---
