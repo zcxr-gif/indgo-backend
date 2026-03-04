@@ -66,6 +66,17 @@ const CommunityAircraftSchema = new mongoose.Schema({
 const CommunityAircraft = mongoose.model('CommunityAircraft', CommunityAircraftSchema);
 
 /* =========================
+ * NEW: GATES SCHEMA
+ * ========================= */
+const AirportGateSchema = new mongoose.Schema({
+    airportCode: { type: String, required: true, unique: true, index: true }, // e.g., "KJFK"
+    gates: { type: mongoose.Schema.Types.Mixed, required: true }, // Flexible to hold the specific gate array structure
+    updatedAt: { type: Date, default: Date.now }
+});
+
+const AirportGate = mongoose.model('AirportGate', AirportGateSchema);
+
+/* =========================
  * NEW: LEADERBOARD SCHEMA
  * ========================= */
 const DailyPilotStatsSchema = new mongoose.Schema({
@@ -190,8 +201,99 @@ app.get('/', (req, res) => {
     res.send('Community Aircraft Backend is Running.');
 });
 
+
 /* =========================
- * NEW: LEADERBOARD API
+ * GATES API (MONGODB INTEGRATION)
+ * ========================= */
+
+// POST: Import gates.json into MongoDB using fast Bulk Upsert
+app.post('/api/gates/import', upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ message: 'JSON file is required.' });
+        }
+
+        const rawData = fs.readFileSync(req.file.path, 'utf8');
+        const gatesData = JSON.parse(rawData);
+
+        // Clean up the temp file from disk immediately to save space
+        fs.unlink(req.file.path, () => {});
+
+        const bulkOps = [];
+
+        // Logic to dynamically handle different standard JSON map formats
+        if (Array.isArray(gatesData)) {
+            // If the JSON is an array of objects: [ { icao: "KJFK", gates: [...] } ]
+            for (const item of gatesData) {
+                const code = item.icao || item.airport || item.airportCode || item.id;
+                if (code) {
+                    bulkOps.push({
+                        updateOne: {
+                            filter: { airportCode: code.toUpperCase() },
+                            update: { $set: { gates: item.gates || item, updatedAt: new Date() } },
+                            upsert: true
+                        }
+                    });
+                }
+            }
+        } else {
+            // If the JSON is an object with airport codes as keys: { "KJFK": [...], "EGLL": [...] }
+            for (const [code, gates] of Object.entries(gatesData)) {
+                bulkOps.push({
+                    updateOne: {
+                        filter: { airportCode: code.toUpperCase() },
+                        update: { $set: { gates: gates, updatedAt: new Date() } },
+                        upsert: true
+                    }
+                });
+            }
+        }
+
+        if (bulkOps.length > 0) {
+            await AirportGate.bulkWrite(bulkOps);
+            res.json({ message: `✅ Successfully imported gates for ${bulkOps.length} airports into MongoDB.` });
+        } else {
+            res.status(400).json({ message: 'Could not parse airport codes from the provided JSON structure.' });
+        }
+
+    } catch (error) {
+        if (req.file) fs.unlink(req.file.path, () => {});
+        console.error('Gates Import Error:', error);
+        res.status(500).json({ message: 'Failed to import gates data to MongoDB.' });
+    }
+});
+
+// GET: Fetch gates for a specific airport (Optimized for constant calling)
+app.get('/api/gates/:icao', async (req, res) => {
+    try {
+        const airportCode = req.params.icao.toUpperCase();
+        const airportData = await AirportGate.findOne({ airportCode }).lean(); // .lean() makes query faster
+
+        if (!airportData) {
+            return res.status(404).json({ message: `No gates found for airport ${airportCode}` });
+        }
+
+        res.json(airportData.gates);
+    } catch (error) {
+        console.error('Gates Fetch Error:', error);
+        res.status(500).json({ message: 'Failed to fetch gates.' });
+    }
+});
+
+// GET: Fetch all gates (Use with caution if dataset is massive)
+app.get('/api/gates', async (req, res) => {
+    try {
+        const allGates = await AirportGate.find({}).lean();
+        res.json(allGates);
+    } catch (error) {
+        console.error('Global Gates Fetch Error:', error);
+        res.status(500).json({ message: 'Failed to fetch global gates dataset.' });
+    }
+});
+
+
+/* =========================
+ * LEADERBOARD API
  * ========================= */
 
 // POST: Track a view (Counts unique viewers per day)
@@ -277,7 +379,7 @@ app.get('/api/leaderboard/top', async (req, res) => {
 
 
 /* =========================
- * NEW: IMAGE PROXY FOR SCREENSHOTS
+ * IMAGE PROXY FOR SCREENSHOTS
  * ========================= */
 app.get('/api/image-proxy', async (req, res) => {
     const imageUrl = req.query.url;
@@ -313,7 +415,7 @@ app.get('/api/image-proxy', async (req, res) => {
 });
 
 /* =========================
- * NEW: FLIGHT TRAILS STORAGE
+ * FLIGHT TRAILS STORAGE
  * ========================= */
 
 // GET: Fetch a user's trails
@@ -816,7 +918,7 @@ app.delete('/api/aircraft/:id', async (req, res) => {
 });
 
 /* =========================
- * NEW: AIRPORT IMAGES API
+ * AIRPORT IMAGES API
  * ========================= */
 
 // POST: Upload Airport Image

@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Database Admin - Import Gates</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            background-color: #f4f4f9;
+            color: #333;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            max-width: 400px;
+            width: 100%;
+            text-align: center;
+        }
+        input[type="file"] {
+            margin: 20px 0;
+            padding: 10px;
+            border: 1px dashed #ccc;
+            width: 90%;
+            border-radius: 5px;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            font-size: 16px;
+            border-radius: 5px;
+            cursor: pointer;
+            width: 100%;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        #status {
+            margin-top: 20px;
+            font-weight: bold;
+            font-size: 14px;
+            word-wrap: break-word;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Upload Gates to MongoDB</h2>
+    <p>Select your <code>gates.json</code> file to parse and upload to the database.</p>
+    
+    <input type="file" id="fileInput" accept=".json" />
+    <button id="uploadBtn" onclick="uploadGates()">Import into Database</button>
+    
+    <div id="status"></div>
+</div>
+
+<script>
+    async function uploadGates() {
+        const fileInput = document.getElementById('fileInput');
+        const statusDiv = document.getElementById('status');
+        const button = document.getElementById('uploadBtn');
+
+        if (fileInput.files.length === 0) {
+            statusDiv.style.color = "red";
+            statusDiv.innerText = "Please select a file first.";
+            return;
+        }
+
+        const file = fileInput.files[0];
+        const formData = new FormData();
+        formData.append('file', file);
+
+        statusDiv.style.color = "black";
+        statusDiv.innerText = "Uploading and processing... This may take a moment for large files.";
+        button.disabled = true;
+
+        try {
+            // Adjust the URL if your server is hosted elsewhere (e.g., https://api.yourdomain.com/api/gates/import)
+            const response = await fetch('http://localhost:5000/api/gates/import', {
+                method: 'POST',
+                body: formData
+            });
+
+            const result = await response.json();
+
+            if (response.ok) {
+                statusDiv.style.color = "green";
+                statusDiv.innerText = result.message; // Will print the success message from your backend
+            } else {
+                statusDiv.style.color = "red";
+                statusDiv.innerText = "Error: " + result.message;
+            }
+        } catch (error) {
+            statusDiv.style.color = "red";
+            statusDiv.innerText = "Network Error: Could not connect to the server. Is it running?";
+            console.error(error);
+        } finally {
+            button.disabled = false;
+        }
+    }
+</script>
+
+</body>
+</html>
