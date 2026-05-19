@@ -51,7 +51,7 @@ const { DeleteObjectCommand, CopyObjectCommand } = require('@aws-sdk/client-s3')
  */
 const deleteAirportImages = async (s3Client, icao) => {
     const bucketName = process.env.AWS_S3_BUCKET_NAME;
-    const prefix = `airports/${icao.toUpperCase().trim()}`;
+    const prefix = `airports/${icao.toUpperCase().trim()}-`;
 
     // 1. Find all objects for this ICAO
     const listCmd = new ListObjectsV2Command({ Bucket: bucketName, Prefix: prefix });
@@ -100,7 +100,7 @@ const updateAirportMetadata = async (s3Client, icao, newContributor) => {
  */
 const getAirportInfo = async (s3Client, icao) => {
     const bucketName = process.env.AWS_S3_BUCKET_NAME;
-    const prefix = `airports/${icao.toUpperCase().trim()}`;
+    const prefix = `airports/${icao.toUpperCase().trim()}-`;
 
     const listCmd = new ListObjectsV2Command({
         Bucket: bucketName,

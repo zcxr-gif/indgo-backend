@@ -168,6 +168,8 @@ const fetchAircraftMetadata = async () => {
     }
 };
 
+const LIVERY_CACHE_MAX = 200; // hard cap so the janitor isn't the only thing keeping us bounded
+
 const fetchLiveriesForAircraft = async (aircraftId) => {
     const now = Date.now();
     if (cachedLiveries[aircraftId] && (now - cachedLiveries[aircraftId].timestamp < 300000)) {
@@ -182,6 +184,21 @@ const fetchLiveriesForAircraft = async (aircraftId) => {
             liveryList = response.data.liveries.map(l => l.name).sort();
         }
         cachedLiveries[aircraftId] = { timestamp: now, data: liveryList };
+
+        // Evict the oldest entry if we're over the cap.
+        const keys = Object.keys(cachedLiveries);
+        if (keys.length > LIVERY_CACHE_MAX) {
+            let oldestKey = keys[0];
+            let oldestTs = cachedLiveries[oldestKey].timestamp;
+            for (const k of keys) {
+                if (cachedLiveries[k].timestamp < oldestTs) {
+                    oldestKey = k;
+                    oldestTs = cachedLiveries[k].timestamp;
+                }
+            }
+            delete cachedLiveries[oldestKey];
+        }
+
         return liveryList;
     } catch (error) {
         console.error(`❌ Failed to fetch liveries for ID ${aircraftId}:`, error.message);
@@ -316,30 +333,53 @@ const normalizeData = async (rawType, rawLivery) => {
 
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) => {
 
-    const client = new Client({ 
-        makeCache: Options.cacheEverything({
-            MessageManager: 50, 
-            UserManager: 100,  
+    // NOTE: `Options.cacheEverything()` is the *opposite* of what we want — it
+    // caches everything with no caps and silently ignores the limits passed to
+    // it. `cacheWithLimits` is the API that actually honours these numbers and
+    // keeps memory bounded.
+    const client = new Client({
+        makeCache: Options.cacheWithLimits({
+            ...Options.DefaultMakeCacheSettings,
+            MessageManager: 50,
+            UserManager: 100,
             GuildMemberManager: 100,
             ThreadManager: 10,
+            PresenceManager: 0,
+            VoiceStateManager: 0,
+            GuildEmojiManager: 0,
+            GuildStickerManager: 0,
+            ReactionManager: 0,
+            ReactionUserManager: 0,
+            StageInstanceManager: 0,
+            GuildInviteManager: 0,
+            GuildScheduledEventManager: 0,
+            AutoModerationRuleManager: 0,
+            BaseGuildEmojiManager: 0
         }),
         sweepers: {
-            messages: {
-                interval: 300, 
-                lifetime: 900, 
-            },
+            ...Options.DefaultSweeperSettings,
+            messages: { interval: 300, lifetime: 900 },
             users: {
-                interval: 3600, 
-                filter: () => user => user.id !== client.user.id, 
+                interval: 3600,
+                filter: () => user => user.id !== client.user.id
             },
+            threads: { interval: 3600, lifetime: 3600 }
         },
         intents: [
             GatewayIntentBits.Guilds,
             GatewayIntentBits.GuildMessages,
-            GatewayIntentBits.GuildMembers, 
-            GatewayIntentBits.MessageContent 
-        ] 
+            GatewayIntentBits.GuildMembers,
+            GatewayIntentBits.MessageContent
+        ]
     });
+
+    // Discord client error surface — without these, transport errors bubble up
+    // as unhandled rejections and (without the process-level guards in server.js)
+    // would take down the whole API.
+    client.on('error', (err) => console.error('🤖 Discord client error:', err && err.message ? err.message : err));
+    client.on('shardError', (err) => console.error('🤖 Discord shard error:', err && err.message ? err.message : err));
+    client.on('warn', (msg) => console.warn('🤖 Discord warn:', msg));
+    client.on('invalidated', () => console.error('🤖 Discord session invalidated — login required.'));
 
     // --- HELPER: LOG MODERATION ACTION ---
     const logModAction = async (actionType, executor, target, reason, details = '') => {
@@ -978,6 +1018,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
     });
 
     client.on('messageCreate', async (message) => {
+      try {
         if (message.author.bot) return;
 
         // --- CHECK CHANNELS ---
@@ -1052,9 +1093,13 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 await message.reply({ embeds: [promptEmbed], components: [row] });
             }
         }
+      } catch (err) {
+        console.error('🛑 messageCreate handler error:', err && err.stack ? err.stack : err);
+      }
     });
 
 client.on('interactionCreate', async (interaction) => {
+      try {
         // --- 1. AUTOCOMPLETE HANDLERS ---
         if (interaction.isAutocomplete()) {
             const focused = interaction.options.getFocused(true);
@@ -1550,27 +1595,38 @@ client.on('interactionCreate', async (interaction) => {
             await interaction.deferReply();
 
             try {
-                const guildMembers = await interaction.guild.members.fetch();
-                
+                // Only pull the fields we need to keep memory small on large guilds.
                 const legacyRecords = await CommunityAircraftModel.find({
                     $or: [{ contributorId: { $exists: false } }, { contributorId: null }]
-                });
+                }).select('contributorName').lean();
 
                 if (legacyRecords.length === 0) {
                     return interaction.editReply("✅ Database is fully linked! No legacy records found.");
                 }
 
                 const uniqueNames = [...new Set(legacyRecords.map(r => r.contributorName))];
-                
+
+                // Resolve each legacy name via search() instead of fetching the
+                // whole roster — Discord's `members.fetch()` pulls every member
+                // into RAM, which blew up memory on larger servers.
+                const resolveMember = async (name) => {
+                    try {
+                        const results = await interaction.guild.members.search({ query: name, limit: 5 });
+                        return results.find(m =>
+                            m.user.username.toLowerCase() === name.toLowerCase() ||
+                            m.displayName.toLowerCase() === name.toLowerCase()
+                        );
+                    } catch (e) {
+                        return null;
+                    }
+                };
+
                 let linkedCount = 0;
                 let failedCount = 0;
                 let log = [];
 
                 for (const name of uniqueNames) {
-                    const match = guildMembers.find(m => 
-                        m.user.username.toLowerCase() === name.toLowerCase() ||
-                        m.displayName.toLowerCase() === name.toLowerCase()
-                    );
+                    const match = await resolveMember(name);
 
                     if (match) {
                         const res = await CommunityAircraftModel.updateMany(
@@ -1744,10 +1800,27 @@ client.on('interactionCreate', async (interaction) => {
                 await interaction.reply({ embeds: [new EmbedBuilder().setTitle('📊 Database Stats').setColor(0x00FF99).setDescription(`Tracked **${count}** aircraft.`)] });
             } catch (e) { await interaction.reply('Error.'); }
         }
+      } catch (err) {
+        // Top-level guard: any uncaught throw inside the interaction handler
+        // used to bubble out as an unhandled rejection and (combined with the
+        // bot living in the same process as Express) crash the API.
+        console.error('🛑 interactionCreate handler error:', err && err.stack ? err.stack : err);
+        try {
+            if (interaction.isRepliable && interaction.isRepliable()) {
+                if (interaction.deferred || interaction.replied) {
+                    await interaction.followUp({ content: '⚠️ Something went wrong handling that.', ephemeral: true }).catch(() => {});
+                } else {
+                    await interaction.reply({ content: '⚠️ Something went wrong handling that.', ephemeral: true }).catch(() => {});
+                }
+            }
+        } catch (_) { /* swallow — we already logged */ }
+      }
     });
 
     if (process.env.DISCORD_BOT_TOKEN) {
-        client.login(process.env.DISCORD_BOT_TOKEN);
+        client.login(process.env.DISCORD_BOT_TOKEN).catch((err) => {
+            console.error('🤖 Discord login failed (continuing without bot):', err && err.message ? err.message : err);
+        });
     } else {
         console.log('⚠️ DISCORD_BOT_TOKEN missing.');
     }
