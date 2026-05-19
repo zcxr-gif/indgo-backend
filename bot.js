@@ -168,6 +168,8 @@ const fetchAircraftMetadata = async () => {
     }
 };
 
+const LIVERY_CACHE_MAX = 200; // hard cap so the janitor isn't the only thing keeping us bounded
+
 const fetchLiveriesForAircraft = async (aircraftId) => {
     const now = Date.now();
     if (cachedLiveries[aircraftId] && (now - cachedLiveries[aircraftId].timestamp < 300000)) {
@@ -182,6 +184,21 @@ const fetchLiveriesForAircraft = async (aircraftId) => {
             liveryList = response.data.liveries.map(l => l.name).sort();
         }
         cachedLiveries[aircraftId] = { timestamp: now, data: liveryList };
+
+        // Evict the oldest entry if we're over the cap.
+        const keys = Object.keys(cachedLiveries);
+        if (keys.length > LIVERY_CACHE_MAX) {
+            let oldestKey = keys[0];
+            let oldestTs = cachedLiveries[oldestKey].timestamp;
+            for (const k of keys) {
+                if (cachedLiveries[k].timestamp < oldestTs) {
+                    oldestKey = k;
+                    oldestTs = cachedLiveries[k].timestamp;
+                }
+            }
+            delete cachedLiveries[oldestKey];
+        }
+
         return liveryList;
     } catch (error) {
         console.error(`❌ Failed to fetch liveries for ID ${aircraftId}:`, error.message);
@@ -314,32 +331,56 @@ const normalizeData = async (rawType, rawLivery) => {
     return { type: finalType, livery: finalLivery };
 };
 
-const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) => {
+const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, models = {}) => {
+    const { DailyPilotStats } = models;
 
-    const client = new Client({ 
-        makeCache: Options.cacheEverything({
-            MessageManager: 50, 
-            UserManager: 100,  
+    // NOTE: `Options.cacheEverything()` is the *opposite* of what we want — it
+    // caches everything with no caps and silently ignores the limits passed to
+    // it. `cacheWithLimits` is the API that actually honours these numbers and
+    // keeps memory bounded.
+    const client = new Client({
+        makeCache: Options.cacheWithLimits({
+            ...Options.DefaultMakeCacheSettings,
+            MessageManager: 50,
+            UserManager: 100,
             GuildMemberManager: 100,
             ThreadManager: 10,
+            PresenceManager: 0,
+            VoiceStateManager: 0,
+            GuildEmojiManager: 0,
+            GuildStickerManager: 0,
+            ReactionManager: 0,
+            ReactionUserManager: 0,
+            StageInstanceManager: 0,
+            GuildInviteManager: 0,
+            GuildScheduledEventManager: 0,
+            AutoModerationRuleManager: 0,
+            BaseGuildEmojiManager: 0
         }),
         sweepers: {
-            messages: {
-                interval: 300, 
-                lifetime: 900, 
-            },
+            ...Options.DefaultSweeperSettings,
+            messages: { interval: 300, lifetime: 900 },
             users: {
-                interval: 3600, 
-                filter: () => user => user.id !== client.user.id, 
+                interval: 3600,
+                filter: () => user => user.id !== client.user.id
             },
+            threads: { interval: 3600, lifetime: 3600 }
         },
         intents: [
             GatewayIntentBits.Guilds,
             GatewayIntentBits.GuildMessages,
-            GatewayIntentBits.GuildMembers, 
-            GatewayIntentBits.MessageContent 
-        ] 
+            GatewayIntentBits.GuildMembers,
+            GatewayIntentBits.MessageContent
+        ]
     });
+
+    // Discord client error surface — without these, transport errors bubble up
+    // as unhandled rejections and (without the process-level guards in server.js)
+    // would take down the whole API.
+    client.on('error', (err) => console.error('🤖 Discord client error:', err && err.message ? err.message : err));
+    client.on('shardError', (err) => console.error('🤖 Discord shard error:', err && err.message ? err.message : err));
+    client.on('warn', (msg) => console.warn('🤖 Discord warn:', msg));
+    client.on('invalidated', () => console.error('🤖 Discord session invalidated — login required.'));
 
     // --- HELPER: LOG MODERATION ACTION ---
     const logModAction = async (actionType, executor, target, reason, details = '') => {
@@ -483,11 +524,16 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                     { name: 'Aircraft Type', value: tp, inline: true },
                     { name: 'Livery', value: l, inline: true },
                     { name: 'Tail Number', value: t.toUpperCase(), inline: true },
-                );
+                )
+                // Reference the attached preview.webp file so the image lives
+                // *inside* the embed. Without this, edits via editReply (which
+                // drops re-attached files) leave a fields-only embed with no
+                // visible preview.
+                .setImage('attachment://preview.webp');
 
             if (isDup) {
                 embed.setTitle('⚠️ Existing Entry Detected');
-                embed.setColor(0xFFA500); 
+                embed.setColor(0xFFA500);
                 embed.setDescription(`**Note:** We already have a photo for **${tp}** in **${l}** livery.\nThis will generally be treated as a **replacement**.`);
             } else {
                 embed.setTitle('📝 Review Your Submission');
@@ -893,10 +939,30 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                      .setDescription('User to inspect')
                 ),
                 
-            // NEW: The Live Bounty Board 
+            // NEW: The Live Bounty Board
             new SlashCommandBuilder()
                 .setName('bounty_board')
                 .setDescription('View the live, sortable list of aircraft pictures needing updates'),
+
+            // Top tracked pilots today (from the tracker view counter).
+            new SlashCommandBuilder()
+                .setName('most_watched')
+                .setDescription('See the top 5 most-tracked pilots on Inflight today'),
+
+            // Pull a random aircraft from the DB.
+            new SlashCommandBuilder()
+                .setName('random')
+                .setDescription('Pull a random aircraft photo from the database'),
+
+            // Show the latest submissions.
+            new SlashCommandBuilder()
+                .setName('recent')
+                .setDescription('Show the 5 most recent aircraft submissions'),
+
+            // Lists every public-facing command grouped by category.
+            new SlashCommandBuilder()
+                .setName('help')
+                .setDescription('Show what this bot can do'),
 
             // System Admin Commands
             new SlashCommandBuilder().setName('migrate_legacy').setDescription('[SYSTEM] Auto-match legacy DB names to current Discord Users').setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
@@ -978,6 +1044,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
     });
 
     client.on('messageCreate', async (message) => {
+      try {
         if (message.author.bot) return;
 
         // --- CHECK CHANNELS ---
@@ -1052,9 +1119,13 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region) =
                 await message.reply({ embeds: [promptEmbed], components: [row] });
             }
         }
+      } catch (err) {
+        console.error('🛑 messageCreate handler error:', err && err.stack ? err.stack : err);
+      }
     });
 
 client.on('interactionCreate', async (interaction) => {
+      try {
         // --- 1. AUTOCOMPLETE HANDLERS ---
         if (interaction.isAutocomplete()) {
             const focused = interaction.options.getFocused(true);
@@ -1332,7 +1403,42 @@ client.on('interactionCreate', async (interaction) => {
                 fields.find(f => f.name === 'Tail Number').value = newTail.toUpperCase();
                 fields.find(f => f.name === 'Aircraft Type').value = newType;
                 fields.find(f => f.name === 'Livery').value = newLivery;
-                await interaction.editReply({ embeds: [newEmbed.setFields(fields)] });
+                newEmbed.setFields(fields);
+
+                // Re-run the duplicate check so an admin edit that now matches
+                // an existing record gets the replacement banner + comparison
+                // embed, and an edit away from a duplicate clears them.
+                const embedsToSend = [newEmbed];
+                try {
+                    const existingEntry = await CommunityAircraftModel.findOne({
+                        aircraftType: { $regex: new RegExp(`^${escapeRegex(newType)}$`, "i") },
+                        liveryName: { $regex: new RegExp(`^${escapeRegex(newLivery)}$`, "i") }
+                    });
+
+                    if (existingEntry) {
+                        newEmbed.setTitle('⚠️ REPLACEMENT REQUEST');
+                        newEmbed.setColor(0xFFA500);
+                        newEmbed.setDescription(`**Admin Notice:** Matches existing **${newType} / ${newLivery}**.\nApproving this will **REPLACE** the old image (shown below).`);
+
+                        if (existingEntry.imageUrl) {
+                            embedsToSend.push(new EmbedBuilder()
+                                .setTitle('📉 Current Database Image')
+                                .setDescription(`**Current Contributor:** ${existingEntry.contributorName || 'Unknown'}\n**Tail:** ${existingEntry.tailNumber || 'Unknown'}`)
+                                .setColor(0x2B2D31)
+                                .setImage(existingEntry.imageUrl)
+                                .setFooter({ text: 'If you approve the new submission, this image will be deleted/overwritten.' }));
+                        }
+                    } else {
+                        newEmbed.setTitle('📋 New Submission Request');
+                        newEmbed.setColor(0x00FF00);
+                        // Strip any leftover replacement description from a prior state.
+                        newEmbed.setDescription(null);
+                    }
+                } catch (e) {
+                    console.error('Admin edit duplicate re-check failed:', e);
+                }
+
+                await interaction.editReply({ embeds: embedsToSend });
                 return;
             }
 
@@ -1364,15 +1470,36 @@ client.on('interactionCreate', async (interaction) => {
             if (customId === 'airport_modal') {
                 await interaction.deferReply({ ephemeral: true });
                 const icao = interaction.fields.getTextInputValue('a_icao').toUpperCase().trim();
-                const originalMsg = await interaction.channel.messages.fetch(interaction.message.reference.messageId);
-                const photoUrl = originalMsg.attachments.first().url;
-                const publicMsg = await (await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID)).send({ embeds: [new EmbedBuilder().setTitle('🏢 New Airport Submission').setColor(0xFFFF00).setImage(photoUrl).addFields({ name: 'ICAO', value: icao })] });
-                
-                const adminEmbed = new EmbedBuilder().setTitle('🏢 Airport Review').setColor(0x0099FF).setImage(photoUrl).addFields({ name: 'ICAO', value: icao }).setFooter({ text: `User: ${interaction.user.id} | Msg: ${publicMsg.id} | Ch: ${interaction.channelId}` });
-                const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`approve_apt_${interaction.user.id}_${icao}`).setLabel('Approve').setStyle(ButtonStyle.Success), new ButtonBuilder().setCustomId(`reject_apt_${interaction.user.id}`).setLabel('Reject').setStyle(ButtonStyle.Danger));
-                await (await client.channels.fetch(AIRPORT_ADMIN_CHANNEL_ID)).send({ embeds: [adminEmbed], components: [row] });
-                await interaction.editReply("✅ Sent for review.");
-                try { await interaction.message.delete(); } catch(e) {}
+
+                // Defensive: the prompt message we replied to may have been
+                // deleted (or never had a reference in the first place).
+                // Without these guards a single missing attachment threw an
+                // uncaught error and the user saw a frozen spinner.
+                const referencedId = interaction.message?.reference?.messageId;
+                if (!referencedId) {
+                    return interaction.editReply("❌ I couldn't find the original photo message — please re-upload.");
+                }
+                const originalMsg = await interaction.channel.messages.fetch(referencedId).catch(() => null);
+                const photo = originalMsg?.attachments?.first();
+                if (!photo) {
+                    return interaction.editReply("❌ The original photo is no longer available. Please re-upload.");
+                }
+                const photoUrl = photo.url;
+
+                try {
+                    const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
+                    const publicMsg = await feedChannel.send({ embeds: [new EmbedBuilder().setTitle('🏢 New Airport Submission').setColor(0xFFFF00).setImage(photoUrl).addFields({ name: 'ICAO', value: icao })] });
+
+                    const adminEmbed = new EmbedBuilder().setTitle('🏢 Airport Review').setColor(0x0099FF).setImage(photoUrl).addFields({ name: 'ICAO', value: icao }).setFooter({ text: `User: ${interaction.user.id} | Msg: ${publicMsg.id} | Ch: ${interaction.channelId}` });
+                    const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`approve_apt_${interaction.user.id}_${icao}`).setLabel('Approve').setStyle(ButtonStyle.Success), new ButtonBuilder().setCustomId(`reject_apt_${interaction.user.id}`).setLabel('Reject').setStyle(ButtonStyle.Danger));
+                    const adminChannel = await client.channels.fetch(AIRPORT_ADMIN_CHANNEL_ID);
+                    await adminChannel.send({ embeds: [adminEmbed], components: [row] });
+                    await interaction.editReply("✅ Sent for review.");
+                    try { await interaction.message.delete(); } catch(e) {}
+                } catch (err) {
+                    console.error('Airport submission send failed:', err);
+                    await interaction.editReply("❌ Couldn't post for review. Please try again or contact an admin.");
+                }
                 return;
             }
 
@@ -1550,27 +1677,38 @@ client.on('interactionCreate', async (interaction) => {
             await interaction.deferReply();
 
             try {
-                const guildMembers = await interaction.guild.members.fetch();
-                
+                // Only pull the fields we need to keep memory small on large guilds.
                 const legacyRecords = await CommunityAircraftModel.find({
                     $or: [{ contributorId: { $exists: false } }, { contributorId: null }]
-                });
+                }).select('contributorName').lean();
 
                 if (legacyRecords.length === 0) {
                     return interaction.editReply("✅ Database is fully linked! No legacy records found.");
                 }
 
                 const uniqueNames = [...new Set(legacyRecords.map(r => r.contributorName))];
-                
+
+                // Resolve each legacy name via search() instead of fetching the
+                // whole roster — Discord's `members.fetch()` pulls every member
+                // into RAM, which blew up memory on larger servers.
+                const resolveMember = async (name) => {
+                    try {
+                        const results = await interaction.guild.members.search({ query: name, limit: 5 });
+                        return results.find(m =>
+                            m.user.username.toLowerCase() === name.toLowerCase() ||
+                            m.displayName.toLowerCase() === name.toLowerCase()
+                        );
+                    } catch (e) {
+                        return null;
+                    }
+                };
+
                 let linkedCount = 0;
                 let failedCount = 0;
                 let log = [];
 
                 for (const name of uniqueNames) {
-                    const match = guildMembers.find(m => 
-                        m.user.username.toLowerCase() === name.toLowerCase() ||
-                        m.displayName.toLowerCase() === name.toLowerCase()
-                    );
+                    const match = await resolveMember(name);
 
                     if (match) {
                         const res = await CommunityAircraftModel.updateMany(
@@ -1744,10 +1882,167 @@ client.on('interactionCreate', async (interaction) => {
                 await interaction.reply({ embeds: [new EmbedBuilder().setTitle('📊 Database Stats').setColor(0x00FF99).setDescription(`Tracked **${count}** aircraft.`)] });
             } catch (e) { await interaction.reply('Error.'); }
         }
+
+        if (interaction.commandName === 'most_watched') {
+            await interaction.deferReply();
+            if (!DailyPilotStats) {
+                return interaction.editReply('❌ Leaderboard is not available right now.');
+            }
+            try {
+                const date = new Date().toISOString().split('T')[0];
+                const top = await DailyPilotStats
+                    .find({ date })
+                    .sort({ viewCount: -1 })
+                    .limit(5)
+                    .select('pilotName viewCount -_id')
+                    .lean();
+
+                if (!top.length) {
+                    return interaction.editReply({ embeds: [new EmbedBuilder().setTitle('📡 Most-Watched Pilots').setColor(0x5865F2).setDescription('Nobody has been tracked yet today. Open the tracker to start!')] });
+                }
+
+                const medals = ['🥇', '🥈', '🥉', '#4', '#5'];
+                const description = top.map((p, i) => `${medals[i]} **${p.pilotName}** — ${p.viewCount} ${p.viewCount === 1 ? 'view' : 'views'}`).join('\n');
+                const embed = new EmbedBuilder()
+                    .setTitle('📡 Most-Watched Pilots Today')
+                    .setColor(0x5865F2)
+                    .setDescription(description)
+                    .setFooter({ text: 'Updates live as people tune in on Inflight.' })
+                    .setTimestamp();
+                await interaction.editReply({ embeds: [embed] });
+            } catch (e) {
+                console.error('most_watched error:', e);
+                await interaction.editReply('⚠️ Failed to load the leaderboard.');
+            }
+        }
+
+        if (interaction.commandName === 'random') {
+            await interaction.deferReply();
+            try {
+                // $sample is the only way to get a true random doc without
+                // pulling the whole collection into memory.
+                const [pick] = await CommunityAircraftModel.aggregate([
+                    { $match: { imageUrl: { $ne: null } } },
+                    { $sample: { size: 1 } }
+                ]);
+
+                if (!pick) {
+                    return interaction.editReply('📭 No aircraft in the database yet.');
+                }
+
+                const embed = new EmbedBuilder()
+                    .setTitle(`🎲 ${pick.tailNumber || 'Unknown'}`)
+                    .setColor(0x9B59B6)
+                    .addFields(
+                        { name: 'Aircraft', value: pick.aircraftType || 'Unknown', inline: true },
+                        { name: 'Livery', value: pick.liveryName || 'Unknown', inline: true },
+                        { name: 'Contributor', value: pick.contributorName || 'Unknown', inline: true }
+                    )
+                    .setImage(pick.imageUrl)
+                    .setTimestamp(pick.uploadedAt);
+                await interaction.editReply({ embeds: [embed] });
+            } catch (e) {
+                console.error('random error:', e);
+                await interaction.editReply('⚠️ Could not fetch a random aircraft.');
+            }
+        }
+
+        if (interaction.commandName === 'recent') {
+            await interaction.deferReply();
+            try {
+                const recents = await CommunityAircraftModel
+                    .find({ imageUrl: { $ne: null } })
+                    .sort({ uploadedAt: -1 })
+                    .limit(5)
+                    .lean();
+
+                if (!recents.length) {
+                    return interaction.editReply('📭 No submissions yet.');
+                }
+
+                const lines = recents.map(r => {
+                    const ts = Math.floor(new Date(r.uploadedAt).getTime() / 1000);
+                    return `**${r.tailNumber || '???'}** — ${r.aircraftType || 'Unknown'} / ${r.liveryName || 'Unknown'} (<t:${ts}:R>)`;
+                });
+
+                const embed = new EmbedBuilder()
+                    .setTitle('🕒 Most Recent Submissions')
+                    .setColor(0x00FF99)
+                    .setDescription(lines.join('\n'))
+                    .setImage(recents[0].imageUrl)
+                    .setFooter({ text: `Newest photo: ${recents[0].tailNumber}` });
+                await interaction.editReply({ embeds: [embed] });
+            } catch (e) {
+                console.error('recent error:', e);
+                await interaction.editReply('⚠️ Could not load recent submissions.');
+            }
+        }
+
+        if (interaction.commandName === 'help') {
+            const embed = new EmbedBuilder()
+                .setTitle('🤖 Inflight Bot — Command Guide')
+                .setColor(0x0099FF)
+                .setDescription('Everything this bot can do, grouped by purpose.')
+                .addFields(
+                    {
+                        name: '📸 Submissions',
+                        value: [
+                            '`/submit` — submit a new aircraft photo',
+                            'Or drop a photo directly in the submission channels and follow the prompts.'
+                        ].join('\n')
+                    },
+                    {
+                        name: '🔍 Database',
+                        value: [
+                            '`/lookup` — find an aircraft by tail, livery, or type',
+                            '`/pull` — fetch a specific aircraft by type + livery',
+                            '`/pull_airport` — fetch an airport photo by ICAO',
+                            '`/random` — pull a random aircraft',
+                            '`/recent` — last 5 submissions',
+                            '`/stats` — database size'
+                        ].join('\n')
+                    },
+                    {
+                        name: '✈️ Live Flights',
+                        value: [
+                            '`/track` — track a live flight on Expert Server',
+                            '`/most_watched` — top 5 tracked pilots today',
+                            '`/links` — tracker, forum & livery DB links'
+                        ].join('\n')
+                    },
+                    {
+                        name: '👤 Contributors',
+                        value: [
+                            '`/profile` — quick contribution stats',
+                            '`/hangar` — detailed breakdown of a user\'s hangar',
+                            '`/bounty_board` — aircraft still needing better photos'
+                        ].join('\n')
+                    }
+                )
+                .setFooter({ text: 'Mod commands (mod_*) are restricted to staff.' });
+            await interaction.reply({ embeds: [embed], ephemeral: true });
+        }
+      } catch (err) {
+        // Top-level guard: any uncaught throw inside the interaction handler
+        // used to bubble out as an unhandled rejection and (combined with the
+        // bot living in the same process as Express) crash the API.
+        console.error('🛑 interactionCreate handler error:', err && err.stack ? err.stack : err);
+        try {
+            if (interaction.isRepliable && interaction.isRepliable()) {
+                if (interaction.deferred || interaction.replied) {
+                    await interaction.followUp({ content: '⚠️ Something went wrong handling that.', ephemeral: true }).catch(() => {});
+                } else {
+                    await interaction.reply({ content: '⚠️ Something went wrong handling that.', ephemeral: true }).catch(() => {});
+                }
+            }
+        } catch (_) { /* swallow — we already logged */ }
+      }
     });
 
     if (process.env.DISCORD_BOT_TOKEN) {
-        client.login(process.env.DISCORD_BOT_TOKEN);
+        client.login(process.env.DISCORD_BOT_TOKEN).catch((err) => {
+            console.error('🤖 Discord login failed (continuing without bot):', err && err.message ? err.message : err);
+        });
     } else {
         console.log('⚠️ DISCORD_BOT_TOKEN missing.');
     }

@@ -30,6 +30,16 @@ const os = require('os');
 
 // MEMORY FIX: Disable Sharp's internal cache to prevent RAM balloons
 sharp.cache(false);
+sharp.concurrency(1);
+
+// STABILITY: Keep the backend alive when the bot (or anything else) misbehaves.
+// Without these, a single rejected promise inside discord.js takes down the API.
+process.on('unhandledRejection', (reason) => {
+    console.error('⚠️  Unhandled Rejection:', reason && reason.stack ? reason.stack : reason);
+});
+process.on('uncaughtException', (err) => {
+    console.error('⚠️  Uncaught Exception:', err && err.stack ? err.stack : err);
+});
 
 // IMPORT THE BOT
 const { startDiscordBot } = require('./bot');
@@ -55,13 +65,20 @@ mongoose.connect(process.env.MONGO_URI)
 const CommunityAircraftSchema = new mongoose.Schema({
     contributorName: { type: String, default: "System" }, // Default to system for pre-filled
     contributorId: { type: String, required: false },
-    aircraftType: { type: String, required: true },    
-    liveryName: { type: String, required: true },      
+    aircraftType: { type: String, required: true },
+    liveryName: { type: String, required: true },
     tailNumber: { type: String, required: true, unique: true }, // Ensure no duplicates
     imageUrl: { type: String, required: false, default: null }, // Now optional
     needsUpdate: { type: Boolean, default: false }, // NEW: Flag for image updates
     uploadedAt: { type: Date, default: Date.now }
 });
+
+// Indexes: every hot query path now hits an index instead of scanning.
+CommunityAircraftSchema.index({ contributorId: 1 });
+CommunityAircraftSchema.index({ contributorName: 1 });
+CommunityAircraftSchema.index({ aircraftType: 1, liveryName: 1 });
+CommunityAircraftSchema.index({ needsUpdate: 1 });
+CommunityAircraftSchema.index({ uploadedAt: -1 });
 
 const CommunityAircraft = mongoose.model('CommunityAircraft', CommunityAircraftSchema);
 
@@ -77,21 +94,63 @@ const AirportGateSchema = new mongoose.Schema({
 const AirportGate = mongoose.model('AirportGate', AirportGateSchema);
 
 /* =========================
- * NEW: LEADERBOARD SCHEMA
+ * LEADERBOARD SCHEMAS
+ *
+ * Old design (replaced): single doc per pilot/day with a `uniqueViewers` array
+ * of hashed IPs. Every track call did `array.includes()` then rewrote the whole
+ * doc. Doc size + CPU grew linearly with traffic for popular pilots.
+ *
+ * New design: two collections backed by MongoDB indexes/TTL.
+ *  - DailyPilotView    : one tiny doc per (date, pilot, viewer). Compound unique
+ *                        index makes "has this viewer seen this pilot today?" an
+ *                        O(1) insert that either succeeds or duplicate-keys.
+ *                        TTL on `createdAt` auto-deletes after 24h.
+ *  - DailyPilotStats   : one tiny doc per (date, pilot) holding the counter.
+ *                        `$inc` is atomic — no full-doc rewrites. TTL on
+ *                        `createdAt` keeps history for 7 days.
  * ========================= */
+const VIEW_TTL_SECONDS = 60 * 60 * 24;            // 24h for individual view records
+const STATS_TTL_SECONDS = 60 * 60 * 24 * 7;       // 7d of daily aggregates
+
+const DailyPilotViewSchema = new mongoose.Schema({
+    date: { type: String, required: true },        // YYYY-MM-DD
+    pilotUserId: { type: String, required: true },
+    viewerHash: { type: String, required: true },
+    createdAt: { type: Date, default: Date.now }
+});
+DailyPilotViewSchema.index({ date: 1, pilotUserId: 1, viewerHash: 1 }, { unique: true });
+DailyPilotViewSchema.index({ createdAt: 1 }, { expireAfterSeconds: VIEW_TTL_SECONDS });
+
+const DailyPilotView = mongoose.model('DailyPilotView', DailyPilotViewSchema);
+
 const DailyPilotStatsSchema = new mongoose.Schema({
-    date: { type: String, required: true }, // Format: YYYY-MM-DD
+    date: { type: String, required: true },
     pilotUserId: { type: String, required: true },
     pilotName: { type: String, required: true },
     viewCount: { type: Number, default: 0 },
-    // We store hashed IPs to ensure unique views per day
-    uniqueViewers: { type: [String], default: [] } 
+    createdAt: { type: Date, default: Date.now }
 });
-
-// Create a compound index for fast lookups
 DailyPilotStatsSchema.index({ date: 1, pilotUserId: 1 }, { unique: true });
+DailyPilotStatsSchema.index({ date: 1, viewCount: -1 });
+DailyPilotStatsSchema.index({ createdAt: 1 }, { expireAfterSeconds: STATS_TTL_SECONDS });
 
 const DailyPilotStats = mongoose.model('DailyPilotStats', DailyPilotStatsSchema);
+
+// One-time cleanup: nuke the legacy stats docs (they carried the uniqueViewers
+// array and an incompatible shape). Runs once per process start; harmless on
+// subsequent restarts when the collection is already empty.
+mongoose.connection.once('open', async () => {
+    try {
+        const result = await DailyPilotStats.collection.deleteMany({
+            $or: [{ uniqueViewers: { $exists: true } }, { createdAt: { $exists: false } }]
+        });
+        if (result.deletedCount > 0) {
+            console.log(`🧹 Cleared ${result.deletedCount} legacy DailyPilotStats docs.`);
+        }
+    } catch (e) {
+        console.error('Legacy stats cleanup failed (non-fatal):', e.message);
+    }
+});
 
 // 4. CONFIGURE AWS CLIENTS
 const s3Client = new S3Client({
@@ -114,16 +173,17 @@ const cloudWatchClient = new CloudWatchClient({
 // Configure Multer to store file in MEMORY temporarily
 const upload = multer({
     dest: os.tmpdir(), 
-    limits: { fileSize: 100 * 1024 * 1024 } // 10MB limit
+    limits: { fileSize: 100 * 1024 * 1024 } // 100MB limit
 });
 
 // --- START THE BOT ---
 // We pass the Model AND the S3 Client/Config to the bot
 startDiscordBot(
-    CommunityAircraft, 
-    s3Client, 
-    process.env.AWS_S3_BUCKET_NAME, 
-    process.env.AWS_REGION
+    CommunityAircraft,
+    s3Client,
+    process.env.AWS_S3_BUCKET_NAME,
+    process.env.AWS_REGION,
+    { DailyPilotStats, DailyPilotView }
 );
 // ---------------------
 
@@ -297,6 +357,10 @@ app.get('/api/gates', async (req, res) => {
  * ========================= */
 
 // POST: Track a view (Counts unique viewers per day)
+// Strategy: try to claim a (date, pilot, viewer) slot via insert. If the unique
+// index rejects the insert with E11000, this viewer already counted today and
+// we short-circuit. Otherwise, atomically `$inc` the stats counter — no
+// growing arrays, no full-doc rewrites, safe under concurrency.
 app.post('/api/leaderboard/track', async (req, res) => {
     try {
         const { pilotUserId, pilotName } = req.body;
@@ -308,49 +372,24 @@ app.post('/api/leaderboard/track', async (req, res) => {
         const viewerIp = req.ip || req.connection.remoteAddress;
         const viewerHash = hashIp(viewerIp);
 
-        // Find the record for this pilot today
-        const stats = await DailyPilotStats.findOne({ date, pilotUserId });
-
-        if (stats) {
-            // Check if this viewer has already viewed this pilot today
-            if (stats.uniqueViewers.includes(viewerHash)) {
-                // Already viewed, do not increment
+        try {
+            await DailyPilotView.create({ date, pilotUserId, viewerHash });
+        } catch (err) {
+            if (err && err.code === 11000) {
                 return res.json({ success: true, counted: false });
             }
-
-            // New unique viewer: Add hash and increment count
-            stats.uniqueViewers.push(viewerHash);
-            stats.viewCount += 1;
-            stats.pilotName = pilotName; 
-            await stats.save();
-        } else {
-            // No record found. Try to create a new one for today!
-            try {
-                await DailyPilotStats.create({
-                    date,
-                    pilotUserId,
-                    pilotName,
-                    viewCount: 1,
-                    uniqueViewers: [viewerHash]
-                });
-            } catch (createError) {
-                // RACE CONDITION CATCH: Code 11000 means another request just created it!
-                if (createError.code === 11000) {
-                    console.log(`Race condition avoided for pilot ${pilotUserId}`);
-                    // Fetch the newly created document and try updating it instead
-                    const retryStats = await DailyPilotStats.findOne({ date, pilotUserId });
-                    if (retryStats && !retryStats.uniqueViewers.includes(viewerHash)) {
-                        retryStats.uniqueViewers.push(viewerHash);
-                        retryStats.viewCount += 1;
-                        retryStats.pilotName = pilotName;
-                        await retryStats.save();
-                    }
-                } else {
-                    // If it's a different error, throw it so the outer catch handles it
-                    throw createError;
-                }
-            }
+            throw err;
         }
+
+        await DailyPilotStats.updateOne(
+            { date, pilotUserId },
+            {
+                $inc: { viewCount: 1 },
+                $set: { pilotName },
+                $setOnInsert: { createdAt: new Date() }
+            },
+            { upsert: true }
+        );
 
         res.json({ success: true, counted: true });
     } catch (error) {
@@ -366,9 +405,10 @@ app.get('/api/leaderboard/top', async (req, res) => {
 
         const topPilots = await DailyPilotStats
             .find({ date })
-            .sort({ viewCount: -1 }) // Highest views first
-            .limit(3) // Top 3
-            .select('pilotName viewCount -_id'); // Return clean data
+            .sort({ viewCount: -1 })
+            .limit(3)
+            .select('pilotName viewCount -_id')
+            .lean();
 
         res.json(topPilots);
     } catch (error) {
