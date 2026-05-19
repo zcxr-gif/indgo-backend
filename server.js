@@ -100,25 +100,39 @@ const AirportGate = mongoose.model('AirportGate', AirportGateSchema);
  * of hashed IPs. Every track call did `array.includes()` then rewrote the whole
  * doc. Doc size + CPU grew linearly with traffic for popular pilots.
  *
- * New design: two collections backed by MongoDB indexes/TTL.
- *  - DailyPilotView    : one tiny doc per (date, pilot, viewer). Compound unique
- *                        index makes "has this viewer seen this pilot today?" an
- *                        O(1) insert that either succeeds or duplicate-keys.
- *                        TTL on `createdAt` auto-deletes after 24h.
- *  - DailyPilotStats   : one tiny doc per (date, pilot) holding the counter.
- *                        `$inc` is atomic — no full-doc rewrites. TTL on
- *                        `createdAt` keeps history for 7 days.
+ * Newer design: tally per (date, pilot, viewer). Worked, but a single pilot
+ * can be flying multiple concurrent flights and we couldn't decompose the
+ * count to know *which* flight was being watched.
+ *
+ * Current design: tally per (date, pilot, flight, viewer). `flightId`
+ * carries the live-tracker's per-flight identifier, so the leaderboard can
+ * surface the exact flight that's drawing eyes. Pre-flightId clients (no
+ * `flightId` in the body) bucket into a sentinel value so their views still
+ * count, just lumped together per pilot.
+ *
+ *  - DailyPilotView    : one tiny doc per (date, pilot, flight, viewer).
+ *                        Compound unique index makes "has this viewer seen
+ *                        this flight today?" an O(1) insert that either
+ *                        succeeds or duplicate-keys. TTL auto-deletes after 24h.
+ *  - DailyPilotStats   : one tiny doc per (date, pilot, flight) holding the
+ *                        counter. `$inc` is atomic — no full-doc rewrites.
+ *                        TTL keeps history for 7 days.
  * ========================= */
 const VIEW_TTL_SECONDS = 60 * 60 * 24;            // 24h for individual view records
 const STATS_TTL_SECONDS = 60 * 60 * 24 * 7;       // 7d of daily aggregates
+const NO_FLIGHT = '__none__';                     // sentinel for pre-flightId clients
 
 const DailyPilotViewSchema = new mongoose.Schema({
     date: { type: String, required: true },        // YYYY-MM-DD
     pilotUserId: { type: String, required: true },
+    flightId: { type: String, required: true, default: NO_FLIGHT },
     viewerHash: { type: String, required: true },
     createdAt: { type: Date, default: Date.now }
 });
-DailyPilotViewSchema.index({ date: 1, pilotUserId: 1, viewerHash: 1 }, { unique: true });
+DailyPilotViewSchema.index(
+    { date: 1, pilotUserId: 1, flightId: 1, viewerHash: 1 },
+    { unique: true }
+);
 DailyPilotViewSchema.index({ createdAt: 1 }, { expireAfterSeconds: VIEW_TTL_SECONDS });
 
 const DailyPilotView = mongoose.model('DailyPilotView', DailyPilotViewSchema);
@@ -127,18 +141,24 @@ const DailyPilotStatsSchema = new mongoose.Schema({
     date: { type: String, required: true },
     pilotUserId: { type: String, required: true },
     pilotName: { type: String, required: true },
+    flightId: { type: String, required: true, default: NO_FLIGHT },
     viewCount: { type: Number, default: 0 },
     createdAt: { type: Date, default: Date.now }
 });
-DailyPilotStatsSchema.index({ date: 1, pilotUserId: 1 }, { unique: true });
+DailyPilotStatsSchema.index(
+    { date: 1, pilotUserId: 1, flightId: 1 },
+    { unique: true }
+);
 DailyPilotStatsSchema.index({ date: 1, viewCount: -1 });
 DailyPilotStatsSchema.index({ createdAt: 1 }, { expireAfterSeconds: STATS_TTL_SECONDS });
 
 const DailyPilotStats = mongoose.model('DailyPilotStats', DailyPilotStatsSchema);
 
-// One-time cleanup: nuke the legacy stats docs (they carried the uniqueViewers
-// array and an incompatible shape). Runs once per process start; harmless on
-// subsequent restarts when the collection is already empty.
+// One-time cleanup on process start. Two jobs:
+//   1. Drop any legacy stats docs left over from the uniqueViewers-array era.
+//   2. Drop the previous (date, pilot, viewer) and (date, pilot) unique
+//      indexes — they conflict with the new flightId-aware ones. Mongoose
+//      will (re)create the correct indexes when the models load.
 mongoose.connection.once('open', async () => {
     try {
         const result = await DailyPilotStats.collection.deleteMany({
@@ -150,6 +170,20 @@ mongoose.connection.once('open', async () => {
     } catch (e) {
         console.error('Legacy stats cleanup failed (non-fatal):', e.message);
     }
+
+    const dropLegacyIndex = async (model, indexName) => {
+        try {
+            await model.collection.dropIndex(indexName);
+            console.log(`🧹 Dropped legacy index ${model.modelName}.${indexName}.`);
+        } catch (e) {
+            // 27 = IndexNotFound — expected on fresh deploys / re-runs.
+            if (e && e.code !== 27 && !/index not found/i.test(e.message)) {
+                console.error(`Index drop (${model.modelName}.${indexName}) failed:`, e.message);
+            }
+        }
+    };
+    await dropLegacyIndex(DailyPilotView,  'date_1_pilotUserId_1_viewerHash_1');
+    await dropLegacyIndex(DailyPilotStats, 'date_1_pilotUserId_1');
 });
 
 // 4. CONFIGURE AWS CLIENTS
@@ -356,14 +390,17 @@ app.get('/api/gates', async (req, res) => {
  * LEADERBOARD API
  * ========================= */
 
-// POST: Track a view (Counts unique viewers per day)
-// Strategy: try to claim a (date, pilot, viewer) slot via insert. If the unique
-// index rejects the insert with E11000, this viewer already counted today and
-// we short-circuit. Otherwise, atomically `$inc` the stats counter — no
-// growing arrays, no full-doc rewrites, safe under concurrency.
+// POST: Track a view (Counts unique viewers per flight per day)
+// Strategy: try to claim a (date, pilot, flight, viewer) slot via insert. If
+// the unique index rejects with E11000, this viewer already counted this
+// flight today and we short-circuit. Otherwise atomically `$inc` the stats
+// counter — no growing arrays, no full-doc rewrites, safe under concurrency.
+//
+// `flightId` is optional for backwards compatibility with older clients; when
+// absent we bucket into NO_FLIGHT so the view still counts somewhere.
 app.post('/api/leaderboard/track', async (req, res) => {
     try {
-        const { pilotUserId, pilotName } = req.body;
+        const { pilotUserId, pilotName, flightId } = req.body;
         if (!pilotUserId || !pilotName) {
             return res.status(400).json({ message: 'Missing pilot info' });
         }
@@ -371,9 +408,10 @@ app.post('/api/leaderboard/track', async (req, res) => {
         const date = getTodayString();
         const viewerIp = req.ip || req.connection.remoteAddress;
         const viewerHash = hashIp(viewerIp);
+        const fid = (typeof flightId === 'string' && flightId.length) ? flightId : NO_FLIGHT;
 
         try {
-            await DailyPilotView.create({ date, pilotUserId, viewerHash });
+            await DailyPilotView.create({ date, pilotUserId, flightId: fid, viewerHash });
         } catch (err) {
             if (err && err.code === 11000) {
                 return res.json({ success: true, counted: false });
@@ -382,7 +420,7 @@ app.post('/api/leaderboard/track', async (req, res) => {
         }
 
         await DailyPilotStats.updateOne(
-            { date, pilotUserId },
+            { date, pilotUserId, flightId: fid },
             {
                 $inc: { viewCount: 1 },
                 $set: { pilotName },
@@ -398,19 +436,52 @@ app.post('/api/leaderboard/track', async (req, res) => {
     }
 });
 
-// GET: Top 3 Most Tracked Pilots Today
+// GET: Top Most Tracked flights today.
+//
+//   ?limit=N          Cap how many rows to return (default 3, max 50).
+//   ?groupBy=pilot    Aggregate per pilot instead of per flight (legacy
+//                     shape). Useful for callers that don't care which
+//                     specific flight is being tracked.
+//
+// Per-flight rows include `pilotUserId` and `flightId` so the caller can
+// pinpoint exactly which live flight to focus on. NO_FLIGHT buckets are
+// filtered out of per-flight responses (they represent pre-flightId
+// clients with no flight to point at) but still feed the pilot rollup.
 app.get('/api/leaderboard/top', async (req, res) => {
     try {
         const date = getTodayString();
+        const rawLimit = parseInt(req.query.limit, 10);
+        const limit = Math.max(1, Math.min(isNaN(rawLimit) ? 3 : rawLimit, 50));
+        const groupBy = (req.query.groupBy || '').toLowerCase();
 
-        const topPilots = await DailyPilotStats
-            .find({ date })
+        if (groupBy === 'pilot') {
+            const rows = await DailyPilotStats.aggregate([
+                { $match: { date } },
+                { $group: {
+                    _id: '$pilotUserId',
+                    pilotName: { $last: '$pilotName' },
+                    viewCount: { $sum: '$viewCount' }
+                } },
+                { $sort: { viewCount: -1 } },
+                { $limit: limit },
+                { $project: {
+                    _id: 0,
+                    pilotUserId: '$_id',
+                    pilotName: 1,
+                    viewCount: 1
+                } }
+            ]);
+            return res.json(rows);
+        }
+
+        const rows = await DailyPilotStats
+            .find({ date, flightId: { $ne: NO_FLIGHT } })
             .sort({ viewCount: -1 })
-            .limit(3)
-            .select('pilotName viewCount -_id')
+            .limit(limit)
+            .select('pilotName pilotUserId flightId viewCount -_id')
             .lean();
 
-        res.json(topPilots);
+        res.json(rows);
     } catch (error) {
         console.error('Leaderboard Fetch Error:', error);
         res.status(500).json({ message: 'Error fetching leaderboard' });
