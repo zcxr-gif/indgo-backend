@@ -179,10 +179,11 @@ const upload = multer({
 // --- START THE BOT ---
 // We pass the Model AND the S3 Client/Config to the bot
 startDiscordBot(
-    CommunityAircraft, 
-    s3Client, 
-    process.env.AWS_S3_BUCKET_NAME, 
-    process.env.AWS_REGION
+    CommunityAircraft,
+    s3Client,
+    process.env.AWS_S3_BUCKET_NAME,
+    process.env.AWS_REGION,
+    { DailyPilotStats, DailyPilotView }
 );
 // ---------------------
 
