@@ -78,6 +78,19 @@
           return ac.imageUrl ? [ac.imageUrl] : [];
         };
 
+        // Per-image contributor names, aligned by index to getAircraftImages().
+        // Each image can come from a different contributor; older records fall
+        // back to the single top-level contributorName.
+        const getAircraftContributors = (ac) => {
+          const images = getAircraftImages(ac);
+          const stored = (ac && Array.isArray(ac.imageContributors)) ? ac.imageContributors : [];
+          return images.map((_, i) => {
+            const c = stored[i];
+            if (c && (c.name || c.id)) return c.name || 'Unknown';
+            return (ac && ac.contributorName) || 'Unknown';
+          });
+        };
+
         const IS_LOCALHOST = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
 
         const API_URL = IS_LOCALHOST
@@ -874,6 +887,7 @@ function AircraftCard({ data, onClick, onDelete, onEdit, onToggleFlag, adminMode
 
         function DetailsModal({ aircraft, onClose, adminMode, onEdit }) {
           const images = getAircraftImages(aircraft);
+          const contributors = getAircraftContributors(aircraft);
           const [activeImage, setActiveImage] = useState(0);
 
           // Reset the selected image whenever a different aircraft is opened
@@ -971,7 +985,7 @@ function AircraftCard({ data, onClick, onDelete, onEdit, onToggleFlag, adminMode
 
                   <div className="space-y-6 flex-1">
                     <InfoRow icon={<Camera />} label="Livery" value={aircraft.liveryName} />
-                    <InfoRow icon={<User />} label="Spotted By" value={aircraft.contributorName} />
+                    <InfoRow icon={<User />} label={hasMultiple ? `Spotted By (Photo ${activeImage + 1})` : "Spotted By"} value={contributors[activeImage] || aircraft.contributorName} />
                     <InfoRow icon={<Hash />} label="Uploaded" value={new Date(aircraft.uploadedAt).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })} />
                     <InfoRow icon={<Settings />} label="Status" value="Active in Fleet" />
                   </div>

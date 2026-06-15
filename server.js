@@ -70,6 +70,17 @@ const CommunityAircraftSchema = new mongoose.Schema({
     tailNumber: { type: String, required: true, unique: true }, // Ensure no duplicates
     imageUrl: { type: String, required: false, default: null }, // Primary image (kept for backward compatibility)
     imageUrls: { type: [String], default: [] }, // NEW: Up to 3 images per aircraft (imageUrl mirrors imageUrls[0])
+    // Per-image contributor info, aligned by index to imageUrls. Different images
+    // on the same aircraft can be supplied by different people, so each slot tracks
+    // its own contributor. The legacy top-level contributorName/Id mirror slot 0.
+    imageContributors: {
+        type: [{
+            name: { type: String, default: "System" },
+            id: { type: String, default: null }
+        }],
+        default: [],
+        _id: false
+    },
     needsUpdate: { type: Boolean, default: false }, // NEW: Flag for image updates
     uploadedAt: { type: Date, default: Date.now }
 });
@@ -307,6 +318,28 @@ const syncPrimaryImage = (entry) => {
 const getEntryImages = (entry) => {
     if (Array.isArray(entry.imageUrls) && entry.imageUrls.length > 0) return [...entry.imageUrls];
     return entry.imageUrl ? [entry.imageUrl] : [];
+};
+
+// Helper: Normalize an entry's per-image contributors into an array aligned to
+// its images. For records created before per-image attribution (or any slot that
+// predates it), fall back to the legacy top-level contributor.
+const getEntryContributors = (entry) => {
+    const images = getEntryImages(entry);
+    const stored = Array.isArray(entry.imageContributors) ? entry.imageContributors : [];
+    return images.map((_, i) => {
+        const c = stored[i];
+        if (c && (c.name || c.id)) return { name: c.name || "System", id: c.id || null };
+        return { name: entry.contributorName || "System", id: entry.contributorId || null };
+    });
+};
+
+// Helper: Mirror the primary (slot 0) image's contributor onto the legacy
+// top-level fields so existing queries/leaderboards keep working.
+const syncPrimaryContributor = (entry) => {
+    if (Array.isArray(entry.imageContributors) && entry.imageContributors.length > 0) {
+        entry.contributorName = entry.imageContributors[0].name || "System";
+        entry.contributorId = entry.imageContributors[0].id || null;
+    }
 };
 
 // Multer config for the aircraft endpoints: accept up to MAX_AIRCRAFT_IMAGES under
@@ -911,7 +944,9 @@ app.post('/api/aircraft', uploadAircraftImages, async (req, res) => {
             liveryName: finalLivery,
             tailNumber: finalTail,
             imageUrls,
-            imageUrl: imageUrls[0] // Primary image kept in sync for backward compatibility
+            imageUrl: imageUrls[0], // Primary image kept in sync for backward compatibility
+            // All images in a single upload come from the same submitter
+            imageContributors: imageUrls.map(() => ({ name: contributorName, id: null }))
         });
 
         await newEntry.save();
@@ -1036,6 +1071,14 @@ app.put('/api/aircraft/:id', uploadAircraftImages, async (req, res) => {
             existingEntry.imageUrls = newImageUrls;
             existingEntry.imageUrl = newImageUrls[0];
 
+            // The full set was replaced by this editor, so attribute every new
+            // image to them (fall back to the entry's existing contributor).
+            const who = contributorName || existingEntry.contributorName || "System";
+            existingEntry.imageContributors = newImageUrls.map(() => ({
+                name: who,
+                id: existingEntry.contributorId || null
+            }));
+
             // Clean up local temp files
             cleanupTempFiles(files);
 
@@ -1043,11 +1086,21 @@ app.put('/api/aircraft/:id', uploadAircraftImages, async (req, res) => {
             existingEntry.needsUpdate = false;
         }
 
-        if (contributorName) existingEntry.contributorName = contributorName;
+        if (contributorName) {
+            existingEntry.contributorName = contributorName;
+            // Editing the contributor name updates the primary (slot 0) image's
+            // contributor; the other slots keep their own attribution.
+            const contributors = getEntryContributors(existingEntry);
+            if (contributors.length > 0) {
+                contributors[0] = { name: contributorName, id: existingEntry.contributorId || null };
+                existingEntry.imageContributors = contributors;
+            }
+        }
         if (finalType) existingEntry.aircraftType = finalType;
         if (finalLivery) existingEntry.liveryName = finalLivery;
         if (finalTail) existingEntry.tailNumber = finalTail.toUpperCase();
 
+        syncPrimaryContributor(existingEntry);
         await existingEntry.save();
 
         res.json({ message: 'Aircraft updated successfully!', data: existingEntry });
@@ -1106,9 +1159,16 @@ app.post('/api/aircraft/:id/images', upload.single('image'), async (req, res) =>
         const url = await processAndUploadAircraftImage(file, entry.tailNumber);
         cleanupTempFiles([file]);
 
+        const contributors = getEntryContributors(entry);
         images.push(url);
+        contributors.push({
+            name: req.body.contributorName || entry.contributorName || "System",
+            id: req.body.contributorId || null
+        });
         entry.imageUrls = images;
+        entry.imageContributors = contributors;
         syncPrimaryImage(entry);
+        syncPrimaryContributor(entry);
         await entry.save();
 
         res.status(201).json({ message: 'Image added.', data: entry });
@@ -1147,16 +1207,28 @@ app.put('/api/aircraft/:id/images/:index', upload.single('image'), async (req, r
         const url = await processAndUploadAircraftImage(file, entry.tailNumber);
         cleanupTempFiles([file]);
 
+        const contributors = getEntryContributors(entry);
+        // Whoever supplies this image becomes its contributor; if none is provided
+        // (e.g. an admin re-upload) keep the slot's existing attribution.
+        const slotContributor = {
+            name: req.body.contributorName || (contributors[index] && contributors[index].name) || entry.contributorName || "System",
+            id: req.body.contributorId || (contributors[index] && contributors[index].id) || null
+        };
+
         if (index < images.length) {
             const oldUrl = images[index];
             images[index] = url;
+            contributors[index] = slotContributor;
             if (oldUrl) await deleteS3Object(oldUrl); // Remove the replaced image from S3
         } else {
             images.push(url);
+            contributors.push(slotContributor);
         }
 
         entry.imageUrls = images;
+        entry.imageContributors = contributors;
         syncPrimaryImage(entry);
+        syncPrimaryContributor(entry);
         await entry.save();
 
         res.json({ message: 'Image replaced.', data: entry });
@@ -1183,9 +1255,13 @@ app.delete('/api/aircraft/:id/images/:index', async (req, res) => {
             return res.status(404).json({ message: 'No image at that slot.' });
         }
 
+        const contributors = getEntryContributors(entry);
         const [removed] = images.splice(index, 1);
+        contributors.splice(index, 1);
         entry.imageUrls = images;
+        entry.imageContributors = contributors;
         syncPrimaryImage(entry);
+        syncPrimaryContributor(entry);
         await entry.save();
 
         if (removed) await deleteS3Object(removed); // Remove the deleted image from S3

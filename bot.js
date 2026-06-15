@@ -507,6 +507,18 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         return entry.imageUrl ? [entry.imageUrl] : [];
     };
 
+    // Per-image contributors aligned to getEntryImages(). Slots without their own
+    // attribution (legacy records) fall back to the entry's top-level contributor.
+    const getEntryContributors = (entry) => {
+        const imgs = getEntryImages(entry);
+        const stored = (entry && Array.isArray(entry.imageContributors)) ? entry.imageContributors : [];
+        return imgs.map((_, i) => {
+            const c = stored[i];
+            if (c && (c.name || c.id)) return { name: c.name || 'System', id: c.id || null };
+            return { name: (entry && entry.contributorName) || 'System', id: (entry && entry.contributorId) || null };
+        });
+    };
+
     const MAX_AIRCRAFT_IMAGES = 3;
 
     // Build the admin review UI for an aircraft submission: mutates `mainEmbed`
@@ -538,15 +550,19 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             mainEmbed.setTitle('⚠️ REPLACEMENT / ADDITIONAL PHOTO').setColor(0xFFA500)
                 .setDescription(`**Admin Notice:** This aircraft already has **${existingImages.length}/${MAX_AIRCRAFT_IMAGES}** photo(s).\nChoose a slot below — **Replace** overwrites that photo, **Add** appends a new one.`);
 
+            const existingContributors = getEntryContributors(existingEntry);
             existingImages.forEach((imgUrl, idx) => {
+                const slotContributor = existingContributors[idx]?.name || 'Unknown';
                 const compEmbed = new EmbedBuilder()
                     .setTitle(`📉 Current Photo ${idx + 1}`)
                     .setColor(0x2B2D31)
                     .setImage(imgUrl)
                     .setFooter({ text: `Replacing Photo ${idx + 1} deletes this image.` });
-                if (idx === 0) {
-                    compEmbed.setDescription(`**Current Contributor:** ${existingEntry.contributorName || 'Unknown'}\n**Tail:** ${existingEntry.tailNumber || 'Unknown'}`);
-                }
+                // Show who contributed each existing photo so admins know a replace
+                // only overwrites that one slot's contributor, not the others.
+                const lines = [`**Photo ${idx + 1} Contributor:** ${slotContributor}`];
+                if (idx === 0) lines.push(`**Tail:** ${existingEntry.tailNumber || 'Unknown'}`);
+                compEmbed.setDescription(lines.join('\n'));
                 extraEmbeds.push(compEmbed);
             });
         }
@@ -1301,26 +1317,39 @@ client.on('interactionCreate', async (interaction) => {
                     });
 
                     let images = getEntryImages(existingEntry);
+                    let contributors = getEntryContributors(existingEntry);
                     // Clamp the chosen slot so we never leave a gap; cap at MAX_AIRCRAFT_IMAGES.
                     let slotIndex = Math.min(Math.max(chosenSlot - 1, 0), images.length);
                     if (slotIndex >= MAX_AIRCRAFT_IMAGES) slotIndex = MAX_AIRCRAFT_IMAGES - 1;
+
+                    // The person who submitted this photo is the contributor of THIS
+                    // slot only — adding/replacing photo 2 or 3 must not overwrite the
+                    // contributor(s) of the other images.
+                    const slotContributor = { name: contributorName, id: targetUserId };
 
                     let replacedUrl = null;
                     if (slotIndex < images.length) {
                         replacedUrl = images[slotIndex];
                         images[slotIndex] = permanentUrl;
+                        contributors[slotIndex] = slotContributor;
                     } else {
                         images.push(permanentUrl);
+                        contributors.push(slotContributor);
                     }
                     images = images.slice(0, MAX_AIRCRAFT_IMAGES);
+                    contributors = contributors.slice(0, MAX_AIRCRAFT_IMAGES);
+
+                    // Legacy top-level contributor mirrors the primary (slot 0) image.
+                    const primaryContributor = contributors[0] || slotContributor;
 
                     // Automatically remove the 'needsUpdate' flag upon approval
                     const updateData = {
-                        contributorName,
-                        contributorId: targetUserId,
+                        contributorName: primaryContributor.name,
+                        contributorId: primaryContributor.id,
                         aircraftType: typeField,
                         liveryName: liveryField,
                         imageUrls: images,
+                        imageContributors: contributors,
                         imageUrl: images[0], // keep legacy primary field in sync
                         uploadedAt: new Date(),
                         needsUpdate: false
