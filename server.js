@@ -68,7 +68,8 @@ const CommunityAircraftSchema = new mongoose.Schema({
     aircraftType: { type: String, required: true },
     liveryName: { type: String, required: true },
     tailNumber: { type: String, required: true, unique: true }, // Ensure no duplicates
-    imageUrl: { type: String, required: false, default: null }, // Now optional
+    imageUrl: { type: String, required: false, default: null }, // Primary image (kept for backward compatibility)
+    imageUrls: { type: [String], default: [] }, // NEW: Up to 3 images per aircraft (imageUrl mirrors imageUrls[0])
     needsUpdate: { type: Boolean, default: false }, // NEW: Flag for image updates
     uploadedAt: { type: Date, default: Date.now }
 });
@@ -239,6 +240,81 @@ const deleteS3Object = async (imageUrl) => {
         console.error(`Error deleting S3 Object: ${imageUrl}`, error);
     }
 };
+
+// Maximum number of images allowed per aircraft
+const MAX_AIRCRAFT_IMAGES = 3;
+
+// Helper: Gather uploaded image files from a multipart request.
+// Accepts both the new 'images' field (multiple) and the legacy 'image' field (single),
+// then caps the total at MAX_AIRCRAFT_IMAGES.
+const collectUploadedImages = (req) => {
+    const files = [];
+    if (req.files) {
+        if (Array.isArray(req.files.images)) files.push(...req.files.images);
+        if (Array.isArray(req.files.image)) files.push(...req.files.image);
+    }
+    // Fallback for upload.single() style requests
+    if (req.file) files.push(req.file);
+    return files.slice(0, MAX_AIRCRAFT_IMAGES);
+};
+
+// Helper: Optimize a single image file and upload it to S3, returning the public URL.
+const processAndUploadAircraftImage = async (file, tailRef) => {
+    const optimizedBuffer = await sharp(file.path)
+        .resize({ width: 1920, withoutEnlargement: true })
+        .webp({ quality: 80 })
+        .toBuffer();
+
+    const cleanTailName = (tailRef || 'aircraft').replace(/[^a-zA-Z0-9]/g, '');
+    // Random suffix avoids collisions when several images are uploaded in the same millisecond
+    const fileName = `community-aircraft/${cleanTailName}-${Date.now()}-${Math.round(Math.random() * 1e6)}.webp`;
+
+    await s3Client.send(new PutObjectCommand({
+        Bucket: process.env.AWS_S3_BUCKET_NAME,
+        Key: fileName,
+        Body: optimizedBuffer,
+        ContentType: 'image/webp',
+    }));
+
+    return `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileName}`;
+};
+
+// Helper: Delete every image associated with an aircraft entry (primary + gallery).
+const deleteAircraftImages = async (entry) => {
+    if (!entry) return;
+    const urls = new Set();
+    if (entry.imageUrl) urls.add(entry.imageUrl);
+    if (Array.isArray(entry.imageUrls)) entry.imageUrls.forEach(u => u && urls.add(u));
+    await Promise.all([...urls].map(deleteS3Object));
+};
+
+// Helper: Remove temp files left on disk by multer after processing.
+const cleanupTempFiles = (files) => {
+    (files || []).forEach(f => {
+        if (f && f.path) fs.unlink(f.path, () => {});
+    });
+};
+
+// Helper: Keep the legacy `imageUrl` field pointed at the first gallery image.
+const syncPrimaryImage = (entry) => {
+    entry.imageUrl = (Array.isArray(entry.imageUrls) && entry.imageUrls.length > 0)
+        ? entry.imageUrls[0]
+        : null;
+};
+
+// Helper: Normalize an entry's stored images into an array, falling back to the
+// legacy single `imageUrl` for records created before multi-image support.
+const getEntryImages = (entry) => {
+    if (Array.isArray(entry.imageUrls) && entry.imageUrls.length > 0) return [...entry.imageUrls];
+    return entry.imageUrl ? [entry.imageUrl] : [];
+};
+
+// Multer config for the aircraft endpoints: accept up to MAX_AIRCRAFT_IMAGES under
+// the new 'images' field plus one legacy 'image' field.
+const uploadAircraftImages = upload.fields([
+    { name: 'images', maxCount: MAX_AIRCRAFT_IMAGES },
+    { name: 'image', maxCount: 1 }
+]);
 
 // Helper: Convert S3 Stream to String
 const streamToString = (stream) =>
@@ -716,8 +792,9 @@ app.get('/api/aircraft/lookup', async (req, res) => {
                 aircraftType: finalType || "Unknown",
                 liveryName: finalLivery || "Standard",
                 tailNumber: finalTail || "N/A", // This will now correctly show "3B-NBP"
-                imageUrl: null, 
-                isPlaceholder: true, 
+                imageUrl: null,
+                imageUrls: [],
+                isPlaceholder: true,
                 uploadedAt: new Date()
             });
         }
@@ -791,17 +868,18 @@ app.get('/api/admin/stats', async (req, res) => {
     }
 });
 
-// POST: Upload a new aircraft
-app.post('/api/aircraft', upload.single('image'), async (req, res) => {
+// POST: Upload a new aircraft (supports up to MAX_AIRCRAFT_IMAGES images)
+app.post('/api/aircraft', uploadAircraftImages, async (req, res) => {
+    const files = collectUploadedImages(req);
     try {
-        if (!req.file) return res.status(400).json({ message: 'Image file is required.' });
-        
+        if (files.length === 0) return res.status(400).json({ message: 'At least one image file is required.' });
+
         // Destructure with mapping support for incoming external JSON keys
-        const { 
-            contributorName = "System", 
-            aircraftType, 
+        const {
+            contributorName = "System",
+            aircraftType,
             model,
-            liveryName, 
+            liveryName,
             livery,
             tailNumber,
             registration
@@ -813,40 +891,27 @@ app.post('/api/aircraft', upload.single('image'), async (req, res) => {
         const finalTail = (tailNumber || registration || "").toUpperCase();
 
         if (!finalType || !finalLivery || !finalTail) {
-            // Clean up temp file if validation fails
-            if (req.file) fs.unlink(req.file.path, () => {});
+            // Clean up temp files if validation fails
+            cleanupTempFiles(files);
             return res.status(400).json({ message: 'All fields (Type/Model, Livery, Tail/Registration) are required.' });
         }
 
-        // 1. Process from DISK (req.file.path) instead of BUFFER
-        const optimizedBuffer = await sharp(req.file.path)
-            .resize({ width: 1920, withoutEnlargement: true }) 
-            .webp({ quality: 80 }) 
-            .toBuffer();
+        // Process and upload each image to S3 (order preserved)
+        const imageUrls = [];
+        for (const file of files) {
+            imageUrls.push(await processAndUploadAircraftImage(file, finalTail));
+        }
 
-        const cleanTailName = finalTail.replace(/[^a-zA-Z0-9]/g, '');
-        const fileName = `community-aircraft/${cleanTailName}-${Date.now()}.webp`;
-
-        await s3Client.send(new PutObjectCommand({
-            Bucket: process.env.AWS_S3_BUCKET_NAME,
-            Key: fileName,
-            Body: optimizedBuffer,
-            ContentType: 'image/webp',
-        }));
-
-        // 2. IMPORTANT: Delete the local temp file to free up disk space
-        fs.unlink(req.file.path, (err) => {
-            if (err) console.error("Failed to clean up temp file:", err);
-        });
-
-        const fileUrl = `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileName}`;
+        // Clean up local temp files to free up disk space
+        cleanupTempFiles(files);
 
         const newEntry = new CommunityAircraft({
             contributorName,
             aircraftType: finalType,
             liveryName: finalLivery,
             tailNumber: finalTail,
-            imageUrl: fileUrl 
+            imageUrls,
+            imageUrl: imageUrls[0] // Primary image kept in sync for backward compatibility
         });
 
         await newEntry.save();
@@ -857,8 +922,8 @@ app.post('/api/aircraft', upload.single('image'), async (req, res) => {
 
     } catch (error) {
         // Ensure cleanup happens even on error
-        if (req.file && req.file.path) fs.unlink(req.file.path, () => {});
-        
+        cleanupTempFiles(files);
+
         console.error('Upload Error:', error);
         res.status(500).json({ message: 'Server error during upload.' });
     }
@@ -928,17 +993,18 @@ app.patch('/api/aircraft/:id/flag', async (req, res) => {
     }
 });
 
-// PUT: Update an existing aircraft
-app.put('/api/aircraft/:id', upload.single('image'), async (req, res) => {
+// PUT: Update an existing aircraft (replaces the full image set when new images are sent)
+app.put('/api/aircraft/:id', uploadAircraftImages, async (req, res) => {
+    const files = collectUploadedImages(req);
     try {
         const { id } = req.params;
-        
+
         // Map mapping support for incoming external JSON keys
-        const { 
-            contributorName, 
-            aircraftType, 
+        const {
+            contributorName,
+            aircraftType,
             model,
-            liveryName, 
+            liveryName,
             livery,
             tailNumber,
             registration
@@ -950,44 +1016,30 @@ app.put('/api/aircraft/:id', upload.single('image'), async (req, res) => {
 
         const existingEntry = await CommunityAircraft.findById(id);
         if (!existingEntry) {
-            // Clean up if file uploaded but record not found
-            if (req.file) fs.unlink(req.file.path, () => {});
+            // Clean up if files uploaded but record not found
+            cleanupTempFiles(files);
             return res.status(404).json({ message: 'Aircraft not found.' });
         }
 
-        let updatedImageUrl = existingEntry.imageUrl;
+        if (files.length > 0) {
+            console.log(`Processing ${files.length} new image(s) for update: ${id}`);
 
-        if (req.file) {
-            console.log(`Processing new image for update: ${id}`);
-            
-            const optimizedBuffer = await sharp(req.file.path)
-                .resize({ width: 1920, withoutEnlargement: true }) 
-                .webp({ quality: 80 }) 
-                .toBuffer();
-
-            // Safe use of tail number for clean filename
-            const cleanTailRef = (finalTail || existingEntry.tailNumber).replace(/[^a-zA-Z0-9]/g, '');
-            const fileName = `community-aircraft/${cleanTailRef}-${Date.now()}.webp`;
-
-            await s3Client.send(new PutObjectCommand({
-                Bucket: process.env.AWS_S3_BUCKET_NAME,
-                Key: fileName,
-                Body: optimizedBuffer,
-                ContentType: 'image/webp',
-            }));
-
-            updatedImageUrl = `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileName}`;
-
-            if (existingEntry.imageUrl) {
-                await deleteS3Object(existingEntry.imageUrl);
+            const tailRef = finalTail || existingEntry.tailNumber;
+            const newImageUrls = [];
+            for (const file of files) {
+                newImageUrls.push(await processAndUploadAircraftImage(file, tailRef));
             }
 
-            // FIX: Clean up local temp file
-            fs.unlink(req.file.path, (err) => {
-                if (err) console.error("Failed to clean up temp file:", err);
-            });
+            // Delete the previous image set now that new ones are in place
+            await deleteAircraftImages(existingEntry);
 
-            // CLEAR THE FLAG: A new image was uploaded, so it no longer needs an update
+            existingEntry.imageUrls = newImageUrls;
+            existingEntry.imageUrl = newImageUrls[0];
+
+            // Clean up local temp files
+            cleanupTempFiles(files);
+
+            // CLEAR THE FLAG: New images were uploaded, so it no longer needs an update
             existingEntry.needsUpdate = false;
         }
 
@@ -995,7 +1047,6 @@ app.put('/api/aircraft/:id', upload.single('image'), async (req, res) => {
         if (finalType) existingEntry.aircraftType = finalType;
         if (finalLivery) existingEntry.liveryName = finalLivery;
         if (finalTail) existingEntry.tailNumber = finalTail.toUpperCase();
-        existingEntry.imageUrl = updatedImageUrl;
 
         await existingEntry.save();
 
@@ -1003,7 +1054,7 @@ app.put('/api/aircraft/:id', upload.single('image'), async (req, res) => {
 
     } catch (error) {
         // FIX: Ensure cleanup on error
-        if (req.file && req.file.path) fs.unlink(req.file.path, () => {});
+        cleanupTempFiles(files);
 
         console.error('Update Error:', error);
         res.status(500).json({ message: 'Server error during update.' });
@@ -1018,13 +1069,131 @@ app.delete('/api/aircraft/:id', async (req, res) => {
 
         if (!entry) return res.status(404).json({ message: 'Aircraft not found.' });
 
-        await deleteS3Object(entry.imageUrl);
+        await deleteAircraftImages(entry);
         await CommunityAircraft.findByIdAndDelete(id);
 
         res.json({ message: 'Aircraft deleted successfully.' });
     } catch (error) {
         console.error('Delete Error:', error);
         res.status(500).json({ message: 'Server error during deletion.' });
+    }
+});
+
+/* =========================
+ * PER-SLOT AIRCRAFT IMAGE MANAGEMENT
+ * Lets the dashboard add / replace / remove any individual image (slot 0-2)
+ * without touching the others. `imageUrl` always mirrors imageUrls[0].
+ * ========================= */
+
+// POST: Append a new image to an aircraft (up to MAX_AIRCRAFT_IMAGES)
+app.post('/api/aircraft/:id/images', upload.single('image'), async (req, res) => {
+    const file = req.file;
+    try {
+        if (!file) return res.status(400).json({ message: 'Image file is required.' });
+
+        const entry = await CommunityAircraft.findById(req.params.id);
+        if (!entry) {
+            cleanupTempFiles([file]);
+            return res.status(404).json({ message: 'Aircraft not found.' });
+        }
+
+        const images = getEntryImages(entry);
+        if (images.length >= MAX_AIRCRAFT_IMAGES) {
+            cleanupTempFiles([file]);
+            return res.status(400).json({ message: `An aircraft can have at most ${MAX_AIRCRAFT_IMAGES} images.` });
+        }
+
+        const url = await processAndUploadAircraftImage(file, entry.tailNumber);
+        cleanupTempFiles([file]);
+
+        images.push(url);
+        entry.imageUrls = images;
+        syncPrimaryImage(entry);
+        await entry.save();
+
+        res.status(201).json({ message: 'Image added.', data: entry });
+    } catch (error) {
+        cleanupTempFiles([file]);
+        console.error('Add Image Error:', error);
+        res.status(500).json({ message: 'Server error while adding image.' });
+    }
+});
+
+// PUT: Replace (or set) the image at a specific slot index
+app.put('/api/aircraft/:id/images/:index', upload.single('image'), async (req, res) => {
+    const file = req.file;
+    try {
+        if (!file) return res.status(400).json({ message: 'Image file is required.' });
+
+        const index = parseInt(req.params.index, 10);
+        if (isNaN(index) || index < 0 || index >= MAX_AIRCRAFT_IMAGES) {
+            cleanupTempFiles([file]);
+            return res.status(400).json({ message: `Slot must be between 0 and ${MAX_AIRCRAFT_IMAGES - 1}.` });
+        }
+
+        const entry = await CommunityAircraft.findById(req.params.id);
+        if (!entry) {
+            cleanupTempFiles([file]);
+            return res.status(404).json({ message: 'Aircraft not found.' });
+        }
+
+        const images = getEntryImages(entry);
+        // Only allow replacing an existing slot or appending to the very next one (no gaps)
+        if (index > images.length) {
+            cleanupTempFiles([file]);
+            return res.status(400).json({ message: 'Cannot leave an empty image slot.' });
+        }
+
+        const url = await processAndUploadAircraftImage(file, entry.tailNumber);
+        cleanupTempFiles([file]);
+
+        if (index < images.length) {
+            const oldUrl = images[index];
+            images[index] = url;
+            if (oldUrl) await deleteS3Object(oldUrl); // Remove the replaced image from S3
+        } else {
+            images.push(url);
+        }
+
+        entry.imageUrls = images;
+        syncPrimaryImage(entry);
+        await entry.save();
+
+        res.json({ message: 'Image replaced.', data: entry });
+    } catch (error) {
+        cleanupTempFiles([file]);
+        console.error('Replace Image Error:', error);
+        res.status(500).json({ message: 'Server error while replacing image.' });
+    }
+});
+
+// DELETE: Remove the image at a specific slot index
+app.delete('/api/aircraft/:id/images/:index', async (req, res) => {
+    try {
+        const index = parseInt(req.params.index, 10);
+        if (isNaN(index) || index < 0) {
+            return res.status(400).json({ message: 'Invalid slot index.' });
+        }
+
+        const entry = await CommunityAircraft.findById(req.params.id);
+        if (!entry) return res.status(404).json({ message: 'Aircraft not found.' });
+
+        const images = getEntryImages(entry);
+        if (index >= images.length) {
+            return res.status(404).json({ message: 'No image at that slot.' });
+        }
+
+        const [removed] = images.splice(index, 1);
+        entry.imageUrls = images;
+        syncPrimaryImage(entry);
+        await entry.save();
+
+        if (removed) await deleteS3Object(removed); // Remove the deleted image from S3
+
+        res.json({ message: 'Image removed.', data: entry });
+    } catch (error) {
+        console.error('Remove Image Error:', error);
+        res.status(500).json({ message: 'Server error while removing image.' });
     }
 });
 

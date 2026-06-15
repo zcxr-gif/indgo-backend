@@ -20,7 +20,7 @@ const {
     PermissionsBitField, // Added for Mod Permissions
     Options 
 } = require('discord.js');
-const { PutObjectCommand } = require('@aws-sdk/client-s3');
+const { PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const axios = require('axios');
 const sharp = require('sharp');
 const fs = require('fs');
@@ -488,6 +488,80 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         }
     };
 
+    // Delete a single stored image from S3 (used when a slot is replaced).
+    const deleteImageFromS3 = async (url) => {
+        if (!url) return;
+        try {
+            const key = new URL(url).pathname.substring(1); // strip leading '/'
+            await s3Client.send(new DeleteObjectCommand({ Bucket: bucketName, Key: key }));
+            console.log(`🗑️ Deleted replaced S3 image: ${key}`);
+        } catch (err) {
+            console.error('S3 delete error:', err.message);
+        }
+    };
+
+    // Normalize a record's images into an ordered array (handles legacy single-image docs).
+    const getEntryImages = (entry) => {
+        if (!entry) return [];
+        if (Array.isArray(entry.imageUrls) && entry.imageUrls.length > 0) return entry.imageUrls.filter(Boolean);
+        return entry.imageUrl ? [entry.imageUrl] : [];
+    };
+
+    const MAX_AIRCRAFT_IMAGES = 3;
+
+    // Build the admin review UI for an aircraft submission: mutates `mainEmbed`
+    // (title/colour/description) and returns the slot-choice buttons plus a
+    // comparison embed per existing photo. The admin chooses which of the (up to
+    // 3) slots the submission lands in — Replace overwrites, Add appends.
+    const buildAircraftReview = (mainEmbed, existingEntry, userId) => {
+        const existingImages = getEntryImages(existingEntry);
+        const extraEmbeds = [];
+        const approveButtons = [];
+
+        if (existingImages.length === 0) {
+            approveButtons.push(
+                new ButtonBuilder().setCustomId(`approve_1_${userId}`).setLabel('Approve & Verify').setStyle(ButtonStyle.Success).setEmoji('✅')
+            );
+            mainEmbed.setTitle('📋 New Submission Request').setColor(0x00FF00).setDescription(null);
+        } else {
+            const slotsToShow = Math.min(existingImages.length + 1, MAX_AIRCRAFT_IMAGES);
+            for (let slot = 1; slot <= slotsToShow; slot++) {
+                const isReplace = slot <= existingImages.length;
+                approveButtons.push(
+                    new ButtonBuilder()
+                        .setCustomId(`approve_${slot}_${userId}`)
+                        .setLabel(`${isReplace ? 'Replace' : 'Add'} Photo ${slot}`)
+                        .setStyle(isReplace ? ButtonStyle.Primary : ButtonStyle.Success)
+                        .setEmoji(isReplace ? '♻️' : '➕')
+                );
+            }
+            mainEmbed.setTitle('⚠️ REPLACEMENT / ADDITIONAL PHOTO').setColor(0xFFA500)
+                .setDescription(`**Admin Notice:** This aircraft already has **${existingImages.length}/${MAX_AIRCRAFT_IMAGES}** photo(s).\nChoose a slot below — **Replace** overwrites that photo, **Add** appends a new one.`);
+
+            existingImages.forEach((imgUrl, idx) => {
+                const compEmbed = new EmbedBuilder()
+                    .setTitle(`📉 Current Photo ${idx + 1}`)
+                    .setColor(0x2B2D31)
+                    .setImage(imgUrl)
+                    .setFooter({ text: `Replacing Photo ${idx + 1} deletes this image.` });
+                if (idx === 0) {
+                    compEmbed.setDescription(`**Current Contributor:** ${existingEntry.contributorName || 'Unknown'}\n**Tail:** ${existingEntry.tailNumber || 'Unknown'}`);
+                }
+                extraEmbeds.push(compEmbed);
+            });
+        }
+
+        const components = [
+            new ActionRowBuilder().addComponents(...approveButtons),
+            new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(`edit_admin_${userId}`).setLabel('Edit Details').setStyle(ButtonStyle.Secondary).setEmoji('✏️'),
+                new ButtonBuilder().setCustomId(`reject_${userId}`).setLabel('Reject').setStyle(ButtonStyle.Danger),
+            )
+        ];
+
+        return { components, extraEmbeds };
+    };
+
     const startSubmissionFlow = async (source, rawType, rawLivery, ignoredTail, photoUrl, user, originChannelId) => {
         
         let currentType = rawType;
@@ -657,51 +731,24 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                     )
                     .setTimestamp();
 
-                const adminRow = new ActionRowBuilder()
-                    .addComponents(
-                        new ButtonBuilder().setCustomId(`approve_${user.id}`).setLabel('Approve & Verify').setStyle(ButtonStyle.Success),
-                        new ButtonBuilder().setCustomId(`edit_admin_${user.id}`).setLabel('Edit Details').setStyle(ButtonStyle.Secondary).setEmoji('✏️'),
-                        new ButtonBuilder().setCustomId(`reject_${user.id}`).setLabel('Reject').setStyle(ButtonStyle.Danger),
-                    );
-
-                const embedsToSend = [finalEmbed];
-
                 // --- KEY FIX: Force Fresh Duplicate Check for Admins ---
                 // We do NOT rely on the previous 'isDuplicate' boolean here.
                 // We perform a real-time lookup right before sending to admin.
                 let existingEntry = null;
                 try {
-                    existingEntry = await CommunityAircraftModel.findOne({ 
+                    existingEntry = await CommunityAircraftModel.findOne({
                         aircraftType: { $regex: new RegExp(`^${escapeRegex(currentType)}$`, "i") },
                         liveryName: { $regex: new RegExp(`^${escapeRegex(currentLivery)}$`, "i") }
                     });
                 } catch(e) { console.error("Error fetching duplicate for comparison", e); }
 
-                if (existingEntry) {
-                    // It IS a duplicate/replacement
-                    finalEmbed.setTitle('⚠️ REPLACEMENT REQUEST');
-                    finalEmbed.setColor(0xFFA500);
-                    finalEmbed.setDescription(`**Admin Notice:** Matches existing **${currentType} / ${currentLivery}**.\nApproving this will **REPLACE** the old image (shown below).`);
+                // Build the admin slot-choice UI (buttons + per-photo comparison embeds).
+                const { components: adminComponents, extraEmbeds } = buildAircraftReview(finalEmbed, existingEntry, user.id);
+                const embedsToSend = [finalEmbed, ...extraEmbeds];
 
-                    if (existingEntry.imageUrl) {
-                        const comparisonEmbed = new EmbedBuilder()
-                            .setTitle('📉 Current Database Image')
-                            .setDescription(`**Current Contributor:** ${existingEntry.contributorName || 'Unknown'}\n**Tail:** ${existingEntry.tailNumber || 'Unknown'}`)
-                            .setColor(0x2B2D31) 
-                            .setImage(existingEntry.imageUrl)
-                            .setFooter({ text: 'If you approve the new submission, this image will be deleted/overwritten.' });
-                        
-                        embedsToSend.push(comparisonEmbed);
-                    }
-                } else {
-                    // It is NEW
-                    finalEmbed.setTitle('📋 New Submission Request');
-                    finalEmbed.setColor(0x00FF00);
-                }
-                
                 finalEmbed.setFooter({ text: `Pending | User: ${user.id} | Msg: ${publicMsg.id} | Ch: ${originChannelId}` });
 
-                await adminChannel.send({ embeds: embedsToSend, components: [adminRow], files: [attachmentData] });
+                await adminChannel.send({ embeds: embedsToSend, components: adminComponents, files: [attachmentData] });
                 
                 userSessions.set(user.id, {
                     type: currentType, 
@@ -1220,14 +1267,23 @@ client.on('interactionCreate', async (interaction) => {
 
             if (customId.startsWith('approve_') && !customId.startsWith('approve_apt_')) {
                 await interaction.deferUpdate();
-                const [_, targetUserId] = customId.split('_');
+                // customId format: approve_<slot>_<userId> (legacy: approve_<userId> => slot 1)
+                const approveParts = customId.split('_');
+                let chosenSlot, targetUserId;
+                if (approveParts.length >= 3) {
+                    chosenSlot = parseInt(approveParts[1], 10) || 1;
+                    targetUserId = approveParts[2];
+                } else {
+                    chosenSlot = 1;
+                    targetUserId = approveParts[1];
+                }
                 const receivedEmbed = interaction.message.embeds[0];
 
                 try {
                     const tailField = receivedEmbed.fields.find(f => f.name === 'Tail Number')?.value;
                     const typeField = receivedEmbed.fields.find(f => f.name === 'Aircraft Type')?.value;
                     const liveryField = receivedEmbed.fields.find(f => f.name === 'Livery')?.value;
-                    
+
                     if (!tailField || !typeField || !liveryField) throw new Error("Missing required aircraft embed fields.");
 
                     let imageUrl = receivedEmbed.image?.url || interaction.message.attachments.first()?.url;
@@ -1237,17 +1293,39 @@ client.on('interactionCreate', async (interaction) => {
                     const member = await interaction.guild.members.fetch(targetUserId).catch(() => null);
                     const contributorName = member ? member.displayName : (await client.users.fetch(targetUserId)).username;
 
+                    // Find the existing record (if any) so we can place the new photo into
+                    // the admin-chosen slot without disturbing the other images.
+                    const existingEntry = await CommunityAircraftModel.findOne({
+                        aircraftType: { $regex: new RegExp(`^${escapeRegex(typeField)}$`, "i") },
+                        liveryName: { $regex: new RegExp(`^${escapeRegex(liveryField)}$`, "i") }
+                    });
+
+                    let images = getEntryImages(existingEntry);
+                    // Clamp the chosen slot so we never leave a gap; cap at MAX_AIRCRAFT_IMAGES.
+                    let slotIndex = Math.min(Math.max(chosenSlot - 1, 0), images.length);
+                    if (slotIndex >= MAX_AIRCRAFT_IMAGES) slotIndex = MAX_AIRCRAFT_IMAGES - 1;
+
+                    let replacedUrl = null;
+                    if (slotIndex < images.length) {
+                        replacedUrl = images[slotIndex];
+                        images[slotIndex] = permanentUrl;
+                    } else {
+                        images.push(permanentUrl);
+                    }
+                    images = images.slice(0, MAX_AIRCRAFT_IMAGES);
+
                     // Automatically remove the 'needsUpdate' flag upon approval
-                    const updateData = { 
-                        contributorName, 
-                        contributorId: targetUserId, 
-                        aircraftType: typeField, 
-                        liveryName: liveryField, 
-                        imageUrl: permanentUrl, 
+                    const updateData = {
+                        contributorName,
+                        contributorId: targetUserId,
+                        aircraftType: typeField,
+                        liveryName: liveryField,
+                        imageUrls: images,
+                        imageUrl: images[0], // keep legacy primary field in sync
                         uploadedAt: new Date(),
-                        needsUpdate: false 
+                        needsUpdate: false
                     };
-                    
+
                     if (tailField !== 'UNKNOWN') updateData.tailNumber = tailField.toUpperCase();
 
                     await CommunityAircraftModel.findOneAndUpdate(
@@ -1255,9 +1333,13 @@ client.on('interactionCreate', async (interaction) => {
                         updateData, { upsert: true }
                     );
 
+                    // Remove the overwritten image from storage (after the DB is updated)
+                    if (replacedUrl && replacedUrl !== permanentUrl) await deleteImageFromS3(replacedUrl);
+
                     if (CONTRIBUTOR_ROLE_ID && member) await member.roles.add(CONTRIBUTOR_ROLE_ID).catch(() => {});
 
-                    await interaction.editReply({ embeds: [EmbedBuilder.from(receivedEmbed).setColor(0x00FF00).setTitle('✅ Approved').setImage(null)], components: [] });
+                    const approvedTitle = `✅ Approved (Photo ${slotIndex + 1} of ${images.length})`;
+                    await interaction.editReply({ embeds: [EmbedBuilder.from(receivedEmbed).setColor(0x00FF00).setTitle(approvedTitle).setImage(null)], components: [] });
 
                     if (publicMsgId) {
                         try {
@@ -1405,40 +1487,32 @@ client.on('interactionCreate', async (interaction) => {
                 fields.find(f => f.name === 'Livery').value = newLivery;
                 newEmbed.setFields(fields);
 
-                // Re-run the duplicate check so an admin edit that now matches
-                // an existing record gets the replacement banner + comparison
-                // embed, and an edit away from a duplicate clears them.
-                const embedsToSend = [newEmbed];
+                // Recover the submitter id from the pending footer so we can rebuild buttons.
+                const submitterId = (oldEmbed.footer?.text || '').match(/User: (\d+)/)?.[1] || interaction.user.id;
+
+                // Re-run the duplicate check so an admin edit that now matches an existing
+                // record gets the replacement banner + per-photo comparison embeds and the
+                // correct slot-choice buttons (and an edit away from a duplicate clears them).
+                let embedsToSend = [newEmbed];
+                let components;
                 try {
                     const existingEntry = await CommunityAircraftModel.findOne({
                         aircraftType: { $regex: new RegExp(`^${escapeRegex(newType)}$`, "i") },
                         liveryName: { $regex: new RegExp(`^${escapeRegex(newLivery)}$`, "i") }
                     });
 
-                    if (existingEntry) {
-                        newEmbed.setTitle('⚠️ REPLACEMENT REQUEST');
-                        newEmbed.setColor(0xFFA500);
-                        newEmbed.setDescription(`**Admin Notice:** Matches existing **${newType} / ${newLivery}**.\nApproving this will **REPLACE** the old image (shown below).`);
-
-                        if (existingEntry.imageUrl) {
-                            embedsToSend.push(new EmbedBuilder()
-                                .setTitle('📉 Current Database Image')
-                                .setDescription(`**Current Contributor:** ${existingEntry.contributorName || 'Unknown'}\n**Tail:** ${existingEntry.tailNumber || 'Unknown'}`)
-                                .setColor(0x2B2D31)
-                                .setImage(existingEntry.imageUrl)
-                                .setFooter({ text: 'If you approve the new submission, this image will be deleted/overwritten.' }));
-                        }
-                    } else {
-                        newEmbed.setTitle('📋 New Submission Request');
-                        newEmbed.setColor(0x00FF00);
-                        // Strip any leftover replacement description from a prior state.
-                        newEmbed.setDescription(null);
-                    }
+                    const review = buildAircraftReview(newEmbed, existingEntry, submitterId);
+                    components = review.components;
+                    embedsToSend = [newEmbed, ...review.extraEmbeds];
+                    // Preserve the pending footer the buildAircraftReview helper doesn't touch.
+                    if (oldEmbed.footer?.text) newEmbed.setFooter({ text: oldEmbed.footer.text });
                 } catch (e) {
                     console.error('Admin edit duplicate re-check failed:', e);
                 }
 
-                await interaction.editReply({ embeds: embedsToSend });
+                const editPayload = { embeds: embedsToSend };
+                if (components) editPayload.components = components;
+                await interaction.editReply(editPayload);
                 return;
             }
 
