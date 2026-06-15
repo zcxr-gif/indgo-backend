@@ -295,6 +295,20 @@ const cleanupTempFiles = (files) => {
     });
 };
 
+// Helper: Keep the legacy `imageUrl` field pointed at the first gallery image.
+const syncPrimaryImage = (entry) => {
+    entry.imageUrl = (Array.isArray(entry.imageUrls) && entry.imageUrls.length > 0)
+        ? entry.imageUrls[0]
+        : null;
+};
+
+// Helper: Normalize an entry's stored images into an array, falling back to the
+// legacy single `imageUrl` for records created before multi-image support.
+const getEntryImages = (entry) => {
+    if (Array.isArray(entry.imageUrls) && entry.imageUrls.length > 0) return [...entry.imageUrls];
+    return entry.imageUrl ? [entry.imageUrl] : [];
+};
+
 // Multer config for the aircraft endpoints: accept up to MAX_AIRCRAFT_IMAGES under
 // the new 'images' field plus one legacy 'image' field.
 const uploadAircraftImages = upload.fields([
@@ -1062,6 +1076,124 @@ app.delete('/api/aircraft/:id', async (req, res) => {
     } catch (error) {
         console.error('Delete Error:', error);
         res.status(500).json({ message: 'Server error during deletion.' });
+    }
+});
+
+/* =========================
+ * PER-SLOT AIRCRAFT IMAGE MANAGEMENT
+ * Lets the dashboard add / replace / remove any individual image (slot 0-2)
+ * without touching the others. `imageUrl` always mirrors imageUrls[0].
+ * ========================= */
+
+// POST: Append a new image to an aircraft (up to MAX_AIRCRAFT_IMAGES)
+app.post('/api/aircraft/:id/images', upload.single('image'), async (req, res) => {
+    const file = req.file;
+    try {
+        if (!file) return res.status(400).json({ message: 'Image file is required.' });
+
+        const entry = await CommunityAircraft.findById(req.params.id);
+        if (!entry) {
+            cleanupTempFiles([file]);
+            return res.status(404).json({ message: 'Aircraft not found.' });
+        }
+
+        const images = getEntryImages(entry);
+        if (images.length >= MAX_AIRCRAFT_IMAGES) {
+            cleanupTempFiles([file]);
+            return res.status(400).json({ message: `An aircraft can have at most ${MAX_AIRCRAFT_IMAGES} images.` });
+        }
+
+        const url = await processAndUploadAircraftImage(file, entry.tailNumber);
+        cleanupTempFiles([file]);
+
+        images.push(url);
+        entry.imageUrls = images;
+        syncPrimaryImage(entry);
+        await entry.save();
+
+        res.status(201).json({ message: 'Image added.', data: entry });
+    } catch (error) {
+        cleanupTempFiles([file]);
+        console.error('Add Image Error:', error);
+        res.status(500).json({ message: 'Server error while adding image.' });
+    }
+});
+
+// PUT: Replace (or set) the image at a specific slot index
+app.put('/api/aircraft/:id/images/:index', upload.single('image'), async (req, res) => {
+    const file = req.file;
+    try {
+        if (!file) return res.status(400).json({ message: 'Image file is required.' });
+
+        const index = parseInt(req.params.index, 10);
+        if (isNaN(index) || index < 0 || index >= MAX_AIRCRAFT_IMAGES) {
+            cleanupTempFiles([file]);
+            return res.status(400).json({ message: `Slot must be between 0 and ${MAX_AIRCRAFT_IMAGES - 1}.` });
+        }
+
+        const entry = await CommunityAircraft.findById(req.params.id);
+        if (!entry) {
+            cleanupTempFiles([file]);
+            return res.status(404).json({ message: 'Aircraft not found.' });
+        }
+
+        const images = getEntryImages(entry);
+        // Only allow replacing an existing slot or appending to the very next one (no gaps)
+        if (index > images.length) {
+            cleanupTempFiles([file]);
+            return res.status(400).json({ message: 'Cannot leave an empty image slot.' });
+        }
+
+        const url = await processAndUploadAircraftImage(file, entry.tailNumber);
+        cleanupTempFiles([file]);
+
+        if (index < images.length) {
+            const oldUrl = images[index];
+            images[index] = url;
+            if (oldUrl) await deleteS3Object(oldUrl); // Remove the replaced image from S3
+        } else {
+            images.push(url);
+        }
+
+        entry.imageUrls = images;
+        syncPrimaryImage(entry);
+        await entry.save();
+
+        res.json({ message: 'Image replaced.', data: entry });
+    } catch (error) {
+        cleanupTempFiles([file]);
+        console.error('Replace Image Error:', error);
+        res.status(500).json({ message: 'Server error while replacing image.' });
+    }
+});
+
+// DELETE: Remove the image at a specific slot index
+app.delete('/api/aircraft/:id/images/:index', async (req, res) => {
+    try {
+        const index = parseInt(req.params.index, 10);
+        if (isNaN(index) || index < 0) {
+            return res.status(400).json({ message: 'Invalid slot index.' });
+        }
+
+        const entry = await CommunityAircraft.findById(req.params.id);
+        if (!entry) return res.status(404).json({ message: 'Aircraft not found.' });
+
+        const images = getEntryImages(entry);
+        if (index >= images.length) {
+            return res.status(404).json({ message: 'No image at that slot.' });
+        }
+
+        const [removed] = images.splice(index, 1);
+        entry.imageUrls = images;
+        syncPrimaryImage(entry);
+        await entry.save();
+
+        if (removed) await deleteS3Object(removed); // Remove the deleted image from S3
+
+        res.json({ message: 'Image removed.', data: entry });
+    } catch (error) {
+        console.error('Remove Image Error:', error);
+        res.status(500).json({ message: 'Server error while removing image.' });
     }
 });
 

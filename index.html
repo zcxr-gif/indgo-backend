@@ -542,13 +542,14 @@
 
               {/* --- MODALS --- */}
               {showFormModal && (
-                <AircraftFormModal 
-                  onClose={() => setShowFormModal(false)} 
+                <AircraftFormModal
+                  onClose={() => setShowFormModal(false)}
                   onSuccess={() => {
                     setShowFormModal(false);
                     fetchAircraft(true); // Silent update on create/edit to prevent jumping
-                    fetchStats(); 
+                    fetchStats();
                   }}
+                  onRefresh={() => { fetchAircraft(true); fetchStats(); }}
                   isDemoMode={isDemoMode}
                   initialData={editingAircraft}
                   prefillData={prefillData}
@@ -1003,7 +1004,7 @@ function AircraftCard({ data, onClick, onDelete, onEdit, onToggleFlag, adminMode
         /**
          * FORM MODAL
          */
-        function AircraftFormModal({ onClose, onSuccess, isDemoMode, initialData = null, prefillData = null }) {
+        function AircraftFormModal({ onClose, onSuccess, onRefresh, isDemoMode, initialData = null, prefillData = null }) {
           const isEditMode = !!initialData;
           const [loading, setLoading] = useState(false);
           const [fetchingMeta, setFetchingMeta] = useState(true);
@@ -1014,10 +1015,75 @@ function AircraftCard({ data, onClick, onDelete, onEdit, onToggleFlag, adminMode
 
           const fileInputRef = useRef(null);
           const MAX_IMAGES = 3;
-          // Existing images (edit mode) shown until new ones are chosen; once the user
-          // selects files, `previews` holds object URLs for the new selection.
-          const [previews, setPreviews] = useState(initialData ? getAircraftImages(initialData) : []);
+          // Create mode: object-URL previews of the new selection (up to 3).
+          const [previews, setPreviews] = useState([]);
           const [hasNewFiles, setHasNewFiles] = useState(false);
+
+          // Edit mode: live gallery managed per-slot against the granular API.
+          const aircraftId = initialData?._id;
+          const [currentImages, setCurrentImages] = useState(isEditMode ? getAircraftImages(initialData) : []);
+          const [slotBusy, setSlotBusy] = useState(false);
+          const slotFileRef = useRef(null);
+          const pendingSlotRef = useRef('add'); // index (number) to replace, or 'add' to append
+
+          // Trigger the hidden picker for a specific slot (or appending a new one)
+          const openSlotPicker = (target) => {
+            if (slotBusy) return;
+            pendingSlotRef.current = target;
+            slotFileRef.current.value = '';
+            slotFileRef.current.click();
+          };
+
+          const handleSlotFile = async (e) => {
+            const file = e.target.files?.[0];
+            if (!file) return;
+            const target = pendingSlotRef.current;
+            if (isDemoMode) { alert('Demo Mode: image changes are disabled.'); return; }
+
+            setSlotBusy(true);
+            try {
+              const body = new FormData();
+              body.append('image', file);
+              const isReplace = typeof target === 'number';
+              const url = isReplace
+                ? `${API_URL}/${aircraftId}/images/${target}`
+                : `${API_URL}/${aircraftId}/images`;
+              const res = await fetch(url, { method: isReplace ? 'PUT' : 'POST', body });
+              if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.message || 'Failed to save image');
+              }
+              const json = await res.json();
+              setCurrentImages(getAircraftImages(json.data));
+              onRefresh?.();
+            } catch (err) {
+              alert('Failed: ' + err.message);
+            } finally {
+              setSlotBusy(false);
+            }
+          };
+
+          const removeSlot = async (index) => {
+            if (slotBusy) return;
+            if (isDemoMode) { alert('Demo Mode: image changes are disabled.'); return; }
+            if (!confirm(`Remove photo ${index + 1}? This deletes it permanently.`)) return;
+
+            setSlotBusy(true);
+            try {
+              const res = await fetch(`${API_URL}/${aircraftId}/images/${index}`, { method: 'DELETE' });
+              if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.message || 'Failed to remove image');
+              }
+              const json = await res.json();
+              setCurrentImages(getAircraftImages(json.data));
+              onRefresh?.();
+            } catch (err) {
+              alert('Failed: ' + err.message);
+            } finally {
+              setSlotBusy(false);
+            }
+          };
 
           const [formData, setFormData] = useState({
             contributorName: initialData?.contributorName || '',
@@ -1134,13 +1200,17 @@ function AircraftCard({ data, onClick, onDelete, onEdit, onToggleFlag, adminMode
               data.append('liveryName', formData.liveryName);
               data.append('tailNumber', formData.tailNumber);
               
-              const selectedFiles = Array.from(fileInputRef.current?.files || []).slice(0, MAX_IMAGES);
-              if (selectedFiles.length > 0) {
-                selectedFiles.forEach(file => data.append('images', file));
-              } else if (!isEditMode) {
-                 alert('Please select at least one image');
-                 setLoading(false);
-                 return;
+              // In edit mode images are managed live (per-slot), so the form submit
+              // only updates the text fields. In create mode we send the chosen photos.
+              if (!isEditMode) {
+                const selectedFiles = Array.from(fileInputRef.current?.files || []).slice(0, MAX_IMAGES);
+                if (selectedFiles.length > 0) {
+                  selectedFiles.forEach(file => data.append('images', file));
+                } else {
+                  alert('Please select at least one image');
+                  setLoading(false);
+                  return;
+                }
               }
 
               const method = isEditMode ? 'PUT' : 'POST';
@@ -1182,7 +1252,49 @@ function AircraftCard({ data, onClick, onDelete, onEdit, onToggleFlag, adminMode
                 <div className="flex-1 overflow-y-auto p-6 scrollbar-thin scrollbar-thumb-slate-200 dark:scrollbar-thumb-slate-700">
                     <form onSubmit={handleSubmit} className="space-y-6">
                     
-                    {/* File Upload Area (up to 3 images) */}
+                    {/* ===== EDIT MODE: manage each of the 3 photo slots independently ===== */}
+                    {isEditMode ? (
+                        <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                                <label className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wide">Photos ({currentImages.length}/{MAX_IMAGES})</label>
+                                {slotBusy && <Loader2 size={16} className="animate-spin text-blue-500" />}
+                            </div>
+
+                            {/* Hidden picker reused for replace + add */}
+                            <input type="file" ref={slotFileRef} accept="image/*" onChange={handleSlotFile} className="hidden" />
+
+                            <div className="grid grid-cols-3 gap-2">
+                                {currentImages.map((src, idx) => (
+                                    <div key={idx} className="relative aspect-[4/3] rounded-xl overflow-hidden bg-slate-100 dark:bg-slate-800 group/slot border border-slate-200 dark:border-slate-700">
+                                        <img src={src} alt={`Photo ${idx + 1}`} className="absolute inset-0 w-full h-full object-cover" onError={(e) => { e.target.src = 'https://via.placeholder.com/400x300?text=No+Image'; }} />
+                                        {idx === 0 && (
+                                            <span className="absolute top-1 left-1 bg-blue-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded z-10">PRIMARY</span>
+                                        )}
+                                        <div className="absolute inset-0 bg-slate-900/60 opacity-0 group-hover/slot:opacity-100 transition-opacity flex items-center justify-center gap-2">
+                                            <button type="button" disabled={slotBusy} onClick={() => openSlotPicker(idx)} title="Replace photo"
+                                                className="p-2 bg-white/90 text-slate-900 rounded-lg hover:scale-110 transition-transform disabled:opacity-50">
+                                                <Pencil size={16} />
+                                            </button>
+                                            <button type="button" disabled={slotBusy} onClick={() => removeSlot(idx)} title="Remove photo"
+                                                className="p-2 bg-red-500/90 text-white rounded-lg hover:scale-110 transition-transform disabled:opacity-50">
+                                                <Trash2 size={16} />
+                                            </button>
+                                        </div>
+                                    </div>
+                                ))}
+
+                                {currentImages.length < MAX_IMAGES && (
+                                    <button type="button" disabled={slotBusy} onClick={() => openSlotPicker('add')}
+                                        className="aspect-[4/3] rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 hover:border-blue-400 dark:hover:border-blue-500 hover:bg-slate-50 dark:hover:bg-slate-800/50 flex flex-col items-center justify-center text-slate-400 hover:text-blue-500 transition-colors disabled:opacity-50">
+                                        <Camera size={24} />
+                                        <span className="text-xs font-semibold mt-1">Add photo</span>
+                                    </button>
+                                )}
+                            </div>
+                            <p className="text-xs text-slate-400 dark:text-slate-500">Hover a photo to replace or remove it. Changes save instantly. The first photo is the cover.</p>
+                        </div>
+                    ) : (
+                    /* ===== CREATE MODE: select up to 3 photos to upload at once ===== */
                     <div className="relative group w-full">
                         <input
                         type="file"
@@ -1207,16 +1319,14 @@ function AircraftCard({ data, onClick, onDelete, onEdit, onToggleFlag, adminMode
                                 </div>
                                 <div className="flex items-center justify-between mt-3">
                                     <p className="text-xs text-slate-400 dark:text-slate-500">
-                                        {hasNewFiles
-                                            ? `${previews.length} new photo${previews.length > 1 ? 's' : ''} selected`
-                                            : (isEditMode ? 'Current photos — selecting new ones replaces all' : `${previews.length} photo${previews.length > 1 ? 's' : ''}`)}
+                                        {previews.length} photo{previews.length > 1 ? 's' : ''} selected
                                     </p>
                                     <button
                                         type="button"
                                         onClick={() => fileInputRef.current?.click()}
                                         className="z-30 bg-slate-100 dark:bg-slate-800 text-slate-900 dark:text-white px-4 py-2 rounded-xl text-sm font-semibold shadow-sm hover:scale-105 transition-transform"
                                     >
-                                        {isEditMode || hasNewFiles ? 'Change Photos' : 'Add Photos'}
+                                        Change Photos
                                     </button>
                                 </div>
                             </div>
@@ -1230,6 +1340,7 @@ function AircraftCard({ data, onClick, onDelete, onEdit, onToggleFlag, adminMode
                             </div>
                         )}
                     </div>
+                    )}
 
                     <div className="grid grid-cols-2 gap-4">
                         <div className="space-y-1">
