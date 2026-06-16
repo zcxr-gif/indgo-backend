@@ -73,7 +73,30 @@ let lastAircraftCacheUpdate = 0;
 let cachedLiveries = {}; 
 
 // --- SESSION MANAGEMENT ---
-const userSessions = new Map(); 
+const userSessions = new Map();
+
+// ===================== UNIFIED VISUAL THEME =====================
+// A clean white / dark-gray palette so every embed reads as one product.
+// THEME.WHITE renders as a crisp white accent bar; THEME.GRAY blends into
+// Discord's dark surface for neutral/secondary content.
+const THEME = {
+    WHITE: 0xFFFFFF,   // primary accent — active, verified, info, highlights
+    GRAY:  0x2B2D31,   // neutral surface — pending, comparisons, dormant
+};
+const BRAND_FOOTER = 'Aircraft Database';
+
+// Submission lifecycle states. `badge` is shown in the embed body and updates
+// live as a submission moves Pending → Verified / Rejected.
+const SUB_STATE = {
+    PENDING:  { color: THEME.GRAY,  badge: '🟡 Awaiting Review' },
+    VERIFIED: { color: THEME.WHITE, badge: '🟢 Verified' },
+    REJECTED: { color: THEME.GRAY,  badge: '🔴 Rejected' },
+};
+
+// Build a consistently-branded embed. Defaults to the white accent.
+const themedEmbed = (color = THEME.WHITE) =>
+    new EmbedBuilder().setColor(color).setFooter({ text: BRAND_FOOTER });
+
 
 // Helper to strip non-ASCII characters for AWS S3 Metadata compatibility
 const sanitizeMetadata = (str) => {
@@ -531,31 +554,38 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         const approveButtons = [];
 
         if (existingImages.length === 0) {
+            // No photo yet: this is an "add" so the approval handler appends
+            // against the live DB state rather than assuming a fixed slot.
             approveButtons.push(
-                new ButtonBuilder().setCustomId(`approve_1_${userId}`).setLabel('Approve & Verify').setStyle(ButtonStyle.Success).setEmoji('✅')
+                new ButtonBuilder().setCustomId(`approve_add_1_${userId}`).setLabel('Approve & Verify').setStyle(ButtonStyle.Success).setEmoji('✅')
             );
-            mainEmbed.setTitle('📋 New Submission Request').setColor(0x00FF00).setDescription(null);
+            mainEmbed.setTitle('📋 New Submission — Awaiting Review').setColor(SUB_STATE.PENDING.color)
+                .setDescription(`**Status:** ${SUB_STATE.PENDING.badge}\nNo photo on record yet for this aircraft.`);
         } else {
             const slotsToShow = Math.min(existingImages.length + 1, MAX_AIRCRAFT_IMAGES);
             for (let slot = 1; slot <= slotsToShow; slot++) {
                 const isReplace = slot <= existingImages.length;
+                // Encode the intent (add/replace) in the customId so the approval
+                // handler re-checks the live image state instead of trusting the
+                // slot number captured when these buttons were first rendered.
+                const action = isReplace ? 'replace' : 'add';
                 approveButtons.push(
                     new ButtonBuilder()
-                        .setCustomId(`approve_${slot}_${userId}`)
+                        .setCustomId(`approve_${action}_${slot}_${userId}`)
                         .setLabel(`${isReplace ? 'Replace' : 'Add'} Photo ${slot}`)
                         .setStyle(isReplace ? ButtonStyle.Primary : ButtonStyle.Success)
                         .setEmoji(isReplace ? '♻️' : '➕')
                 );
             }
-            mainEmbed.setTitle('⚠️ REPLACEMENT / ADDITIONAL PHOTO').setColor(0xFFA500)
-                .setDescription(`**Admin Notice:** This aircraft already has **${existingImages.length}/${MAX_AIRCRAFT_IMAGES}** photo(s).\nChoose a slot below — **Replace** overwrites that photo, **Add** appends a new one.`);
+            mainEmbed.setTitle('♻️ Replacement / Additional Photo — Awaiting Review').setColor(SUB_STATE.PENDING.color)
+                .setDescription(`**Status:** ${SUB_STATE.PENDING.badge}\nThis aircraft already has **${existingImages.length}/${MAX_AIRCRAFT_IMAGES}** photo(s).\nChoose a slot below — **Replace** overwrites that photo, **Add** appends a new one.`);
 
             const existingContributors = getEntryContributors(existingEntry);
             existingImages.forEach((imgUrl, idx) => {
                 const slotContributor = existingContributors[idx]?.name || 'Unknown';
                 const compEmbed = new EmbedBuilder()
-                    .setTitle(`📉 Current Photo ${idx + 1}`)
-                    .setColor(0x2B2D31)
+                    .setTitle(`🖼️ Current Photo ${idx + 1}`)
+                    .setColor(THEME.GRAY)
                     .setImage(imgUrl)
                     .setFooter({ text: `Replacing Photo ${idx + 1} deletes this image.` });
                 // Show who contributed each existing photo so admins know a replace
@@ -609,7 +639,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         let isDuplicate = await checkDuplicate(currentType, currentLivery);
 
         const createPreviewEmbed = (t, tp, l, imgUrl, isDup) => {
-            const embed = new EmbedBuilder()
+            const embed = themedEmbed(THEME.WHITE)
                 .addFields(
                     { name: 'Aircraft Type', value: tp, inline: true },
                     { name: 'Livery', value: l, inline: true },
@@ -619,17 +649,16 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 // *inside* the embed. Without this, edits via editReply (which
                 // drops re-attached files) leave a fields-only embed with no
                 // visible preview.
-                .setImage('attachment://preview.webp');
+                .setImage('attachment://preview.webp')
+                .setFooter({ text: `${BRAND_FOOTER} • Confirm to submit` });
 
             if (isDup) {
-                embed.setTitle('⚠️ Existing Entry Detected');
-                embed.setColor(0xFFA500);
-                embed.setDescription(`**Note:** We already have a photo for **${tp}** in **${l}** livery.\nThis will generally be treated as a **replacement**.`);
+                embed.setTitle('♻️ Existing Entry Detected')
+                    .setColor(THEME.GRAY)
+                    .setDescription(`We already have a photo for **${tp}** in **${l}** livery.\nThis will generally be treated as a **replacement or additional photo**.`);
             } else {
-                embed.setTitle('📝 Review Your Submission');
-                embed.setColor(0x0099FF);
-                embed.setDescription('I have auto-detected the registration and corrected the names.\nPlease confirm the details below.');
-                embed.setFooter({ text: 'Click Confirm to submit.' });
+                embed.setTitle('📝 Review Your Submission')
+                    .setDescription('I auto-detected the registration and tidied the names.\nConfirm the details below — or edit them first.');
             }
             return embed;
         };
@@ -722,17 +751,18 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 const attachmentData = { attachment: finalPhotoUrl, name: 'aircraft.webp' };
 
                 // 1. Send to Public Feed (Pending Status)
-                const publicEmbed = new EmbedBuilder()
-                    .setTitle('📸 New Aircraft Spotted! (Pending Review)')
-                    .setColor(0xFFFF00) 
-                    .setDescription(`A user has submitted a new photo! Status: **Under Review**`)
+                const publicEmbed = themedEmbed(SUB_STATE.PENDING.color)
+                    .setTitle('📸 New Aircraft Spotted')
+                    .setDescription(`**Status:** ${SUB_STATE.PENDING.badge}\nA new photo has been submitted and is awaiting admin review.`)
                     .addFields(
                         { name: 'Aircraft', value: currentType, inline: true },
                         { name: 'Livery', value: currentLivery, inline: true },
                         { name: 'Tail Number', value: currentTail.toUpperCase(), inline: true },
                         { name: 'Spotted By', value: `<@${user.id}>`, inline: false }
                     )
-                    .setFooter({ text: 'Submissions are reviewed by admins before database entry.' })
+                    // Render the photo INSIDE the embed (not as a loose attachment)
+                    // so the layout matches the verified state after approval.
+                    .setImage('attachment://aircraft.webp')
                     .setTimestamp();
 
                 const publicMsg = await feedChannel.send({ embeds: [publicEmbed], files: [attachmentData] });
@@ -819,11 +849,10 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 return `${medal} ${nameDisplay} — **${entry.count}** contributions`;
             }).join('\n');
 
-            const leaderboardEmbed = new EmbedBuilder()
+            const leaderboardEmbed = themedEmbed(THEME.WHITE)
                 .setTitle('🏆 Top Contributors Leaderboard')
                 .setDescription(`Here are the top pilots helping build our database!\n\n${description}`)
-                .setColor(0xFFD700)
-                .setFooter({ text: 'Updated Daily • Submit photos to climb the ranks!' })
+                .setFooter({ text: `${BRAND_FOOTER} • Updated daily — submit photos to climb!` })
                 .setTimestamp();
 
             let lastMessage = (await channel.messages.fetch({ limit: 5 })).find(m => m.author.id === client.user.id);
@@ -870,10 +899,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             const start = safePage * itemsPerPage;
             const pageData = enriched.slice(start, start + itemsPerPage);
             
-            const embed = new EmbedBuilder()
+            const embed = themedEmbed(THEME.WHITE)
                 .setTitle('🎯 Aircraft Photo Update Bounties')
-                .setColor(0xFF8C00)
-                .setFooter({ text: `Page ${safePage + 1} of ${totalPages} • Real-time live data` })
+                .setFooter({ text: `${BRAND_FOOTER} • Page ${safePage + 1} of ${totalPages}` })
                 .setTimestamp();
                 
             if (pageData.length === 0) {
@@ -1098,7 +1126,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             const welcomeEmbed = new EmbedBuilder()
                 .setTitle(`Welcome to Inflight!`)
                 .setDescription(`Hello ${member}, welcome to the server!`)
-                .setColor(0x0099FF)
+                .setColor(THEME.WHITE)
                 .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
                 .addFields({ name: '📸 Submit Photos', value: `Post your photos directly in <#${SUBMISSION_CHANNEL_ID}> to contribute!` })
                 .setTimestamp();
@@ -1127,17 +1155,21 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
 
                 const session = userSessions.get(message.author.id);
                 if (session && Date.now() < session.expiresAt) {
+                    // Don't silently reuse the last aircraft — ask the user to confirm
+                    // the auto-fill. Stash this photo so the button handler can use it.
                     session.expiresAt = Date.now() + 300000;
+                    session.pendingPhoto = photo.url;
                     userSessions.set(message.author.id, session);
-                    await startSubmissionFlow(
-                        message, 
-                        session.type, 
-                        session.livery, 
-                        null, 
-                        photo.url, 
-                        message.author, 
-                        message.channelId 
+
+                    const confirmRow = new ActionRowBuilder().addComponents(
+                        new ButtonBuilder().setCustomId(`autofill_yes_${message.author.id}`).setLabel('Yes — same aircraft').setEmoji('✅').setStyle(ButtonStyle.Success),
+                        new ButtonBuilder().setCustomId(`autofill_no_${message.author.id}`).setLabel('No — new aircraft').setEmoji('🆕').setStyle(ButtonStyle.Secondary),
                     );
+                    const confirmEmbed = themedEmbed(THEME.WHITE)
+                        .setTitle('🔁 Same aircraft as before?')
+                        .setDescription(`I still have your last submission details saved:\n\n> **Aircraft:** ${session.type}\n> **Livery:** ${session.livery}\n> **Tail:** ${session.tail}\n\nTap **Yes** to auto-fill these, or **No** to enter new details.`);
+
+                    await message.reply({ embeds: [confirmEmbed], components: [confirmRow] });
                     return;
                 }
 
@@ -1150,9 +1182,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                             .setStyle(ButtonStyle.Primary)
                     );
 
-                const promptEmbed = new EmbedBuilder()
-                    .setColor(0x0099FF)
-                    .setDescription(`**Thanks for the photo!**\nPlease click the button below to enter the **Aircraft** and **Livery** details.`);
+                const promptEmbed = themedEmbed(THEME.WHITE)
+                    .setTitle('📸 New Aircraft Photo')
+                    .setDescription('Thanks for the photo! Tap **Identify Aircraft** below to enter the **aircraft type** and **livery**.');
 
                 await message.reply({ embeds: [promptEmbed], components: [row] });
             }
@@ -1175,9 +1207,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                             .setStyle(ButtonStyle.Primary)
                     );
 
-                const promptEmbed = new EmbedBuilder()
-                    .setColor(0x0099FF)
-                    .setDescription(`**Thanks for the airport photo!**\nPlease click the button below to enter the **ICAO Code** for this airport.`);
+                const promptEmbed = themedEmbed(THEME.WHITE)
+                    .setTitle('🏢 New Airport Photo')
+                    .setDescription('Thanks for the airport photo! Tap **Identify Airport** below to enter the **ICAO code**.');
 
                 await message.reply({ embeds: [promptEmbed], components: [row] });
             }
@@ -1253,6 +1285,39 @@ client.on('interactionCreate', async (interaction) => {
             }
 
             // --- AIRCRAFT BUTTONS ---
+            // Autofill confirmation: user uploaded another photo within the session.
+            if (customId.startsWith('autofill_yes_')) {
+                const originalUserId = customId.split('_')[2];
+                if (interaction.user.id !== originalUserId) return interaction.reply({ content: "This isn't your submission.", ephemeral: true });
+                const session = userSessions.get(originalUserId);
+                if (!session || Date.now() >= session.expiresAt || !session.pendingPhoto) {
+                    return interaction.update({ embeds: [themedEmbed(THEME.GRAY).setTitle('⏳ Session Expired').setDescription('Please re-upload your photo to start a new submission.')], components: [] });
+                }
+                const photoUrl = session.pendingPhoto;
+                session.pendingPhoto = null;
+                session.expiresAt = Date.now() + 300000;
+                userSessions.set(originalUserId, session);
+                // deferUpdate so startSubmissionFlow edits THIS prompt into the preview.
+                await interaction.deferUpdate();
+                await startSubmissionFlow(interaction, session.type, session.livery, null, photoUrl, interaction.user, interaction.channelId);
+                return;
+            }
+
+            if (customId.startsWith('autofill_no_')) {
+                const originalUserId = customId.split('_')[2];
+                if (interaction.user.id !== originalUserId) return interaction.reply({ content: "This isn't your submission.", ephemeral: true });
+                // Reset the saved session so the user can enter brand-new details.
+                userSessions.delete(originalUserId);
+                const row = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`start_ident_${originalUserId}`).setLabel('Identify Aircraft').setEmoji('✈️').setStyle(ButtonStyle.Primary)
+                );
+                await interaction.update({
+                    embeds: [themedEmbed(THEME.WHITE).setTitle('📸 New Aircraft Photo').setDescription('No problem — tap **Identify Aircraft** below to enter new details.')],
+                    components: [row]
+                });
+                return;
+            }
+
             if (customId.startsWith('start_ident_')) {
                 const originalUserId = customId.split('_')[2];
                 if (interaction.user.id !== originalUserId) return interaction.reply({ content: "This is not your photo.", ephemeral: true });
@@ -1283,10 +1348,18 @@ client.on('interactionCreate', async (interaction) => {
 
             if (customId.startsWith('approve_') && !customId.startsWith('approve_apt_')) {
                 await interaction.deferUpdate();
-                // customId format: approve_<slot>_<userId> (legacy: approve_<userId> => slot 1)
+                // customId format: approve_<action>_<slot>_<userId> where action is
+                // 'add' | 'replace'. Older formats are still accepted:
+                //   approve_<slot>_<userId>  (slot only — intent inferred at approval)
+                //   approve_<userId>         (legacy single-photo => slot 1)
                 const approveParts = customId.split('_');
+                let approveAction = null; // 'add' | 'replace' | null (infer)
                 let chosenSlot, targetUserId;
-                if (approveParts.length >= 3) {
+                if (approveParts.length >= 4) {
+                    approveAction = approveParts[1];
+                    chosenSlot = parseInt(approveParts[2], 10) || 1;
+                    targetUserId = approveParts[3];
+                } else if (approveParts.length === 3) {
                     chosenSlot = parseInt(approveParts[1], 10) || 1;
                     targetUserId = approveParts[2];
                 } else {
@@ -1304,6 +1377,7 @@ client.on('interactionCreate', async (interaction) => {
 
                     let imageUrl = receivedEmbed.image?.url || interaction.message.attachments.first()?.url;
                     const publicMsgId = (receivedEmbed.footer?.text || '').match(/Msg: (\d+)/)?.[1];
+                    const originChannelId = (receivedEmbed.footer?.text || '').match(/Ch: (\d+)/)?.[1];
 
                     const permanentUrl = await uploadImageToS3(imageUrl, tailField);
                     const member = await interaction.guild.members.fetch(targetUserId).catch(() => null);
@@ -1318,9 +1392,43 @@ client.on('interactionCreate', async (interaction) => {
 
                     let images = getEntryImages(existingEntry);
                     let contributors = getEntryContributors(existingEntry);
-                    // Clamp the chosen slot so we never leave a gap; cap at MAX_AIRCRAFT_IMAGES.
-                    let slotIndex = Math.min(Math.max(chosenSlot - 1, 0), images.length);
-                    if (slotIndex >= MAX_AIRCRAFT_IMAGES) slotIndex = MAX_AIRCRAFT_IMAGES - 1;
+
+                    // RE-CHECK against the LIVE database before placing the photo.
+                    // The slot baked into the button was decided when the buttons
+                    // were rendered; by the time an admin clicks, other submissions
+                    // for the same aircraft may already have been approved. Without
+                    // this re-check, a second pending "add" (rendered as slot 1 when
+                    // there were 0 photos) would overwrite the photo that was just
+                    // approved into slot 1. We honour the admin's intent (add vs
+                    // replace) against the current image count instead.
+                    let slotIndex;
+                    let isReplace;
+                    if (approveAction === 'add') {
+                        // Append as a NEW photo at the end of the current list. If
+                        // the aircraft is already full, fall back to the last slot.
+                        if (images.length < MAX_AIRCRAFT_IMAGES) {
+                            slotIndex = images.length;
+                            isReplace = false;
+                        } else {
+                            slotIndex = MAX_AIRCRAFT_IMAGES - 1;
+                            isReplace = true;
+                        }
+                    } else if (approveAction === 'replace') {
+                        // Replace the targeted slot if it still exists; if that photo
+                        // is gone (images shrank since render), append instead.
+                        slotIndex = chosenSlot - 1;
+                        if (slotIndex >= 0 && slotIndex < images.length) {
+                            isReplace = true;
+                        } else {
+                            slotIndex = Math.min(images.length, MAX_AIRCRAFT_IMAGES - 1);
+                            isReplace = slotIndex < images.length;
+                        }
+                    } else {
+                        // Legacy buttons (no encoded action): infer from live state.
+                        slotIndex = Math.min(Math.max(chosenSlot - 1, 0), images.length);
+                        if (slotIndex >= MAX_AIRCRAFT_IMAGES) slotIndex = MAX_AIRCRAFT_IMAGES - 1;
+                        isReplace = slotIndex < images.length;
+                    }
 
                     // The person who submitted this photo is the contributor of THIS
                     // slot only — adding/replacing photo 2 or 3 must not overwrite the
@@ -1328,7 +1436,7 @@ client.on('interactionCreate', async (interaction) => {
                     const slotContributor = { name: contributorName, id: targetUserId };
 
                     let replacedUrl = null;
-                    if (slotIndex < images.length) {
+                    if (isReplace && slotIndex < images.length) {
                         replacedUrl = images[slotIndex];
                         images[slotIndex] = permanentUrl;
                         contributors[slotIndex] = slotContributor;
@@ -1367,18 +1475,51 @@ client.on('interactionCreate', async (interaction) => {
 
                     if (CONTRIBUTOR_ROLE_ID && member) await member.roles.add(CONTRIBUTOR_ROLE_ID).catch(() => {});
 
-                    const approvedTitle = `✅ Approved (Photo ${slotIndex + 1} of ${images.length})`;
-                    await interaction.editReply({ embeds: [EmbedBuilder.from(receivedEmbed).setColor(0x00FF00).setTitle(approvedTitle).setImage(null)], components: [] });
+                    const approvedTitle = `✅ Approved — Photo ${slotIndex + 1} of ${images.length}`;
+                    // Keep the verified photo rendered inside the admin embed (using the
+                    // permanent S3 URL) and drop the temporary upload attachment.
+                    await interaction.editReply({
+                        embeds: [EmbedBuilder.from(receivedEmbed).setColor(SUB_STATE.VERIFIED.color).setTitle(approvedTitle).setImage(permanentUrl)],
+                        components: [],
+                        attachments: []
+                    });
 
                     if (publicMsgId) {
                         try {
                             const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
                             const publicMsg = await feedChannel.messages.fetch(publicMsgId);
-                            await publicMsg.edit({ content: permanentUrl, embeds: [EmbedBuilder.from(publicMsg.embeds[0]).setTitle('✅ Verified').setColor(0x00FF00).setImage(null)], files: [] });
+                            // Embed the PERMANENT image (S3 URLs don't expire) instead of
+                            // posting the raw link as message content. This keeps the photo
+                            // visible on the message forever and removes the temp attachment.
+                            await publicMsg.edit({
+                                content: '',
+                                embeds: [EmbedBuilder.from(publicMsg.embeds[0])
+                                    .setTitle('✅ Verified Aircraft')
+                                    .setColor(SUB_STATE.VERIFIED.color)
+                                    .setDescription(`**Status:** ${SUB_STATE.VERIFIED.badge}\nThis photo has been verified and saved to the database.`)
+                                    .setImage(permanentUrl)],
+                                attachments: []
+                            });
                         } catch (e) {}
                     }
-                } catch (err) { 
-                    console.error("Aircraft Approval Error:", err); 
+
+                    // Let the submitter know their photo went live, with the image.
+                    if (originChannelId) {
+                        try {
+                            const userChannel = await client.channels.fetch(originChannelId).catch(() => null);
+                            if (userChannel) {
+                                await userChannel.send({
+                                    content: `<@${targetUserId}>`,
+                                    embeds: [themedEmbed(SUB_STATE.VERIFIED.color)
+                                        .setTitle('✅ Photo Approved')
+                                        .setDescription(`**Status:** ${SUB_STATE.VERIFIED.badge}\nYour **${typeField}** (${liveryField}) photo is now live in the database. Thanks for contributing! 🎉`)
+                                        .setImage(permanentUrl)]
+                                });
+                            }
+                        } catch (e) {}
+                    }
+                } catch (err) {
+                    console.error("Aircraft Approval Error:", err);
                 }
                 return;
             }
@@ -1407,13 +1548,33 @@ client.on('interactionCreate', async (interaction) => {
                 await interaction.deferUpdate();
                 const [_, __, targetUserId, icao] = customId.split('_');
                 const imageUrl = interaction.message.embeds[0].image?.url;
+                const aptPublicMsgId = (interaction.message.embeds[0].footer?.text || '').match(/Msg: (\d+)/)?.[1];
+                const aptOriginChannelId = (interaction.message.embeds[0].footer?.text || '').match(/Ch: (\d+)/)?.[1];
                 try {
                     const member = await interaction.guild.members.fetch(targetUserId).catch(() => null);
                     const contributorName = sanitizeMetadata(member ? member.displayName : "Unknown");
                     const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
                     if (typeof deleteAirportImages === 'function') await deleteAirportImages(s3Client, icao);
                     const finalUrl = await uploadAirportImage(s3Client, { buffer: Buffer.from(response.data) }, icao, contributorName);
-                    await interaction.editReply({ embeds: [EmbedBuilder.from(interaction.message.embeds[0]).setTitle(`✅ Airport Approved: ${icao}`).setColor(0x00FF00).setImage(finalUrl)], components: [] });
+                    await interaction.editReply({ embeds: [EmbedBuilder.from(interaction.message.embeds[0]).setTitle(`✅ Airport Approved: ${icao}`).setColor(SUB_STATE.VERIFIED.color).setDescription(`**Status:** ${SUB_STATE.VERIFIED.badge}`).setImage(finalUrl)], components: [] });
+
+                    // Update the public feed message too, swapping the temporary Discord
+                    // image URL (which expires) for the permanent stored one.
+                    if (aptPublicMsgId) {
+                        try {
+                            const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
+                            const publicMsg = await feedChannel.messages.fetch(aptPublicMsgId);
+                            await publicMsg.edit({ embeds: [EmbedBuilder.from(publicMsg.embeds[0]).setTitle(`✅ Verified Airport: ${icao}`).setColor(SUB_STATE.VERIFIED.color).setDescription(`**Status:** ${SUB_STATE.VERIFIED.badge}`).setImage(finalUrl)] });
+                        } catch (e) {}
+                    }
+
+                    // Notify the submitter in their channel with the verified image.
+                    if (aptOriginChannelId) {
+                        try {
+                            const userChannel = await client.channels.fetch(aptOriginChannelId).catch(() => null);
+                            if (userChannel) await userChannel.send({ content: `<@${targetUserId}>`, embeds: [themedEmbed(SUB_STATE.VERIFIED.color).setTitle('✅ Airport Photo Approved').setDescription(`**Status:** ${SUB_STATE.VERIFIED.badge}\nYour **${icao}** photo is now live. Thanks! 🎉`).setImage(finalUrl)] });
+                        } catch (e) {}
+                    }
                 } catch (err) { console.error("Airport Approval Error:", err); }
                 return;
             }
@@ -1552,20 +1713,36 @@ client.on('interactionCreate', async (interaction) => {
                 const oldEmbed = interaction.message.embeds[0];
                 const publicMsgId = (oldEmbed.footer?.text || '').match(/Msg: (\d+)/)?.[1];
                 const originChannelId = (oldEmbed.footer?.text || '').match(/Ch: (\d+)/)?.[1];
+                // Grab the image being rejected so we can show it to the user.
+                const rejectedImageUrl = oldEmbed.image?.url || interaction.message.attachments.first()?.url;
 
-                await interaction.editReply({ embeds: [EmbedBuilder.from(oldEmbed).setTitle('❌ Rejected').setColor(0xFF0000).setDescription(`Reason: ${reason}`).setImage(null)], components: [] });
-                
+                // Keep the photo visible on the admin message (don't null it) so the
+                // record of what was rejected stays intact.
+                await interaction.editReply({ embeds: [EmbedBuilder.from(oldEmbed).setTitle('❌ Rejected').setColor(SUB_STATE.REJECTED.color).setDescription(`${SUB_STATE.REJECTED.badge}\n**Reason:** ${reason}`)], components: [] });
+
                 if (publicMsgId) {
                     try {
                         const feed = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
                         const msg = await feed.messages.fetch(publicMsgId);
-                        await msg.edit({ embeds: [EmbedBuilder.from(msg.embeds[0]).setTitle('❌ Rejected').setColor(0xFF0000).setImage(null)] });
+                        await msg.edit({ embeds: [EmbedBuilder.from(msg.embeds[0]).setTitle('❌ Rejected').setColor(SUB_STATE.REJECTED.color).setDescription(`**Status:** ${SUB_STATE.REJECTED.badge}\nThis submission was not approved.`).setImage(null)], attachments: [] });
                     } catch(e) {}
                 }
-                
+
                 if (originChannelId) {
                     const channel = await client.channels.fetch(originChannelId).catch(() => null);
-                    if (channel) await channel.send({ content: `<@${targetUserId}>`, embeds: [new EmbedBuilder().setTitle('❌ Photo Rejected').setDescription(`Reason: ${reason}`).setColor(0xFF0000)] });
+                    if (channel) {
+                        const userEmbed = themedEmbed(SUB_STATE.REJECTED.color)
+                            .setTitle('❌ Photo Rejected')
+                            .setDescription(`**Status:** ${SUB_STATE.REJECTED.badge}\n**Reason:** ${reason}\n\nFeel free to submit a new photo — corrections are welcome!`);
+                        const payload = { content: `<@${targetUserId}>`, embeds: [userEmbed] };
+                        // Re-upload the rejected image onto the user's message so they can
+                        // see exactly what was declined (and it stays persistent).
+                        if (rejectedImageUrl) {
+                            userEmbed.setImage('attachment://rejected.webp');
+                            payload.files = [{ attachment: rejectedImageUrl, name: 'rejected.webp' }];
+                        }
+                        await channel.send(payload).catch(() => {});
+                    }
                 }
                 return;
             }
@@ -1591,9 +1768,9 @@ client.on('interactionCreate', async (interaction) => {
 
                 try {
                     const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
-                    const publicMsg = await feedChannel.send({ embeds: [new EmbedBuilder().setTitle('🏢 New Airport Submission').setColor(0xFFFF00).setImage(photoUrl).addFields({ name: 'ICAO', value: icao })] });
+                    const publicMsg = await feedChannel.send({ embeds: [themedEmbed(SUB_STATE.PENDING.color).setTitle('🏢 New Airport Submission').setDescription(`**Status:** ${SUB_STATE.PENDING.badge}`).setImage(photoUrl).addFields({ name: 'ICAO', value: icao })] });
 
-                    const adminEmbed = new EmbedBuilder().setTitle('🏢 Airport Review').setColor(0x0099FF).setImage(photoUrl).addFields({ name: 'ICAO', value: icao }).setFooter({ text: `User: ${interaction.user.id} | Msg: ${publicMsg.id} | Ch: ${interaction.channelId}` });
+                    const adminEmbed = themedEmbed(SUB_STATE.PENDING.color).setTitle('🏢 Airport Review — Awaiting Approval').setDescription(`**Status:** ${SUB_STATE.PENDING.badge}`).setImage(photoUrl).addFields({ name: 'ICAO', value: icao }).setFooter({ text: `User: ${interaction.user.id} | Msg: ${publicMsg.id} | Ch: ${interaction.channelId}` });
                     const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`approve_apt_${interaction.user.id}_${icao}`).setLabel('Approve').setStyle(ButtonStyle.Success), new ButtonBuilder().setCustomId(`reject_apt_${interaction.user.id}`).setLabel('Reject').setStyle(ButtonStyle.Danger));
                     const adminChannel = await client.channels.fetch(AIRPORT_ADMIN_CHANNEL_ID);
                     await adminChannel.send({ embeds: [adminEmbed], components: [row] });
@@ -1613,18 +1790,29 @@ client.on('interactionCreate', async (interaction) => {
                 const oldEmbed = interaction.message.embeds[0];
                 const publicMsgId = (oldEmbed.footer?.text || '').match(/Msg: (\d+)/)?.[1];
                 const originChannelId = (oldEmbed.footer?.text || '').match(/Ch: (\d+)/)?.[1];
+                const rejectedImageUrl = oldEmbed.image?.url;
 
-                await interaction.editReply({ embeds: [EmbedBuilder.from(oldEmbed).setTitle('❌ Airport Rejected').setColor(0xFF0000).setDescription(`Reason: ${reason}`).setImage(null)], components: [] });
+                await interaction.editReply({ embeds: [EmbedBuilder.from(oldEmbed).setTitle('❌ Airport Rejected').setColor(SUB_STATE.REJECTED.color).setDescription(`${SUB_STATE.REJECTED.badge}\n**Reason:** ${reason}`)], components: [] });
                 if (publicMsgId) {
                     try {
                         const feed = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
                         const msg = await feed.messages.fetch(publicMsgId);
-                        await msg.edit({ embeds: [EmbedBuilder.from(msg.embeds[0]).setTitle('❌ Rejected').setColor(0xFF0000).setImage(null)] });
+                        await msg.edit({ embeds: [EmbedBuilder.from(msg.embeds[0]).setTitle('❌ Rejected').setColor(SUB_STATE.REJECTED.color).setDescription(`**Status:** ${SUB_STATE.REJECTED.badge}`).setImage(null)] });
                     } catch(e) {}
                 }
                 if (originChannelId) {
                     const ch = await client.channels.fetch(originChannelId).catch(() => null);
-                    if (ch) await ch.send({ content: `<@${targetUserId}>`, embeds: [new EmbedBuilder().setTitle('❌ Airport Photo Rejected').setDescription(`Reason: ${reason}`).setColor(0xFF0000)] });
+                    if (ch) {
+                        const userEmbed = themedEmbed(SUB_STATE.REJECTED.color)
+                            .setTitle('❌ Airport Photo Rejected')
+                            .setDescription(`**Status:** ${SUB_STATE.REJECTED.badge}\n**Reason:** ${reason}\n\nFeel free to submit a new photo.`);
+                        const payload = { content: `<@${targetUserId}>`, embeds: [userEmbed] };
+                        if (rejectedImageUrl) {
+                            userEmbed.setImage('attachment://rejected.webp');
+                            payload.files = [{ attachment: rejectedImageUrl, name: 'rejected.webp' }];
+                        }
+                        await ch.send(payload).catch(() => {});
+                    }
                 }
                 return;
             }
@@ -1635,7 +1823,7 @@ client.on('interactionCreate', async (interaction) => {
                 const desc = interaction.fields.getTextInputValue('ticket_desc') || 'No description';
                 const thread = await interaction.channel.threads.create({ name: `ticket-${interaction.user.username}-${topic}`, type: ChannelType.PrivateThread, reason: 'Support Ticket' });
                 await thread.members.add(interaction.user.id);
-                const embed = new EmbedBuilder().setTitle('🎫 Support Ticket').addFields({ name: 'Topic', value: topic }, { name: 'Description', value: desc }).setColor(0x0099FF);
+                const embed = new EmbedBuilder().setTitle('🎫 Support Ticket').addFields({ name: 'Topic', value: topic }, { name: 'Description', value: desc }).setColor(THEME.WHITE);
                 const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('close_ticket_action').setLabel('Close Ticket').setStyle(ButtonStyle.Danger));
                 await thread.send({ content: `<@&${ADMIN_ROLE_ID}>`, embeds: [embed], components: [row] });
                 await interaction.editReply(`Ticket created: <#${thread.id}>`);
@@ -1713,7 +1901,7 @@ client.on('interactionCreate', async (interaction) => {
                     if (!match) return interaction.editReply(`❌ Pilot "${query}" not found.`);
                     
                     const phase = match.position.alt_ft < 1000 && match.position.gs_kt < 40 ? 'On Ground' : 'Flying';
-                    const embed = new EmbedBuilder().setTitle(`📡 Tracking: ${match.callsign}`).setColor(0x00FF99).addFields({ name: 'Pilot', value: match.username || 'Unknown', inline: true }, { name: 'Aircraft', value: match.aircraft?.aircraftName || 'Unknown', inline: true }, { name: 'Altitude', value: `${Math.round(match.position.alt_ft).toLocaleString()} ft`, inline: true }, { name: 'Status', value: phase, inline: true });
+                    const embed = new EmbedBuilder().setTitle(`📡 Tracking: ${match.callsign}`).setColor(THEME.WHITE).addFields({ name: 'Pilot', value: match.username || 'Unknown', inline: true }, { name: 'Aircraft', value: match.aircraft?.aircraftName || 'Unknown', inline: true }, { name: 'Altitude', value: `${Math.round(match.position.alt_ft).toLocaleString()} ft`, inline: true }, { name: 'Status', value: phase, inline: true });
                     await interaction.editReply({ embeds: [embed] });
                 } catch (e) { await interaction.editReply("❌ API Connection Failed."); }
                 return;
@@ -1725,7 +1913,7 @@ client.on('interactionCreate', async (interaction) => {
                 try {
                     const stats = await CommunityAircraftModel.aggregate([{ $match: { $or: [{ contributorId: target.id }, { contributorName: target.username }] } }, { $group: { _id: null, total: { $sum: 1 }, types: { $addToSet: "$aircraftType" }, liveries: { $addToSet: "$liveryName" } } }]);
                     if (!stats.length) return interaction.editReply(`📂 ${target.username}'s hangar is empty.`);
-                    const embed = new EmbedBuilder().setTitle(`✈️ ${target.username}'s Hangar`).setColor(0xFFD700).addFields({ name: 'Total Photos', value: `${stats[0].total}`, inline: true }, { name: 'Unique Types', value: `${stats[0].types.length}`, inline: true });
+                    const embed = new EmbedBuilder().setTitle(`✈️ ${target.username}'s Hangar`).setColor(THEME.WHITE).addFields({ name: 'Total Photos', value: `${stats[0].total}`, inline: true }, { name: 'Unique Types', value: `${stats[0].types.length}`, inline: true });
                     const latest = await CommunityAircraftModel.findOne({ $or: [{ contributorId: target.id }, { contributorName: target.username }] }).sort({ uploadedAt: -1 });
                     if (latest) embed.setImage(latest.imageUrl);
                     await interaction.editReply({ embeds: [embed] });
@@ -1742,7 +1930,7 @@ client.on('interactionCreate', async (interaction) => {
             const ticketEmbed = new EmbedBuilder()
                 .setTitle('🎫 Inflight Support')
                 .setDescription('Click the button below to open a private support ticket.\n\nYou can ask about:\n• Database corrections\n• Submission issues\n• Role/Account help')
-                .setColor(0x0099FF)
+                .setColor(THEME.WHITE)
                 .setFooter({ text: 'Our team will assist you as soon as possible.' });
 
             const row = new ActionRowBuilder().addComponents(
@@ -1760,7 +1948,7 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.commandName === 'links') {
             const embed = new EmbedBuilder()
                 .setTitle('🔗 Useful Resources')
-                .setColor(0x0099FF)
+                .setColor(THEME.WHITE)
                 .setDescription('Here are the links to the flight tracker, forum thread, and livery database:')
                 .addFields(
                     { name: '📡 Flight Tracker', value: '[Inflight.info](https://inflight.info)', inline: true },
@@ -1871,7 +2059,7 @@ client.on('interactionCreate', async (interaction) => {
                 });
                 if (!result) await interaction.editReply(`❌ No match for "**${query}**".`);
                 else {
-                    const embed = new EmbedBuilder().setTitle(`🔍 ${result.tailNumber}`).setColor(0x0099FF).addFields({ name: 'Aircraft', value: result.aircraftType, inline: true }, { name: 'Livery', value: result.liveryName, inline: true }, { name: 'Contributor', value: result.contributorName, inline: true }).setImage(result.imageUrl).setTimestamp(result.uploadedAt);
+                    const embed = new EmbedBuilder().setTitle(`🔍 ${result.tailNumber}`).setColor(THEME.WHITE).addFields({ name: 'Aircraft', value: result.aircraftType, inline: true }, { name: 'Livery', value: result.liveryName, inline: true }, { name: 'Contributor', value: result.contributorName, inline: true }).setImage(result.imageUrl).setTimestamp(result.uploadedAt);
                     await interaction.editReply({ embeds: [embed] });
                 }
             } catch (e) { await interaction.editReply('⚠️ Search Error.'); }
@@ -1894,10 +2082,15 @@ client.on('interactionCreate', async (interaction) => {
                     return;
                 }
 
+                // Show every stored photo (up to 3), not just the primary one.
+                const pullImages = getEntryImages(result);
+                const pullContributors = getEntryContributors(result);
+                const primaryImage = pullImages[0] || result.imageUrl;
+
                 const pullEmbed = new EmbedBuilder()
                     .setTitle('🗃️ Aircraft Database Record')
-                    .setColor(0x00FF00) 
-                    .setDescription(`**Status:** ✅ Verified / Live`) 
+                    .setColor(THEME.WHITE)
+                    .setDescription(`**Status:** ✅ Verified / Live${pullImages.length > 1 ? `\n📸 **${pullImages.length} photos** on record` : ''}`)
                     .addFields(
                         { name: 'Aircraft Type', value: result.aircraftType, inline: true },
                         { name: 'Livery', value: result.liveryName, inline: true },
@@ -1905,10 +2098,20 @@ client.on('interactionCreate', async (interaction) => {
                         { name: 'Contributor', value: result.contributorName, inline: true },
                         { name: 'Uploaded', value: `<t:${Math.floor(new Date(result.uploadedAt).getTime() / 1000)}:R>`, inline: true }
                     )
-                    .setImage(result.imageUrl)
+                    .setImage(primaryImage)
                     .setFooter({ text: `Record ID: ${result._id}` });
 
-                await interaction.editReply({ embeds: [pullEmbed] });
+                // Additional photos ride along as extra embeds so they all render
+                // inside the same message.
+                const galleryEmbeds = pullImages.slice(1).map((url, i) =>
+                    new EmbedBuilder()
+                        .setColor(THEME.WHITE)
+                        .setTitle(`📷 Photo ${i + 2}`)
+                        .setDescription(`Contributor: ${pullContributors[i + 1]?.name || result.contributorName}`)
+                        .setImage(url)
+                );
+
+                await interaction.editReply({ embeds: [pullEmbed, ...galleryEmbeds] });
 
             } catch (e) { 
                 console.error(e);
@@ -1929,7 +2132,7 @@ client.on('interactionCreate', async (interaction) => {
                 if (!airportData || !imageUrl) {
                     const noPicEmbed = new EmbedBuilder()
                         .setTitle(`🏢 Airport: ${icaoInput}`)
-                        .setColor(0x808080)
+                        .setColor(THEME.GRAY)
                         .setDescription(`❌ No picture submitted yet for **${icaoInput}**.`);
                     
                     return interaction.editReply({ embeds: [noPicEmbed] });
@@ -1937,7 +2140,7 @@ client.on('interactionCreate', async (interaction) => {
 
                 const pullEmbed = new EmbedBuilder()
                     .setTitle(`🏢 Airport Database Record`)
-                    .setColor(0x00FF00) 
+                    .setColor(THEME.WHITE) 
                     .setDescription(`**Status:** ✅ Verified / Live`) 
                     .addFields(
                         { name: 'ICAO Code', value: icaoInput, inline: true },
@@ -1951,7 +2154,7 @@ client.on('interactionCreate', async (interaction) => {
                 console.error("Airport Pull Error:", e);
                 const noPicEmbed = new EmbedBuilder()
                     .setTitle(`🏢 Airport: ${icaoInput}`)
-                    .setColor(0x808080)
+                    .setColor(THEME.GRAY)
                     .setDescription(`❌ No picture submitted yet for **${icaoInput}**.`);
                 
                 await interaction.editReply({ embeds: [noPicEmbed] });
@@ -1973,7 +2176,7 @@ client.on('interactionCreate', async (interaction) => {
                     $or: [{ contributorId: targetUser.id }, { contributorName: targetUser.username }]
                 }).sort({ uploadedAt: -1 });
 
-                const embed = new EmbedBuilder().setTitle(`✈️ Pilot Profile: ${targetUser.username}`).setThumbnail(targetUser.displayAvatarURL()).setColor(0xFFD700).addFields({ name: 'Total Contributions', value: `${count}`, inline: true });
+                const embed = new EmbedBuilder().setTitle(`✈️ Pilot Profile: ${targetUser.username}`).setThumbnail(targetUser.displayAvatarURL()).setColor(THEME.WHITE).addFields({ name: 'Total Contributions', value: `${count}`, inline: true });
                 if (recent) { embed.addFields({ name: 'Last Spotted', value: `${recent.tailNumber}` }); embed.setImage(recent.imageUrl); }
                 await interaction.editReply({ embeds: [embed] });
             } catch (e) { await interaction.editReply('Error.'); }
@@ -1982,7 +2185,7 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.commandName === 'stats') {
             try {
                 const count = await CommunityAircraftModel.countDocuments();
-                await interaction.reply({ embeds: [new EmbedBuilder().setTitle('📊 Database Stats').setColor(0x00FF99).setDescription(`Tracked **${count}** aircraft.`)] });
+                await interaction.reply({ embeds: [new EmbedBuilder().setTitle('📊 Database Stats').setColor(THEME.WHITE).setDescription(`Tracked **${count}** aircraft.`)] });
             } catch (e) { await interaction.reply('Error.'); }
         }
 
@@ -2001,14 +2204,14 @@ client.on('interactionCreate', async (interaction) => {
                     .lean();
 
                 if (!top.length) {
-                    return interaction.editReply({ embeds: [new EmbedBuilder().setTitle('📡 Most-Watched Pilots').setColor(0x5865F2).setDescription('Nobody has been tracked yet today. Open the tracker to start!')] });
+                    return interaction.editReply({ embeds: [new EmbedBuilder().setTitle('📡 Most-Watched Pilots').setColor(THEME.WHITE).setDescription('Nobody has been tracked yet today. Open the tracker to start!')] });
                 }
 
                 const medals = ['🥇', '🥈', '🥉', '#4', '#5'];
                 const description = top.map((p, i) => `${medals[i]} **${p.pilotName}** — ${p.viewCount} ${p.viewCount === 1 ? 'view' : 'views'}`).join('\n');
                 const embed = new EmbedBuilder()
                     .setTitle('📡 Most-Watched Pilots Today')
-                    .setColor(0x5865F2)
+                    .setColor(THEME.WHITE)
                     .setDescription(description)
                     .setFooter({ text: 'Updates live as people tune in on Inflight.' })
                     .setTimestamp();
@@ -2035,7 +2238,7 @@ client.on('interactionCreate', async (interaction) => {
 
                 const embed = new EmbedBuilder()
                     .setTitle(`🎲 ${pick.tailNumber || 'Unknown'}`)
-                    .setColor(0x9B59B6)
+                    .setColor(THEME.WHITE)
                     .addFields(
                         { name: 'Aircraft', value: pick.aircraftType || 'Unknown', inline: true },
                         { name: 'Livery', value: pick.liveryName || 'Unknown', inline: true },
@@ -2070,7 +2273,7 @@ client.on('interactionCreate', async (interaction) => {
 
                 const embed = new EmbedBuilder()
                     .setTitle('🕒 Most Recent Submissions')
-                    .setColor(0x00FF99)
+                    .setColor(THEME.WHITE)
                     .setDescription(lines.join('\n'))
                     .setImage(recents[0].imageUrl)
                     .setFooter({ text: `Newest photo: ${recents[0].tailNumber}` });
@@ -2084,7 +2287,7 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.commandName === 'help') {
             const embed = new EmbedBuilder()
                 .setTitle('🤖 Inflight Bot — Command Guide')
-                .setColor(0x0099FF)
+                .setColor(THEME.WHITE)
                 .setDescription('Everything this bot can do, grouped by purpose.')
                 .addFields(
                     {
