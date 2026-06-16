@@ -739,6 +739,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                         { name: 'Spotted By', value: `<@${user.id}>`, inline: false }
                     )
                     .setFooter({ text: 'Submissions are reviewed by admins before database entry.' })
+                    // Render the photo INSIDE the embed (not as a loose attachment)
+                    // so the layout matches the verified state after approval.
+                    .setImage('attachment://aircraft.webp')
                     .setTimestamp();
 
                 const publicMsg = await feedChannel.send({ embeds: [publicEmbed], files: [attachmentData] });
@@ -1416,13 +1419,30 @@ client.on('interactionCreate', async (interaction) => {
                     if (CONTRIBUTOR_ROLE_ID && member) await member.roles.add(CONTRIBUTOR_ROLE_ID).catch(() => {});
 
                     const approvedTitle = `✅ Approved (Photo ${slotIndex + 1} of ${images.length})`;
-                    await interaction.editReply({ embeds: [EmbedBuilder.from(receivedEmbed).setColor(0x00FF00).setTitle(approvedTitle).setImage(null)], components: [] });
+                    // Keep the verified photo rendered inside the admin embed (using the
+                    // permanent S3 URL) and drop the temporary upload attachment.
+                    await interaction.editReply({
+                        embeds: [EmbedBuilder.from(receivedEmbed).setColor(0x00FF00).setTitle(approvedTitle).setImage(permanentUrl)],
+                        components: [],
+                        attachments: []
+                    });
 
                     if (publicMsgId) {
                         try {
                             const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
                             const publicMsg = await feedChannel.messages.fetch(publicMsgId);
-                            await publicMsg.edit({ content: permanentUrl, embeds: [EmbedBuilder.from(publicMsg.embeds[0]).setTitle('✅ Verified').setColor(0x00FF00).setImage(null)], files: [] });
+                            // Embed the PERMANENT image (S3 URLs don't expire) instead of
+                            // posting the raw link as message content. This keeps the photo
+                            // visible on the message forever and removes the temp attachment.
+                            await publicMsg.edit({
+                                content: '',
+                                embeds: [EmbedBuilder.from(publicMsg.embeds[0])
+                                    .setTitle('✅ Verified Aircraft')
+                                    .setColor(0x00FF00)
+                                    .setDescription('This photo has been verified and saved to the database.')
+                                    .setImage(permanentUrl)],
+                                attachments: []
+                            });
                         } catch (e) {}
                     }
                 } catch (err) { 
@@ -1455,6 +1475,7 @@ client.on('interactionCreate', async (interaction) => {
                 await interaction.deferUpdate();
                 const [_, __, targetUserId, icao] = customId.split('_');
                 const imageUrl = interaction.message.embeds[0].image?.url;
+                const aptPublicMsgId = (interaction.message.embeds[0].footer?.text || '').match(/Msg: (\d+)/)?.[1];
                 try {
                     const member = await interaction.guild.members.fetch(targetUserId).catch(() => null);
                     const contributorName = sanitizeMetadata(member ? member.displayName : "Unknown");
@@ -1462,6 +1483,16 @@ client.on('interactionCreate', async (interaction) => {
                     if (typeof deleteAirportImages === 'function') await deleteAirportImages(s3Client, icao);
                     const finalUrl = await uploadAirportImage(s3Client, { buffer: Buffer.from(response.data) }, icao, contributorName);
                     await interaction.editReply({ embeds: [EmbedBuilder.from(interaction.message.embeds[0]).setTitle(`✅ Airport Approved: ${icao}`).setColor(0x00FF00).setImage(finalUrl)], components: [] });
+
+                    // Update the public feed message too, swapping the temporary Discord
+                    // image URL (which expires) for the permanent stored one.
+                    if (aptPublicMsgId) {
+                        try {
+                            const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
+                            const publicMsg = await feedChannel.messages.fetch(aptPublicMsgId);
+                            await publicMsg.edit({ embeds: [EmbedBuilder.from(publicMsg.embeds[0]).setTitle(`✅ Verified Airport: ${icao}`).setColor(0x00FF00).setImage(finalUrl)] });
+                        } catch (e) {}
+                    }
                 } catch (err) { console.error("Airport Approval Error:", err); }
                 return;
             }
@@ -1607,10 +1638,10 @@ client.on('interactionCreate', async (interaction) => {
                     try {
                         const feed = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
                         const msg = await feed.messages.fetch(publicMsgId);
-                        await msg.edit({ embeds: [EmbedBuilder.from(msg.embeds[0]).setTitle('❌ Rejected').setColor(0xFF0000).setImage(null)] });
+                        await msg.edit({ embeds: [EmbedBuilder.from(msg.embeds[0]).setTitle('❌ Rejected').setColor(0xFF0000).setImage(null)], attachments: [] });
                     } catch(e) {}
                 }
-                
+
                 if (originChannelId) {
                     const channel = await client.channels.fetch(originChannelId).catch(() => null);
                     if (channel) await channel.send({ content: `<@${targetUserId}>`, embeds: [new EmbedBuilder().setTitle('❌ Photo Rejected').setDescription(`Reason: ${reason}`).setColor(0xFF0000)] });
@@ -1942,10 +1973,15 @@ client.on('interactionCreate', async (interaction) => {
                     return;
                 }
 
+                // Show every stored photo (up to 3), not just the primary one.
+                const pullImages = getEntryImages(result);
+                const pullContributors = getEntryContributors(result);
+                const primaryImage = pullImages[0] || result.imageUrl;
+
                 const pullEmbed = new EmbedBuilder()
                     .setTitle('🗃️ Aircraft Database Record')
-                    .setColor(0x00FF00) 
-                    .setDescription(`**Status:** ✅ Verified / Live`) 
+                    .setColor(0x00FF00)
+                    .setDescription(`**Status:** ✅ Verified / Live${pullImages.length > 1 ? `\n📸 **${pullImages.length} photos** on record` : ''}`)
                     .addFields(
                         { name: 'Aircraft Type', value: result.aircraftType, inline: true },
                         { name: 'Livery', value: result.liveryName, inline: true },
@@ -1953,10 +1989,20 @@ client.on('interactionCreate', async (interaction) => {
                         { name: 'Contributor', value: result.contributorName, inline: true },
                         { name: 'Uploaded', value: `<t:${Math.floor(new Date(result.uploadedAt).getTime() / 1000)}:R>`, inline: true }
                     )
-                    .setImage(result.imageUrl)
+                    .setImage(primaryImage)
                     .setFooter({ text: `Record ID: ${result._id}` });
 
-                await interaction.editReply({ embeds: [pullEmbed] });
+                // Additional photos ride along as extra embeds so they all render
+                // inside the same message.
+                const galleryEmbeds = pullImages.slice(1).map((url, i) =>
+                    new EmbedBuilder()
+                        .setColor(0x00FF00)
+                        .setTitle(`📷 Photo ${i + 2}`)
+                        .setDescription(`Contributor: ${pullContributors[i + 1]?.name || result.contributorName}`)
+                        .setImage(url)
+                );
+
+                await interaction.editReply({ embeds: [pullEmbed, ...galleryEmbeds] });
 
             } catch (e) { 
                 console.error(e);
