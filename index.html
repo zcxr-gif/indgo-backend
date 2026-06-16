@@ -4,1459 +4,1112 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AeroGallery | Advanced Fleet Database</title>
-    
-    <!-- Tailwind CSS with Dark Mode Configuration -->
+
+    <!-- Tailwind CSS (utility styling, loaded from CDN; page degrades gracefully if unavailable) -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
             darkMode: 'class',
             theme: {
                 extend: {
-                    fontFamily: {
-                        sans: ['Inter', 'system-ui', 'sans-serif'],
-                    },
-                    colors: {
-                        slate: {
-                            850: '#151f32',
-                            950: '#020617',
-                        }
-                    }
+                    fontFamily: { sans: ['Inter', 'system-ui', 'sans-serif'] },
+                    colors: { slate: { 850: '#151f32', 950: '#020617' } }
                 }
             }
         }
     </script>
-    
-    <!-- Babel for React -->
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
-    <!-- Google Fonts -->
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-
-    <!-- Import Map for React & Icons -->
-    <script type="importmap">
-    {
-      "imports": {
-        "react": "https://esm.sh/react@18.2.0",
-        "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
-        "lucide-react": "https://esm.sh/lucide-react@0.292.0"
-      }
-    }
-    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 
     <style>
-        body { font-family: 'Inter', sans-serif; }
-        /* Custom Scrollbar */
-        ::-webkit-scrollbar { width: 8px; }
+        :root { color-scheme: light dark; }
+        body { font-family: 'Inter', system-ui, sans-serif; }
+
+        ::-webkit-scrollbar { width: 9px; height: 9px; }
         ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 5px; }
         .dark ::-webkit-scrollbar-thumb { background: #475569; }
-        
-        /* Smooth Fade In */
-        .fade-in { animation: fadeIn 0.3s ease-in-out; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+        @keyframes fadeUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes zoomIn { from { opacity: 0; transform: scale(.96); } to { opacity: 1; transform: scale(1); } }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes shimmer { 100% { transform: translateX(100%); } }
+
+        .fade-up { animation: fadeUp .4s cubic-bezier(.16,1,.3,1) both; }
+        .fade-in { animation: fadeIn .25s ease both; }
+        .zoom-in { animation: zoomIn .25s cubic-bezier(.16,1,.3,1) both; }
+        .spin { animation: spin .8s linear infinite; }
+
+        /* Staggered card entrance */
+        .grid-stagger > * { animation: fadeUp .45s cubic-bezier(.16,1,.3,1) both; }
+
+        .skeleton { position: relative; overflow: hidden; background: #e2e8f0; }
+        .dark .skeleton { background: #1e293b; }
+        .skeleton::after {
+            content: ''; position: absolute; inset: 0; transform: translateX(-100%);
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,.45), transparent);
+            animation: shimmer 1.4s infinite;
+        }
+        .dark .skeleton::after { background: linear-gradient(90deg, transparent, rgba(255,255,255,.06), transparent); }
     </style>
 </head>
-<body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100 transition-colors duration-300">
-    <div id="root"></div>
+<body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100 transition-colors duration-300 min-h-screen">
+    <div id="app" class="min-h-screen flex flex-col"></div>
+    <div id="modal-root"></div>
 
-    <script type="text/babel" data-type="module">
-        import React, { useState, useEffect, useRef, useMemo } from 'react';
-        import { createRoot } from 'react-dom/client';
-        import { 
-          Plane, Upload, Search, X, Info, Camera, User, Tag, Hash, Trash2,
-          AlertCircle, CheckCircle2, Loader2, Edit, Pencil, Moon, Sun,
-          Filter, SlidersHorizontal, Settings, Shield, BarChart3, ChevronDown,
-          Database, Cloud, Server, HardDrive, LayoutGrid, ListChecks, Flag,
-          Images, ChevronLeft, ChevronRight
-        } from 'lucide-react';
+    <script>
+    (function () {
+        'use strict';
 
-        // Normalize an aircraft record into an ordered list of image URLs.
-        // Falls back to the legacy single `imageUrl` field for older records.
-        const getAircraftImages = (ac) => {
-          if (!ac) return [];
-          if (Array.isArray(ac.imageUrls) && ac.imageUrls.length > 0) return ac.imageUrls.filter(Boolean);
-          return ac.imageUrl ? [ac.imageUrl] : [];
-        };
+        // ---------------------------------------------------------------------
+        // CONFIG & ENDPOINTS
+        // ---------------------------------------------------------------------
+        const IS_LOCALHOST = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+        const API_URL   = IS_LOCALHOST ? 'http://localhost:5000/api/aircraft' : '/api/aircraft';
+        const STATS_URL = IS_LOCALHOST ? 'http://localhost:5000/api/admin/stats' : '/api/admin/stats';
+        const META_BASE = 'https://site--acars-backend--6dmjph8ltlhv.code.run';
+        const META_URL  = META_BASE + '/api/metadata';
+        const liveriesUrl = (id) => `${META_BASE}/api/aircraft/${id}/liveries`;
+        const MAX_IMAGES = 3;
 
-        // Per-image contributor names, aligned by index to getAircraftImages().
-        // Each image can come from a different contributor; older records fall
-        // back to the single top-level contributorName.
-        const getAircraftContributors = (ac) => {
-          const images = getAircraftImages(ac);
-          const stored = (ac && Array.isArray(ac.imageContributors)) ? ac.imageContributors : [];
-          return images.map((_, i) => {
-            const c = stored[i];
-            if (c && (c.name || c.id)) return c.name || 'Unknown';
-            return (ac && ac.contributorName) || 'Unknown';
-          });
-        };
+        // Inline SVG placeholder — replaces the dead via.placeholder.com fallback.
+        const PLACEHOLDER =
+            "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 400 300'%3E%3Crect width='400' height='300' fill='%23eef2f7'/%3E%3Cg fill='%23c2ccda'%3E%3Cpath d='M214 118l-7 33 14 14-2 9-21-11-11 21-9-2 7-28-24-7 2-8 27 3 17-29 8 2z'/%3E%3C/g%3E%3C/svg%3E";
 
-        const IS_LOCALHOST = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-
-        const API_URL = IS_LOCALHOST
-          ? 'http://localhost:5000/api/aircraft'
-          : '/api/aircraft';
-        
-        const STATS_URL = IS_LOCALHOST
-          ? 'http://localhost:5000/api/admin/stats'
-          : '/api/admin/stats';
-
-        // --- DEMO DATA ---
+        // ---------------------------------------------------------------------
+        // DEMO / FALLBACK DATA
+        // ---------------------------------------------------------------------
         const DEMO_DATA = [
-          { _id: '1', contributorName: 'Captain Dave', aircraftType: 'Boeing 737-800', liveryName: 'SkyBlue Airlines', tailNumber: 'N737SB', imageUrl: 'https://images.unsplash.com/photo-1540962351504-03099e0a754b?auto=format&fit=crop&q=80&w=1000', uploadedAt: new Date().toISOString() },
-          { _id: '2', contributorName: 'Sarah Aviator', aircraftType: 'Airbus A320', liveryName: 'Ocean Air', tailNumber: 'F-OCEA', imageUrl: 'https://images.unsplash.com/photo-1569154941061-e231b4725ef1?auto=format&fit=crop&q=80&w=1000', uploadedAt: new Date(Date.now() - 86400000).toISOString() },
-          { _id: '3', contributorName: 'Mike Zulu', aircraftType: 'Cessna 172', liveryName: 'Private', tailNumber: 'N172SP', imageUrl: 'https://images.unsplash.com/photo-1559067515-bf7d799b23e2?auto=format&fit=crop&q=80&w=1000', uploadedAt: new Date(Date.now() - 172800000).toISOString() },
+            { _id: '1', contributorName: 'Captain Dave', aircraftType: 'Boeing 737-800', liveryName: 'SkyBlue Airlines', tailNumber: 'N737SB', imageUrl: 'https://images.unsplash.com/photo-1540962351504-03099e0a754b?auto=format&fit=crop&q=80&w=1000', uploadedAt: new Date().toISOString() },
+            { _id: '2', contributorName: 'Sarah Aviator', aircraftType: 'Airbus A320', liveryName: 'Ocean Air', tailNumber: 'F-OCEA', imageUrl: 'https://images.unsplash.com/photo-1569154941061-e231b4725ef1?auto=format&fit=crop&q=80&w=1000', uploadedAt: new Date(Date.now() - 86400000).toISOString() },
+            { _id: '3', contributorName: 'Mike Zulu', aircraftType: 'Cessna 172', liveryName: 'Private', tailNumber: 'N172SP', imageUrl: 'https://images.unsplash.com/photo-1559067515-bf7d799b23e2?auto=format&fit=crop&q=80&w=1000', uploadedAt: new Date(Date.now() - 172800000).toISOString() },
         ];
-
-        // --- FALLBACK METADATA ---
         const DEMO_METADATA_AIRCRAFT = [
-            { id: 'a1', name: 'Airbus A320' },
-            { id: 'a2', name: 'Airbus A350' },
-            { id: 'a3', name: 'Boeing 737-800' },
-            { id: 'a4', name: 'Boeing 777-300ER' },
-            { id: 'a5', name: 'Bombardier CRJ-900' },
-            { id: 'a6', name: 'Cessna 172' },
+            { id: 'a1', name: 'Airbus A320' }, { id: 'a2', name: 'Airbus A350' },
+            { id: 'a3', name: 'Boeing 737-800' }, { id: 'a4', name: 'Boeing 777-300ER' },
+            { id: 'a5', name: 'Bombardier CRJ-900' }, { id: 'a6', name: 'Cessna 172' },
             { id: 'a7', name: 'Embraer E175' }
         ];
-
         const DEMO_METADATA_LIVERIES = [
-            { id: 'l1', name: 'Standard / House' },
-            { id: 'l2', name: 'SkyBlue Airlines' },
-            { id: 'l3', name: 'Ocean Air' },
-            { id: 'l4', name: 'Private' },
-            { id: 'l5', name: 'Retro Livery' },
-            { id: 'l6', name: 'Cargo Logic' },
-            { id: 'l7', name: 'Alliance' }
+            { id: 'l1', name: 'Standard / House' }, { id: 'l2', name: 'SkyBlue Airlines' },
+            { id: 'l3', name: 'Ocean Air' }, { id: 'l4', name: 'Private' },
+            { id: 'l5', name: 'Retro Livery' }, { id: 'l6', name: 'Cargo Logic' }, { id: 'l7', name: 'Alliance' }
         ];
 
-        // --- UTILS ---
+        // ---------------------------------------------------------------------
+        // STATE
+        // ---------------------------------------------------------------------
+        const state = {
+            aircrafts: [], stats: null, loading: true, isDemoMode: false,
+            theme: 'light', view: 'gallery',
+            search: '', filterType: 'All', filterContributor: 'All', sort: 'newest',
+            dash: { master: [], liveries: {}, expandedId: null, loadingMeta: false }
+        };
+
+        // ---------------------------------------------------------------------
+        // UTILITIES
+        // ---------------------------------------------------------------------
+        const $ = (sel, root = document) => root.querySelector(sel);
+        const el = (id) => document.getElementById(id);
+
+        function esc(s) {
+            return String(s == null ? '' : s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
         function formatBytes(bytes, decimals = 1) {
             if (!+bytes) return '0 B';
-            const k = 1024;
-            const dm = decimals < 0 ? 0 : decimals;
+            const k = 1024, dm = decimals < 0 ? 0 : decimals;
             const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
             const i = Math.floor(Math.log(bytes) / Math.log(k));
             return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
         }
 
-        function App() {
-          // --- GLOBAL STATE ---
-          const [aircrafts, setAircrafts] = useState([]);
-          const [stats, setStats] = useState(null);
-          const [loading, setLoading] = useState(true);
-          const [isDemoMode, setIsDemoMode] = useState(false);
-          const [theme, setTheme] = useState('light');
-          
-          // --- VIEW STATE ---
-          const [currentView, setCurrentView] = useState('gallery'); // 'gallery' or 'collection'
+        function fullDate(dateStr) {
+            const d = new Date(dateStr);
+            if (isNaN(d)) return '—';
+            return d.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
+        }
 
-          // --- FILTER & SEARCH STATE ---
-          const [searchTerm, setSearchTerm] = useState('');
-          const [filterType, setFilterType] = useState('All');
-          const [filterContributor, setFilterContributor] = useState('All');
-          const [sortBy, setSortBy] = useState('newest'); // 'newest', 'oldest', 'az'
+        // Normalise an aircraft record into an ordered list of image URLs.
+        function getImages(ac) {
+            if (!ac) return [];
+            if (Array.isArray(ac.imageUrls) && ac.imageUrls.length > 0) return ac.imageUrls.filter(Boolean);
+            return ac.imageUrl ? [ac.imageUrl] : [];
+        }
+        // Per-image contributor names, aligned by index to getImages().
+        function getContributors(ac) {
+            const imgs = getImages(ac);
+            const stored = (ac && Array.isArray(ac.imageContributors)) ? ac.imageContributors : [];
+            return imgs.map((_, i) => {
+                const c = stored[i];
+                if (c && (c.name || c.id)) return c.name || 'Unknown';
+                return (ac && ac.contributorName) || 'Unknown';
+            });
+        }
 
-          // --- ADMIN / UI STATE ---
-          const [adminMode, setAdminMode] = useState(true);
-          const [showFormModal, setShowFormModal] = useState(false);
-          const [editingAircraft, setEditingAircraft] = useState(null);
-          const [selectedAircraft, setSelectedAircraft] = useState(null);
-          
-          // --- PREFILL STATE (New) ---
-          const [prefillData, setPrefillData] = useState(null);
+        // ---------------------------------------------------------------------
+        // ICONS (inline SVG — no external icon library / network dependency)
+        // ---------------------------------------------------------------------
+        const PATHS = {
+            plane: "M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-.9.1-1.1.5l-.3.5c-.2.5-.1 1 .3 1.3L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.3c.3.4.8.5 1.3.3l.5-.2c.4-.3.6-.7.5-1.2Z",
+            upload: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4 M17 8l-5-5-5 5 M12 3v12",
+            search: "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16Z M21 21l-4.3-4.3",
+            x: "M18 6 6 18 M6 6l12 12",
+            camera: "M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3Z M12 16a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z",
+            user: "M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2 M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z",
+            calendar: "M8 2v4 M16 2v4 M3 10h18 M5 4h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z",
+            trash: "M3 6h18 M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2 M10 11v6 M14 11v6",
+            alertCircle: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z M12 8v4 M12 16h.01",
+            check: "M22 11.08V12a10 10 0 1 1-5.93-9.14 M22 4 12 14.01l-3-3",
+            loader: "M21 12a9 9 0 1 1-6.219-8.56",
+            pencil: "M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3Z",
+            moon: "M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z",
+            sun: "M12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z M12 2v2 M12 20v2 M4.9 4.9l1.4 1.4 M17.7 17.7l1.4 1.4 M2 12h2 M20 12h2 M4.9 19.1l1.4-1.4 M17.7 6.3l1.4-1.4",
+            activity: "M22 12h-4l-3 9L9 3l-3 9H2",
+            database: "M12 8c4.97 0 9-1.34 9-3s-4.03-3-9-3-9 1.34-9 3 4.03 3 9 3Z M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5 M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3",
+            cloud: "M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z",
+            chevDown: "m6 9 6 6 6-6",
+            chevLeft: "m15 18-6-6 6-6",
+            chevRight: "m9 18 6-6-6-6",
+            grid: "M3 3h7v7H3z M14 3h7v7h-7z M14 14h7v7h-7z M3 14h7v7H3z",
+            checks: "m3 7 2 2 4-4 M3 17l2 2 4-4 M13 6h8 M13 12h8 M13 18h8",
+            flag: "M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z M4 22v-7",
+            images: "M22 4H10a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2Z M4 8v10a2 2 0 0 0 2 2h10 M14 8a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0Z",
+            tag: "M3 7v5l9 9 7-7-9-9H4 M7.5 8.5h.01",
+            chart: "M3 3v18h18 M18 17V9 M13 17V5 M8 17v-3"
+        };
+        function icon(name, size = 18, cls = '', opts = {}) {
+            const d = PATHS[name] || '';
+            const fill = opts.fill ? 'currentColor' : 'none';
+            const segs = d.split(' M');
+            const paths = segs.map((seg, i) => `<path d="${i === 0 ? seg : 'M' + seg}"/>`).join('');
+            return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" `
+                + `fill="${fill}" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" `
+                + `class="${cls}" style="display:inline-block;vertical-align:middle" aria-hidden="true">${paths}</svg>`;
+        }
 
-          // --- INITIALIZATION ---
-          useEffect(() => {
-            // Theme Check
-            const savedTheme = localStorage.getItem('theme');
-            if (savedTheme) {
-                setTheme(savedTheme);
-                document.documentElement.classList.toggle('dark', savedTheme === 'dark');
-            } else if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
-                setTheme('dark');
-                document.documentElement.classList.add('dark');
+        // ---------------------------------------------------------------------
+        // DERIVED DATA
+        // ---------------------------------------------------------------------
+        function uniqueTypes() {
+            return ['All', ...[...new Set(state.aircrafts.map(a => a.aircraftType).filter(Boolean))].sort()];
+        }
+        function uniqueContributors() {
+            return ['All', ...[...new Set(state.aircrafts.map(a => a.contributorName).filter(Boolean))].sort()];
+        }
+        function filteredAircraft() {
+            let r = state.aircrafts.slice();
+            const q = state.search.trim().toLowerCase();
+            if (q) {
+                r = r.filter(ac =>
+                    (ac.tailNumber || '').toLowerCase().includes(q) ||
+                    (ac.aircraftType || '').toLowerCase().includes(q) ||
+                    (ac.liveryName || '').toLowerCase().includes(q) ||
+                    (ac.contributorName || '').toLowerCase().includes(q));
             }
+            if (state.filterType !== 'All') r = r.filter(ac => ac.aircraftType === state.filterType);
+            if (state.filterContributor !== 'All') r = r.filter(ac => ac.contributorName === state.filterContributor);
+            r.sort((a, b) => {
+                if (state.sort === 'newest') return new Date(b.uploadedAt) - new Date(a.uploadedAt);
+                if (state.sort === 'oldest') return new Date(a.uploadedAt) - new Date(b.uploadedAt);
+                if (state.sort === 'az') return (a.tailNumber || '').localeCompare(b.tailNumber || '');
+                return 0;
+            });
+            return r;
+        }
 
-            // Fetch Data
-            fetchAircraft();
-            fetchStats();
-          }, []);
-
-          const toggleTheme = () => {
-              const newTheme = theme === 'light' ? 'dark' : 'light';
-              setTheme(newTheme);
-              localStorage.setItem('theme', newTheme);
-              document.documentElement.classList.toggle('dark');
-          };
-
-          const fetchStats = async () => {
-              try {
-                  const res = await fetch(STATS_URL);
-                  if (res.ok) {
-                      const data = await res.json();
-                      setStats(data);
-                  }
-              } catch (err) {
-                  console.warn("Stats service unavailable");
-              }
-          };
-
-          const fetchAircraft = async (silent = false) => {
-            // Only show the loading spinner if we aren't doing a silent background refresh
-            if (!silent) setLoading(true); 
+        // ---------------------------------------------------------------------
+        // DATA FETCHING
+        // ---------------------------------------------------------------------
+        async function fetchAircraft(silent = false) {
+            if (!silent) { state.loading = true; renderContent(); }
             try {
-              const response = await fetch(API_URL);
-              if (!response.ok) throw new Error('Failed to connect');
-              const data = await response.json();
-              setAircrafts(data);
-              setIsDemoMode(false);
-            } catch (error) {
-              console.warn("Backend unreachable, switching to Demo Mode.");
-              if (!silent) {
-                 setAircrafts(DEMO_DATA);
-                 setIsDemoMode(true);
-              }
+                const res = await fetch(API_URL);
+                if (!res.ok) throw new Error('bad status');
+                const data = await res.json();
+                state.aircrafts = Array.isArray(data) ? data : [];
+                state.isDemoMode = false;
+            } catch (err) {
+                console.warn('Backend unreachable, switching to Demo Mode.');
+                if (!silent) { state.aircrafts = DEMO_DATA.slice(); state.isDemoMode = true; }
             } finally {
-              if (!silent) setLoading(false);
+                state.loading = false;
+                renderShell();
             }
-          };
+        }
+        async function fetchStats() {
+            try {
+                const res = await fetch(STATS_URL);
+                if (res.ok) { state.stats = await res.json(); renderControls(); }
+            } catch (_) { /* stats are optional */ }
+        }
 
-          // --- DERIVED DATA (FILTERS) ---
-          
-          // Get unique values for dropdowns
-          const uniqueTypes = useMemo(() => ['All', ...new Set(aircrafts.map(a => a.aircraftType).filter(Boolean).sort())], [aircrafts]);
-          const uniqueContributors = useMemo(() => ['All', ...new Set(aircrafts.map(a => a.contributorName).filter(Boolean).sort())], [aircrafts]);
-
-          // Filter and Sort Logic
-          const filteredAndSortedAircraft = useMemo(() => {
-              let result = [...aircrafts];
-
-              // Search
-              if (searchTerm) {
-                  const lower = searchTerm.toLowerCase();
-                  result = result.filter(ac => 
-                    ac.tailNumber.toLowerCase().includes(lower) ||
-                    ac.aircraftType.toLowerCase().includes(lower) ||
-                    ac.liveryName.toLowerCase().includes(lower)
-                  );
-              }
-
-              // Type Filter
-              if (filterType !== 'All') {
-                  result = result.filter(ac => ac.aircraftType === filterType);
-              }
-
-              // Contributor Filter
-              if (filterContributor !== 'All') {
-                  result = result.filter(ac => ac.contributorName === filterContributor);
-              }
-
-              // Sorting
-              result.sort((a, b) => {
-                  if (sortBy === 'newest') return new Date(b.uploadedAt) - new Date(a.uploadedAt);
-                  if (sortBy === 'oldest') return new Date(a.uploadedAt) - new Date(b.uploadedAt);
-                  if (sortBy === 'az') return a.tailNumber.localeCompare(b.tailNumber);
-                  return 0;
-              });
-
-              return result;
-          }, [aircrafts, searchTerm, filterType, filterContributor, sortBy]);
-
-          // --- HANDLERS ---
-          const handleEdit = (aircraft, e) => {
-            if(e) e.stopPropagation();
-            setEditingAircraft(aircraft);
-            setPrefillData(null);
-            setShowFormModal(true);
-          };
-
-          const handleCreate = () => {
-            setEditingAircraft(null);
-            setPrefillData(null);
-            setShowFormModal(true);
-          };
-
-          // Handle uploading missing items from the dashboard
-          const handlePrefillUpload = (aircraftId, aircraftType, liveryName) => {
-              setEditingAircraft(null);
-              setPrefillData({ aircraftId, aircraftType, liveryName });
-              setShowFormModal(true);
-          };
-
-          const handleDelete = async (id, e) => {
-            if(e) e.stopPropagation();
+        // ---------------------------------------------------------------------
+        // ACTIONS
+        // ---------------------------------------------------------------------
+        async function deleteAircraft(id) {
             if (!confirm('Are you sure you want to delete this aircraft?')) return;
-
-            if (isDemoMode) {
-              setAircrafts(prev => prev.filter(a => a._id !== id));
-              return;
+            if (state.isDemoMode) {
+                state.aircrafts = state.aircrafts.filter(a => a._id !== id);
+                return renderShell();
             }
-
             try {
-              await fetch(`${API_URL}/${id}`, { method: 'DELETE' });
-              fetchAircraft(true); // Passing true triggers a silent update to save your scroll position
-              fetchStats(); 
-              if (selectedAircraft && selectedAircraft._id === id) setSelectedAircraft(null);
-            } catch (error) {
-              alert('Error deleting aircraft');
-            }
-          };
+                await fetch(`${API_URL}/${id}`, { method: 'DELETE' });
+                await fetchAircraft(true); fetchStats();
+            } catch (_) { alert('Error deleting aircraft'); }
+        }
 
-          const handleToggleFlag = async (id, e) => {
-            if(e) e.stopPropagation();
-
-            if (isDemoMode) {
-              setAircrafts(prev => prev.map(a => a._id === id ? { ...a, needsUpdate: !a.needsUpdate } : a));
-              return;
-            }
-
-            // Optimistically update the local state immediately for instant UI feedback (no lag)
-            setAircrafts(prev => prev.map(a => a._id === id ? { ...a, needsUpdate: !a.needsUpdate } : a));
-
+        async function toggleFlag(id) {
+            const flip = () => { state.aircrafts = state.aircrafts.map(a => a._id === id ? Object.assign({}, a, { needsUpdate: !a.needsUpdate }) : a); };
+            if (state.isDemoMode) { flip(); return renderContent(); }
+            flip(); renderContent(); // optimistic
             try {
-              const res = await fetch(`${API_URL}/${id}/flag`, { method: 'PATCH' });
-              if (res.ok) {
-                fetchAircraft(true); // Silently sync with backend to ensure everything matches
-              } else {
-                // Revert UI if the server request failed
-                setAircrafts(prev => prev.map(a => a._id === id ? { ...a, needsUpdate: !a.needsUpdate } : a));
-                alert('Failed to toggle flag');
-              }
-            } catch (error) {
-              console.error("Error toggling flag", error);
-              // Revert UI if the server request failed
-              setAircrafts(prev => prev.map(a => a._id === id ? { ...a, needsUpdate: !a.needsUpdate } : a));
-              alert('Error toggling update flag');
-            }
-          };
-
-          return (
-            <div className="min-h-screen flex flex-col font-sans selection:bg-blue-200 dark:selection:bg-blue-900">
-              
-              <nav className="sticky top-0 z-30 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md border-b border-slate-200 dark:border-slate-800 transition-colors duration-300">
-  <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-    <div className="flex items-center justify-between h-16">
-      
-      {/* Logo Section */}
-      <div className="flex items-center gap-3 cursor-pointer" onClick={() => {setSearchTerm(''); setFilterType('All'); setCurrentView('gallery');}}>
-          <div className="bg-gradient-to-br from-blue-600 to-indigo-600 p-2 rounded-xl text-white shadow-lg shadow-blue-500/20">
-              <Plane size={20} fill="currentColor" className="transform -rotate-45" />
-          </div>
-          <div className="hidden sm:block">
-              <h1 className="text-lg font-bold tracking-tight text-slate-900 dark:text-white">AeroGallery</h1>
-              <p className="text-[10px] uppercase font-bold text-slate-400 dark:text-slate-500 tracking-wider">Fleet Database</p>
-          </div>
-      </div>
-
-      {/* View Switcher */}
-                    <div className="hidden md:flex items-center bg-slate-100 dark:bg-slate-800 p-1 rounded-lg">
-                        <button 
-                            onClick={() => setCurrentView('gallery')}
-                            className={`flex items-center gap-2 px-3 py-1.5 text-xs font-bold uppercase tracking-wide rounded-md transition-all ${currentView === 'gallery' ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`}
-                        >
-                            <LayoutGrid size={14} /> Gallery
-                        </button>
-                        <button 
-                            onClick={() => setCurrentView('collection')}
-                            className={`flex items-center gap-2 px-3 py-1.5 text-xs font-bold uppercase tracking-wide rounded-md transition-all ${currentView === 'collection' ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}`}
-                        >
-                            <ListChecks size={14} /> Checklist
-                        </button>
-                    </div>
-
-      {/* Actions */}
-      <div className="flex items-center gap-2 sm:gap-3">
-          {/* New Airport Database Button */}
-          <a 
-              href="/airports.html" 
-              className="hidden lg:flex items-center gap-2 px-4 py-2 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 font-medium rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors text-sm"
-          >
-              <Database size={16} />
-              <span>Airport Database</span>
-          </a>
-
-          <button 
-              onClick={toggleTheme}
-              className="p-2 text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800 rounded-lg transition-colors"
-          >
-              {theme === 'light' ? <Moon size={20}/> : <Sun size={20}/>}
-          </button>
-
-          <button 
-              onClick={handleCreate}
-              className="hidden sm:flex items-center gap-2 bg-slate-900 dark:bg-blue-600 hover:bg-slate-800 dark:hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition-all shadow-lg hover:shadow-xl active:scale-95"
-          >
-              <Upload size={16} />
-              <span>Upload</span>
-          </button>
-      </div>
-    </div>
-  </div>
-</nav>
-
-              {/* --- CONTENT AREA SWITCHER --- */}
-              
-              {currentView === 'gallery' ? (
-                  <>
-                  {/* --- CONTROL BAR (Filters & Stats) --- */}
-                  <div className="bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 transition-colors duration-300 animate-in slide-in-from-top-2">
-                      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
-                          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-                              
-                              {/* Stats - Including New Storage Stats */}
-                              <div className="flex flex-wrap items-center gap-4 sm:gap-6 text-sm text-slate-500 dark:text-slate-400">
-                                    <div className="flex items-center gap-2">
-                                        <BarChart3 size={16} />
-                                        <span className="font-medium text-slate-900 dark:text-white">{aircrafts.length}</span> <span className="hidden sm:inline">Aircraft</span>
-                                    </div>
-                                    <div className="hidden sm:flex items-center gap-2">
-                                        <Tag size={16} />
-                                        <span className="font-medium text-slate-900 dark:text-white">{uniqueTypes.length - 1}</span> <span className="hidden sm:inline">Types</span>
-                                    </div>
-                                    
-                                    {/* NEW STORAGE STATS SECTION */}
-                                    {stats && (
-                                        <>
-                                            <div className="hidden lg:flex h-4 w-px bg-slate-200 dark:bg-slate-700 mx-1"></div>
-                                            
-                                            <div className="flex items-center gap-2" title="S3 Object Storage Usage">
-                                                <Cloud size={16} className="text-blue-500" />
-                                                <span className="font-medium text-slate-900 dark:text-white">{formatBytes(stats.s3SizeBytes)}</span> 
-                                                <span className="hidden sm:inline text-xs uppercase font-bold tracking-wider">Cloud</span>
-                                            </div>
-                                            
-                                            <div className="flex items-center gap-2" title="MongoDB Storage Usage">
-                                                <Database size={16} className="text-indigo-500" />
-                                                <span className="font-medium text-slate-900 dark:text-white">{formatBytes(stats.dbSizeBytes)}</span> 
-                                                <span className="hidden sm:inline text-xs uppercase font-bold tracking-wider">DB</span>
-                                            </div>
-                                        </>
-                                    )}
-                              </div>
-
-                              {/* Filter Controls */}
-                              <div className="flex flex-wrap items-center gap-3">
-                                  {/* Mobile Search */}
-                                  <div className="md:hidden w-full mb-2">
-                                      <input
-                                            type="text"
-                                            className="w-full pl-4 pr-4 py-2 border border-slate-200 dark:border-slate-700 rounded-lg bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none text-sm"
-                                            placeholder="Search..."
-                                            value={searchTerm}
-                                            onChange={(e) => setSearchTerm(e.target.value)}
-                                        />
-                                  </div>
-
-                                  {/* Desktop Search */}
-                                  <div className="hidden md:flex relative max-w-[200px]">
-                                        <input
-                                            type="text"
-                                            className="w-full pl-3 pr-8 py-1.5 border border-slate-200 dark:border-slate-700 rounded-lg bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none text-sm"
-                                            placeholder="Quick search..."
-                                            value={searchTerm}
-                                            onChange={(e) => setSearchTerm(e.target.value)}
-                                        />
-                                        <Search size={14} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400" />
-                                  </div>
-
-                                  <div className="flex items-center gap-2 w-full md:w-auto overflow-x-auto pb-2 md:pb-0 scrollbar-hide">
-                                    <FilterSelect 
-                                        label="Type" 
-                                        options={uniqueTypes} 
-                                        value={filterType} 
-                                        onChange={(e) => setFilterType(e.target.value)} 
-                                    />
-                                    <FilterSelect 
-                                        label="Contributor" 
-                                        options={uniqueContributors} 
-                                        value={filterContributor} 
-                                        onChange={(e) => setFilterContributor(e.target.value)} 
-                                    />
-                                    
-                                    <div className="h-6 w-px bg-slate-200 dark:bg-slate-700 mx-1"></div>
-
-                                    <select 
-                                        value={sortBy}
-                                        onChange={(e) => setSortBy(e.target.value)}
-                                        className="bg-transparent text-sm font-medium text-slate-700 dark:text-slate-300 border-none focus:ring-0 cursor-pointer hover:text-blue-600 dark:hover:text-blue-400 transition-colors outline-none"
-                                    >
-                                        <option value="newest">Newest First</option>
-                                        <option value="oldest">Oldest First</option>
-                                        <option value="az">A-Z (Tail)</option>
-                                    </select>
-                                  </div>
-                              </div>
-                          </div>
-                      </div>
-                  </div>
-
-                  {/* --- DEMO BANNER --- */}
-                  {isDemoMode && (
-                    <div className="bg-amber-50 dark:bg-amber-900/30 border-b border-amber-200 dark:border-amber-800/50 px-4 py-2 text-center text-xs font-medium text-amber-800 dark:text-amber-200 flex items-center justify-center gap-2">
-                      <AlertCircle size={14} />
-                      Demo Mode Active: Changes are local only.
-                    </div>
-                  )}
-
-                  {/* --- MAIN GRID --- */}
-                  <main className="flex-1 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full fade-in">
-                    {loading ? (
-                      <div className="flex flex-col items-center justify-center h-64 text-slate-400">
-                        <Loader2 className="animate-spin mb-4 text-blue-600" size={40} />
-                        <p className="animate-pulse font-medium">Loading fleet data...</p>
-                      </div>
-                    ) : filteredAndSortedAircraft.length === 0 ? (
-                      <div className="flex flex-col items-center justify-center py-20 bg-white dark:bg-slate-800/50 rounded-3xl border border-dashed border-slate-300 dark:border-slate-700">
-                        <div className="bg-slate-100 dark:bg-slate-700 p-4 rounded-full mb-4">
-                            <Search size={32} className="text-slate-400 dark:text-slate-500" />
-                        </div>
-                        <h3 className="text-lg font-semibold text-slate-900 dark:text-white">No aircraft found</h3>
-                        <p className="text-slate-500 dark:text-slate-400 text-sm mt-1 max-w-xs text-center">
-                            Try adjusting your filters or search terms, or add a new aircraft.
-                        </p>
-                        <button onClick={() => {setSearchTerm(''); setFilterType('All'); setFilterContributor('All');}} className="mt-6 text-blue-600 dark:text-blue-400 hover:underline font-medium text-sm">
-                          Clear Filters
-                        </button>
-                      </div>
-                    ) : (
-                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 pb-20">
-                        {filteredAndSortedAircraft.map((aircraft) => (
-                          <AircraftCard 
-                            key={aircraft._id} 
-                            data={aircraft} 
-                            adminMode={adminMode}
-                            onClick={() => setSelectedAircraft(aircraft)}
-                            onDelete={handleDelete}
-                            onEdit={handleEdit}
-                            onToggleFlag={handleToggleFlag}
-                          />
-                        ))}
-                      </div>
-                    )}
-                  </main>
-                  </>
-              ) : (
-                  /* --- COLLECTION DASHBOARD VIEW --- */
-                  <main className="flex-1 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full">
-                      <CollectionDashboard 
-                          uploadedAircrafts={aircrafts} 
-                          onUploadPrefill={handlePrefillUpload}
-                      />
-                  </main>
-              )}
-
-              {/* --- FLOAT BUTTON (Mobile) --- */}
-              <button 
-                onClick={handleCreate}
-                className="sm:hidden fixed bottom-6 right-6 z-40 bg-blue-600 text-white p-4 rounded-full shadow-xl shadow-blue-600/30 active:scale-95 transition-transform"
-              >
-                <Upload size={24} />
-              </button>
-
-              {/* --- MODALS --- */}
-              {showFormModal && (
-                <AircraftFormModal
-                  onClose={() => setShowFormModal(false)}
-                  onSuccess={() => {
-                    setShowFormModal(false);
-                    fetchAircraft(true); // Silent update on create/edit to prevent jumping
-                    fetchStats();
-                  }}
-                  onRefresh={() => { fetchAircraft(true); fetchStats(); }}
-                  isDemoMode={isDemoMode}
-                  initialData={editingAircraft}
-                  prefillData={prefillData}
-                />
-              )}
-
-              {selectedAircraft && (
-                <DetailsModal 
-                  aircraft={selectedAircraft} 
-                  onClose={() => setSelectedAircraft(null)}
-                  adminMode={adminMode}
-                  onEdit={(e) => { handleEdit(selectedAircraft, e); setSelectedAircraft(null); }} 
-                />
-              )}
-            </div>
-          );
+                const res = await fetch(`${API_URL}/${id}/flag`, { method: 'PATCH' });
+                if (res.ok) { await fetchAircraft(true); }
+                else { flip(); renderContent(); alert('Failed to toggle flag'); }
+            } catch (_) { flip(); renderContent(); alert('Error toggling update flag'); }
         }
 
-        // --- NEW COMPONENT: COLLECTION DASHBOARD ---
-        function CollectionDashboard({ uploadedAircrafts, onUploadPrefill }) {
-          const [masterAircraft, setMasterAircraft] = useState([]);
-          const [expandedAircraftId, setExpandedAircraftId] = useState(null);
-          const [masterLiveries, setMasterLiveries] = useState([]);
-          const [loadingMeta, setLoadingMeta] = useState(true);
-          const [loadingLiveries, setLoadingLiveries] = useState(false);
-
-          // Fetch Master Aircraft List on mount
-          useEffect(() => {
-            const fetchMasterData = async () => {
-              try {
-                const res = await fetch('https://site--acars-backend--6dmjph8ltlhv.code.run/api/metadata');
-                if (!res.ok) throw new Error('Failed to fetch metadata');
-                const data = await res.json();
-                // Sort alphabetically
-                setMasterAircraft(data.aircraft.sort((a, b) => a.name.localeCompare(b.name)));
-              } catch (err) {
-                console.warn("Metadata fetch failed", err);
-              } finally {
-                setLoadingMeta(false);
-              }
-            };
-            fetchMasterData();
-          }, []);
-
-          // Fetch Liveries when an aircraft is expanded
-          const handleExpand = async (aircraftId) => {
-            if (expandedAircraftId === aircraftId) {
-              setExpandedAircraftId(null); // Collapse
-              return;
-            }
-            
-            setExpandedAircraftId(aircraftId);
-            setLoadingLiveries(true);
-            setMasterLiveries([]); // Reset while loading
-
-            try {
-              const res = await fetch(`https://site--acars-backend--6dmjph8ltlhv.code.run/api/aircraft/${aircraftId}/liveries`);
-              if (res.ok) {
-                const data = await res.json();
-                setMasterLiveries(data.liveries.sort((a, b) => a.name.localeCompare(b.name)));
-              }
-            } catch (err) {
-              console.warn("Livery fetch failed", err);
-            } finally {
-              setLoadingLiveries(false);
-            }
-          };
-
-          // Helper: Check if we have at least one photo of this aircraft type
-          const hasType = (typeName) => {
-            return uploadedAircrafts.some(a => a.aircraftType === typeName);
-          };
-
-          // Helper: Get count of photos for this type
-          const getTypeCount = (typeName) => {
-            return uploadedAircrafts.filter(a => a.aircraftType === typeName).length;
-          };
-
-          // Helper: Check if we have a specific livery
-          const hasLivery = (typeName, liveryName) => {
-            return uploadedAircrafts.some(a => 
-              a.aircraftType === typeName && a.liveryName === liveryName
-            );
-          };
-
-          if (loadingMeta) {
-            return (
-              <div className="flex flex-col items-center justify-center h-64 text-slate-400">
-                <Loader2 className="animate-spin mb-4 text-blue-600" size={40} />
-                <p>Analyzing Fleet Database...</p>
-              </div>
-            );
-          }
-
-          // Calculate Progress
-          const collectedTypes = masterAircraft.filter(a => hasType(a.name)).length;
-          const totalTypes = masterAircraft.length;
-          const progressPercent = Math.round((collectedTypes / totalTypes) * 100);
-
-          return (
-            <div className="max-w-5xl mx-auto pb-20 fade-in">
-              {/* Progress Header */}
-              <div className="bg-white dark:bg-slate-900 rounded-2xl p-6 shadow-sm border border-slate-200 dark:border-slate-800 mb-8">
-                <div className="flex items-center justify-between mb-4">
-                  <div>
-                    <h2 className="text-xl font-bold text-slate-900 dark:text-white">Collection Status</h2>
-                    <p className="text-sm text-slate-500 dark:text-slate-400">Compare your uploads against the Global Database</p>
-                  </div>
-                  <div className="text-right">
-                    <span className="text-3xl font-bold text-blue-600 dark:text-blue-400">{progressPercent}%</span>
-                    <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">Completion</p>
-                  </div>
-                </div>
-                <div className="w-full bg-slate-100 dark:bg-slate-800 rounded-full h-3 overflow-hidden">
-                  <div 
-                    className="bg-blue-600 h-full rounded-full transition-all duration-1000 ease-out"
-                    style={{ width: `${progressPercent}%` }}
-                  ></div>
-                </div>
-                <div className="mt-2 text-xs text-slate-500 text-right">
-                  {collectedTypes} of {totalTypes} Aircraft Types Collected
-                </div>
-              </div>
-
-              {/* Grid of Aircraft */}
-              <div className="grid gap-4">
-                {masterAircraft.map((ac) => {
-                  const isCollected = hasType(ac.name);
-                  const isExpanded = expandedAircraftId === ac.id;
-                  const count = getTypeCount(ac.name);
-
-                  return (
-                    <div key={ac.id} className={`bg-white dark:bg-slate-900 rounded-xl border transition-all duration-300 overflow-hidden ${isCollected ? 'border-slate-200 dark:border-slate-800' : 'border-amber-200 dark:border-amber-900/50'}`}>
-                      
-                      {/* Header Row */}
-                      <div 
-                        onClick={() => handleExpand(ac.id)}
-                        className={`p-4 flex items-center justify-between cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors ${isExpanded ? 'bg-slate-50 dark:bg-slate-800/50' : ''}`}
-                      >
-                        <div className="flex items-center gap-4">
-                          <div className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${isCollected ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-600' : 'bg-slate-100 dark:bg-slate-800 text-slate-400'}`}>
-                             {isCollected ? <CheckCircle2 size={20} /> : <Plane size={20} />}
-                          </div>
-                          <div>
-                            <h3 className={`font-bold text-lg ${isCollected ? 'text-slate-900 dark:text-white' : 'text-slate-500 dark:text-slate-400'}`}>
-                              {ac.name}
-                            </h3>
-                            <p className="text-xs text-slate-500 dark:text-slate-500 flex items-center gap-1">
-                              {isCollected ? (
-                                <span className="text-blue-600 dark:text-blue-400 font-medium">{count} Photos in fleet</span>
-                              ) : (
-                                <span className="text-amber-600 dark:text-amber-500 font-medium">Missing from fleet</span>
-                              )}
-                            </p>
-                          </div>
-                        </div>
-                        
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide mr-2 hidden sm:block">
-                            {isExpanded ? 'Hide Liveries' : 'View Liveries'}
-                          </span>
-                          <ChevronDown size={20} className={`text-slate-400 transition-transform duration-300 ${isExpanded ? 'rotate-180' : ''}`} />
-                        </div>
-                      </div>
-
-                      {/* Expanded Livery Section */}
-                      {isExpanded && (
-                        <div className="border-t border-slate-100 dark:border-slate-800 p-4 bg-slate-50/50 dark:bg-slate-950/30 animate-in slide-in-from-top-2">
-                          {loadingLiveries ? (
-                            <div className="flex items-center gap-2 text-slate-400 text-sm py-4">
-                              <Loader2 className="animate-spin" size={16} /> Fetching known liveries...
-                            </div>
-                          ) : (
-                            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
-                              {masterLiveries.map(liv => {
-                                const haveLivery = hasLivery(ac.name, liv.name);
-                                return (
-                                  <div key={liv.id} className="flex items-center justify-between p-3 bg-white dark:bg-slate-900 rounded-lg border border-slate-200 dark:border-slate-800">
-                                    <div className="flex items-center gap-2 overflow-hidden">
-                                      <div className={`w-2 h-2 rounded-full shrink-0 ${haveLivery ? 'bg-green-500' : 'bg-slate-300 dark:bg-slate-700'}`}></div>
-                                      <span className={`text-sm truncate ${haveLivery ? 'text-slate-900 dark:text-white font-medium' : 'text-slate-500 dark:text-slate-400'}`}>
-                                        {liv.name}
-                                      </span>
-                                    </div>
-                                    
-                                    {!haveLivery && (
-                                      <button 
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          onUploadPrefill(ac.id, ac.name, liv.name);
-                                        }}
-                                        className="text-xs bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 px-2 py-1 rounded-md hover:bg-blue-100 dark:hover:bg-blue-900/40 transition-colors font-medium whitespace-nowrap ml-2"
-                                      >
-                                        Upload
-                                      </button>
-                                    )}
-                                  </div>
-                                );
-                              })}
-                              {masterLiveries.length === 0 && (
-                                <div className="text-slate-400 text-sm italic col-span-full">No specific liveries listed in database.</div>
-                              )}
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          );
-        }
-
-        // --- SUB-COMPONENTS ---
-
-        function FilterSelect({ label, options, value, onChange }) {
-            return (
-                <div className="relative group">
-                    <select 
-                        value={value} 
-                        onChange={onChange}
-                        className="appearance-none pl-3 pr-8 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-transparent hover:border-slate-300 dark:hover:border-slate-600 text-slate-700 dark:text-slate-200 text-sm font-medium focus:ring-2 focus:ring-blue-500 focus:outline-none transition-all cursor-pointer min-w-[140px]"
-                    >
-                        {options.map(opt => (
-                            <option key={opt} value={opt}>{label}: {opt}</option>
-                        ))}
-                    </select>
-                    <ChevronDown size={14} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
-                </div>
-            );
-        }
-
-function AircraftCard({ data, onClick, onDelete, onEdit, onToggleFlag, adminMode }) {
-          const images = getAircraftImages(data);
-          return (
-            <div 
-              onClick={onClick}
-              className={`group bg-white dark:bg-slate-900 rounded-2xl shadow-sm border overflow-hidden hover:shadow-xl hover:-translate-y-1 transition-all duration-300 cursor-pointer relative flex flex-col h-full fade-in ${data.needsUpdate ? 'border-amber-400 dark:border-amber-600' : 'border-slate-200 dark:border-slate-800 hover:border-blue-200 dark:hover:border-blue-900'}`}
-            >
-              {/* Image Container */}
-              <div className="relative aspect-[4/3] bg-slate-100 dark:bg-slate-800 overflow-hidden">
-                <img
-                  src={images[0] || data.imageUrl}
-                  alt={data.tailNumber}
-                  className="w-full h-full object-cover transition-transform duration-700 group-hover:scale-105"
-                  onError={(e) => { e.target.src = 'https://via.placeholder.com/400x300?text=No+Image'; }}
-                />
-                <div className="absolute inset-0 bg-gradient-to-t from-slate-900/60 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300"></div>
-
-                {/* Multi-photo badge */}
-                {images.length > 1 && (
-                  <div className="absolute bottom-3 left-3 bg-black/60 backdrop-blur-sm px-2 py-1 rounded-md text-xs font-bold shadow-sm text-white flex items-center gap-1">
-                    <Images size={12} /> {images.length}
-                  </div>
-                )}
-
-                <div className="absolute top-3 right-3 bg-white/90 dark:bg-slate-950/90 backdrop-blur-sm px-2.5 py-1 rounded-md text-xs font-bold shadow-sm border border-white/50 dark:border-slate-800/50 text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
-                  {data.needsUpdate && <AlertCircle size={14} className="text-amber-500" />}
-                  {data.tailNumber}
-                </div>
-
-                {/* Flag Badge on Image */}
-                {data.needsUpdate && (
-                  <div className="absolute top-3 left-3 bg-amber-500/90 backdrop-blur-sm px-2.5 py-1 rounded-md text-xs font-bold shadow-sm text-white flex items-center gap-1">
-                    <Flag size={12} fill="currentColor" /> Needs Update
-                  </div>
-                )}
-              </div>
-
-              {/* Content */}
-              <div className="p-5 flex-1 flex flex-col">
-                <div className="flex-1">
-                    <h3 className="font-bold text-slate-900 dark:text-white truncate text-lg mb-1" title={data.aircraftType}>
-                    {data.aircraftType}
-                    </h3>
-                    <p className="text-sm text-slate-500 dark:text-slate-400 truncate flex items-center gap-1.5">
-                        <Camera size={12} />
-                        {data.liveryName}
-                    </p>
-                </div>
-                
-                <div className="flex items-center justify-between pt-4 mt-2 border-t border-slate-100 dark:border-slate-800">
-                  <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
-                    <div className="w-5 h-5 rounded-full bg-blue-100 dark:bg-blue-900/30 flex items-center justify-center text-blue-600 dark:text-blue-400 font-bold">
-                        {data.contributorName.charAt(0)}
-                    </div>
-                    <span className="truncate max-w-[100px]">{data.contributorName}</span>
-                  </div>
-                  
-                  {/* Admin Actions */}
-                  {adminMode && (
-                      <div className="flex items-center gap-1 animate-in slide-in-from-right-4 duration-200">
-                        <button 
-                            onClick={(e) => onToggleFlag(data._id, e)}
-                            className={`transition-colors p-1.5 rounded-full ${data.needsUpdate ? 'text-amber-500 bg-amber-50 dark:bg-amber-900/20 hover:bg-amber-100 dark:hover:bg-amber-900/40' : 'text-slate-400 hover:text-amber-500 dark:hover:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20'}`}
-                            title={data.needsUpdate ? "Remove Update Flag" : "Flag for Update"}
-                        >
-                            <Flag size={16} />
-                        </button>
-                        <button 
-                            onClick={(e) => onEdit(data, e)}
-                            className="text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 transition-colors p-1.5 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-full"
-                            title="Edit"
-                        >
-                            <Pencil size={16} />
-                        </button>
-                        <button 
-                            onClick={(e) => onDelete(data._id, e)}
-                            className="text-slate-400 hover:text-red-500 dark:hover:text-red-400 transition-colors p-1.5 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-full"
-                            title="Delete"
-                        >
-                            <Trash2 size={16} />
-                        </button>
-                      </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          );
-        }
-
-        function DetailsModal({ aircraft, onClose, adminMode, onEdit }) {
-          const images = getAircraftImages(aircraft);
-          const contributors = getAircraftContributors(aircraft);
-          const [activeImage, setActiveImage] = useState(0);
-
-          // Reset the selected image whenever a different aircraft is opened
-          useEffect(() => { setActiveImage(0); }, [aircraft && aircraft._id]);
-
-          if (!aircraft) return null;
-
-          const hasMultiple = images.length > 1;
-          const showImage = (idx) => setActiveImage((idx + images.length) % images.length);
-
-          return (
-            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/80 backdrop-blur-md animate-in fade-in duration-200">
-              <div 
-                onClick={(e) => e.stopPropagation()}
-                className="bg-white dark:bg-slate-900 rounded-3xl w-full max-w-5xl max-h-[90vh] overflow-hidden shadow-2xl flex flex-col md:flex-row relative animate-in zoom-in-95 duration-200 border border-slate-200 dark:border-slate-700"
-              >
-                
-                <button 
-                  onClick={onClose}
-                  className="absolute top-4 right-4 z-20 p-2 bg-black/40 hover:bg-black/60 text-white rounded-full backdrop-blur-md transition-all"
-                >
-                  <X size={20} />
+        // ---------------------------------------------------------------------
+        // RENDER: SHELL (nav + control bar + content container)
+        // ---------------------------------------------------------------------
+        function renderShell() {
+            const app = el('app');
+            app.innerHTML = `
+                ${navHTML()}
+                <div id="controlbar"></div>
+                <div id="banner"></div>
+                <div id="content" class="flex-1 w-full"></div>
+                <button data-action="create"
+                    class="sm:hidden fixed bottom-6 right-6 z-40 bg-blue-600 text-white p-4 rounded-full shadow-xl shadow-blue-600/30 active:scale-95 transition-transform">
+                    ${icon('upload', 24)}
                 </button>
+            `;
+            renderControls();
+            renderContent();
+        }
 
-                {/* Image Section */}
-                <div className="w-full md:w-3/5 bg-slate-950 flex flex-col">
-                  <div className="flex-1 flex items-center justify-center relative group min-h-0">
-                     <img
-                      src={images[activeImage] || aircraft.imageUrl}
-                      alt={aircraft.tailNumber}
-                      className="w-full h-full object-contain max-h-[40vh] md:max-h-full"
-                      onError={(e) => { e.target.src = 'https://via.placeholder.com/800x600?text=No+Image'; }}
-                     />
-
-                     {hasMultiple && (
-                       <>
-                         <button
-                           onClick={() => showImage(activeImage - 1)}
-                           className="absolute left-3 top-1/2 -translate-y-1/2 p-2 bg-black/40 hover:bg-black/70 text-white rounded-full backdrop-blur-md transition-all opacity-0 group-hover:opacity-100"
-                           title="Previous photo"
-                         >
-                           <ChevronLeft size={22} />
-                         </button>
-                         <button
-                           onClick={() => showImage(activeImage + 1)}
-                           className="absolute right-3 top-1/2 -translate-y-1/2 p-2 bg-black/40 hover:bg-black/70 text-white rounded-full backdrop-blur-md transition-all opacity-0 group-hover:opacity-100"
-                           title="Next photo"
-                         >
-                           <ChevronRight size={22} />
-                         </button>
-                         <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-black/50 backdrop-blur-sm px-2.5 py-1 rounded-full text-xs font-semibold text-white">
-                           {activeImage + 1} / {images.length}
-                         </div>
-                       </>
-                     )}
+        function navHTML() {
+            const tab = (view, label, ic) => `
+                <button data-action="view" data-view="${view}"
+                    class="flex items-center gap-2 px-3 py-1.5 text-xs font-bold uppercase tracking-wide rounded-md transition-all ${
+                        state.view === view
+                            ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm'
+                            : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}">
+                    ${icon(ic, 14)} ${label}
+                </button>`;
+            return `
+            <nav class="sticky top-0 z-30 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md border-b border-slate-200 dark:border-slate-800 transition-colors duration-300">
+              <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                <div class="flex items-center justify-between h-16">
+                  <div class="flex items-center gap-3 cursor-pointer" data-action="home">
+                      <div class="bg-gradient-to-br from-blue-600 to-indigo-600 p-2 rounded-xl text-white shadow-lg shadow-blue-500/20">
+                          ${icon('plane', 20, '-rotate-45', { fill: true })}
+                      </div>
+                      <div class="hidden sm:block">
+                          <h1 class="text-lg font-extrabold tracking-tight text-slate-900 dark:text-white">AeroGallery</h1>
+                          <p class="text-[10px] uppercase font-bold text-slate-400 dark:text-slate-500 tracking-wider">Fleet Database</p>
+                      </div>
                   </div>
 
-                  {/* Thumbnail strip */}
-                  {hasMultiple && (
-                    <div className="flex gap-2 p-3 justify-center bg-slate-950/80 flex-shrink-0">
-                      {images.map((img, idx) => (
-                        <button
-                          key={idx}
-                          onClick={() => setActiveImage(idx)}
-                          className={`relative w-16 h-12 rounded-lg overflow-hidden border-2 transition-all ${idx === activeImage ? 'border-blue-500 ring-2 ring-blue-500/40' : 'border-transparent opacity-60 hover:opacity-100'}`}
-                        >
-                          <img src={img} alt={`${aircraft.tailNumber} ${idx + 1}`} className="w-full h-full object-cover" />
-                        </button>
-                      ))}
+                  <div class="hidden md:flex items-center bg-slate-100 dark:bg-slate-800 p-1 rounded-lg">
+                      ${tab('gallery', 'Gallery', 'grid')}
+                      ${tab('collection', 'Checklist', 'checks')}
+                  </div>
+
+                  <div class="flex items-center gap-2 sm:gap-3">
+                      <a href="/airports.html"
+                          class="hidden lg:flex items-center gap-2 px-4 py-2 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 font-medium rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors text-sm">
+                          ${icon('database', 16)} <span>Airport Database</span>
+                      </a>
+                      <button id="themeBtn" data-action="theme"
+                          class="p-2 text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800 rounded-lg transition-colors">
+                          ${icon(state.theme === 'light' ? 'moon' : 'sun', 20)}
+                      </button>
+                      <button data-action="create"
+                          class="hidden sm:flex items-center gap-2 bg-slate-900 dark:bg-blue-600 hover:bg-slate-800 dark:hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition-all shadow-lg hover:shadow-xl active:scale-95">
+                          ${icon('upload', 16)} <span>Upload</span>
+                      </button>
+                  </div>
+                </div>
+              </div>
+            </nav>`;
+        }
+
+        // ---------------------------------------------------------------------
+        // RENDER: CONTROL BAR (stats + search + filters) — gallery view only
+        // ---------------------------------------------------------------------
+        function renderControls() {
+            const bar = el('controlbar');
+            if (!bar) return;
+            if (state.view !== 'gallery') { bar.innerHTML = ''; const b = el('banner'); if (b) b.innerHTML = ''; return; }
+
+            const types = uniqueTypes();
+            const contribs = uniqueContributors();
+            const opt = (label, arr, current) =>
+                arr.map(o => `<option value="${esc(o)}" ${o === current ? 'selected' : ''}>${esc(label)}: ${esc(o)}</option>`).join('');
+
+            const statChip = (ic, val, label, color = '') => `
+                <div class="flex items-center gap-2" title="${esc(label)}">
+                    <span class="${color}">${icon(ic, 16)}</span>
+                    <span class="font-semibold text-slate-900 dark:text-white">${esc(val)}</span>
+                    <span class="hidden sm:inline text-xs uppercase font-bold tracking-wider text-slate-400">${esc(label)}</span>
+                </div>`;
+
+            bar.innerHTML = `
+            <div class="bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 transition-colors duration-300">
+              <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+                <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                  <div class="flex flex-wrap items-center gap-4 sm:gap-5 text-sm text-slate-500 dark:text-slate-400">
+                    ${statChip('chart', state.aircrafts.length, 'Aircraft')}
+                    ${statChip('tag', Math.max(0, types.length - 1), 'Types')}
+                    ${state.stats ? `
+                        <div class="hidden lg:block h-4 w-px bg-slate-200 dark:bg-slate-700"></div>
+                        ${statChip('cloud', formatBytes(state.stats.s3SizeBytes), 'Cloud', 'text-blue-500')}
+                        ${statChip('database', formatBytes(state.stats.dbSizeBytes), 'DB', 'text-indigo-500')}
+                    ` : ''}
+                  </div>
+
+                  <div class="flex flex-wrap items-center gap-3">
+                    <div class="relative w-full md:w-auto">
+                        <input id="searchInput" type="text" placeholder="Search tail, type, livery…"
+                            value="${esc(state.search)}"
+                            class="w-full md:w-64 pl-9 pr-3 py-2 border border-slate-200 dark:border-slate-700 rounded-lg bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none text-sm transition" />
+                        <span class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">${icon('search', 15)}</span>
                     </div>
-                  )}
-                </div>
-
-                {/* Details Section */}
-                <div className="w-full md:w-2/5 p-8 flex flex-col bg-white dark:bg-slate-900 overflow-y-auto">
-                  <div className="mb-8">
-                     <div className="flex justify-between items-start">
-                        <div>
-                            <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 text-xs font-bold uppercase tracking-wider mb-3">
-                                <Plane size={12} /> Aircraft Profile
-                            </div>
-                            <h2 className="text-4xl font-bold text-slate-900 dark:text-white tracking-tight">{aircraft.tailNumber}</h2>
+                    <div class="flex items-center gap-2 w-full md:w-auto overflow-x-auto no-scrollbar pb-1 md:pb-0">
+                        <div class="relative shrink-0">
+                            <select id="typeSelect" class="appearance-none pl-3 pr-8 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 border border-transparent hover:border-slate-300 dark:hover:border-slate-600 text-slate-700 dark:text-slate-200 text-sm font-medium focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer">
+                                ${opt('Type', types, state.filterType)}
+                            </select>
+                            <span class="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none">${icon('chevDown', 14)}</span>
                         </div>
-                        {adminMode && (
-                             <button 
-                                onClick={onEdit} 
-                                className="p-2 bg-slate-100 dark:bg-slate-800 rounded-full text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400"
-                            >
-                                <Edit size={20} />
-                             </button>
-                        )}
-                     </div>
-                     <p className="text-xl text-slate-500 dark:text-slate-400 mt-2">{aircraft.aircraftType}</p>
-                  </div>
-
-                  <div className="space-y-6 flex-1">
-                    <InfoRow icon={<Camera />} label="Livery" value={aircraft.liveryName} />
-                    <InfoRow icon={<User />} label={hasMultiple ? `Spotted By (Photo ${activeImage + 1})` : "Spotted By"} value={contributors[activeImage] || aircraft.contributorName} />
-                    <InfoRow icon={<Hash />} label="Uploaded" value={new Date(aircraft.uploadedAt).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })} />
-                    <InfoRow icon={<Settings />} label="Status" value="Active in Fleet" />
-                  </div>
-
-                  <div className="mt-8 pt-6 border-t border-slate-100 dark:border-slate-800">
-                    <button onClick={onClose} className="w-full py-3 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-900 dark:text-white font-semibold rounded-xl transition-colors">
-                        Close Details
-                    </button>
+                        <div class="relative shrink-0">
+                            <select id="contribSelect" class="appearance-none pl-3 pr-8 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 border border-transparent hover:border-slate-300 dark:hover:border-slate-600 text-slate-700 dark:text-slate-200 text-sm font-medium focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer">
+                                ${opt('By', contribs, state.filterContributor)}
+                            </select>
+                            <span class="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none">${icon('chevDown', 14)}</span>
+                        </div>
+                        <div class="h-6 w-px bg-slate-200 dark:bg-slate-700 mx-1 shrink-0"></div>
+                        <select id="sortSelect" class="bg-transparent text-sm font-medium text-slate-700 dark:text-slate-300 border-none focus:ring-0 cursor-pointer outline-none shrink-0">
+                            <option value="newest" ${state.sort === 'newest' ? 'selected' : ''}>Newest First</option>
+                            <option value="oldest" ${state.sort === 'oldest' ? 'selected' : ''}>Oldest First</option>
+                            <option value="az" ${state.sort === 'az' ? 'selected' : ''}>A–Z (Tail)</option>
+                        </select>
+                    </div>
                   </div>
                 </div>
               </div>
-            </div>
-          );
+            </div>`;
+
+            // Bind controls (these survive content re-renders, so typing keeps focus).
+            const search = el('searchInput');
+            if (search) search.addEventListener('input', (e) => { state.search = e.target.value; renderContent(); });
+            const ts = el('typeSelect');
+            if (ts) ts.addEventListener('change', (e) => { state.filterType = e.target.value; renderContent(); });
+            const cs = el('contribSelect');
+            if (cs) cs.addEventListener('change', (e) => { state.filterContributor = e.target.value; renderContent(); });
+            const ss = el('sortSelect');
+            if (ss) ss.addEventListener('change', (e) => { state.sort = e.target.value; renderContent(); });
+
+            // Demo banner
+            const banner = el('banner');
+            if (banner) banner.innerHTML = state.isDemoMode ? `
+                <div class="bg-amber-50 dark:bg-amber-900/30 border-b border-amber-200 dark:border-amber-800/50 px-4 py-2 text-center text-xs font-medium text-amber-800 dark:text-amber-200 flex items-center justify-center gap-2">
+                    ${icon('alertCircle', 14)} Demo Mode Active: Changes are local only.
+                </div>` : '';
         }
 
-        function InfoRow({ icon, label, value }) {
-          return (
-            <div className="flex items-start gap-4 group">
-              <div className="p-3 bg-slate-50 dark:bg-slate-800 rounded-xl text-slate-400 dark:text-slate-500 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">
-                {React.cloneElement(icon, { size: 20 })}
-              </div>
-              <div>
-                <p className="text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wide mb-0.5">{label}</p>
-                <p className="text-base font-medium text-slate-900 dark:text-slate-200">{value}</p>
-              </div>
-            </div>
-          );
+        // ---------------------------------------------------------------------
+        // RENDER: CONTENT (gallery grid OR collection dashboard)
+        // ---------------------------------------------------------------------
+        function renderContent() {
+            const c = el('content');
+            if (!c) return;
+            if (state.view === 'collection') return renderDashboard();
+
+            if (state.loading) {
+                c.innerHTML = `
+                <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full">
+                    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+                        ${Array.from({ length: 8 }).map(() => `
+                            <div class="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 overflow-hidden">
+                                <div class="aspect-[4/3] skeleton"></div>
+                                <div class="p-5 space-y-3">
+                                    <div class="h-4 w-2/3 rounded skeleton"></div>
+                                    <div class="h-3 w-1/2 rounded skeleton"></div>
+                                </div>
+                            </div>`).join('')}
+                    </div>
+                </main>`;
+                return;
+            }
+
+            const list = filteredAircraft();
+            if (list.length === 0) {
+                c.innerHTML = `
+                <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full fade-in">
+                    <div class="flex flex-col items-center justify-center py-20 bg-white dark:bg-slate-900/50 rounded-3xl border border-dashed border-slate-300 dark:border-slate-700">
+                        <div class="bg-slate-100 dark:bg-slate-800 p-4 rounded-full mb-4 text-slate-400">${icon('search', 32)}</div>
+                        <h3 class="text-lg font-semibold text-slate-900 dark:text-white">No aircraft found</h3>
+                        <p class="text-slate-500 dark:text-slate-400 text-sm mt-1 max-w-xs text-center">Try adjusting your filters or search terms, or add a new aircraft.</p>
+                        <button data-action="clear-filters" class="mt-6 text-blue-600 dark:text-blue-400 hover:underline font-medium text-sm">Clear Filters</button>
+                    </div>
+                </main>`;
+                return;
+            }
+
+            c.innerHTML = `
+            <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full">
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 pb-20 grid-stagger">
+                    ${list.map((ac, i) => cardHTML(ac, i)).join('')}
+                </div>
+            </main>`;
         }
 
-        /**
-         * FORM MODAL
-         */
-        function AircraftFormModal({ onClose, onSuccess, onRefresh, isDemoMode, initialData = null, prefillData = null }) {
-          const isEditMode = !!initialData;
-          const [loading, setLoading] = useState(false);
-          const [fetchingMeta, setFetchingMeta] = useState(true);
-          
-          const [metadata, setMetadata] = useState({ aircraft: [] }); 
-          const [specificLiveries, setSpecificLiveries] = useState([]); 
-          const [loadingLiveries, setLoadingLiveries] = useState(false);
+        function cardHTML(data, i) {
+            const images = getImages(data);
+            const cover = images[0] || data.imageUrl || PLACEHOLDER;
+            const flagged = !!data.needsUpdate;
+            const name = data.contributorName || 'Unknown';
+            const initial = (name.charAt(0) || '?').toUpperCase();
+            const delay = Math.min(i, 11) * 0.04;
+            return `
+            <div data-action="open" data-id="${esc(data._id)}" style="animation-delay:${delay}s"
+                class="group bg-white dark:bg-slate-900 rounded-2xl shadow-sm border overflow-hidden hover:shadow-xl hover:-translate-y-1 transition-all duration-300 cursor-pointer relative flex flex-col ${
+                    flagged ? 'border-amber-400 dark:border-amber-600' : 'border-slate-200 dark:border-slate-800 hover:border-blue-300 dark:hover:border-blue-800'}">
+                <div class="relative aspect-[4/3] bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                    <img src="${esc(cover)}" alt="${esc(data.tailNumber)}" loading="lazy" decoding="async"
+                        class="w-full h-full object-cover transition-transform duration-700 group-hover:scale-105"
+                        onerror="this.onerror=null;this.src='${PLACEHOLDER}'" />
+                    <div class="absolute inset-0 bg-gradient-to-t from-slate-900/55 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300"></div>
+                    ${images.length > 1 ? `
+                        <div class="absolute bottom-3 left-3 bg-black/60 backdrop-blur-sm px-2 py-1 rounded-md text-xs font-bold text-white flex items-center gap-1">
+                            ${icon('images', 12)} ${images.length}
+                        </div>` : ''}
+                    <div class="absolute top-3 right-3 bg-white/90 dark:bg-slate-950/90 backdrop-blur-sm px-2.5 py-1 rounded-md text-xs font-bold border border-white/50 dark:border-slate-800/50 text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                        ${flagged ? `<span class="text-amber-500">${icon('alertCircle', 14)}</span>` : ''}${esc(data.tailNumber || '—')}
+                    </div>
+                    ${flagged ? `
+                        <div class="absolute top-3 left-3 bg-amber-500/90 backdrop-blur-sm px-2.5 py-1 rounded-md text-xs font-bold text-white flex items-center gap-1">
+                            ${icon('flag', 12, '', { fill: true })} Needs Update
+                        </div>` : ''}
+                </div>
+                <div class="p-5 flex-1 flex flex-col">
+                    <div class="flex-1 min-w-0">
+                        <h3 class="font-bold text-slate-900 dark:text-white truncate text-lg mb-1" title="${esc(data.aircraftType)}">${esc(data.aircraftType || 'Unknown type')}</h3>
+                        <p class="text-sm text-slate-500 dark:text-slate-400 truncate flex items-center gap-1.5">${icon('camera', 12)} ${esc(data.liveryName || '—')}</p>
+                    </div>
+                    <div class="flex items-center justify-between pt-4 mt-3 border-t border-slate-100 dark:border-slate-800">
+                        <div class="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400 min-w-0">
+                            <div class="w-6 h-6 rounded-full bg-blue-100 dark:bg-blue-900/30 flex items-center justify-center text-blue-600 dark:text-blue-400 font-bold shrink-0">${esc(initial)}</div>
+                            <span class="truncate max-w-[110px]">${esc(name)}</span>
+                        </div>
+                        <div class="flex items-center gap-1">
+                            <button data-action="flag" data-id="${esc(data._id)}" title="${flagged ? 'Remove flag' : 'Flag for update'}"
+                                class="p-1.5 rounded-full transition-colors ${flagged ? 'text-amber-500 bg-amber-50 dark:bg-amber-900/20' : 'text-slate-400 hover:text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-900/20'}">${icon('flag', 16)}</button>
+                            <button data-action="edit" data-id="${esc(data._id)}" title="Edit"
+                                class="p-1.5 rounded-full text-slate-400 hover:text-blue-500 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors">${icon('pencil', 16)}</button>
+                            <button data-action="delete" data-id="${esc(data._id)}" title="Delete"
+                                class="p-1.5 rounded-full text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors">${icon('trash', 16)}</button>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        }
 
-          const fileInputRef = useRef(null);
-          const MAX_IMAGES = 3;
-          // Create mode: object-URL previews of the new selection (up to 3).
-          const [previews, setPreviews] = useState([]);
-          const [hasNewFiles, setHasNewFiles] = useState(false);
-
-          // Edit mode: live gallery managed per-slot against the granular API.
-          const aircraftId = initialData?._id;
-          const [currentImages, setCurrentImages] = useState(isEditMode ? getAircraftImages(initialData) : []);
-          const [slotBusy, setSlotBusy] = useState(false);
-          const slotFileRef = useRef(null);
-          const pendingSlotRef = useRef('add'); // index (number) to replace, or 'add' to append
-
-          // Trigger the hidden picker for a specific slot (or appending a new one)
-          const openSlotPicker = (target) => {
-            if (slotBusy) return;
-            pendingSlotRef.current = target;
-            slotFileRef.current.value = '';
-            slotFileRef.current.click();
-          };
-
-          const handleSlotFile = async (e) => {
-            const file = e.target.files?.[0];
-            if (!file) return;
-            const target = pendingSlotRef.current;
-            if (isDemoMode) { alert('Demo Mode: image changes are disabled.'); return; }
-
-            setSlotBusy(true);
+        // ---------------------------------------------------------------------
+        // RENDER: COLLECTION DASHBOARD (checklist)
+        // ---------------------------------------------------------------------
+        async function ensureDashboardMeta() {
+            if (state.dash.master.length > 0 || state.dash.loadingMeta) return;
+            state.dash.loadingMeta = true;
+            renderDashboard();
             try {
-              const body = new FormData();
-              body.append('image', file);
-              const isReplace = typeof target === 'number';
-              const url = isReplace
-                ? `${API_URL}/${aircraftId}/images/${target}`
-                : `${API_URL}/${aircraftId}/images`;
-              const res = await fetch(url, { method: isReplace ? 'PUT' : 'POST', body });
-              if (!res.ok) {
-                const err = await res.json().catch(() => ({}));
-                throw new Error(err.message || 'Failed to save image');
-              }
-              const json = await res.json();
-              setCurrentImages(getAircraftImages(json.data));
-              onRefresh?.();
-            } catch (err) {
-              alert('Failed: ' + err.message);
+                const res = await fetch(META_URL);
+                if (!res.ok) throw new Error('meta');
+                const data = await res.json();
+                state.dash.master = (data.aircraft || []).slice().sort((a, b) => a.name.localeCompare(b.name));
+            } catch (_) {
+                state.dash.master = DEMO_METADATA_AIRCRAFT.slice();
             } finally {
-              setSlotBusy(false);
+                state.dash.loadingMeta = false;
+                renderDashboard();
             }
-          };
+        }
 
-          const removeSlot = async (index) => {
-            if (slotBusy) return;
-            if (isDemoMode) { alert('Demo Mode: image changes are disabled.'); return; }
-            if (!confirm(`Remove photo ${index + 1}? This deletes it permanently.`)) return;
-
-            setSlotBusy(true);
-            try {
-              const res = await fetch(`${API_URL}/${aircraftId}/images/${index}`, { method: 'DELETE' });
-              if (!res.ok) {
-                const err = await res.json().catch(() => ({}));
-                throw new Error(err.message || 'Failed to remove image');
-              }
-              const json = await res.json();
-              setCurrentImages(getAircraftImages(json.data));
-              onRefresh?.();
-            } catch (err) {
-              alert('Failed: ' + err.message);
-            } finally {
-              setSlotBusy(false);
-            }
-          };
-
-          const [formData, setFormData] = useState({
-            contributorName: initialData?.contributorName || '',
-            aircraftType: initialData?.aircraftType || prefillData?.aircraftType || '',
-            aircraftId: prefillData?.aircraftId || '', 
-            liveryName: initialData?.liveryName || prefillData?.liveryName || '',
-            tailNumber: initialData?.tailNumber || ''
-          });
-
-          useEffect(() => {
-            const init = async () => {
+        async function toggleExpand(id) {
+            state.dash.expandedId = state.dash.expandedId === id ? null : id;
+            renderDashboard();
+            if (state.dash.expandedId && !state.dash.liveries[id]) {
                 try {
-                    const res = await fetch('https://site--acars-backend--6dmjph8ltlhv.code.run/api/metadata');
-                    if (!res.ok) throw new Error('Metadata service unreachable');
+                    const res = await fetch(liveriesUrl(id));
+                    if (!res.ok) throw new Error('liv');
                     const data = await res.json();
-                    const sortedAircraft = data.aircraft.sort((a, b) => a.name.localeCompare(b.name));
-                    setMetadata({ aircraft: sortedAircraft });
-
-                    if (isEditMode && initialData.aircraftType) {
-                        const match = sortedAircraft.find(a => a.name === initialData.aircraftType);
-                        if (match) {
-                            setFormData(prev => ({ ...prev, aircraftId: match.id }));
-                            await fetchLiveries(match.id, initialData.liveryName);
-                        }
-                    } else if (prefillData && prefillData.aircraftId) {
-                         // PREFILL LOGIC: Load liveries if we have a prefilled ID
-                         await fetchLiveries(prefillData.aircraftId, prefillData.liveryName);
-                    }
-
-                } catch (err) {
-                    console.warn("Failed to load dropdowns, using demo metadata:", err);
-                    setMetadata({ aircraft: DEMO_METADATA_AIRCRAFT });
-                    if (isEditMode && initialData.aircraftType) {
-                        const match = DEMO_METADATA_AIRCRAFT.find(a => a.name === initialData.aircraftType);
-                        if (match) {
-                            setFormData(prev => ({ ...prev, aircraftId: match.id }));
-                            setSpecificLiveries(DEMO_METADATA_LIVERIES);
-                        }
-                    }
-                } finally {
-                    setFetchingMeta(false);
+                    state.dash.liveries[id] = (data.liveries || []).slice().sort((a, b) => a.name.localeCompare(b.name));
+                } catch (_) {
+                    state.dash.liveries[id] = DEMO_METADATA_LIVERIES.slice();
                 }
-            };
-            init();
-          }, []);
-
-          const fetchLiveries = async (aircraftId, preselectedLiveryName = null) => {
-             setLoadingLiveries(true);
-             try {
-                const res = await fetch(`https://site--acars-backend--6dmjph8ltlhv.code.run/api/aircraft/${aircraftId}/liveries`);
-                if (res.ok) {
-                    const data = await res.json();
-                    if (data.liveries) {
-                        data.liveries.sort((a, b) => a.name.localeCompare(b.name));
-                        setSpecificLiveries(data.liveries);
-                        if (!preselectedLiveryName) {
-                            setFormData(prev => ({ ...prev, liveryName: '' }));
-                        }
-                    }
-                } else {
-                     throw new Error('Livery fetch failed');
-                }
-             } catch (err) {
-                 console.warn("Failed to fetch liveries, using demo list:", err);
-                 setSpecificLiveries(DEMO_METADATA_LIVERIES);
-                 if (!preselectedLiveryName) {
-                     setFormData(prev => ({ ...prev, liveryName: '' }));
-                 }
-             } finally {
-                 setLoadingLiveries(false);
-             }
-          };
-
-          const handleChange = (e) => {
-            setFormData({ ...formData, [e.target.name]: e.target.value });
-          };
-
-          const handleAircraftChange = (e) => {
-             const selectedId = e.target.value;
-             const selectedObj = metadata.aircraft.find(a => a.id === selectedId);
-             
-             setFormData({
-                 ...formData,
-                 aircraftId: selectedId,
-                 aircraftType: selectedObj ? selectedObj.name : '',
-                 liveryName: '' 
-             });
-
-             setSpecificLiveries([]);
-             if (selectedId) fetchLiveries(selectedId);
-          };
-
-          const handleFileChange = (e) => {
-            const files = Array.from(e.target.files || []).slice(0, MAX_IMAGES);
-            if (files.length > 0) {
-              setPreviews(files.map(f => URL.createObjectURL(f)));
-              setHasNewFiles(true);
+                renderDashboard();
             }
-          };
-
-          const handleSubmit = async (e) => {
-            e.preventDefault();
-            setLoading(true);
-
-            if (isDemoMode) {
-              setTimeout(() => { alert("Demo Mode: Changes saved locally."); onSuccess(); }, 1000);
-              return;
-            }
-
-            try {
-              const data = new FormData();
-              data.append('contributorName', formData.contributorName);
-              data.append('aircraftType', formData.aircraftType);
-              data.append('liveryName', formData.liveryName);
-              data.append('tailNumber', formData.tailNumber);
-              
-              // In edit mode images are managed live (per-slot), so the form submit
-              // only updates the text fields. In create mode we send the chosen photos.
-              if (!isEditMode) {
-                const selectedFiles = Array.from(fileInputRef.current?.files || []).slice(0, MAX_IMAGES);
-                if (selectedFiles.length > 0) {
-                  selectedFiles.forEach(file => data.append('images', file));
-                } else {
-                  alert('Please select at least one image');
-                  setLoading(false);
-                  return;
-                }
-              }
-
-              const method = isEditMode ? 'PUT' : 'POST';
-              const url = isEditMode ? `${API_URL}/${initialData._id}` : API_URL;
-
-              const response = await fetch(url, {
-                method: method,
-                body: data, 
-              });
-
-              if (!response.ok) {
-                const err = await response.json();
-                throw new Error(err.message || 'Operation failed');
-              }
-
-              onSuccess();
-            } catch (error) {
-              console.error(error);
-              alert('Failed: ' + error.message);
-            } finally {
-              setLoading(false);
-            }
-          };
-
-          return (
-            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/80 backdrop-blur-md animate-in fade-in duration-200">
-              <div className="bg-white dark:bg-slate-900 rounded-2xl w-full max-w-2xl shadow-xl overflow-hidden animate-in zoom-in-95 flex flex-col max-h-[90vh] border border-slate-200 dark:border-slate-800">
-                
-                <div className="px-6 py-4 border-b border-slate-100 dark:border-slate-800 flex justify-between items-center bg-slate-50/50 dark:bg-slate-900/50 flex-shrink-0">
-                  <h2 className="text-lg font-bold text-slate-800 dark:text-white flex items-center gap-2">
-                    {isEditMode ? <Edit size={20} className="text-blue-600 dark:text-blue-400"/> : <Upload size={20} className="text-blue-600 dark:text-blue-400"/>} 
-                    {isEditMode ? 'Edit Aircraft' : 'Upload Aircraft'}
-                  </h2>
-                  <button onClick={onClose} className="p-2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full transition-all">
-                        <X size={20} />
-                  </button>
-                </div>
-
-                <div className="flex-1 overflow-y-auto p-6 scrollbar-thin scrollbar-thumb-slate-200 dark:scrollbar-thumb-slate-700">
-                    <form onSubmit={handleSubmit} className="space-y-6">
-                    
-                    {/* ===== EDIT MODE: manage each of the 3 photo slots independently ===== */}
-                    {isEditMode ? (
-                        <div className="space-y-2">
-                            <div className="flex items-center justify-between">
-                                <label className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wide">Photos ({currentImages.length}/{MAX_IMAGES})</label>
-                                {slotBusy && <Loader2 size={16} className="animate-spin text-blue-500" />}
-                            </div>
-
-                            {/* Hidden picker reused for replace + add */}
-                            <input type="file" ref={slotFileRef} accept="image/*" onChange={handleSlotFile} className="hidden" />
-
-                            <div className="grid grid-cols-3 gap-2">
-                                {currentImages.map((src, idx) => (
-                                    <div key={idx} className="relative aspect-[4/3] rounded-xl overflow-hidden bg-slate-100 dark:bg-slate-800 group/slot border border-slate-200 dark:border-slate-700">
-                                        <img src={src} alt={`Photo ${idx + 1}`} className="absolute inset-0 w-full h-full object-cover" onError={(e) => { e.target.src = 'https://via.placeholder.com/400x300?text=No+Image'; }} />
-                                        {idx === 0 && (
-                                            <span className="absolute top-1 left-1 bg-blue-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded z-10">PRIMARY</span>
-                                        )}
-                                        <div className="absolute inset-0 bg-slate-900/60 opacity-0 group-hover/slot:opacity-100 transition-opacity flex items-center justify-center gap-2">
-                                            <button type="button" disabled={slotBusy} onClick={() => openSlotPicker(idx)} title="Replace photo"
-                                                className="p-2 bg-white/90 text-slate-900 rounded-lg hover:scale-110 transition-transform disabled:opacity-50">
-                                                <Pencil size={16} />
-                                            </button>
-                                            <button type="button" disabled={slotBusy} onClick={() => removeSlot(idx)} title="Remove photo"
-                                                className="p-2 bg-red-500/90 text-white rounded-lg hover:scale-110 transition-transform disabled:opacity-50">
-                                                <Trash2 size={16} />
-                                            </button>
-                                        </div>
-                                    </div>
-                                ))}
-
-                                {currentImages.length < MAX_IMAGES && (
-                                    <button type="button" disabled={slotBusy} onClick={() => openSlotPicker('add')}
-                                        className="aspect-[4/3] rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 hover:border-blue-400 dark:hover:border-blue-500 hover:bg-slate-50 dark:hover:bg-slate-800/50 flex flex-col items-center justify-center text-slate-400 hover:text-blue-500 transition-colors disabled:opacity-50">
-                                        <Camera size={24} />
-                                        <span className="text-xs font-semibold mt-1">Add photo</span>
-                                    </button>
-                                )}
-                            </div>
-                            <p className="text-xs text-slate-400 dark:text-slate-500">Hover a photo to replace or remove it. Changes save instantly. The first photo is the cover.</p>
-                        </div>
-                    ) : (
-                    /* ===== CREATE MODE: select up to 3 photos to upload at once ===== */
-                    <div className="relative group w-full">
-                        <input
-                        type="file"
-                        ref={fileInputRef}
-                        accept="image/*"
-                        multiple
-                        onChange={handleFileChange}
-                        className={`absolute inset-0 w-full h-full opacity-0 cursor-pointer z-20 ${previews.length > 0 ? 'h-0' : ''}`}
-                        />
-
-                        {previews.length > 0 ? (
-                            <div className="rounded-2xl border border-slate-200 dark:border-slate-700 p-3">
-                                <div className="grid grid-cols-3 gap-2">
-                                    {previews.map((src, idx) => (
-                                        <div key={idx} className="relative aspect-[4/3] rounded-xl overflow-hidden bg-slate-100 dark:bg-slate-800">
-                                            <img src={src} alt={`Preview ${idx + 1}`} className="absolute inset-0 w-full h-full object-cover" />
-                                            {idx === 0 && (
-                                                <span className="absolute top-1 left-1 bg-blue-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded">PRIMARY</span>
-                                            )}
-                                        </div>
-                                    ))}
-                                </div>
-                                <div className="flex items-center justify-between mt-3">
-                                    <p className="text-xs text-slate-400 dark:text-slate-500">
-                                        {previews.length} photo{previews.length > 1 ? 's' : ''} selected
-                                    </p>
-                                    <button
-                                        type="button"
-                                        onClick={() => fileInputRef.current?.click()}
-                                        className="z-30 bg-slate-100 dark:bg-slate-800 text-slate-900 dark:text-white px-4 py-2 rounded-xl text-sm font-semibold shadow-sm hover:scale-105 transition-transform"
-                                    >
-                                        Change Photos
-                                    </button>
-                                </div>
-                            </div>
-                        ) : (
-                            <div className="relative w-full overflow-hidden rounded-2xl transition-all duration-300 h-48 border-2 border-dashed border-slate-300 dark:border-slate-700 hover:border-blue-400 dark:hover:border-blue-500 hover:bg-slate-50 dark:hover:bg-slate-800/50 flex flex-col items-center justify-center">
-                                <div className="p-4 bg-slate-100 dark:bg-slate-800 rounded-full mb-3 text-slate-400 group-hover:text-blue-500 transition-colors">
-                                    <Camera size={32} />
-                                </div>
-                                <p className="text-sm font-semibold text-slate-500 dark:text-slate-400 group-hover:text-blue-500 transition-colors">Click to select up to 3 photos</p>
-                                <p className="text-xs text-slate-400 dark:text-slate-500 mt-1">PNG, JPG · first photo becomes the cover</p>
-                            </div>
-                        )}
-                    </div>
-                    )}
-
-                    <div className="grid grid-cols-2 gap-4">
-                        <div className="space-y-1">
-                        <label className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wide">Tail Number</label>
-                        <input 
-                            required
-                            name="tailNumber"
-                            placeholder="e.g. N12345"
-                            className="w-full px-4 py-3 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all uppercase text-slate-900 dark:text-white placeholder-slate-400"
-                            value={formData.tailNumber}
-                            onChange={handleChange}
-                        />
-                        </div>
-                        <div className="space-y-1">
-                        <label className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wide">Contributor</label>
-                        <input 
-                            required
-                            name="contributorName"
-                            placeholder="Your Name"
-                            className="w-full px-4 py-3 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all text-slate-900 dark:text-white placeholder-slate-400"
-                            value={formData.contributorName}
-                            onChange={handleChange}
-                        />
-                        </div>
-                    </div>
-
-                    {/* Aircraft Type Dropdown */}
-                    <div className="space-y-1">
-                        <label className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wide">Aircraft Type</label>
-                        {fetchingMeta ? (
-                             <div className="animate-pulse h-12 bg-slate-100 dark:bg-slate-800 rounded-xl w-full"></div>
-                        ) : (
-                            <div className="relative">
-                                <select 
-                                    required
-                                    name="aircraftId"
-                                    className="w-full px-4 py-3 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all appearance-none text-slate-900 dark:text-white cursor-pointer"
-                                    value={formData.aircraftId}
-                                    onChange={handleAircraftChange}
-                                >
-                                    <option value="">Select Aircraft...</option>
-                                    {metadata.aircraft.map(ac => (
-                                        <option key={ac.id} value={ac.id}>{ac.name}</option>
-                                    ))}
-                                </select>
-                                <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400">
-                                    <ChevronDown size={16} />
-                                </div>
-                            </div>
-                        )}
-                    </div>
-
-                    {/* Livery Dropdown */}
-                    <div className="space-y-1">
-                        <label className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wide">
-                            Livery Name {loadingLiveries && <span className="text-blue-500 ml-2 animate-pulse text-[10px]">(Loading...)</span>}
-                        </label>
-                         {fetchingMeta ? (
-                             <div className="animate-pulse h-12 bg-slate-100 dark:bg-slate-800 rounded-xl w-full"></div>
-                        ) : (
-                            <div className="relative">
-                                <select 
-                                    required
-                                    name="liveryName"
-                                    disabled={!formData.aircraftId || loadingLiveries}
-                                    className="w-full px-4 py-3 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all appearance-none text-slate-900 dark:text-white disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-                                    value={formData.liveryName}
-                                    onChange={handleChange}
-                                >
-                                    <option value="">
-                                        {loadingLiveries ? "Fetching Liveries..." : 
-                                         !formData.aircraftId ? "Select Aircraft First" : 
-                                         "Select Livery..."}
-                                    </option>
-                                    {specificLiveries.map(livery => (
-                                        <option key={livery.id} value={livery.name}>{livery.name}</option>
-                                    ))}
-                                </select>
-                                <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400">
-                                    {loadingLiveries ? <Loader2 size={16} className="animate-spin" /> : <ChevronDown size={16} />}
-                                </div>
-                            </div>
-                        )}
-                    </div>
-
-                    <button 
-                        type="submit" 
-                        disabled={loading}
-                        className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3.5 rounded-xl transition-all shadow-lg shadow-blue-600/20 active:scale-[0.98] disabled:opacity-70 disabled:cursor-not-allowed flex justify-center items-center gap-2 mt-2"
-                    >
-                        {loading ? <Loader2 className="animate-spin" size={20}/> : <CheckCircle2 size={20}/>}
-                        {loading ? 'Saving...' : (isEditMode ? 'Update Aircraft' : 'Submit Contribution')}
-                    </button>
-                    </form>
-                </div>
-              </div>
-            </div>
-          );
         }
-        
-        const root = createRoot(document.getElementById('root'));
-        root.render(<App />);
+
+        function renderDashboard() {
+            const c = el('content');
+            if (!c) return;
+            const d = state.dash;
+
+            if (d.loadingMeta && d.master.length === 0) {
+                c.innerHTML = `<main class="max-w-5xl mx-auto px-4 py-8 w-full"><div class="flex flex-col items-center justify-center h-64 text-slate-400">
+                    <span class="spin mb-4 text-blue-600">${icon('loader', 40)}</span><p>Analysing fleet database…</p></div></main>`;
+                return;
+            }
+
+            const hasType = (n) => state.aircrafts.some(a => a.aircraftType === n);
+            const typeCount = (n) => state.aircrafts.filter(a => a.aircraftType === n).length;
+            const hasLivery = (t, l) => state.aircrafts.some(a => a.aircraftType === t && a.liveryName === l);
+
+            const collected = d.master.filter(a => hasType(a.name)).length;
+            const total = d.master.length || 1;
+            const pct = Math.round((collected / total) * 100);
+
+            c.innerHTML = `
+            <main class="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full fade-up">
+                <div class="bg-white dark:bg-slate-900 rounded-2xl p-6 shadow-sm border border-slate-200 dark:border-slate-800 mb-8">
+                    <div class="flex items-center justify-between mb-4">
+                        <div>
+                            <h2 class="text-xl font-bold text-slate-900 dark:text-white">Collection Status</h2>
+                            <p class="text-sm text-slate-500 dark:text-slate-400">Compare your uploads against the global database</p>
+                        </div>
+                        <div class="text-right">
+                            <span class="text-3xl font-extrabold text-blue-600 dark:text-blue-400">${pct}%</span>
+                            <p class="text-xs font-bold text-slate-400 uppercase tracking-wider">Completion</p>
+                        </div>
+                    </div>
+                    <div class="w-full bg-slate-100 dark:bg-slate-800 rounded-full h-3 overflow-hidden">
+                        <div class="bg-gradient-to-r from-blue-600 to-indigo-500 h-full rounded-full transition-all duration-700 ease-out" style="width:${pct}%"></div>
+                    </div>
+                    <div class="mt-2 text-xs text-slate-500 text-right">${collected} of ${d.master.length} aircraft types collected</div>
+                </div>
+
+                <div class="grid gap-4">
+                    ${d.master.map(ac => {
+                        const collectedType = hasType(ac.name);
+                        const expanded = d.expandedId === ac.id;
+                        const count = typeCount(ac.name);
+                        const livs = d.liveries[ac.id];
+                        return `
+                        <div class="bg-white dark:bg-slate-900 rounded-xl border transition-all duration-300 overflow-hidden ${collectedType ? 'border-slate-200 dark:border-slate-800' : 'border-amber-200 dark:border-amber-900/50'}">
+                            <div data-action="expand" data-id="${esc(ac.id)}" class="p-4 flex items-center justify-between cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors ${expanded ? 'bg-slate-50 dark:bg-slate-800/50' : ''}">
+                                <div class="flex items-center gap-4 min-w-0">
+                                    <div class="w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${collectedType ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-600' : 'bg-slate-100 dark:bg-slate-800 text-slate-400'}">
+                                        ${collectedType ? icon('check', 20) : icon('plane', 20)}
+                                    </div>
+                                    <div class="min-w-0">
+                                        <h3 class="font-bold text-lg truncate ${collectedType ? 'text-slate-900 dark:text-white' : 'text-slate-500 dark:text-slate-400'}">${esc(ac.name)}</h3>
+                                        <p class="text-xs flex items-center gap-1">${collectedType
+                                            ? `<span class="text-blue-600 dark:text-blue-400 font-medium">${count} photo${count === 1 ? '' : 's'} in fleet</span>`
+                                            : `<span class="text-amber-600 dark:text-amber-500 font-medium">Missing from fleet</span>`}</p>
+                                    </div>
+                                </div>
+                                <div class="flex items-center gap-2 shrink-0">
+                                    <span class="text-xs font-semibold text-slate-400 uppercase tracking-wide hidden sm:block">${expanded ? 'Hide' : 'Liveries'}</span>
+                                    <span class="text-slate-400 transition-transform duration-300 ${expanded ? 'rotate-180' : ''} inline-block">${icon('chevDown', 20)}</span>
+                                </div>
+                            </div>
+                            ${expanded ? `
+                            <div class="border-t border-slate-100 dark:border-slate-800 p-4 bg-slate-50/50 dark:bg-slate-950/30">
+                                ${!livs ? `
+                                    <div class="flex items-center gap-2 text-slate-400 text-sm py-4"><span class="spin">${icon('loader', 16)}</span> Fetching known liveries…</div>
+                                ` : livs.length === 0 ? `
+                                    <div class="text-slate-400 text-sm italic">No specific liveries listed in database.</div>
+                                ` : `
+                                    <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+                                        ${livs.map(liv => {
+                                            const have = hasLivery(ac.name, liv.name);
+                                            return `
+                                            <div class="flex items-center justify-between p-3 bg-white dark:bg-slate-900 rounded-lg border border-slate-200 dark:border-slate-800">
+                                                <div class="flex items-center gap-2 overflow-hidden">
+                                                    <span class="w-2 h-2 rounded-full shrink-0 ${have ? 'bg-green-500' : 'bg-slate-300 dark:bg-slate-700'}"></span>
+                                                    <span class="text-sm truncate ${have ? 'text-slate-900 dark:text-white font-medium' : 'text-slate-500 dark:text-slate-400'}">${esc(liv.name)}</span>
+                                                </div>
+                                                ${have ? '' : `<button data-action="prefill" data-acid="${esc(ac.id)}" data-acname="${esc(ac.name)}" data-livery="${esc(liv.name)}"
+                                                    class="text-xs bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 px-2 py-1 rounded-md hover:bg-blue-100 dark:hover:bg-blue-900/40 transition-colors font-medium whitespace-nowrap ml-2">Upload</button>`}
+                                            </div>`;
+                                        }).join('')}
+                                    </div>
+                                `}
+                            </div>` : ''}
+                        </div>`;
+                    }).join('')}
+                </div>
+            </main>`;
+        }
+
+        // ---------------------------------------------------------------------
+        // MODALS
+        // ---------------------------------------------------------------------
+        function closeModal() { el('modal-root').innerHTML = ''; document.body.style.overflow = ''; }
+        function openModalWrap(innerHTML) {
+            const root = el('modal-root');
+            root.innerHTML = `<div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/80 backdrop-blur-md fade-in" data-modal-overlay>${innerHTML}</div>`;
+            document.body.style.overflow = 'hidden';
+            root.firstElementChild.addEventListener('mousedown', (e) => { if (e.target.hasAttribute('data-modal-overlay')) closeModal(); });
+            return root.firstElementChild;
+        }
+
+        function infoRow(ic, label, value) {
+            return `<div class="flex items-start gap-4 group">
+                <div class="p-3 bg-slate-50 dark:bg-slate-800 rounded-xl text-slate-400 dark:text-slate-500 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">${icon(ic, 20)}</div>
+                <div class="min-w-0">
+                    <p class="text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wide mb-0.5">${esc(label)}</p>
+                    <p class="text-base font-medium text-slate-900 dark:text-slate-200 break-words">${esc(value)}</p>
+                </div>
+            </div>`;
+        }
+
+        // ---- DETAILS MODAL ----
+        function openDetails(id) {
+            const ac = state.aircrafts.find(a => a._id === id);
+            if (!ac) return;
+            const images = getImages(ac);
+            const contributors = getContributors(ac);
+            let active = 0;
+            const multi = images.length > 1;
+
+            const overlay = openModalWrap(`
+                <div class="bg-white dark:bg-slate-900 rounded-3xl w-full max-w-5xl max-h-[90vh] overflow-hidden shadow-2xl flex flex-col md:flex-row relative zoom-in border border-slate-200 dark:border-slate-700">
+                    <button data-action="close-modal" class="absolute top-4 right-4 z-20 p-2 bg-black/40 hover:bg-black/60 text-white rounded-full backdrop-blur-md transition-all">${icon('x', 20)}</button>
+                    <div class="w-full md:w-3/5 bg-slate-950 flex flex-col">
+                        <div class="flex-1 flex items-center justify-center relative group min-h-0">
+                            <img id="detailImg" src="${esc(images[0] || ac.imageUrl || PLACEHOLDER)}" alt="${esc(ac.tailNumber)}"
+                                class="w-full h-full object-contain max-h-[40vh] md:max-h-full" onerror="this.onerror=null;this.src='${PLACEHOLDER}'" />
+                            ${multi ? `
+                                <button data-nav="prev" class="absolute left-3 top-1/2 -translate-y-1/2 p-2 bg-black/40 hover:bg-black/70 text-white rounded-full backdrop-blur-md transition-all opacity-0 group-hover:opacity-100">${icon('chevLeft', 22)}</button>
+                                <button data-nav="next" class="absolute right-3 top-1/2 -translate-y-1/2 p-2 bg-black/40 hover:bg-black/70 text-white rounded-full backdrop-blur-md transition-all opacity-0 group-hover:opacity-100">${icon('chevRight', 22)}</button>
+                                <div id="detailCounter" class="absolute bottom-3 left-1/2 -translate-x-1/2 bg-black/50 backdrop-blur-sm px-2.5 py-1 rounded-full text-xs font-semibold text-white">1 / ${images.length}</div>
+                            ` : ''}
+                        </div>
+                        ${multi ? `<div class="flex gap-2 p-3 justify-center bg-slate-950/80 flex-shrink-0 overflow-x-auto no-scrollbar">
+                            ${images.map((img, idx) => `<button data-thumb="${idx}" class="thumb relative w-16 h-12 rounded-lg overflow-hidden border-2 transition-all shrink-0 ${idx === 0 ? 'border-blue-500 ring-2 ring-blue-500/40' : 'border-transparent opacity-60 hover:opacity-100'}">
+                                <img src="${esc(img)}" class="w-full h-full object-cover" onerror="this.onerror=null;this.src='${PLACEHOLDER}'" /></button>`).join('')}
+                        </div>` : ''}
+                    </div>
+                    <div class="w-full md:w-2/5 p-8 flex flex-col bg-white dark:bg-slate-900 overflow-y-auto">
+                        <div class="mb-8">
+                            <div class="flex justify-between items-start">
+                                <div>
+                                    <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 text-xs font-bold uppercase tracking-wider mb-3">${icon('plane', 12)} Aircraft Profile</div>
+                                    <h2 class="text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight break-words">${esc(ac.tailNumber || '—')}</h2>
+                                </div>
+                                <button data-action="edit" data-id="${esc(ac._id)}" class="p-2 bg-slate-100 dark:bg-slate-800 rounded-full text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 transition-colors">${icon('pencil', 20)}</button>
+                            </div>
+                            <p class="text-xl text-slate-500 dark:text-slate-400 mt-2">${esc(ac.aircraftType || 'Unknown type')}</p>
+                        </div>
+                        <div class="space-y-5 flex-1">
+                            ${infoRow('camera', 'Livery', ac.liveryName || '—')}
+                            <div id="detailContributor">${infoRow('user', multi ? 'Spotted By (Photo 1)' : 'Spotted By', contributors[0] || ac.contributorName || 'Unknown')}</div>
+                            ${infoRow('calendar', 'Uploaded', fullDate(ac.uploadedAt))}
+                            ${infoRow('activity', 'Status', ac.needsUpdate ? 'Flagged for update' : 'Active in fleet')}
+                        </div>
+                        <div class="mt-8 pt-6 border-t border-slate-100 dark:border-slate-800">
+                            <button data-action="close-modal" class="w-full py-3 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-900 dark:text-white font-semibold rounded-xl transition-colors">Close Details</button>
+                        </div>
+                    </div>
+                </div>
+            `);
+
+            if (multi) {
+                const imgEl = $('#detailImg', overlay);
+                const counter = $('#detailCounter', overlay);
+                const contribEl = $('#detailContributor', overlay);
+                const thumbs = overlay.querySelectorAll('.thumb');
+                const show = (idx) => {
+                    active = (idx + images.length) % images.length;
+                    imgEl.src = images[active] || PLACEHOLDER;
+                    counter.textContent = `${active + 1} / ${images.length}`;
+                    contribEl.innerHTML = infoRow('user', `Spotted By (Photo ${active + 1})`, contributors[active] || ac.contributorName || 'Unknown');
+                    thumbs.forEach((t, i) => {
+                        t.className = 'thumb relative w-16 h-12 rounded-lg overflow-hidden border-2 transition-all shrink-0 ' +
+                            (i === active ? 'border-blue-500 ring-2 ring-blue-500/40' : 'border-transparent opacity-60 hover:opacity-100');
+                    });
+                };
+                overlay.querySelector('[data-nav="prev"]').addEventListener('click', () => show(active - 1));
+                overlay.querySelector('[data-nav="next"]').addEventListener('click', () => show(active + 1));
+                thumbs.forEach((t) => t.addEventListener('click', () => show(parseInt(t.dataset.thumb, 10))));
+            }
+        }
+
+        // ---- FORM MODAL (create / edit) ----
+        function openForm(opts = {}) {
+            const initial = opts.initial || null;          // aircraft record => edit mode
+            const prefill = opts.prefill || null;          // { aircraftId, aircraftType, liveryName }
+            const isEdit = !!initial;
+
+            const formState = {
+                metaAircraft: [],
+                liveries: [],
+                fetchingMeta: true,
+                loadingLiveries: false,
+                slotBusy: false,
+                currentImages: isEdit ? getImages(initial) : [],
+                previews: [],
+                files: [],
+                aircraftId: prefill ? (prefill.aircraftId || '') : '',
+            };
+            const aircraftId = isEdit ? initial._id : null;
+
+            const overlay = openModalWrap(`
+                <div class="bg-white dark:bg-slate-900 rounded-2xl w-full max-w-2xl shadow-xl overflow-hidden zoom-in flex flex-col max-h-[90vh] border border-slate-200 dark:border-slate-800">
+                    <div class="px-6 py-4 border-b border-slate-100 dark:border-slate-800 flex justify-between items-center bg-slate-50/50 dark:bg-slate-900/50 flex-shrink-0">
+                        <h2 class="text-lg font-bold text-slate-800 dark:text-white flex items-center gap-2">
+                            <span class="text-blue-600 dark:text-blue-400">${icon(isEdit ? 'pencil' : 'upload', 20)}</span>
+                            ${isEdit ? 'Edit Aircraft' : 'Upload Aircraft'}
+                        </h2>
+                        <button data-action="close-modal" class="p-2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full transition-all">${icon('x', 20)}</button>
+                    </div>
+                    <div class="flex-1 overflow-y-auto p-6">
+                        <form id="acForm" class="space-y-6" novalidate>
+                            <div id="imageSection"></div>
+                            <div class="grid grid-cols-2 gap-4">
+                                <div class="space-y-1">
+                                    <label class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wide">Tail Number</label>
+                                    <input required name="tailNumber" placeholder="e.g. N12345" value="${esc(initial ? initial.tailNumber : '')}"
+                                        class="w-full px-4 py-3 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all uppercase text-slate-900 dark:text-white placeholder-slate-400" />
+                                </div>
+                                <div class="space-y-1">
+                                    <label class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wide">Contributor</label>
+                                    <input required name="contributorName" placeholder="Your Name" value="${esc(initial ? initial.contributorName : '')}"
+                                        class="w-full px-4 py-3 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all text-slate-900 dark:text-white placeholder-slate-400" />
+                                </div>
+                            </div>
+                            <div class="space-y-1">
+                                <label class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wide">Aircraft Type</label>
+                                <div id="typeWrap"></div>
+                            </div>
+                            <div class="space-y-1">
+                                <label class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wide">Livery Name <span id="livLoading" class="text-blue-500 ml-2 text-[10px] hidden">(Loading…)</span></label>
+                                <div id="liveryWrap"></div>
+                            </div>
+                            <input type="hidden" name="aircraftType" value="${esc(initial ? initial.aircraftType : (prefill ? prefill.aircraftType : ''))}" />
+                            <input type="hidden" name="liveryName" value="${esc(initial ? initial.liveryName : (prefill ? prefill.liveryName : ''))}" />
+                            <button type="submit" id="submitBtn"
+                                class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3.5 rounded-xl transition-all shadow-lg shadow-blue-600/20 active:scale-[0.98] disabled:opacity-70 disabled:cursor-not-allowed flex justify-center items-center gap-2 mt-2">
+                                ${icon('check', 20)} <span>${isEdit ? 'Update Aircraft' : 'Submit Contribution'}</span>
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            `);
+
+            const form = $('#acForm', overlay);
+            const typeHidden = form.elements['aircraftType'];
+            const liveryHidden = form.elements['liveryName'];
+            let pendingSlot = 'add';
+
+            // ---- image section ----
+            function renderImageSection() {
+                const sec = $('#imageSection', overlay);
+                if (isEdit) {
+                    sec.innerHTML = `
+                        <div class="space-y-2">
+                            <div class="flex items-center justify-between">
+                                <label class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wide">Photos (${formState.currentImages.length}/${MAX_IMAGES})</label>
+                                ${formState.slotBusy ? `<span class="spin text-blue-500">${icon('loader', 16)}</span>` : ''}
+                            </div>
+                            <input type="file" id="slotFile" accept="image/*" class="hidden" />
+                            <div class="grid grid-cols-3 gap-2">
+                                ${formState.currentImages.map((src, idx) => `
+                                    <div class="relative aspect-[4/3] rounded-xl overflow-hidden bg-slate-100 dark:bg-slate-800 group/slot border border-slate-200 dark:border-slate-700">
+                                        <img src="${esc(src)}" class="absolute inset-0 w-full h-full object-cover" onerror="this.onerror=null;this.src='${PLACEHOLDER}'" />
+                                        ${idx === 0 ? `<span class="absolute top-1 left-1 bg-blue-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded z-10">PRIMARY</span>` : ''}
+                                        <div class="absolute inset-0 bg-slate-900/60 opacity-0 group-hover/slot:opacity-100 transition-opacity flex items-center justify-center gap-2">
+                                            <button type="button" data-slot-edit="${idx}" ${formState.slotBusy ? 'disabled' : ''} title="Replace" class="p-2 bg-white/90 text-slate-900 rounded-lg hover:scale-110 transition-transform disabled:opacity-50">${icon('pencil', 16)}</button>
+                                            <button type="button" data-slot-del="${idx}" ${formState.slotBusy ? 'disabled' : ''} title="Remove" class="p-2 bg-red-500/90 text-white rounded-lg hover:scale-110 transition-transform disabled:opacity-50">${icon('trash', 16)}</button>
+                                        </div>
+                                    </div>`).join('')}
+                                ${formState.currentImages.length < MAX_IMAGES ? `
+                                    <button type="button" id="slotAdd" ${formState.slotBusy ? 'disabled' : ''}
+                                        class="aspect-[4/3] rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 hover:border-blue-400 hover:bg-slate-50 dark:hover:bg-slate-800/50 flex flex-col items-center justify-center text-slate-400 hover:text-blue-500 transition-colors disabled:opacity-50">
+                                        ${icon('camera', 24)}<span class="text-xs font-semibold mt-1">Add photo</span></button>` : ''}
+                            </div>
+                            <p class="text-xs text-slate-400 dark:text-slate-500">Hover a photo to replace or remove it. Changes save instantly. The first photo is the cover.</p>
+                        </div>`;
+                    wireSlots();
+                } else {
+                    const p = formState.previews;
+                    sec.innerHTML = `
+                        <div class="relative group w-full">
+                            <input type="file" id="createFiles" accept="image/*" multiple class="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-20 ${p.length > 0 ? 'pointer-events-none' : ''}" />
+                            ${p.length > 0 ? `
+                                <div class="rounded-2xl border border-slate-200 dark:border-slate-700 p-3">
+                                    <div class="grid grid-cols-3 gap-2">
+                                        ${p.map((src, idx) => `<div class="relative aspect-[4/3] rounded-xl overflow-hidden bg-slate-100 dark:bg-slate-800">
+                                            <img src="${esc(src)}" class="absolute inset-0 w-full h-full object-cover" />
+                                            ${idx === 0 ? `<span class="absolute top-1 left-1 bg-blue-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded">PRIMARY</span>` : ''}</div>`).join('')}
+                                    </div>
+                                    <div class="flex items-center justify-between mt-3">
+                                        <p class="text-xs text-slate-400 dark:text-slate-500">${p.length} photo${p.length > 1 ? 's' : ''} selected</p>
+                                        <button type="button" id="changePhotos" class="z-30 bg-slate-100 dark:bg-slate-800 text-slate-900 dark:text-white px-4 py-2 rounded-xl text-sm font-semibold shadow-sm hover:scale-105 transition-transform">Change Photos</button>
+                                    </div>
+                                </div>` : `
+                                <div class="relative w-full overflow-hidden rounded-2xl transition-all duration-300 h-48 border-2 border-dashed border-slate-300 dark:border-slate-700 hover:border-blue-400 hover:bg-slate-50 dark:hover:bg-slate-800/50 flex flex-col items-center justify-center">
+                                    <div class="p-4 bg-slate-100 dark:bg-slate-800 rounded-full mb-3 text-slate-400 group-hover:text-blue-500 transition-colors">${icon('camera', 32)}</div>
+                                    <p class="text-sm font-semibold text-slate-500 dark:text-slate-400 group-hover:text-blue-500 transition-colors">Click to select up to ${MAX_IMAGES} photos</p>
+                                    <p class="text-xs text-slate-400 dark:text-slate-500 mt-1">PNG, JPG · first photo becomes the cover</p>
+                                </div>`}
+                        </div>`;
+                    const filesInput = $('#createFiles', overlay);
+                    filesInput.addEventListener('change', (e) => {
+                        const files = Array.from(e.target.files || []).slice(0, MAX_IMAGES);
+                        formState.previews.forEach(URL.revokeObjectURL);
+                        formState.previews = files.map(f => URL.createObjectURL(f));
+                        formState.files = files;
+                        renderImageSection();
+                    });
+                    const change = $('#changePhotos', overlay);
+                    if (change) change.addEventListener('click', () => filesInput.click());
+                }
+            }
+
+            // ---- per-slot image management (edit mode) ----
+            function wireSlots() {
+                const slotFile = $('#slotFile', overlay);
+                const openPicker = (target) => { if (formState.slotBusy) return; pendingSlot = target; slotFile.value = ''; slotFile.click(); };
+                overlay.querySelectorAll('[data-slot-edit]').forEach(b => b.addEventListener('click', () => openPicker(parseInt(b.dataset.slotEdit, 10))));
+                overlay.querySelectorAll('[data-slot-del]').forEach(b => b.addEventListener('click', () => removeSlot(parseInt(b.dataset.slotDel, 10))));
+                const add = $('#slotAdd', overlay);
+                if (add) add.addEventListener('click', () => openPicker('add'));
+                slotFile.addEventListener('change', handleSlotFile);
+            }
+            async function handleSlotFile(e) {
+                const file = e.target.files && e.target.files[0];
+                if (!file) return;
+                if (state.isDemoMode) { alert('Demo Mode: image changes are disabled.'); return; }
+                formState.slotBusy = true; renderImageSection();
+                try {
+                    const body = new FormData(); body.append('image', file);
+                    const isReplace = typeof pendingSlot === 'number';
+                    const url = isReplace ? `${API_URL}/${aircraftId}/images/${pendingSlot}` : `${API_URL}/${aircraftId}/images`;
+                    const res = await fetch(url, { method: isReplace ? 'PUT' : 'POST', body });
+                    if (!res.ok) { const er = await res.json().catch(() => ({})); throw new Error(er.message || 'Failed to save image'); }
+                    const json = await res.json();
+                    formState.currentImages = getImages(json.data);
+                    await fetchAircraft(true); fetchStats();
+                } catch (err) { alert('Failed: ' + err.message); }
+                finally { formState.slotBusy = false; renderImageSection(); }
+            }
+            async function removeSlot(index) {
+                if (formState.slotBusy) return;
+                if (state.isDemoMode) { alert('Demo Mode: image changes are disabled.'); return; }
+                if (!confirm(`Remove photo ${index + 1}? This deletes it permanently.`)) return;
+                formState.slotBusy = true; renderImageSection();
+                try {
+                    const res = await fetch(`${API_URL}/${aircraftId}/images/${index}`, { method: 'DELETE' });
+                    if (!res.ok) { const er = await res.json().catch(() => ({})); throw new Error(er.message || 'Failed to remove image'); }
+                    const json = await res.json();
+                    formState.currentImages = getImages(json.data);
+                    await fetchAircraft(true); fetchStats();
+                } catch (err) { alert('Failed: ' + err.message); }
+                finally { formState.slotBusy = false; renderImageSection(); }
+            }
+
+            // ---- type & livery dropdowns ----
+            function renderTypeSelect() {
+                const wrap = $('#typeWrap', overlay);
+                if (formState.fetchingMeta) { wrap.innerHTML = `<div class="h-12 rounded-xl skeleton"></div>`; return; }
+                wrap.innerHTML = `
+                    <div class="relative">
+                        <select id="typeSelectForm" required class="w-full px-4 py-3 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all appearance-none text-slate-900 dark:text-white cursor-pointer">
+                            <option value="">Select Aircraft…</option>
+                            ${formState.metaAircraft.map(a => `<option value="${esc(a.id)}" ${a.id === formState.aircraftId ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}
+                        </select>
+                        <span class="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400">${icon('chevDown', 16)}</span>
+                    </div>`;
+                $('#typeSelectForm', overlay).addEventListener('change', (e) => {
+                    const selId = e.target.value;
+                    const obj = formState.metaAircraft.find(a => a.id === selId);
+                    formState.aircraftId = selId;
+                    typeHidden.value = obj ? obj.name : '';
+                    liveryHidden.value = '';
+                    formState.liveries = [];
+                    renderLiverySelect();
+                    if (selId) fetchLiveries(selId);
+                });
+            }
+            function renderLiverySelect() {
+                const wrap = $('#liveryWrap', overlay);
+                if (formState.fetchingMeta) { wrap.innerHTML = `<div class="h-12 rounded-xl skeleton"></div>`; return; }
+                const disabled = !formState.aircraftId || formState.loadingLiveries;
+                wrap.innerHTML = `
+                    <div class="relative">
+                        <select id="liverySelectForm" required ${disabled ? 'disabled' : ''} class="w-full px-4 py-3 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all appearance-none text-slate-900 dark:text-white disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer">
+                            <option value="">${formState.loadingLiveries ? 'Fetching liveries…' : (!formState.aircraftId ? 'Select aircraft first' : 'Select livery…')}</option>
+                            ${formState.liveries.map(l => `<option value="${esc(l.name)}" ${l.name === liveryHidden.value ? 'selected' : ''}>${esc(l.name)}</option>`).join('')}
+                        </select>
+                        <span class="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400">${formState.loadingLiveries ? `<span class="spin inline-block">${icon('loader', 16)}</span>` : icon('chevDown', 16)}</span>
+                    </div>`;
+                const ll = $('#livLoading', overlay); if (ll) ll.classList.toggle('hidden', !formState.loadingLiveries);
+                $('#liverySelectForm', overlay).addEventListener('change', (e) => { liveryHidden.value = e.target.value; });
+            }
+            async function fetchLiveries(id, preselect) {
+                formState.loadingLiveries = true; renderLiverySelect();
+                try {
+                    const res = await fetch(liveriesUrl(id));
+                    if (!res.ok) throw new Error('liv');
+                    const data = await res.json();
+                    formState.liveries = (data.liveries || []).slice().sort((a, b) => a.name.localeCompare(b.name));
+                } catch (_) {
+                    formState.liveries = DEMO_METADATA_LIVERIES.slice();
+                } finally {
+                    formState.loadingLiveries = false;
+                    if (preselect) liveryHidden.value = preselect;
+                    renderLiverySelect();
+                }
+            }
+
+            // ---- init metadata ----
+            (async function initMeta() {
+                try {
+                    const res = await fetch(META_URL);
+                    if (!res.ok) throw new Error('meta');
+                    const data = await res.json();
+                    formState.metaAircraft = (data.aircraft || []).slice().sort((a, b) => a.name.localeCompare(b.name));
+                } catch (_) {
+                    formState.metaAircraft = DEMO_METADATA_AIRCRAFT.slice();
+                }
+                formState.fetchingMeta = false;
+
+                if (isEdit && initial.aircraftType) {
+                    const match = formState.metaAircraft.find(a => a.name === initial.aircraftType);
+                    if (match) { formState.aircraftId = match.id; typeHidden.value = match.name; }
+                    renderTypeSelect(); renderLiverySelect();
+                    if (match) await fetchLiveries(match.id, initial.liveryName);
+                } else if (prefill && prefill.aircraftId) {
+                    formState.aircraftId = prefill.aircraftId;
+                    renderTypeSelect(); renderLiverySelect();
+                    await fetchLiveries(prefill.aircraftId, prefill.liveryName);
+                } else {
+                    renderTypeSelect(); renderLiverySelect();
+                }
+            })();
+
+            // ---- submit ----
+            form.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const btn = $('#submitBtn', overlay);
+                const fd = new FormData(form);
+                const resetBtn = () => {
+                    btn.disabled = false;
+                    btn.innerHTML = `${icon('check', 20)}<span>${isEdit ? 'Update Aircraft' : 'Submit Contribution'}</span>`;
+                };
+
+                if (!fd.get('aircraftType') || !fd.get('liveryName')) { alert('Please choose an aircraft type and livery.'); return; }
+
+                if (state.isDemoMode) {
+                    btn.disabled = true;
+                    setTimeout(() => { alert('Demo Mode: changes saved locally.'); closeModal(); }, 600);
+                    return;
+                }
+
+                btn.disabled = true;
+                btn.innerHTML = `<span class="spin">${icon('loader', 20)}</span><span>Saving…</span>`;
+                try {
+                    const data = new FormData();
+                    data.append('contributorName', fd.get('contributorName') || '');
+                    data.append('aircraftType', fd.get('aircraftType') || '');
+                    data.append('liveryName', fd.get('liveryName') || '');
+                    data.append('tailNumber', fd.get('tailNumber') || '');
+
+                    if (!isEdit) {
+                        const files = (formState.files || []).slice(0, MAX_IMAGES);
+                        if (files.length === 0) { alert('Please select at least one image'); resetBtn(); return; }
+                        files.forEach(f => data.append('images', f));
+                    }
+
+                    const url = isEdit ? `${API_URL}/${initial._id}` : API_URL;
+                    const res = await fetch(url, { method: isEdit ? 'PUT' : 'POST', body: data });
+                    if (!res.ok) { const er = await res.json().catch(() => ({})); throw new Error(er.message || 'Operation failed'); }
+                    closeModal();
+                    await fetchAircraft(true); fetchStats();
+                } catch (err) {
+                    alert('Failed: ' + err.message);
+                    resetBtn();
+                }
+            });
+
+            renderImageSection();
+            renderTypeSelect();
+            renderLiverySelect();
+        }
+
+        // ---------------------------------------------------------------------
+        // GLOBAL EVENT DELEGATION
+        // ---------------------------------------------------------------------
+        document.addEventListener('click', (e) => {
+            const target = e.target.closest('[data-action]');
+            if (!target) return;
+            const a = target.dataset.action;
+            const id = target.dataset.id;
+            switch (a) {
+                case 'home':
+                    state.search = ''; state.filterType = 'All'; state.filterContributor = 'All'; state.view = 'gallery';
+                    renderShell(); break;
+                case 'view':
+                    state.view = target.dataset.view;
+                    renderShell();
+                    if (state.view === 'collection') ensureDashboardMeta();
+                    break;
+                case 'theme': toggleTheme(); break;
+                case 'create': openForm(); break;
+                case 'open': openDetails(id); break;
+                case 'edit': { const ac = state.aircrafts.find(x => x._id === id); if (ac) { closeModal(); openForm({ initial: ac }); } break; }
+                case 'delete': deleteAircraft(id); break;
+                case 'flag': toggleFlag(id); break;
+                case 'clear-filters':
+                    state.search = ''; state.filterType = 'All'; state.filterContributor = 'All';
+                    renderControls(); renderContent(); break;
+                case 'expand': toggleExpand(id); break;
+                case 'prefill':
+                    openForm({ prefill: { aircraftId: target.dataset.acid, aircraftType: target.dataset.acname, liveryName: target.dataset.livery } });
+                    break;
+                case 'close-modal': closeModal(); break;
+            }
+        });
+
+        document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
+
+        // ---------------------------------------------------------------------
+        // THEME
+        // ---------------------------------------------------------------------
+        function toggleTheme() {
+            state.theme = state.theme === 'light' ? 'dark' : 'light';
+            localStorage.setItem('theme', state.theme);
+            document.documentElement.classList.toggle('dark', state.theme === 'dark');
+            const btn = el('themeBtn');
+            if (btn) btn.innerHTML = icon(state.theme === 'light' ? 'moon' : 'sun', 20);
+        }
+        function initTheme() {
+            const saved = localStorage.getItem('theme');
+            if (saved) state.theme = saved;
+            else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) state.theme = 'dark';
+            document.documentElement.classList.toggle('dark', state.theme === 'dark');
+        }
+
+        // ---------------------------------------------------------------------
+        // BOOT
+        // ---------------------------------------------------------------------
+        initTheme();
+        renderShell();
+        fetchAircraft();
+        fetchStats();
+    })();
     </script>
 </body>
 </html>
