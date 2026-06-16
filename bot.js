@@ -531,17 +531,23 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         const approveButtons = [];
 
         if (existingImages.length === 0) {
+            // No photo yet: this is an "add" so the approval handler appends
+            // against the live DB state rather than assuming a fixed slot.
             approveButtons.push(
-                new ButtonBuilder().setCustomId(`approve_1_${userId}`).setLabel('Approve & Verify').setStyle(ButtonStyle.Success).setEmoji('✅')
+                new ButtonBuilder().setCustomId(`approve_add_1_${userId}`).setLabel('Approve & Verify').setStyle(ButtonStyle.Success).setEmoji('✅')
             );
             mainEmbed.setTitle('📋 New Submission Request').setColor(0x00FF00).setDescription(null);
         } else {
             const slotsToShow = Math.min(existingImages.length + 1, MAX_AIRCRAFT_IMAGES);
             for (let slot = 1; slot <= slotsToShow; slot++) {
                 const isReplace = slot <= existingImages.length;
+                // Encode the intent (add/replace) in the customId so the approval
+                // handler re-checks the live image state instead of trusting the
+                // slot number captured when these buttons were first rendered.
+                const action = isReplace ? 'replace' : 'add';
                 approveButtons.push(
                     new ButtonBuilder()
-                        .setCustomId(`approve_${slot}_${userId}`)
+                        .setCustomId(`approve_${action}_${slot}_${userId}`)
                         .setLabel(`${isReplace ? 'Replace' : 'Add'} Photo ${slot}`)
                         .setStyle(isReplace ? ButtonStyle.Primary : ButtonStyle.Success)
                         .setEmoji(isReplace ? '♻️' : '➕')
@@ -1283,10 +1289,18 @@ client.on('interactionCreate', async (interaction) => {
 
             if (customId.startsWith('approve_') && !customId.startsWith('approve_apt_')) {
                 await interaction.deferUpdate();
-                // customId format: approve_<slot>_<userId> (legacy: approve_<userId> => slot 1)
+                // customId format: approve_<action>_<slot>_<userId> where action is
+                // 'add' | 'replace'. Older formats are still accepted:
+                //   approve_<slot>_<userId>  (slot only — intent inferred at approval)
+                //   approve_<userId>         (legacy single-photo => slot 1)
                 const approveParts = customId.split('_');
+                let approveAction = null; // 'add' | 'replace' | null (infer)
                 let chosenSlot, targetUserId;
-                if (approveParts.length >= 3) {
+                if (approveParts.length >= 4) {
+                    approveAction = approveParts[1];
+                    chosenSlot = parseInt(approveParts[2], 10) || 1;
+                    targetUserId = approveParts[3];
+                } else if (approveParts.length === 3) {
                     chosenSlot = parseInt(approveParts[1], 10) || 1;
                     targetUserId = approveParts[2];
                 } else {
@@ -1318,9 +1332,43 @@ client.on('interactionCreate', async (interaction) => {
 
                     let images = getEntryImages(existingEntry);
                     let contributors = getEntryContributors(existingEntry);
-                    // Clamp the chosen slot so we never leave a gap; cap at MAX_AIRCRAFT_IMAGES.
-                    let slotIndex = Math.min(Math.max(chosenSlot - 1, 0), images.length);
-                    if (slotIndex >= MAX_AIRCRAFT_IMAGES) slotIndex = MAX_AIRCRAFT_IMAGES - 1;
+
+                    // RE-CHECK against the LIVE database before placing the photo.
+                    // The slot baked into the button was decided when the buttons
+                    // were rendered; by the time an admin clicks, other submissions
+                    // for the same aircraft may already have been approved. Without
+                    // this re-check, a second pending "add" (rendered as slot 1 when
+                    // there were 0 photos) would overwrite the photo that was just
+                    // approved into slot 1. We honour the admin's intent (add vs
+                    // replace) against the current image count instead.
+                    let slotIndex;
+                    let isReplace;
+                    if (approveAction === 'add') {
+                        // Append as a NEW photo at the end of the current list. If
+                        // the aircraft is already full, fall back to the last slot.
+                        if (images.length < MAX_AIRCRAFT_IMAGES) {
+                            slotIndex = images.length;
+                            isReplace = false;
+                        } else {
+                            slotIndex = MAX_AIRCRAFT_IMAGES - 1;
+                            isReplace = true;
+                        }
+                    } else if (approveAction === 'replace') {
+                        // Replace the targeted slot if it still exists; if that photo
+                        // is gone (images shrank since render), append instead.
+                        slotIndex = chosenSlot - 1;
+                        if (slotIndex >= 0 && slotIndex < images.length) {
+                            isReplace = true;
+                        } else {
+                            slotIndex = Math.min(images.length, MAX_AIRCRAFT_IMAGES - 1);
+                            isReplace = slotIndex < images.length;
+                        }
+                    } else {
+                        // Legacy buttons (no encoded action): infer from live state.
+                        slotIndex = Math.min(Math.max(chosenSlot - 1, 0), images.length);
+                        if (slotIndex >= MAX_AIRCRAFT_IMAGES) slotIndex = MAX_AIRCRAFT_IMAGES - 1;
+                        isReplace = slotIndex < images.length;
+                    }
 
                     // The person who submitted this photo is the contributor of THIS
                     // slot only — adding/replacing photo 2 or 3 must not overwrite the
@@ -1328,7 +1376,7 @@ client.on('interactionCreate', async (interaction) => {
                     const slotContributor = { name: contributorName, id: targetUserId };
 
                     let replacedUrl = null;
-                    if (slotIndex < images.length) {
+                    if (isReplace && slotIndex < images.length) {
                         replacedUrl = images[slotIndex];
                         images[slotIndex] = permanentUrl;
                         contributors[slotIndex] = slotContributor;
