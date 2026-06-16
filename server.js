@@ -1273,6 +1273,45 @@ app.delete('/api/aircraft/:id/images/:index', async (req, res) => {
     }
 });
 
+// PATCH: Update only the contributor name of a specific slot, without touching the
+// image itself. Lets the dashboard correct/reattribute who spotted each photo.
+app.patch('/api/aircraft/:id/images/:index/contributor', async (req, res) => {
+    try {
+        const index = parseInt(req.params.index, 10);
+        if (isNaN(index) || index < 0 || index >= MAX_AIRCRAFT_IMAGES) {
+            return res.status(400).json({ message: `Slot must be between 0 and ${MAX_AIRCRAFT_IMAGES - 1}.` });
+        }
+
+        const contributorName = (req.body.contributorName || '').trim();
+        if (!contributorName) {
+            return res.status(400).json({ message: 'Contributor name is required.' });
+        }
+
+        const entry = await CommunityAircraft.findById(req.params.id);
+        if (!entry) return res.status(404).json({ message: 'Aircraft not found.' });
+
+        const images = getEntryImages(entry);
+        if (index >= images.length) {
+            return res.status(404).json({ message: 'No image at that slot.' });
+        }
+
+        // Re-attribute this slot only; the other slots keep their own contributor.
+        const contributors = getEntryContributors(entry);
+        contributors[index] = {
+            name: contributorName,
+            id: (contributors[index] && contributors[index].id) || null
+        };
+        entry.imageContributors = contributors;
+        syncPrimaryContributor(entry); // keep the legacy top-level field aligned to slot 0
+        await entry.save();
+
+        res.json({ message: 'Contributor updated.', data: entry });
+    } catch (error) {
+        console.error('Update Contributor Error:', error);
+        res.status(500).json({ message: 'Server error while updating contributor.' });
+    }
+});
+
 /* =========================
  * AIRPORT IMAGES API
  * ========================= */
