@@ -608,6 +608,49 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         return { components, extraEmbeds };
     };
 
+    // After an aircraft photo is approved, OTHER still-pending review cards in the
+    // admin channel for the SAME aircraft were rendered against the old image count
+    // (e.g. two users submit the same plane → both cards say "no photo yet"). Once
+    // one is approved the others are stale: they still show the empty-state "Approve
+    // & Verify" button instead of the live "Replace Photo 1 / Add Photo 2" choices.
+    // Re-render those siblings against the freshly-updated entry so the admin sees
+    // the real slot count and picks Add/Replace deliberately.
+    const refreshPendingReviewsFor = async (typeField, liveryField, updatedEntry, skipMessageId) => {
+        try {
+            const adminChannel = await client.channels.fetch(ADMIN_CHANNEL_ID).catch(() => null);
+            if (!adminChannel) return;
+            const recent = await adminChannel.messages.fetch({ limit: 50 }).catch(() => null);
+            if (!recent) return;
+            for (const [, msg] of recent) {
+                if (msg.id === skipMessageId) continue;
+                if (!client.user || msg.author.id !== client.user.id) continue;
+                if (!msg.components || msg.components.length === 0) continue;
+                const embed = msg.embeds[0];
+                if (!embed || !Array.isArray(embed.fields)) continue;
+                // Only refresh cards that still carry approve buttons (i.e. unresolved
+                // pending reviews — verified/rejected cards have their buttons stripped).
+                const stillPending = msg.components.some(row =>
+                    row.components.some(c => (c.customId || '').startsWith('approve_') && !(c.customId || '').startsWith('approve_apt_')));
+                if (!stillPending) continue;
+                const t = embed.fields.find(f => f.name === 'Aircraft Type')?.value;
+                const l = embed.fields.find(f => f.name === 'Livery')?.value;
+                if (!t || !l) continue;
+                if (t.toLowerCase() !== typeField.toLowerCase() || l.toLowerCase() !== liveryField.toLowerCase()) continue;
+
+                const submitterId = (embed.footer?.text || '').match(/User: (\d+)/)?.[1];
+                if (!submitterId) continue;
+                const refreshed = EmbedBuilder.from(embed);
+                const review = buildAircraftReview(refreshed, updatedEntry, submitterId);
+                // buildAircraftReview rewrites title/description but not the footer; keep
+                // the pending footer (User/Msg/Ch ids) so later handlers can recover them.
+                if (embed.footer?.text) refreshed.setFooter({ text: embed.footer.text });
+                await msg.edit({ embeds: [refreshed, ...review.extraEmbeds], components: review.components }).catch(() => {});
+            }
+        } catch (e) {
+            console.error('refreshPendingReviewsFor failed:', e);
+        }
+    };
+
     const startSubmissionFlow = async (source, rawType, rawLivery, ignoredTail, photoUrl, user, originChannelId) => {
         
         let currentType = rawType;
@@ -1518,6 +1561,15 @@ client.on('interactionCreate', async (interaction) => {
                             }
                         } catch (e) {}
                     }
+
+                    // Refresh any other still-pending review cards for the same aircraft so
+                    // they reflect the photo we just saved (e.g. a duplicate submission's
+                    // card flips from "no photo yet" to "1/3 — Add Photo 2 / Replace Photo 1").
+                    await refreshPendingReviewsFor(typeField, liveryField, {
+                        imageUrls: images,
+                        imageContributors: contributors,
+                        tailNumber: updateData.tailNumber
+                    }, interaction.message.id);
                 } catch (err) {
                     console.error("Aircraft Approval Error:", err);
                 }

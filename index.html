@@ -759,6 +759,7 @@
                 loadingLiveries: false,
                 slotBusy: false,
                 currentImages: isEdit ? getImages(initial) : [],
+                currentContributors: isEdit ? getContributors(initial) : [],
                 previews: [],
                 files: [],
                 aircraftId: prefill ? (prefill.aircraftId || '') : '',
@@ -840,6 +841,19 @@
                                         ${icon('camera', 24)}<span class="text-xs font-semibold mt-1">Add photo</span></button>` : ''}
                             </div>
                             <p class="text-xs text-slate-400 dark:text-slate-500">Hover a photo to replace or remove it. Changes save instantly. The first photo is the cover.</p>
+                            ${formState.currentImages.length > 0 ? `
+                            <div class="space-y-2 pt-2 mt-1 border-t border-slate-100 dark:border-slate-800">
+                                <label class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wide">Photo Contributors</label>
+                                ${formState.currentImages.map((_, idx) => `
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-xs font-semibold text-slate-400 dark:text-slate-500 w-14 shrink-0">Photo ${idx + 1}</span>
+                                        <input type="text" data-contrib-input="${idx}" value="${esc(formState.currentContributors[idx] || '')}" placeholder="Contributor name"
+                                            class="flex-1 px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none transition-all text-sm text-slate-900 dark:text-white placeholder-slate-400" />
+                                        <button type="button" data-contrib-save="${idx}" ${formState.slotBusy ? 'disabled' : ''} title="Save contributor"
+                                            class="px-3 py-2 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-lg text-xs font-bold hover:bg-blue-600 hover:text-white transition-colors disabled:opacity-50 shrink-0">Save</button>
+                                    </div>`).join('')}
+                                <p class="text-xs text-slate-400 dark:text-slate-500">Correct who spotted each photo. Saves instantly per photo.</p>
+                            </div>` : ''}
                         </div>`;
                     wireSlots();
                 } else {
@@ -887,6 +901,28 @@
                 const add = $('#slotAdd', overlay);
                 if (add) add.addEventListener('click', () => openPicker('add'));
                 slotFile.addEventListener('change', handleSlotFile);
+                overlay.querySelectorAll('[data-contrib-save]').forEach(b =>
+                    b.addEventListener('click', () => saveContributor(parseInt(b.dataset.contribSave, 10))));
+            }
+            async function saveContributor(index) {
+                if (formState.slotBusy) return;
+                if (state.isDemoMode) { alert('Demo Mode: contributor changes are disabled.'); return; }
+                const input = overlay.querySelector(`[data-contrib-input="${index}"]`);
+                const name = (input && input.value || '').trim();
+                if (!name) { alert('Contributor name cannot be empty.'); return; }
+                formState.slotBusy = true; renderImageSection();
+                try {
+                    const res = await fetch(`${API_URL}/${aircraftId}/images/${index}/contributor`, {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ contributorName: name })
+                    });
+                    if (!res.ok) { const er = await res.json().catch(() => ({})); throw new Error(er.message || 'Failed to update contributor'); }
+                    const json = await res.json();
+                    formState.currentContributors = getContributors(json.data);
+                    await fetchAircraft(true); fetchStats();
+                } catch (err) { alert('Failed: ' + err.message); }
+                finally { formState.slotBusy = false; renderImageSection(); }
             }
             async function handleSlotFile(e) {
                 const file = e.target.files && e.target.files[0];
