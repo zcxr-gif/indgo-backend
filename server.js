@@ -1,12 +1,15 @@
 // server.js
 // A lightweight backend for Community Aircraft Contributions and Flight Trail Storage.
 
-const { 
-    uploadAirportImage, 
-    getAirportInfo, 
-    deleteAirportImages, 
-    updateAirportMetadata 
+const {
+    uploadAirportImage,
+    getAirportInfo,
+    deleteAirportImages,
+    updateAirportMetadata
 } = require('./airports');
+
+// VA Advertisement image helpers (banner + logo -> S3 as WebP)
+const { uploadVaImage, deleteVaImage } = require('./vaAds');
 
 const express = require('express');
 const mongoose = require('mongoose');
@@ -104,6 +107,83 @@ const AirportGateSchema = new mongoose.Schema({
 });
 
 const AirportGate = mongoose.model('AirportGate', AirportGateSchema);
+
+/* =========================
+ * VIRTUAL AIRLINE ADVERTISEMENT SCHEMA
+ *
+ * Backs the VA advertising directory: Infinite Flight virtual airlines (VA)
+ * and virtual organizations (VO) submit a banner + info to recruit pilots.
+ *
+ * Submissions default to `status: "pending"` so anything coming from a public
+ * form is held for moderation before it shows on the public directory — an ad
+ * board that auto-publishes is an ad board full of spam. Approved ads can be
+ * `featured` to pin them to the top. Lightweight view/click counters let each
+ * VA measure how its ad is performing without a separate analytics service.
+ * ========================= */
+const VA_AD_STATUSES = ['pending', 'approved', 'rejected'];
+const VA_AD_TYPES = ['VA', 'VO']; // Virtual Airline vs Virtual Organization (IF terminology)
+
+const VirtualAirlineAdSchema = new mongoose.Schema({
+    // --- Identity ---
+    name: { type: String, required: true, unique: true, trim: true },
+    callsign: { type: String, trim: true, uppercase: true, default: null }, // e.g. "IGO", "SPEEDBIRD"
+    type: { type: String, enum: VA_AD_TYPES, default: 'VA' },
+
+    // --- Copy ---
+    tagline: { type: String, trim: true, maxlength: 140, default: '' }, // short hook
+    description: { type: String, trim: true, maxlength: 4000, default: '' },
+
+    // --- Media (S3 WebP URLs) ---
+    bannerUrl: { type: String, default: null },
+    logoUrl: { type: String, default: null },
+
+    // --- Links ---
+    websiteUrl: { type: String, trim: true, default: null },
+    discordUrl: { type: String, trim: true, default: null },        // Discord invite
+    ifcThreadUrl: { type: String, trim: true, default: null },      // Infinite Flight Community forum thread
+    applicationUrl: { type: String, trim: true, default: null },    // where pilots apply / join
+
+    // --- VA details ---
+    region: { type: String, trim: true, default: 'Global' },        // e.g. "Asia", "Europe", "Global"
+    hubs: { type: [String], default: [] },                          // primary hub ICAOs, e.g. ["VABB", "VIDP"]
+    fleet: { type: [String], default: [] },                         // aircraft types operated
+    pilotCount: { type: Number, default: 0, min: 0 },
+    recruiting: { type: Boolean, default: true },                   // currently accepting applications?
+    minGrade: { type: Number, default: null, min: 1, max: 5 },      // IF grade requirement (1-5), if any
+    requirements: { type: String, trim: true, default: '' },        // free-text joining requirements
+    tags: { type: [String], default: [] },                          // searchable keywords
+
+    // --- Ownership / contact (who submitted) ---
+    ownerName: { type: String, trim: true, default: 'Unknown' },
+    ownerId: { type: String, default: null },                       // Discord ID, if submitted via bot/auth
+    contactEmail: { type: String, trim: true, lowercase: true, default: null },
+
+    // --- Moderation & promotion ---
+    status: { type: String, enum: VA_AD_STATUSES, default: 'pending', index: true },
+    featured: { type: Boolean, default: false },
+
+    // --- Analytics ---
+    views: { type: Number, default: 0 },                            // detail-page impressions
+    clicks: { type: Number, default: 0 },                           // click-throughs on join/apply link
+
+    createdAt: { type: Date, default: Date.now },
+    updatedAt: { type: Date, default: Date.now }
+});
+
+// Index the hot query paths: public listing filters by status, then sorts by
+// featured/newest; callsign and text search back the directory's search box.
+VirtualAirlineAdSchema.index({ status: 1, featured: -1, createdAt: -1 });
+VirtualAirlineAdSchema.index({ region: 1 });
+VirtualAirlineAdSchema.index({ callsign: 1 });
+VirtualAirlineAdSchema.index({ name: 'text', tagline: 'text', description: 'text', tags: 'text' });
+
+// Keep updatedAt fresh on every save.
+VirtualAirlineAdSchema.pre('save', function (next) {
+    this.updatedAt = new Date();
+    next();
+});
+
+const VirtualAirlineAd = mongoose.model('VirtualAirlineAd', VirtualAirlineAdSchema);
 
 /* =========================
  * LEADERBOARD SCHEMAS
@@ -1432,6 +1512,348 @@ app.put('/api/airports/:icao', upload.single('image'), async (req, res) => {
         if (req.file) fs.unlink(req.file.path, () => {});
         console.error('Airport Update Error:', error);
         res.status(500).json({ message: 'Error updating airport data.' });
+    }
+});
+
+/* =========================
+ * VIRTUAL AIRLINE ADVERTISEMENT API
+ *
+ * A directory of Infinite Flight VAs/VOs. Public visitors see only `approved`
+ * ads; admins manage moderation. Banner + logo are uploaded as multipart and
+ * optimized to WebP via vaAds.js.
+ * ========================= */
+
+// Multer config for VA ads: one banner + one logo.
+const uploadVaImages = upload.fields([
+    { name: 'banner', maxCount: 1 },
+    { name: 'logo', maxCount: 1 }
+]);
+
+// Helper: parse a field that may arrive as a JSON array string, a comma-separated
+// string, or an already-parsed array (depending on how the client sends it).
+const parseListField = (value) => {
+    if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean);
+    if (typeof value !== 'string' || !value.trim()) return [];
+    const raw = value.trim();
+    if (raw.startsWith('[')) {
+        try {
+            const arr = JSON.parse(raw);
+            if (Array.isArray(arr)) return arr.map(v => String(v).trim()).filter(Boolean);
+        } catch (_) { /* fall through to CSV parsing */ }
+    }
+    return raw.split(',').map(s => s.trim()).filter(Boolean);
+};
+
+// Helper: pull a single uploaded file (banner/logo) out of a multer .fields() req.
+const getUploadedField = (req, field) =>
+    (req.files && Array.isArray(req.files[field]) && req.files[field][0]) || null;
+
+// Helper: notify Discord when a new VA ad is submitted (for moderation).
+const sendVaAdWebhook = async (ad) => {
+    if (!process.env.DISCORD_WEBHOOK_URL) return;
+    try {
+        const payload = {
+            embeds: [{
+                title: '📣 New VA Advertisement Submitted',
+                description: ad.tagline || ad.description?.slice(0, 200) || 'No description provided.',
+                color: 3447003, // Blue
+                fields: [
+                    { name: 'Name', value: ad.name, inline: true },
+                    { name: 'Type', value: ad.type, inline: true },
+                    { name: 'Callsign', value: ad.callsign || '—', inline: true },
+                    { name: 'Region', value: ad.region || '—', inline: true },
+                    { name: 'Status', value: ad.status, inline: true },
+                    { name: 'Submitted by', value: ad.ownerName || 'Unknown', inline: true }
+                ],
+                image: ad.bannerUrl ? { url: ad.bannerUrl } : undefined,
+                thumbnail: ad.logoUrl ? { url: ad.logoUrl } : undefined,
+                timestamp: new Date().toISOString(),
+                footer: { text: 'VA Advertisement System' }
+            }]
+        };
+        await axios.post(process.env.DISCORD_WEBHOOK_URL, payload);
+        console.log(`🔔 VA ad submission notified: ${ad.name}`);
+    } catch (error) {
+        console.error('❌ Failed to send VA ad webhook:', error.message);
+    }
+};
+
+// GET: List VA ads.
+//   ?status=approved|pending|rejected|all   (default: approved — the public view)
+//   ?region=Asia                            filter by region (case-insensitive)
+//   ?type=VA|VO
+//   ?recruiting=true|false
+//   ?featured=true
+//   ?search=text                            full-text search across name/tagline/description/tags
+//   ?page=1&limit=20                         pagination (limit capped at 100)
+//   ?sort=newest|oldest|popular|name        (default: featured first, then newest)
+app.get('/api/va-ads', async (req, res) => {
+    try {
+        const {
+            status = 'approved',
+            region,
+            type,
+            recruiting,
+            featured,
+            search,
+            sort
+        } = req.query;
+
+        const query = {};
+
+        // status=all returns everything (admin view); otherwise filter to one status.
+        if (status && status !== 'all') {
+            if (!VA_AD_STATUSES.includes(status)) {
+                return res.status(400).json({ message: `Invalid status. Use one of: ${VA_AD_STATUSES.join(', ')}, all.` });
+            }
+            query.status = status;
+        }
+        if (region) query.region = { $regex: `^${region}$`, $options: 'i' };
+        if (type && VA_AD_TYPES.includes(type)) query.type = type;
+        if (recruiting === 'true') query.recruiting = true;
+        if (recruiting === 'false') query.recruiting = false;
+        if (featured === 'true') query.featured = true;
+        if (search && search.trim()) query.$text = { $search: search.trim() };
+
+        // Pagination
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 20, 100));
+        const skip = (page - 1) * limit;
+
+        // Sorting
+        let sortSpec;
+        switch ((sort || '').toLowerCase()) {
+            case 'oldest': sortSpec = { createdAt: 1 }; break;
+            case 'popular': sortSpec = { views: -1, clicks: -1 }; break;
+            case 'name': sortSpec = { name: 1 }; break;
+            case 'newest': sortSpec = { createdAt: -1 }; break;
+            default: sortSpec = { featured: -1, createdAt: -1 }; // default: pinned first, then newest
+        }
+
+        const [ads, total] = await Promise.all([
+            VirtualAirlineAd.find(query).sort(sortSpec).skip(skip).limit(limit).lean(),
+            VirtualAirlineAd.countDocuments(query)
+        ]);
+
+        res.json({
+            data: ads,
+            pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
+        });
+    } catch (error) {
+        console.error('VA Ads List Error:', error);
+        res.status(500).json({ message: 'Error fetching VA advertisements.' });
+    }
+});
+
+// GET: A single VA ad by id.
+//   ?track=view   atomically increment the view counter (for the detail page).
+app.get('/api/va-ads/:id', async (req, res) => {
+    try {
+        const ad = req.query.track === 'view'
+            ? await VirtualAirlineAd.findByIdAndUpdate(
+                req.params.id, { $inc: { views: 1 } }, { new: true }
+            ).lean()
+            : await VirtualAirlineAd.findById(req.params.id).lean();
+
+        if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+        res.json(ad);
+    } catch (error) {
+        console.error('VA Ad Fetch Error:', error);
+        res.status(500).json({ message: 'Error fetching VA advertisement.' });
+    }
+});
+
+// POST: Submit a new VA ad (multipart: banner + logo + fields).
+app.post('/api/va-ads', uploadVaImages, async (req, res) => {
+    const bannerFile = getUploadedField(req, 'banner');
+    const logoFile = getUploadedField(req, 'logo');
+    try {
+        const { name } = req.body;
+        if (!name || !name.trim()) {
+            cleanupTempFiles([bannerFile, logoFile].filter(Boolean));
+            return res.status(400).json({ message: 'VA name is required.' });
+        }
+
+        // Reject duplicate names early (the schema also enforces this).
+        const existing = await VirtualAirlineAd.findOne({ name: name.trim() }).lean();
+        if (existing) {
+            cleanupTempFiles([bannerFile, logoFile].filter(Boolean));
+            return res.status(409).json({ message: 'A VA with that name has already been submitted.' });
+        }
+
+        const ref = req.body.callsign || name;
+        const bannerUrl = bannerFile ? await uploadVaImage(s3Client, bannerFile, ref, 'banner') : null;
+        const logoUrl = logoFile ? await uploadVaImage(s3Client, logoFile, ref, 'logo') : null;
+
+        const ad = new VirtualAirlineAd({
+            name: name.trim(),
+            callsign: req.body.callsign || null,
+            type: VA_AD_TYPES.includes(req.body.type) ? req.body.type : 'VA',
+            tagline: req.body.tagline,
+            description: req.body.description,
+            bannerUrl,
+            logoUrl,
+            websiteUrl: req.body.websiteUrl || null,
+            discordUrl: req.body.discordUrl || null,
+            ifcThreadUrl: req.body.ifcThreadUrl || null,
+            applicationUrl: req.body.applicationUrl || null,
+            region: req.body.region || 'Global',
+            hubs: parseListField(req.body.hubs).map(h => h.toUpperCase()),
+            fleet: parseListField(req.body.fleet),
+            pilotCount: parseInt(req.body.pilotCount, 10) || 0,
+            recruiting: req.body.recruiting === undefined ? true : req.body.recruiting !== 'false',
+            minGrade: req.body.minGrade ? parseInt(req.body.minGrade, 10) : null,
+            requirements: req.body.requirements,
+            tags: parseListField(req.body.tags),
+            ownerName: req.body.ownerName || 'Unknown',
+            ownerId: req.body.ownerId || null,
+            contactEmail: req.body.contactEmail || null
+            // status defaults to "pending" — held for moderation.
+        });
+
+        await ad.save();
+        await sendVaAdWebhook(ad);
+
+        res.status(201).json({ message: 'VA advertisement submitted for review.', data: ad });
+    } catch (error) {
+        cleanupTempFiles([bannerFile, logoFile].filter(Boolean));
+        if (error.code === 11000) {
+            return res.status(409).json({ message: 'A VA with that name already exists.' });
+        }
+        console.error('VA Ad Create Error:', error);
+        res.status(500).json({ message: 'Server error while creating VA advertisement.' });
+    }
+});
+
+// PUT: Update an existing VA ad. Any provided field is updated; banner/logo are
+// replaced (old S3 image deleted) only when a new file is uploaded.
+app.put('/api/va-ads/:id', uploadVaImages, async (req, res) => {
+    const bannerFile = getUploadedField(req, 'banner');
+    const logoFile = getUploadedField(req, 'logo');
+    try {
+        const ad = await VirtualAirlineAd.findById(req.params.id);
+        if (!ad) {
+            cleanupTempFiles([bannerFile, logoFile].filter(Boolean));
+            return res.status(404).json({ message: 'VA advertisement not found.' });
+        }
+
+        const ref = req.body.callsign || ad.callsign || req.body.name || ad.name;
+
+        // Replace images if new ones were sent.
+        if (bannerFile) {
+            const newUrl = await uploadVaImage(s3Client, bannerFile, ref, 'banner');
+            if (ad.bannerUrl) await deleteVaImage(s3Client, ad.bannerUrl);
+            ad.bannerUrl = newUrl;
+        }
+        if (logoFile) {
+            const newUrl = await uploadVaImage(s3Client, logoFile, ref, 'logo');
+            if (ad.logoUrl) await deleteVaImage(s3Client, ad.logoUrl);
+            ad.logoUrl = newUrl;
+        }
+
+        // Scalar/text fields: only overwrite when the key is present in the body.
+        const b = req.body;
+        if (b.name !== undefined) ad.name = b.name.trim();
+        if (b.callsign !== undefined) ad.callsign = b.callsign || null;
+        if (b.type !== undefined && VA_AD_TYPES.includes(b.type)) ad.type = b.type;
+        if (b.tagline !== undefined) ad.tagline = b.tagline;
+        if (b.description !== undefined) ad.description = b.description;
+        if (b.websiteUrl !== undefined) ad.websiteUrl = b.websiteUrl || null;
+        if (b.discordUrl !== undefined) ad.discordUrl = b.discordUrl || null;
+        if (b.ifcThreadUrl !== undefined) ad.ifcThreadUrl = b.ifcThreadUrl || null;
+        if (b.applicationUrl !== undefined) ad.applicationUrl = b.applicationUrl || null;
+        if (b.region !== undefined) ad.region = b.region || 'Global';
+        if (b.hubs !== undefined) ad.hubs = parseListField(b.hubs).map(h => h.toUpperCase());
+        if (b.fleet !== undefined) ad.fleet = parseListField(b.fleet);
+        if (b.pilotCount !== undefined) ad.pilotCount = parseInt(b.pilotCount, 10) || 0;
+        if (b.recruiting !== undefined) ad.recruiting = b.recruiting !== 'false' && b.recruiting !== false;
+        if (b.minGrade !== undefined) ad.minGrade = b.minGrade ? parseInt(b.minGrade, 10) : null;
+        if (b.requirements !== undefined) ad.requirements = b.requirements;
+        if (b.tags !== undefined) ad.tags = parseListField(b.tags);
+        if (b.ownerName !== undefined) ad.ownerName = b.ownerName || 'Unknown';
+        if (b.contactEmail !== undefined) ad.contactEmail = b.contactEmail || null;
+
+        await ad.save();
+        res.json({ message: 'VA advertisement updated.', data: ad });
+    } catch (error) {
+        cleanupTempFiles([bannerFile, logoFile].filter(Boolean));
+        if (error.code === 11000) {
+            return res.status(409).json({ message: 'A VA with that name already exists.' });
+        }
+        console.error('VA Ad Update Error:', error);
+        res.status(500).json({ message: 'Server error while updating VA advertisement.' });
+    }
+});
+
+// PATCH: Moderate an ad — set its status to approved/rejected/pending.
+app.patch('/api/va-ads/:id/status', async (req, res) => {
+    try {
+        const { status } = req.body;
+        if (!VA_AD_STATUSES.includes(status)) {
+            return res.status(400).json({ message: `Status must be one of: ${VA_AD_STATUSES.join(', ')}.` });
+        }
+        const ad = await VirtualAirlineAd.findByIdAndUpdate(
+            req.params.id, { status }, { new: true }
+        );
+        if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+        res.json({ message: `VA advertisement ${status}.`, data: ad });
+    } catch (error) {
+        console.error('VA Ad Status Error:', error);
+        res.status(500).json({ message: 'Server error while updating status.' });
+    }
+});
+
+// PATCH: Toggle (or set) the featured flag to pin an ad to the top.
+app.patch('/api/va-ads/:id/feature', async (req, res) => {
+    try {
+        const ad = await VirtualAirlineAd.findById(req.params.id);
+        if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+
+        // Accept an explicit boolean, otherwise flip the current value.
+        ad.featured = typeof req.body.featured === 'boolean' ? req.body.featured : !ad.featured;
+        await ad.save();
+        res.json({ message: `Featured set to ${ad.featured}.`, data: ad });
+    } catch (error) {
+        console.error('VA Ad Feature Error:', error);
+        res.status(500).json({ message: 'Server error while toggling featured.' });
+    }
+});
+
+// POST: Track a click-through (e.g. on the join/apply link). Returns the target
+// URL so the frontend can redirect after recording the click.
+app.post('/api/va-ads/:id/click', async (req, res) => {
+    try {
+        const ad = await VirtualAirlineAd.findByIdAndUpdate(
+            req.params.id, { $inc: { clicks: 1 } }, { new: true }
+        ).select('applicationUrl websiteUrl discordUrl clicks').lean();
+        if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+        res.json({
+            success: true,
+            clicks: ad.clicks,
+            redirectUrl: ad.applicationUrl || ad.websiteUrl || ad.discordUrl || null
+        });
+    } catch (error) {
+        console.error('VA Ad Click Error:', error);
+        res.status(500).json({ message: 'Server error while tracking click.' });
+    }
+});
+
+// DELETE: Remove a VA ad and clean up its S3 images.
+app.delete('/api/va-ads/:id', async (req, res) => {
+    try {
+        const ad = await VirtualAirlineAd.findById(req.params.id);
+        if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+
+        await Promise.all([
+            deleteVaImage(s3Client, ad.bannerUrl),
+            deleteVaImage(s3Client, ad.logoUrl)
+        ]);
+        await VirtualAirlineAd.findByIdAndDelete(req.params.id);
+
+        res.json({ message: 'VA advertisement deleted.' });
+    } catch (error) {
+        console.error('VA Ad Delete Error:', error);
+        res.status(500).json({ message: 'Server error while deleting VA advertisement.' });
     }
 });
 
