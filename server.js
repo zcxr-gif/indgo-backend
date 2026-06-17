@@ -112,13 +112,14 @@ const AirportGate = mongoose.model('AirportGate', AirportGateSchema);
  * VIRTUAL AIRLINE ADVERTISEMENT SCHEMA
  *
  * Backs the VA advertising directory: Infinite Flight virtual airlines (VA)
- * and virtual organizations (VO) submit a banner + info to recruit pilots.
+ * and virtual organizations (VO) get a banner + info to recruit pilots.
  *
- * Submissions default to `status: "pending"` so anything coming from a public
- * form is held for moderation before it shows on the public directory — an ad
- * board that auto-publishes is an ad board full of spam. Approved ads can be
- * `featured` to pin them to the top. Lightweight view/click counters let each
- * VA measure how its ad is performing without a separate analytics service.
+ * Entries are created by admins/staff only (no public submission form), so they
+ * default to `status: "approved"` and go live immediately. The status field is
+ * kept as a simple show/hide switch — set "pending" to stage a draft or
+ * "rejected" to archive an ad without deleting it. Approved ads can be
+ * `featured` to pin them to the top, and lightweight view/click counters let
+ * each VA measure how its ad is performing without a separate analytics service.
  * ========================= */
 const VA_AD_STATUSES = ['pending', 'approved', 'rejected'];
 const VA_AD_TYPES = ['VA', 'VO']; // Virtual Airline vs Virtual Organization (IF terminology)
@@ -159,7 +160,7 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     contactEmail: { type: String, trim: true, lowercase: true, default: null },
 
     // --- Moderation & promotion ---
-    status: { type: String, enum: VA_AD_STATUSES, default: 'pending', index: true },
+    status: { type: String, enum: VA_AD_STATUSES, default: 'approved', index: true },
     featured: { type: Boolean, default: false },
 
     // --- Analytics ---
@@ -1548,13 +1549,13 @@ const parseListField = (value) => {
 const getUploadedField = (req, field) =>
     (req.files && Array.isArray(req.files[field]) && req.files[field][0]) || null;
 
-// Helper: notify Discord when a new VA ad is submitted (for moderation).
+// Helper: announce a newly added VA ad to Discord (optional; admin-authored).
 const sendVaAdWebhook = async (ad) => {
     if (!process.env.DISCORD_WEBHOOK_URL) return;
     try {
         const payload = {
             embeds: [{
-                title: '📣 New VA Advertisement Submitted',
+                title: '📣 New VA Advertisement Added',
                 description: ad.tagline || ad.description?.slice(0, 200) || 'No description provided.',
                 color: 3447003, // Blue
                 fields: [
@@ -1562,8 +1563,8 @@ const sendVaAdWebhook = async (ad) => {
                     { name: 'Type', value: ad.type, inline: true },
                     { name: 'Callsign', value: ad.callsign || '—', inline: true },
                     { name: 'Region', value: ad.region || '—', inline: true },
-                    { name: 'Status', value: ad.status, inline: true },
-                    { name: 'Submitted by', value: ad.ownerName || 'Unknown', inline: true }
+                    { name: 'Recruiting', value: ad.recruiting ? 'Yes' : 'No', inline: true },
+                    { name: 'Status', value: ad.status, inline: true }
                 ],
                 image: ad.bannerUrl ? { url: ad.bannerUrl } : undefined,
                 thumbnail: ad.logoUrl ? { url: ad.logoUrl } : undefined,
@@ -1572,7 +1573,7 @@ const sendVaAdWebhook = async (ad) => {
             }]
         };
         await axios.post(process.env.DISCORD_WEBHOOK_URL, payload);
-        console.log(`🔔 VA ad submission notified: ${ad.name}`);
+        console.log(`🔔 VA ad added: ${ad.name}`);
     } catch (error) {
         console.error('❌ Failed to send VA ad webhook:', error.message);
     }
@@ -1707,14 +1708,15 @@ app.post('/api/va-ads', uploadVaImages, async (req, res) => {
             tags: parseListField(req.body.tags),
             ownerName: req.body.ownerName || 'Unknown',
             ownerId: req.body.ownerId || null,
-            contactEmail: req.body.contactEmail || null
-            // status defaults to "pending" — held for moderation.
+            contactEmail: req.body.contactEmail || null,
+            // Admin-authored, so default to live; pass status to stage a draft.
+            status: VA_AD_STATUSES.includes(req.body.status) ? req.body.status : 'approved'
         });
 
         await ad.save();
         await sendVaAdWebhook(ad);
 
-        res.status(201).json({ message: 'VA advertisement submitted for review.', data: ad });
+        res.status(201).json({ message: 'VA advertisement created.', data: ad });
     } catch (error) {
         cleanupTempFiles([bannerFile, logoFile].filter(Boolean));
         if (error.code === 11000) {
@@ -1772,6 +1774,8 @@ app.put('/api/va-ads/:id', uploadVaImages, async (req, res) => {
         if (b.tags !== undefined) ad.tags = parseListField(b.tags);
         if (b.ownerName !== undefined) ad.ownerName = b.ownerName || 'Unknown';
         if (b.contactEmail !== undefined) ad.contactEmail = b.contactEmail || null;
+        if (b.status !== undefined && VA_AD_STATUSES.includes(b.status)) ad.status = b.status;
+        if (b.featured !== undefined) ad.featured = b.featured === true || b.featured === 'true';
 
         await ad.save();
         res.json({ message: 'VA advertisement updated.', data: ad });
