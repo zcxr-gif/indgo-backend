@@ -1873,6 +1873,12 @@ app.get('/airports', (req, res) => {
     res.sendFile(path.join(__dirname, 'airports.html'));
 });
 
+// Specific route for the VA Advertisement Manager (admin/staff dashboard)
+// Accessible via yoursite.com/va-ads
+app.get('/va-ads', (req, res) => {
+    res.sendFile(path.join(__dirname, 'va-ads.html'));
+});
+
 // 3. Specific route for the Aircraft Database root
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
