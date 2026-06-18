@@ -176,6 +176,9 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
 VirtualAirlineAdSchema.index({ status: 1, featured: -1, createdAt: -1 });
 VirtualAirlineAdSchema.index({ region: 1 });
 VirtualAirlineAdSchema.index({ callsign: 1 });
+// Back the "which VAs are based at this airport?" lookup (e.g. to render a VA's
+// banner on an airport page). hubs holds the primary hub ICAOs for each VA.
+VirtualAirlineAdSchema.index({ hubs: 1 });
 VirtualAirlineAdSchema.index({ name: 'text', tagline: 'text', description: 'text', tags: 'text' });
 
 // Keep updatedAt fresh on every save.
@@ -1585,6 +1588,7 @@ const sendVaAdWebhook = async (ad) => {
 //   ?type=VA|VO
 //   ?recruiting=true|false
 //   ?featured=true
+//   ?icao=VABB                              only VAs that hub at this airport (one or more, comma-separated)
 //   ?search=text                            full-text search across name/tagline/description/tags
 //   ?page=1&limit=20                         pagination (limit capped at 100)
 //   ?sort=newest|oldest|popular|name        (default: featured first, then newest)
@@ -1596,6 +1600,7 @@ app.get('/api/va-ads', async (req, res) => {
             type,
             recruiting,
             featured,
+            icao,
             search,
             sort
         } = req.query;
@@ -1611,6 +1616,13 @@ app.get('/api/va-ads', async (req, res) => {
         }
         if (region) query.region = { $regex: `^${region}$`, $options: 'i' };
         if (type && VA_AD_TYPES.includes(type)) query.type = type;
+        // icao: match VAs whose hub list contains the airport(s). hubs are stored
+        // uppercased on save, so normalize the query the same way. Accepts a single
+        // ICAO or a comma-separated list (e.g. ?icao=VABB,VIDP).
+        if (icao && icao.trim()) {
+            const codes = icao.split(',').map(c => c.trim().toUpperCase()).filter(Boolean);
+            if (codes.length) query.hubs = { $in: codes };
+        }
         if (recruiting === 'true') query.recruiting = true;
         if (recruiting === 'false') query.recruiting = false;
         if (featured === 'true') query.featured = true;
@@ -1643,6 +1655,48 @@ app.get('/api/va-ads', async (req, res) => {
     } catch (error) {
         console.error('VA Ads List Error:', error);
         res.status(500).json({ message: 'Error fetching VA advertisements.' });
+    }
+});
+
+// GET: Banner(s) for an airport.
+// Convenience endpoint for embedding a VA banner on an airport page/screen:
+// returns the approved, banner-having VAs that hub at :icao, featured first.
+//   ?pick=random   return a single randomly-chosen ad (good for rotating slots)
+//   ?limit=N       cap how many ads come back (default 10, max 50)
+// Declared before '/api/va-ads/:id' for clarity (the two routes have different
+// segment counts, so Express wouldn't confuse them either way).
+app.get('/api/va-ads/banner/:icao', async (req, res) => {
+    try {
+        const code = String(req.params.icao || '').trim().toUpperCase();
+        if (!code) return res.status(400).json({ message: 'ICAO is required.' });
+
+        const query = {
+            status: 'approved',
+            hubs: code,
+            bannerUrl: { $ne: null }
+        };
+
+        if ((req.query.pick || '').toLowerCase() === 'random') {
+            // Sample one at random so an airport slot can rotate between VAs.
+            const [ad] = await VirtualAirlineAd.aggregate([
+                { $match: query },
+                { $sample: { size: 1 } }
+            ]);
+            if (!ad) return res.status(404).json({ message: `No VA banners found for ${code}.` });
+            return res.json({ icao: code, data: ad });
+        }
+
+        const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 10, 50));
+        const ads = await VirtualAirlineAd
+            .find(query)
+            .sort({ featured: -1, createdAt: -1 })
+            .limit(limit)
+            .lean();
+
+        res.json({ icao: code, count: ads.length, data: ads });
+    } catch (error) {
+        console.error('VA Ad Banner Error:', error);
+        res.status(500).json({ message: 'Error fetching VA banners for airport.' });
     }
 });
 
