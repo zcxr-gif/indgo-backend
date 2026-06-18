@@ -69,6 +69,16 @@ const GIVEAWAY_MOD_CHANNEL_ID = ADMIN_CHANNEL_ID;        // moderation/staff cha
 const GIVEAWAY_TICKET_CHANNEL_ID = TICKET_PANEL_CHANNEL_ID; // parent channel for winner help tickets
 const DEFAULT_GIVEAWAY_PRIZE = 'Inflight Pro — 1 Month Subscription';
 
+// --- VA (VIRTUAL AIRLINE) SYSTEM CONFIGURATION ---
+// Pilots apply with /va_apply; the application posts to the review channel for
+// staff to Approve / Reject / Request edits. On approval the bot provisions a
+// private VA channel under the category, a VA-specific role, and grants the
+// shared "VA Rep" role (which unlocks the reps general chat).
+const VA_CATEGORY_ID = '1517173854206693416';            // parent category for per-VA channels
+const VA_REPS_CHAT_ID = '1517174670334361732';           // shared reps general chat
+const VA_APPLICATION_CHANNEL_ID = '1517177121422835852'; // where applications post for review
+const VA_REP_ROLE_NAME = 'VA Rep';                       // shared role gating the reps chat
+
 const METADATA_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api/metadata';
 const BASE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api';
 
@@ -365,7 +375,7 @@ const normalizeData = async (rawType, rawLivery) => {
 };
 
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, models = {}) => {
-    const { DailyPilotStats } = models;
+    const { DailyPilotStats, VirtualAirlineAd } = models;
 
     // NOTE: `Options.cacheEverything()` is the *opposite* of what we want — it
     // caches everything with no caps and silently ignores the limits passed to
@@ -542,6 +552,148 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         } finally {
             activeGiveaways.delete(messageId);
         }
+    };
+
+    // ===================== VA (VIRTUAL AIRLINE) SYSTEM =====================
+
+    // Turn a VA name into a valid Discord channel slug.
+    const vaChannelSlug = (name) => {
+        const slug = (name || 'va').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 90);
+        return slug || 'virtual-airline';
+    };
+
+    // The card pinned inside a VA's private channel (and shown on approval).
+    const buildVaInfoEmbed = (ad) => {
+        const embed = new EmbedBuilder()
+            .setTitle(`✈️ ${ad.name}`)
+            .setColor(THEME.WHITE)
+            .setFooter({ text: BRAND_FOOTER })
+            .setTimestamp();
+        if (ad.tagline) embed.setDescription(ad.tagline);
+
+        const fields = [{ name: 'Type', value: ad.type || 'VA', inline: true }];
+        if (ad.callsign) fields.push({ name: 'Callsign', value: ad.callsign, inline: true });
+        if (ad.region) fields.push({ name: 'Region', value: ad.region, inline: true });
+        if (ad.hubs && ad.hubs.length) fields.push({ name: 'Hubs', value: ad.hubs.join(', '), inline: true });
+        fields.push({ name: 'Recruiting', value: ad.recruiting ? 'Yes ✅' : 'No', inline: true });
+
+        const links = [];
+        if (ad.websiteUrl) links.push(`[Website](${ad.websiteUrl})`);
+        if (ad.applicationUrl) links.push(`[Apply](${ad.applicationUrl})`);
+        if (ad.discordUrl) links.push(`[Discord](${ad.discordUrl})`);
+        if (ad.ifcThreadUrl) links.push(`[IFC Thread](${ad.ifcThreadUrl})`);
+        if (links.length) fields.push({ name: 'Links', value: links.join(' • '), inline: false });
+
+        embed.addFields(fields);
+        if (ad.logoUrl) { try { embed.setThumbnail(ad.logoUrl); } catch (_) {} }
+        if (ad.bannerUrl) { try { embed.setImage(ad.bannerUrl); } catch (_) {} }
+        return embed;
+    };
+
+    // The embed staff see in the review channel for a pending application.
+    const buildVaReviewEmbed = (ad) => new EmbedBuilder()
+        .setTitle('🆕 VA Application — Pending Review')
+        .setColor(THEME.GRAY)
+        .addFields(
+            { name: 'Name', value: ad.name, inline: true },
+            { name: 'Type', value: ad.type || 'VA', inline: true },
+            { name: 'Callsign', value: ad.callsign || '—', inline: true },
+            { name: 'Owner', value: ad.ownerId ? `<@${ad.ownerId}>` : (ad.ownerName || 'Unknown'), inline: true },
+            { name: 'Tagline', value: ad.tagline || '—', inline: false },
+            { name: 'Links', value: [ad.websiteUrl, ad.discordUrl].filter(Boolean).join('\n') || '—', inline: false }
+        )
+        .setFooter({ text: `Application ID: ${ad._id}` })
+        .setTimestamp();
+
+    const buildVaReviewButtons = (id) => new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`va_approve_${id}`).setLabel('Approve & Create').setStyle(ButtonStyle.Success).setEmoji('✅'),
+        new ButtonBuilder().setCustomId(`va_edit_${id}`).setLabel('Request Edits').setStyle(ButtonStyle.Secondary).setEmoji('✏️'),
+        new ButtonBuilder().setCustomId(`va_reject_${id}`).setLabel('Reject').setStyle(ButtonStyle.Danger).setEmoji('❌')
+    );
+
+    // Find-or-create the shared "VA Rep" role and make sure it can see the reps
+    // general chat. Called on every provision so the wiring self-heals.
+    const ensureVaRepRole = async (guild) => {
+        try {
+            let role = guild.roles.cache.find(r => r.name === VA_REP_ROLE_NAME)
+                || (await guild.roles.fetch().then(rs => rs.find(r => r.name === VA_REP_ROLE_NAME)).catch(() => null));
+            if (!role) {
+                role = await guild.roles.create({ name: VA_REP_ROLE_NAME, color: 0x3BA55D, mentionable: true, reason: 'Shared VA representative role' });
+            }
+            const repsChat = await guild.channels.fetch(VA_REPS_CHAT_ID).catch(() => null);
+            if (repsChat && !repsChat.permissionOverwrites.cache.get(role.id)) {
+                await repsChat.permissionOverwrites.edit(role.id, {
+                    ViewChannel: true, SendMessages: true, ReadMessageHistory: true
+                }).catch(() => {});
+            }
+            return role;
+        } catch (e) {
+            console.error('❌ ensureVaRepRole error:', e);
+            return null;
+        }
+    };
+
+    // Provision (idempotently) a VA's role + private channel, grant the owner the
+    // VA role and the shared rep role, and persist the IDs back onto the ad.
+    const provisionVaSpace = async (guild, ad) => {
+        const result = { role: null, channel: null, repRole: null };
+
+        // 1. VA-specific role (reuse if already linked).
+        let vaRole = ad.discordRoleId
+            ? (guild.roles.cache.get(ad.discordRoleId) || await guild.roles.fetch(ad.discordRoleId).catch(() => null))
+            : null;
+        if (!vaRole) {
+            vaRole = await guild.roles.create({
+                name: ad.name.slice(0, 90),
+                color: Math.floor(Math.random() * 0xFFFFFF),
+                mentionable: true,
+                reason: `VA space for ${ad.name}`
+            });
+            ad.discordRoleId = vaRole.id;
+        }
+        result.role = vaRole;
+
+        // 2. Shared rep role + reps chat access.
+        result.repRole = await ensureVaRepRole(guild);
+
+        // 3. Private VA channel under the category (reuse if already linked).
+        let channel = ad.discordChannelId
+            ? (guild.channels.cache.get(ad.discordChannelId) || await guild.channels.fetch(ad.discordChannelId).catch(() => null))
+            : null;
+        if (!channel) {
+            channel = await guild.channels.create({
+                name: vaChannelSlug(ad.name),
+                type: ChannelType.GuildText,
+                parent: VA_CATEGORY_ID,
+                topic: `${ad.type || 'VA'} • ${ad.callsign || ad.name} — private VA channel`,
+                permissionOverwrites: [
+                    { id: guild.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+                    { id: vaRole.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] },
+                    { id: ADMIN_ROLE_ID, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.ManageMessages] }
+                ],
+                reason: `VA space for ${ad.name}`
+            });
+            ad.discordChannelId = channel.id;
+            try {
+                const info = await channel.send({ content: `Welcome to **${ad.name}**! 🛫`, embeds: [buildVaInfoEmbed(ad)] });
+                await info.pin().catch(() => {});
+            } catch (_) { /* pin/send best-effort */ }
+        }
+        result.channel = channel;
+
+        // 4. Give the owner the VA role + the shared rep role.
+        if (ad.ownerId) {
+            const owner = await guild.members.fetch(ad.ownerId).catch(() => null);
+            if (owner) {
+                await owner.roles.add(vaRole).catch(() => {});
+                if (result.repRole) await owner.roles.add(result.repRole).catch(() => {});
+            }
+        }
+
+        // 5. Persist the linkage.
+        if (ad.save) { try { await ad.save(); } catch (e) { console.error('❌ Failed to save VA ad linkage:', e.message); } }
+
+        return result;
     };
 
     const uploadImageToS3 = async (url, tailNumber) => {
@@ -1214,6 +1366,22 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                     ))
                 .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageEvents),
 
+            new SlashCommandBuilder().setName('va_apply').setDescription('Apply to register your Virtual Airline / Organization'),
+
+            new SlashCommandBuilder().setName('va_addrep').setDescription('[STAFF] Add a representative to a VA (grants VA + rep access)')
+                .addStringOption(o => o.setName('va').setDescription('VA name').setRequired(true).setAutocomplete(true))
+                .addUserOption(o => o.setName('user').setDescription('User to add').setRequired(true))
+                .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageRoles),
+
+            new SlashCommandBuilder().setName('va_removerep').setDescription('[STAFF] Remove a representative from a VA')
+                .addStringOption(o => o.setName('va').setDescription('VA name').setRequired(true).setAutocomplete(true))
+                .addUserOption(o => o.setName('user').setDescription('User to remove').setRequired(true))
+                .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageRoles),
+
+            new SlashCommandBuilder().setName('va_remove').setDescription("[STAFF] Delete a VA's role and channel")
+                .addStringOption(o => o.setName('va').setDescription('VA name').setRequired(true).setAutocomplete(true))
+                .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageRoles),
+
             // Moderator Commands
             new SlashCommandBuilder().setName('mod_kick').setDescription('[MOD] Kick a user')
                 .addUserOption(o => o.setName('user').setDescription('User to kick').setRequired(true))
@@ -1385,6 +1553,19 @@ client.on('interactionCreate', async (interaction) => {
                 const filtered = list.filter(a => a.name.toLowerCase().includes(focused.value.toLowerCase())).slice(0, 25);
                 await interaction.respond(filtered.map(a => ({ name: a.name, value: a.name })));
                 return;
+            }
+
+            // VA name autocomplete for the /va_* staff commands.
+            if (focused.name === 'va') {
+                if (!VirtualAirlineAd) return interaction.respond([]);
+                try {
+                    const q = (focused.value || '').trim();
+                    const ads = await VirtualAirlineAd.find(q ? { name: { $regex: q, $options: 'i' } } : {})
+                        .select('name').sort({ name: 1 }).limit(25).lean();
+                    return interaction.respond(ads.map(a => ({ name: a.name.slice(0, 100), value: a.name.slice(0, 100) })));
+                } catch (_) {
+                    return interaction.respond([]);
+                }
             }
 
             if (focused.name === 'aircraft_type') {
@@ -1779,6 +1960,64 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.reply({ content: '✅ You have entered the giveaway! Good luck! 🎉', ephemeral: true });
             }
 
+            // --- VA APPLICATION REVIEW BUTTONS ---
+            if (customId.startsWith('va_approve_') || customId.startsWith('va_reject_') || customId.startsWith('va_edit_')) {
+                // Staff only.
+                if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID) && !interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+                    return interaction.reply({ content: '❌ Staff only.', ephemeral: true });
+                }
+                if (!VirtualAirlineAd) {
+                    return interaction.reply({ content: '❌ VA system unavailable (database not connected).', ephemeral: true });
+                }
+
+                // Reject / Request Edits both collect text via a modal first. Encode
+                // the review message id so the modal submit can update this message.
+                if (customId.startsWith('va_reject_')) {
+                    const id = customId.replace('va_reject_', '');
+                    const modal = new ModalBuilder().setCustomId(`va_reject_modal_${id}_${interaction.message.id}`).setTitle('Reject VA Application');
+                    modal.addComponents(new ActionRowBuilder().addComponents(
+                        new TextInputBuilder().setCustomId('va_reason').setLabel('Reason (sent to the applicant)').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(500)
+                    ));
+                    return interaction.showModal(modal);
+                }
+                if (customId.startsWith('va_edit_')) {
+                    const id = customId.replace('va_edit_', '');
+                    const modal = new ModalBuilder().setCustomId(`va_editreq_modal_${id}_${interaction.message.id}`).setTitle('Request Edits');
+                    modal.addComponents(new ActionRowBuilder().addComponents(
+                        new TextInputBuilder().setCustomId('va_changes').setLabel('What needs changing?').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(500)
+                    ));
+                    return interaction.showModal(modal);
+                }
+
+                // Approve → provision the VA space.
+                const id = customId.replace('va_approve_', '');
+                await interaction.deferReply({ ephemeral: true });
+                const ad = await VirtualAirlineAd.findById(id).catch(() => null);
+                if (!ad) return interaction.editReply('❌ Application not found (it may have been deleted).');
+
+                try {
+                    ad.status = 'approved';
+                    const { role, channel } = await provisionVaSpace(interaction.guild, ad);
+
+                    const approvedEmbed = EmbedBuilder.from(interaction.message.embeds[0] || buildVaReviewEmbed(ad))
+                        .setTitle('✅ VA Application — Approved')
+                        .setColor(THEME.WHITE);
+                    await interaction.message.edit({ embeds: [approvedEmbed], components: [] }).catch(() => {});
+
+                    await interaction.message.reply(`✅ **${ad.name}** approved by <@${interaction.user.id}>.\n• Role: ${role ? `<@&${role.id}>` : '—'}\n• Channel: ${channel ? `<#${channel.id}>` : '—'}`).catch(() => {});
+
+                    if (ad.ownerId) {
+                        const owner = await client.users.fetch(ad.ownerId).catch(() => null);
+                        if (owner) await owner.send(`🎉 Your VA **${ad.name}** has been approved! Your private channel is ${channel ? `<#${channel.id}>` : 'ready'}.`).catch(() => {});
+                    }
+
+                    return interaction.editReply(`✅ Provisioned **${ad.name}** — ${channel ? `<#${channel.id}>` : 'channel'} and role created.`);
+                } catch (e) {
+                    console.error('❌ VA approval/provision error:', e);
+                    return interaction.editReply('❌ Failed to provision the VA space. Check that the bot has **Manage Roles** + **Manage Channels** and that the category ID is correct.');
+                }
+            }
+
             // --- TICKET BUTTONS ---
             if (customId === 'create_ticket_start') {
                 const topicSelect = new StringSelectMenuBuilder().setCustomId('ticket_topic_select').setPlaceholder('Select a topic')
@@ -2020,6 +2259,115 @@ client.on('interactionCreate', async (interaction) => {
                 await interaction.editReply(`Ticket created: <#${thread.id}>`);
                 return;
             }
+
+            // --- VA APPLICATION SUBMITTED ---
+            if (customId === 'va_apply_modal') {
+                await interaction.deferReply({ ephemeral: true });
+                if (!VirtualAirlineAd) return interaction.editReply('❌ VA system unavailable (database not connected).');
+
+                const name = interaction.fields.getTextInputValue('va_name').trim();
+                const callsign = (interaction.fields.getTextInputValue('va_callsign') || '').trim().toUpperCase() || null;
+                let type = (interaction.fields.getTextInputValue('va_type') || 'VA').trim().toUpperCase();
+                if (type !== 'VA' && type !== 'VO') type = 'VA';
+                const tagline = (interaction.fields.getTextInputValue('va_tagline') || '').trim().slice(0, 140);
+                const linksRaw = (interaction.fields.getTextInputValue('va_links') || '').trim();
+
+                // Parse the free-text links field: a discord invite vs a generic website.
+                let websiteUrl = null, discordUrl = null;
+                for (const line of linksRaw.split(/[\n,]+/).map(s => s.trim()).filter(Boolean)) {
+                    if (/discord(\.gg|app\.com|\.com)/i.test(line)) discordUrl = line;
+                    else if (!websiteUrl) websiteUrl = line;
+                }
+
+                try {
+                    // Names are unique in the directory. Reuse an existing pending row the
+                    // same owner already submitted (a re-apply after a "request edits"),
+                    // otherwise refuse to clash with someone else's VA.
+                    let ad = await VirtualAirlineAd.findOne({ name });
+                    if (ad) {
+                        if (ad.status === 'approved') {
+                            return interaction.editReply(`⚠️ **${name}** is already registered and approved.`);
+                        }
+                        if (ad.ownerId && ad.ownerId !== interaction.user.id) {
+                            return interaction.editReply(`❌ A VA named **${name}** has already been submitted by someone else. Please use a different name.`);
+                        }
+                        ad.callsign = callsign; ad.type = type; ad.tagline = tagline;
+                        ad.websiteUrl = websiteUrl; ad.discordUrl = discordUrl;
+                        ad.ownerId = interaction.user.id; ad.ownerName = interaction.user.username;
+                        ad.status = 'pending';
+                    } else {
+                        ad = new VirtualAirlineAd({
+                            name, callsign, type, tagline, websiteUrl, discordUrl,
+                            ownerId: interaction.user.id, ownerName: interaction.user.username,
+                            status: 'pending'
+                        });
+                    }
+                    await ad.save();
+
+                    const reviewChannel = await client.channels.fetch(VA_APPLICATION_CHANNEL_ID).catch(() => null);
+                    if (reviewChannel) {
+                        await reviewChannel.send({
+                            content: `<@&${ADMIN_ROLE_ID}> new VA application`,
+                            embeds: [buildVaReviewEmbed(ad)],
+                            components: [buildVaReviewButtons(ad._id)]
+                        });
+                    }
+                    return interaction.editReply(`✅ Your application for **${name}** has been submitted! Staff will review it shortly.`);
+                } catch (e) {
+                    console.error('❌ VA apply error:', e);
+                    return interaction.editReply('❌ Could not submit your application. Please try again later.');
+                }
+            }
+
+            // --- VA: REJECT (with reason) ---
+            if (customId.startsWith('va_reject_modal_')) {
+                await interaction.deferReply({ ephemeral: true });
+                if (!VirtualAirlineAd) return interaction.editReply('❌ VA system unavailable.');
+                const [adId, msgId] = customId.replace('va_reject_modal_', '').split('_');
+                const reason = interaction.fields.getTextInputValue('va_reason');
+                const ad = await VirtualAirlineAd.findById(adId).catch(() => null);
+                if (!ad) return interaction.editReply('❌ Application not found.');
+
+                ad.status = 'rejected';
+                try { await ad.save(); } catch (_) {}
+
+                if (ad.ownerId) {
+                    const owner = await client.users.fetch(ad.ownerId).catch(() => null);
+                    if (owner) await owner.send(`❌ Your VA application for **${ad.name}** was rejected.\n**Reason:** ${reason}`).catch(() => {});
+                }
+                // Update the original review message.
+                const reviewChannel = await client.channels.fetch(VA_APPLICATION_CHANNEL_ID).catch(() => null);
+                const reviewMsg = reviewChannel ? await reviewChannel.messages.fetch(msgId).catch(() => null) : null;
+                if (reviewMsg) {
+                    const rejEmbed = EmbedBuilder.from(reviewMsg.embeds[0] || buildVaReviewEmbed(ad))
+                        .setTitle('❌ VA Application — Rejected')
+                        .setColor(THEME.GRAY)
+                        .addFields({ name: 'Rejection Reason', value: reason });
+                    await reviewMsg.edit({ embeds: [rejEmbed], components: [] }).catch(() => {});
+                }
+                return interaction.editReply(`❌ Rejected **${ad.name}** and notified the applicant.`);
+            }
+
+            // --- VA: REQUEST EDITS ---
+            if (customId.startsWith('va_editreq_modal_')) {
+                await interaction.deferReply({ ephemeral: true });
+                if (!VirtualAirlineAd) return interaction.editReply('❌ VA system unavailable.');
+                const [adId, msgId] = customId.replace('va_editreq_modal_', '').split('_');
+                const changes = interaction.fields.getTextInputValue('va_changes');
+                const ad = await VirtualAirlineAd.findById(adId).catch(() => null);
+                if (!ad) return interaction.editReply('❌ Application not found.');
+
+                if (ad.ownerId) {
+                    const owner = await client.users.fetch(ad.ownerId).catch(() => null);
+                    if (owner) await owner.send(`✏️ Edits requested for your VA application **${ad.name}**:\n> ${changes}\n\nPlease run \`/va_apply\` again with the same name to resubmit.`).catch(() => {});
+                }
+                const reviewChannel = await client.channels.fetch(VA_APPLICATION_CHANNEL_ID).catch(() => null);
+                const reviewMsg = reviewChannel ? await reviewChannel.messages.fetch(msgId).catch(() => null) : null;
+                if (reviewMsg) {
+                    await reviewMsg.reply(`✏️ <@${interaction.user.id}> requested edits from <@${ad.ownerId}>:\n> ${changes}`).catch(() => {});
+                }
+                return interaction.editReply('✏️ Edit request sent to the applicant. The application stays pending.');
+            }
         }
 
         // --- 5. SLASH COMMAND HANDLERS ---
@@ -2157,6 +2505,80 @@ client.on('interactionCreate', async (interaction) => {
 
                 setTimeout(() => { endGiveaway(giveawayMessage.id); }, durationMin * 60 * 1000);
                 return;
+            }
+
+            // --- VA: APPLY (opens the application modal) ---
+            if (commandName === 'va_apply') {
+                if (!VirtualAirlineAd) {
+                    return interaction.reply({ content: '❌ VA system unavailable right now.', ephemeral: true });
+                }
+                const modal = new ModalBuilder().setCustomId('va_apply_modal').setTitle('VA / VO Application');
+                modal.addComponents(
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_name').setLabel('VA / VO Name').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(80)),
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_callsign').setLabel('Callsign (e.g. IGO)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(20)),
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_type').setLabel('Type — VA or VO').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(2).setPlaceholder('VA')),
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_tagline').setLabel('Short description / tagline').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(140)),
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_links').setLabel('Website + Discord (one per line)').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(300))
+                );
+                await interaction.showModal(modal);
+                return;
+            }
+
+            // --- VA: STAFF MANAGEMENT (add/remove rep, remove VA) ---
+            if (commandName === 'va_addrep' || commandName === 'va_removerep' || commandName === 'va_remove') {
+                if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID) && !interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+                    return interaction.reply({ content: '❌ Staff only.', ephemeral: true });
+                }
+                if (!VirtualAirlineAd) {
+                    return interaction.reply({ content: '❌ VA system unavailable.', ephemeral: true });
+                }
+                await interaction.deferReply({ ephemeral: true });
+
+                const vaName = interaction.options.getString('va');
+                const ad = await VirtualAirlineAd.findOne({ name: vaName }).catch(() => null);
+                if (!ad) return interaction.editReply(`❌ No VA named **${vaName}** found.`);
+                if (!ad.discordRoleId) return interaction.editReply(`❌ **${vaName}** hasn't been provisioned yet (approve its application first).`);
+
+                const vaRole = interaction.guild.roles.cache.get(ad.discordRoleId) || await interaction.guild.roles.fetch(ad.discordRoleId).catch(() => null);
+                if (!vaRole) return interaction.editReply(`❌ The role for **${vaName}** no longer exists.`);
+
+                if (commandName === 'va_remove') {
+                    try {
+                        if (ad.discordChannelId) {
+                            const ch = await interaction.guild.channels.fetch(ad.discordChannelId).catch(() => null);
+                            if (ch) await ch.delete('VA removed by staff').catch(() => {});
+                        }
+                        await vaRole.delete('VA removed by staff').catch(() => {});
+                        ad.discordRoleId = null; ad.discordChannelId = null;
+                        await ad.save().catch(() => {});
+                        return interaction.editReply(`🗑️ Removed the role and channel for **${vaName}**.`);
+                    } catch (e) {
+                        console.error('❌ va_remove error:', e);
+                        return interaction.editReply('❌ Failed to remove the VA space.');
+                    }
+                }
+
+                // add/remove rep
+                const user = interaction.options.getUser('user');
+                const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+                if (!member) return interaction.editReply('❌ That user is not in this server.');
+
+                try {
+                    if (commandName === 'va_addrep') {
+                        const repRole = await ensureVaRepRole(interaction.guild);
+                        await member.roles.add(vaRole).catch(() => {});
+                        if (repRole) await member.roles.add(repRole).catch(() => {});
+                        return interaction.editReply(`✅ Added <@${user.id}> as a rep of **${vaName}** (VA channel + reps chat access granted).`);
+                    } else {
+                        // Remove only the VA-specific role; keep the shared rep role since
+                        // the user may represent other VAs.
+                        await member.roles.remove(vaRole).catch(() => {});
+                        return interaction.editReply(`✅ Removed <@${user.id}> from **${vaName}**. (They keep the shared VA Rep role in case they rep other VAs — remove it manually if needed.)`);
+                    }
+                } catch (e) {
+                    console.error('❌ va rep management error:', e);
+                    return interaction.editReply('❌ Failed to update roles. Check the bot has **Manage Roles** and its role is above the VA roles.');
+                }
             }
         }
         
@@ -2567,9 +2989,17 @@ client.on('interactionCreate', async (interaction) => {
                         value: [
                             '`/giveaway` — *(staff)* start a giveaway; members tap a button to enter and a winner is drawn automatically'
                         ].join('\n')
+                    },
+                    {
+                        name: '🛫 Virtual Airlines',
+                        value: [
+                            '`/va_apply` — apply to register your VA/VO (staff approve in Discord)',
+                            '`/va_addrep` / `/va_removerep` — *(staff)* manage a VA\'s reps',
+                            '`/va_remove` — *(staff)* delete a VA\'s role + channel'
+                        ].join('\n')
                     }
                 )
-                .setFooter({ text: 'Mod commands (mod_*) and /giveaway are restricted to staff.' });
+                .setFooter({ text: 'Staff-only: mod_*, /giveaway, and /va_* management commands.' });
             await interaction.reply({ embeds: [embed], ephemeral: true });
         }
       } catch (err) {

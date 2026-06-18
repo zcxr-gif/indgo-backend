@@ -163,6 +163,10 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     status: { type: String, enum: VA_AD_STATUSES, default: 'approved', index: true },
     featured: { type: Boolean, default: false },
 
+    // --- Discord provisioning (set by the bot when a VA is approved) ---
+    discordRoleId: { type: String, default: null },     // VA-specific role
+    discordChannelId: { type: String, default: null },  // VA's private channel
+
     // --- Analytics ---
     views: { type: Number, default: 0 },                            // detail-page impressions
     clicks: { type: Number, default: 0 },                           // click-throughs on join/apply link
@@ -313,7 +317,7 @@ startDiscordBot(
     s3Client,
     process.env.AWS_S3_BUCKET_NAME,
     process.env.AWS_REGION,
-    { DailyPilotStats, DailyPilotView }
+    { DailyPilotStats, DailyPilotView, VirtualAirlineAd }
 );
 // ---------------------
 
