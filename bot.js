@@ -39,6 +39,10 @@ const AIRPORT_ADMIN_CHANNEL_ID = '1463636133685628989';
 // Import airport helpers (Ensure these are exported in airports.js)
 const { uploadAirportImage, getAirportInfo, deleteAirportImages } = require('./airports');
 
+// Import VA image helpers so the bot can accept banner/logo uploads in-channel
+// and push them to S3, exactly like the web dashboard does.
+const { uploadVaImage, deleteVaImage } = require('./vaAds');
+
 // Promisify pipeline for efficient stream handling
 const pipeline = util.promisify(stream.pipeline);
 
@@ -562,6 +566,20 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         return slug || 'virtual-airline';
     };
 
+    // Render a VA's stored base radio callsign in Infinite Flight VA format.
+    // We store just the base (e.g. "OCEAN"); pilots fly as "OCEAN ##VA", with the
+    // "##" standing in for their individual pilot number — like Discover Virtual's
+    // "Ocean ##VA". Tolerates a base that already carries the suffix so we never
+    // double it up (e.g. "OCEAN VA" or "OCEAN ##VA" → "OCEAN ##VA").
+    const formatVaCallsign = (base) => {
+        if (!base) return null;
+        const clean = String(base).trim().toUpperCase()
+            .replace(/\s*#+\s*VA$/i, '')   // strip an existing "##VA"
+            .replace(/\s+VA$/i, '')         // ...or a bare trailing "VA"
+            .trim();
+        return clean ? `${clean} ##VA` : null;
+    };
+
     // The card pinned inside a VA's private channel (and shown on approval).
     const buildVaInfoEmbed = (ad) => {
         const embed = new EmbedBuilder()
@@ -572,7 +590,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         if (ad.tagline) embed.setDescription(ad.tagline);
 
         const fields = [{ name: 'Type', value: ad.type || 'VA', inline: true }];
-        if (ad.callsign) fields.push({ name: 'Callsign', value: ad.callsign, inline: true });
+        if (ad.callsign) fields.push({ name: 'Callsign', value: formatVaCallsign(ad.callsign), inline: true });
         if (ad.region) fields.push({ name: 'Region', value: ad.region, inline: true });
         if (ad.hubs && ad.hubs.length) fields.push({ name: 'Hubs', value: ad.hubs.join(', '), inline: true });
         fields.push({ name: 'Recruiting', value: ad.recruiting ? 'Yes ✅' : 'No', inline: true });
@@ -597,7 +615,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         .addFields(
             { name: 'Name', value: ad.name, inline: true },
             { name: 'Type', value: ad.type || 'VA', inline: true },
-            { name: 'Callsign', value: ad.callsign || '—', inline: true },
+            { name: 'Callsign', value: formatVaCallsign(ad.callsign) || '—', inline: true },
             { name: 'Owner', value: ad.ownerId ? `<@${ad.ownerId}>` : (ad.ownerName || 'Unknown'), inline: true },
             { name: 'Tagline', value: ad.tagline || '—', inline: false },
             { name: 'Links', value: [ad.websiteUrl, ad.discordUrl].filter(Boolean).join('\n') || '—', inline: false }
@@ -610,6 +628,90 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         new ButtonBuilder().setCustomId(`va_edit_${id}`).setLabel('Request Edits').setStyle(ButtonStyle.Secondary).setEmoji('✏️'),
         new ButtonBuilder().setCustomId(`va_reject_${id}`).setLabel('Reject').setStyle(ButtonStyle.Danger).setEmoji('❌')
     );
+
+    // The short /va_apply form only captures the basics. Once a VA is approved and
+    // its private channel exists, we post this card so the owner can fill in
+    // everything the directory card wants — banner, logo, description, hubs, etc.
+    // Buttons carry the ad id so the handlers know which VA they're editing.
+    const buildVaSetupCard = (ad) => {
+        const missing = [];
+        if (!ad.bannerUrl) missing.push('banner');
+        if (!ad.logoUrl) missing.push('logo');
+        if (!ad.description) missing.push('description');
+        if (!ad.region || ad.region === 'Global') missing.push('region');
+        if (!ad.hubs || !ad.hubs.length) missing.push('hubs');
+        if (!ad.fleet || !ad.fleet.length) missing.push('fleet');
+
+        const embed = new EmbedBuilder()
+            .setTitle('🧩 Finish setting up your VA listing')
+            .setColor(THEME.WHITE)
+            .setDescription(
+                "Your VA is approved and live, but the application only captured the basics. " +
+                "Tap the buttons below to plug in the rest so your directory card looks complete.\n\n" +
+                "• **Add Details** — description, region, hubs, fleet, requirements\n" +
+                "• **Links & Recruiting** — apply link, IFC thread, min grade, pilot count, tags\n" +
+                "• **Upload Banner / Logo** — send the image as your next message here" +
+                (missing.length
+                    ? `\n\n**Still missing:** ${missing.join(', ')}`
+                    : "\n\n✅ Everything's filled in — thanks!")
+            )
+            .setFooter({ text: BRAND_FOOTER });
+
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`va_setup_details_${ad._id}`).setLabel('Add Details').setStyle(ButtonStyle.Primary).setEmoji('📝'),
+            new ButtonBuilder().setCustomId(`va_setup_links_${ad._id}`).setLabel('Links & Recruiting').setStyle(ButtonStyle.Secondary).setEmoji('🔗'),
+            new ButtonBuilder().setCustomId(`va_setup_banner_${ad._id}`).setLabel('Upload Banner').setStyle(ButtonStyle.Secondary).setEmoji('🖼️'),
+            new ButtonBuilder().setCustomId(`va_setup_logo_${ad._id}`).setLabel('Upload Logo').setStyle(ButtonStyle.Secondary).setEmoji('🏷️')
+        );
+        return { embeds: [embed], components: [row] };
+    };
+
+    // Only the VA's owner (or staff) may edit its listing.
+    const canManageVa = (interaction, ad) =>
+        (ad.ownerId && interaction.user.id === ad.ownerId) ||
+        !!interaction.member?.roles?.cache?.has(ADMIN_ROLE_ID) ||
+        !!interaction.member?.permissions?.has(PermissionsBitField.Flags.Administrator);
+
+    // Download a Discord image attachment and push it to S3 as the VA's banner or
+    // logo. Runs from a message collector started by the Upload buttons below.
+    const handleVaImageUpload = async (channel, user, ad, kind) => {
+        const prompt = await channel.send(`📥 <@${user.id}> — send your **${kind}** image as your next message in this channel (PNG/JPG, within 2 minutes).`);
+        const collector = channel.createMessageCollector({
+            filter: (m) => m.author.id === user.id && m.attachments.size > 0,
+            max: 1,
+            time: 120000
+        });
+
+        collector.on('collect', async (msg) => {
+            const att = msg.attachments.first();
+            const isImage = (att.contentType || '').startsWith('image/') || /\.(png|jpe?g|webp|gif)$/i.test(att.name || '');
+            if (!isImage) {
+                await channel.send(`❌ That didn't look like an image. Tap **Upload ${kind === 'banner' ? 'Banner' : 'Logo'}** again to retry.`).catch(() => {});
+                return;
+            }
+            try {
+                const resp = await axios.get(att.url, { responseType: 'arraybuffer' });
+                const ref = ad.callsign || ad.name;
+                const url = await uploadVaImage(s3Client, { buffer: Buffer.from(resp.data) }, ref, kind);
+
+                // Swap out the old image so we don't orphan it in the bucket.
+                const oldUrl = kind === 'banner' ? ad.bannerUrl : ad.logoUrl;
+                if (oldUrl) await deleteVaImage(s3Client, oldUrl).catch(() => {});
+                if (kind === 'banner') ad.bannerUrl = url; else ad.logoUrl = url;
+                await ad.save();
+
+                await channel.send({ content: `✅ ${kind === 'banner' ? 'Banner' : 'Logo'} updated!`, embeds: [buildVaInfoEmbed(ad)] }).catch(() => {});
+            } catch (e) {
+                console.error(`❌ VA ${kind} upload error:`, e);
+                await channel.send(`❌ Couldn't process that image. Please try again.`).catch(() => {});
+            }
+        });
+
+        collector.on('end', (collected) => {
+            if (collected.size === 0) channel.send(`⌛ <@${user.id}> — ${kind} upload timed out. Tap the button again when you're ready.`).catch(() => {});
+            prompt.delete().catch(() => {});
+        });
+    };
 
     // Find-or-create the shared "VA Rep" role and make sure it can see the reps
     // general chat. Called on every provision so the wiring self-heals.
@@ -665,7 +767,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 name: vaChannelSlug(ad.name),
                 type: ChannelType.GuildText,
                 parent: VA_CATEGORY_ID,
-                topic: `${ad.type || 'VA'} • ${ad.callsign || ad.name} — private VA channel`,
+                topic: `${ad.type || 'VA'} • ${formatVaCallsign(ad.callsign) || ad.name} — private VA channel`,
                 permissionOverwrites: [
                     { id: guild.id, deny: [PermissionsBitField.Flags.ViewChannel] },
                     { id: vaRole.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] },
@@ -677,6 +779,12 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             try {
                 const info = await channel.send({ content: `Welcome to **${ad.name}**! 🛫`, embeds: [buildVaInfoEmbed(ad)] });
                 await info.pin().catch(() => {});
+                // Right after provisioning, ask the owner for everything the short
+                // application form didn't capture (banner, logo, full details).
+                await channel.send({
+                    content: ad.ownerId ? `<@${ad.ownerId}>` : undefined,
+                    ...buildVaSetupCard(ad)
+                });
             } catch (_) { /* pin/send best-effort */ }
         }
         result.channel = channel;
@@ -2018,6 +2126,60 @@ client.on('interactionCreate', async (interaction) => {
                 }
             }
 
+            // --- VA SETUP CARD BUTTONS (owner fills in the rest, post-approval) ---
+            if (customId.startsWith('va_setup_')) {
+                if (!VirtualAirlineAd) {
+                    return interaction.reply({ content: '❌ VA system unavailable (database not connected).', ephemeral: true });
+                }
+                // customId: va_setup_<action>_<adId>
+                const rest = customId.replace('va_setup_', '');
+                const sep = rest.indexOf('_');
+                const action = rest.slice(0, sep);
+                const adId = rest.slice(sep + 1);
+
+                const ad = await VirtualAirlineAd.findById(adId).catch(() => null);
+                if (!ad) return interaction.reply({ content: '❌ This VA listing no longer exists.', ephemeral: true });
+                if (!canManageVa(interaction, ad)) {
+                    return interaction.reply({ content: '❌ Only this VA\'s owner (or staff) can edit its listing.', ephemeral: true });
+                }
+
+                // Banner / logo come in as image attachments — a modal can't take a
+                // file, so we kick off a message collector in this channel.
+                if (action === 'banner' || action === 'logo') {
+                    await interaction.reply({ content: `🖼️ Ready for your **${action}** — see the prompt below.`, ephemeral: true });
+                    handleVaImageUpload(interaction.channel, interaction.user, ad, action);
+                    return;
+                }
+
+                // Text details → modal #1 (5 fields max per Discord modal).
+                if (action === 'details') {
+                    const modal = new ModalBuilder().setCustomId(`va_setup_details_modal_${adId}`).setTitle('VA Details');
+                    modal.addComponents(
+                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_description').setLabel('Full description').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(4000).setValue(ad.description || '')),
+                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_region').setLabel('Region (e.g. Asia, Europe, Global)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(40).setValue(ad.region && ad.region !== 'Global' ? ad.region : '')),
+                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_hubs').setLabel('Hub ICAOs (comma separated)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(120).setPlaceholder('VABB, VIDP, OMDB').setValue((ad.hubs || []).join(', '))),
+                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_fleet').setLabel('Fleet (comma separated)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(200).setPlaceholder('A320, B738, B77W').setValue((ad.fleet || []).join(', '))),
+                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_requirements').setLabel('Joining requirements').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000).setValue(ad.requirements || ''))
+                    );
+                    return interaction.showModal(modal);
+                }
+
+                // Links + recruiting → modal #2.
+                if (action === 'links') {
+                    const modal = new ModalBuilder().setCustomId(`va_setup_links_modal_${adId}`).setTitle('Links & Recruiting');
+                    modal.addComponents(
+                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_applicationUrl').setLabel('Apply / join link').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(200).setValue(ad.applicationUrl || '')),
+                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_ifcThreadUrl').setLabel('IFC forum thread URL').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(200).setValue(ad.ifcThreadUrl || '')),
+                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_minGrade').setLabel('Minimum IF grade (1-5, blank = none)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(1).setPlaceholder('3').setValue(ad.minGrade ? String(ad.minGrade) : '')),
+                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_pilotCount').setLabel('Current pilot count').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(6).setPlaceholder('25').setValue(ad.pilotCount ? String(ad.pilotCount) : '')),
+                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_tags').setLabel('Tags / keywords (comma separated)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(200).setPlaceholder('long-haul, realism, events').setValue((ad.tags || []).join(', ')))
+                    );
+                    return interaction.showModal(modal);
+                }
+
+                return interaction.reply({ content: '❌ Unknown setup action.', ephemeral: true });
+            }
+
             // --- TICKET BUTTONS ---
             if (customId === 'create_ticket_start') {
                 const topicSelect = new StringSelectMenuBuilder().setCustomId('ticket_topic_select').setPlaceholder('Select a topic')
@@ -2266,7 +2428,12 @@ client.on('interactionCreate', async (interaction) => {
                 if (!VirtualAirlineAd) return interaction.editReply('❌ VA system unavailable (database not connected).');
 
                 const name = interaction.fields.getTextInputValue('va_name').trim();
-                const callsign = (interaction.fields.getTextInputValue('va_callsign') || '').trim().toUpperCase() || null;
+                // Store just the base radio callsign (e.g. "OCEAN"); the "##VA"
+                // suffix is rendered at display time via formatVaCallsign().
+                const callsignRaw = (interaction.fields.getTextInputValue('va_callsign') || '').trim().toUpperCase();
+                const callsign = callsignRaw
+                    ? (callsignRaw.replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim() || null)
+                    : null;
                 let type = (interaction.fields.getTextInputValue('va_type') || 'VA').trim().toUpperCase();
                 if (type !== 'VA' && type !== 'VO') type = 'VA';
                 const tagline = (interaction.fields.getTextInputValue('va_tagline') || '').trim().slice(0, 140);
@@ -2367,6 +2534,70 @@ client.on('interactionCreate', async (interaction) => {
                     await reviewMsg.reply(`✏️ <@${interaction.user.id}> requested edits from <@${ad.ownerId}>:\n> ${changes}`).catch(() => {});
                 }
                 return interaction.editReply('✏️ Edit request sent to the applicant. The application stays pending.');
+            }
+
+            // --- VA SETUP: DETAILS SUBMITTED (post-approval profile fill-in) ---
+            if (customId.startsWith('va_setup_details_modal_')) {
+                await interaction.deferReply({ ephemeral: true });
+                if (!VirtualAirlineAd) return interaction.editReply('❌ VA system unavailable.');
+                const adId = customId.replace('va_setup_details_modal_', '');
+                const ad = await VirtualAirlineAd.findById(adId).catch(() => null);
+                if (!ad) return interaction.editReply('❌ This VA listing no longer exists.');
+                if (!canManageVa(interaction, ad)) return interaction.editReply('❌ Only this VA\'s owner (or staff) can edit its listing.');
+
+                const splitList = (s) => (s || '').split(/[\n,]+/).map(x => x.trim()).filter(Boolean);
+                const description = (interaction.fields.getTextInputValue('va_description') || '').trim();
+                const region = (interaction.fields.getTextInputValue('va_region') || '').trim();
+                const requirements = (interaction.fields.getTextInputValue('va_requirements') || '').trim();
+
+                ad.description = description;
+                if (region) ad.region = region;
+                ad.hubs = splitList(interaction.fields.getTextInputValue('va_hubs')).map(h => h.toUpperCase());
+                ad.fleet = splitList(interaction.fields.getTextInputValue('va_fleet')).map(f => f.toUpperCase());
+                ad.requirements = requirements;
+
+                try {
+                    await ad.save();
+                } catch (e) {
+                    console.error('❌ VA setup details save error:', e);
+                    return interaction.editReply('❌ Could not save those details. Please try again.');
+                }
+                return interaction.editReply({ content: '✅ Details saved! Here\'s how your listing looks now:', embeds: [buildVaInfoEmbed(ad)] });
+            }
+
+            // --- VA SETUP: LINKS & RECRUITING SUBMITTED ---
+            if (customId.startsWith('va_setup_links_modal_')) {
+                await interaction.deferReply({ ephemeral: true });
+                if (!VirtualAirlineAd) return interaction.editReply('❌ VA system unavailable.');
+                const adId = customId.replace('va_setup_links_modal_', '');
+                const ad = await VirtualAirlineAd.findById(adId).catch(() => null);
+                if (!ad) return interaction.editReply('❌ This VA listing no longer exists.');
+                if (!canManageVa(interaction, ad)) return interaction.editReply('❌ Only this VA\'s owner (or staff) can edit its listing.');
+
+                const splitList = (s) => (s || '').split(/[\n,]+/).map(x => x.trim()).filter(Boolean);
+                const applicationUrl = (interaction.fields.getTextInputValue('va_applicationUrl') || '').trim();
+                const ifcThreadUrl = (interaction.fields.getTextInputValue('va_ifcThreadUrl') || '').trim();
+                const minGradeRaw = (interaction.fields.getTextInputValue('va_minGrade') || '').trim();
+                const pilotCountRaw = (interaction.fields.getTextInputValue('va_pilotCount') || '').trim();
+
+                ad.applicationUrl = applicationUrl || null;
+                ad.ifcThreadUrl = ifcThreadUrl || null;
+
+                const minGrade = parseInt(minGradeRaw, 10);
+                ad.minGrade = (Number.isInteger(minGrade) && minGrade >= 1 && minGrade <= 5) ? minGrade : null;
+
+                const pilotCount = parseInt(pilotCountRaw, 10);
+                if (Number.isInteger(pilotCount) && pilotCount >= 0) ad.pilotCount = pilotCount;
+
+                ad.tags = splitList(interaction.fields.getTextInputValue('va_tags')).map(t => t.toLowerCase());
+
+                try {
+                    await ad.save();
+                } catch (e) {
+                    console.error('❌ VA setup links save error:', e);
+                    return interaction.editReply('❌ Could not save those links. Please try again.');
+                }
+                return interaction.editReply({ content: '✅ Links & recruiting info saved! Here\'s your updated listing:', embeds: [buildVaInfoEmbed(ad)] });
             }
         }
 
@@ -2515,7 +2746,7 @@ client.on('interactionCreate', async (interaction) => {
                 const modal = new ModalBuilder().setCustomId('va_apply_modal').setTitle('VA / VO Application');
                 modal.addComponents(
                     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_name').setLabel('VA / VO Name').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(80)),
-                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_callsign').setLabel('Callsign (e.g. IGO)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(20)),
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_callsign').setLabel('Radio Callsign (pilots fly as NAME ##VA)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(20).setPlaceholder('e.g. Ocean (pilots fly as OCEAN ##VA)')),
                     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_type').setLabel('Type — VA or VO').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(2).setPlaceholder('VA')),
                     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_tagline').setLabel('Short description / tagline').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(140)),
                     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_links').setLabel('Website + Discord (one per line)').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(300))
