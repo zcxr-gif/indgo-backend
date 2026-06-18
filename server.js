@@ -193,6 +193,15 @@ VirtualAirlineAdSchema.pre('save', function (next) {
 
 const VirtualAirlineAd = mongoose.model('VirtualAirlineAd', VirtualAirlineAdSchema);
 
+// Store only the base radio callsign (e.g. "OCEAN"); the Infinite Flight VA
+// suffix "##VA" is appended at display time. Strip it here so a value entered as
+// "Ocean ##VA" or "Ocean VA" is normalized back to "OCEAN".
+const normalizeCallsignBase = (raw) => {
+    if (!raw) return null;
+    const clean = String(raw).trim().toUpperCase().replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim();
+    return clean || null;
+};
+
 /* =========================
  * LEADERBOARD SCHEMAS
  *
@@ -1568,7 +1577,7 @@ const sendVaAdWebhook = async (ad) => {
                 fields: [
                     { name: 'Name', value: ad.name, inline: true },
                     { name: 'Type', value: ad.type, inline: true },
-                    { name: 'Callsign', value: ad.callsign || '—', inline: true },
+                    { name: 'Callsign', value: ad.callsign ? `${ad.callsign} ##VA` : '—', inline: true },
                     { name: 'Region', value: ad.region || '—', inline: true },
                     { name: 'Recruiting', value: ad.recruiting ? 'Yes' : 'No', inline: true },
                     { name: 'Status', value: ad.status, inline: true }
@@ -1740,13 +1749,14 @@ app.post('/api/va-ads', uploadVaImages, async (req, res) => {
             return res.status(409).json({ message: 'A VA with that name has already been submitted.' });
         }
 
-        const ref = req.body.callsign || name;
+        const callsign = normalizeCallsignBase(req.body.callsign);
+        const ref = callsign || name;
         const bannerUrl = bannerFile ? await uploadVaImage(s3Client, bannerFile, ref, 'banner') : null;
         const logoUrl = logoFile ? await uploadVaImage(s3Client, logoFile, ref, 'logo') : null;
 
         const ad = new VirtualAirlineAd({
             name: name.trim(),
-            callsign: req.body.callsign || null,
+            callsign,
             type: VA_AD_TYPES.includes(req.body.type) ? req.body.type : 'VA',
             tagline: req.body.tagline,
             description: req.body.description,
@@ -1814,7 +1824,7 @@ app.put('/api/va-ads/:id', uploadVaImages, async (req, res) => {
         // Scalar/text fields: only overwrite when the key is present in the body.
         const b = req.body;
         if (b.name !== undefined) ad.name = b.name.trim();
-        if (b.callsign !== undefined) ad.callsign = b.callsign || null;
+        if (b.callsign !== undefined) ad.callsign = normalizeCallsignBase(b.callsign);
         if (b.type !== undefined && VA_AD_TYPES.includes(b.type)) ad.type = b.type;
         if (b.tagline !== undefined) ad.tagline = b.tagline;
         if (b.description !== undefined) ad.description = b.description;
