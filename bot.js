@@ -64,6 +64,11 @@ const ADMIN_ROLE_ID = '1442258765016469649'; // Admin Role for Mod Commands
 const TICKET_PANEL_CHANNEL_ID = '1442462474489299115';
 const TRANSCRIPT_CHANNEL_ID = '1442471030642966548'; // Used for Tickets AND Mod Logs
 
+// --- GIVEAWAY CONFIGURATION ---
+const GIVEAWAY_MOD_CHANNEL_ID = ADMIN_CHANNEL_ID;        // moderation/staff channel for winner fulfillment
+const GIVEAWAY_TICKET_CHANNEL_ID = TICKET_PANEL_CHANNEL_ID; // parent channel for winner help tickets
+const DEFAULT_GIVEAWAY_PRIZE = 'Inflight Pro — 1 Month Subscription';
+
 const METADATA_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api/metadata';
 const BASE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api';
 
@@ -74,6 +79,11 @@ let cachedLiveries = {};
 
 // --- SESSION MANAGEMENT ---
 const userSessions = new Map();
+
+// --- GIVEAWAY STATE ---
+// Keyed by the giveaway message ID. Held in memory (mirrors userSessions) —
+// active giveaways do not survive a bot restart, which is fine for short runs.
+const activeGiveaways = new Map();
 
 // ===================== UNIFIED VISUAL THEME =====================
 // A clean white / dark-gray palette so every embed reads as one product.
@@ -439,6 +449,98 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             await transcriptChannel.send({ embeds: [logEmbed] });
         } catch (error) {
             console.error('❌ Failed to log mod action:', error);
+        }
+    };
+
+    // --- HELPER: END A GIVEAWAY (pick a winner, announce, hand off to staff) ---
+    const endGiveaway = async (messageId) => {
+        const g = activeGiveaways.get(messageId);
+        if (!g || g.ended) return;
+        g.ended = true;
+
+        try {
+            const channel = await client.channels.fetch(g.channelId).catch(() => null);
+            const message = channel ? await channel.messages.fetch(messageId).catch(() => null) : null;
+
+            const entrants = Array.from(g.entrants);
+            const winnerId = entrants.length ? entrants[Math.floor(Math.random() * entrants.length)] : null;
+
+            const endedEmbed = new EmbedBuilder()
+                .setTitle('🎉 Giveaway Ended')
+                .setColor(THEME.WHITE)
+                .setFooter({ text: BRAND_FOOTER })
+                .addFields(
+                    { name: 'Prize', value: g.prize, inline: false },
+                    { name: 'Entries', value: `${entrants.length}`, inline: true },
+                    { name: 'Winner', value: winnerId ? `<@${winnerId}>` : 'No valid entries 😢', inline: true }
+                )
+                .setTimestamp();
+
+            // Lock the original message (remove the Enter button).
+            if (message) await message.edit({ embeds: [endedEmbed], components: [] }).catch(() => {});
+
+            if (!winnerId) {
+                if (channel) await channel.send('🎉 The giveaway ended but nobody entered — no winner this time!').catch(() => {});
+                return;
+            }
+
+            const winnerTag = `<@${winnerId}>`;
+
+            // Public announcement in the giveaway channel.
+            if (channel) {
+                await channel.send({ content: `🎉 Congratulations ${winnerTag}! You won **${g.prize}**!`, embeds: [endedEmbed] }).catch(() => {});
+            }
+
+            // Hand the winner off to staff so the prize can be fulfilled.
+            if (g.delivery === 'ticket') {
+                try {
+                    const ticketParent = await client.channels.fetch(GIVEAWAY_TICKET_CHANNEL_ID).catch(() => null);
+                    if (ticketParent && ticketParent.threads) {
+                        const thread = await ticketParent.threads.create({
+                            name: `giveaway-winner-${winnerId}`,
+                            type: ChannelType.PrivateThread,
+                            reason: 'Giveaway winner prize fulfillment'
+                        });
+                        await thread.members.add(winnerId).catch(() => {});
+                        const tEmbed = new EmbedBuilder()
+                            .setTitle('🎁 Giveaway Winner — Prize Fulfillment')
+                            .setColor(THEME.WHITE)
+                            .setDescription('Please deliver the prize to the winner and close this ticket when done.')
+                            .addFields(
+                                { name: 'Winner', value: winnerTag, inline: true },
+                                { name: 'Prize', value: g.prize, inline: true },
+                                { name: 'Hosted by', value: `<@${g.hostId}>`, inline: true }
+                            )
+                            .setTimestamp();
+                        const row = new ActionRowBuilder().addComponents(
+                            new ButtonBuilder().setCustomId('close_ticket_action').setLabel('Close Ticket').setStyle(ButtonStyle.Danger)
+                        );
+                        await thread.send({ content: `<@&${ADMIN_ROLE_ID}> ${winnerTag}`, embeds: [tEmbed], components: [row] });
+                    }
+                } catch (e) { console.error('❌ Failed to open giveaway winner ticket:', e); }
+            } else {
+                try {
+                    const modChannel = await client.channels.fetch(GIVEAWAY_MOD_CHANNEL_ID).catch(() => null);
+                    if (modChannel) {
+                        const mEmbed = new EmbedBuilder()
+                            .setTitle('🎁 Giveaway Winner — Action Needed')
+                            .setColor(THEME.WHITE)
+                            .setDescription('Please deliver the prize to the winner below.')
+                            .addFields(
+                                { name: 'Winner', value: winnerTag, inline: true },
+                                { name: 'Prize', value: g.prize, inline: true },
+                                { name: 'Hosted by', value: `<@${g.hostId}>`, inline: true },
+                                { name: 'Total Entries', value: `${entrants.length}`, inline: true }
+                            )
+                            .setTimestamp();
+                        await modChannel.send({ content: `<@&${ADMIN_ROLE_ID}>`, embeds: [mEmbed] });
+                    }
+                } catch (e) { console.error('❌ Failed to send giveaway winner mod message:', e); }
+            }
+        } catch (e) {
+            console.error('❌ endGiveaway error:', e);
+        } finally {
+            activeGiveaways.delete(messageId);
         }
     };
 
@@ -1102,6 +1204,16 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             new SlashCommandBuilder().setName('migrate_legacy').setDescription('[SYSTEM] Auto-match legacy DB names to current Discord Users').setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
             new SlashCommandBuilder().setName('setup_tickets').setDescription('[SYSTEM] Post the help ticket panel in the current channel').setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
 
+            new SlashCommandBuilder().setName('giveaway').setDescription('[MOD] Start a giveaway for an Inflight Pro subscription')
+                .addIntegerOption(o => o.setName('duration').setDescription('How long the giveaway runs, in minutes').setRequired(true).setMinValue(1).setMaxValue(10080))
+                .addStringOption(o => o.setName('prize').setDescription('Prize (defaults to Inflight Pro — 1 Month)').setRequired(false))
+                .addStringOption(o => o.setName('delivery').setDescription('How to hand the prize to the winner (default: moderation channel)').setRequired(false)
+                    .addChoices(
+                        { name: 'Message the moderation channel', value: 'mod_message' },
+                        { name: 'Open a help ticket for the winner', value: 'ticket' }
+                    ))
+                .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageEvents),
+
             // Moderator Commands
             new SlashCommandBuilder().setName('mod_kick').setDescription('[MOD] Kick a user')
                 .addUserOption(o => o.setName('user').setDescription('User to kick').setRequired(true))
@@ -1640,6 +1752,33 @@ client.on('interactionCreate', async (interaction) => {
                 return;
             }
 
+            // --- GIVEAWAY ENTRY BUTTON ---
+            if (customId === 'giveaway_enter') {
+                const g = activeGiveaways.get(interaction.message.id);
+                if (!g || g.ended) {
+                    return interaction.reply({ content: '❌ This giveaway has already ended.', ephemeral: true });
+                }
+                if (g.entrants.has(interaction.user.id)) {
+                    return interaction.reply({ content: 'ℹ️ You are already entered. Good luck! 🎉', ephemeral: true });
+                }
+                g.entrants.add(interaction.user.id);
+
+                // Live-update the entry count shown on the embed.
+                try {
+                    const baseEmbed = interaction.message.embeds[0];
+                    if (baseEmbed) {
+                        const newEmbed = EmbedBuilder.from(baseEmbed);
+                        const fields = newEmbed.data.fields || [];
+                        const idx = fields.findIndex(f => f.name === 'Entries');
+                        if (idx !== -1) fields[idx].value = `${g.entrants.size}`;
+                        newEmbed.setFields(fields);
+                        await interaction.message.edit({ embeds: [newEmbed] }).catch(() => {});
+                    }
+                } catch (e) { /* non-fatal — entry still counts */ }
+
+                return interaction.reply({ content: '✅ You have entered the giveaway! Good luck! 🎉', ephemeral: true });
+            }
+
             // --- TICKET BUTTONS ---
             if (customId === 'create_ticket_start') {
                 const topicSelect = new StringSelectMenuBuilder().setCustomId('ticket_topic_select').setPlaceholder('Select a topic')
@@ -1970,6 +2109,53 @@ client.on('interactionCreate', async (interaction) => {
                     if (latest) embed.setImage(latest.imageUrl);
                     await interaction.editReply({ embeds: [embed] });
                 } catch (e) { await interaction.editReply("❌ Database Error."); }
+                return;
+            }
+
+            // --- GIVEAWAY COMMAND ---
+            if (commandName === 'giveaway') {
+                if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID) && !interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+                    return interaction.reply({ content: '❌ Access Denied.', ephemeral: true });
+                }
+
+                const durationMin = interaction.options.getInteger('duration');
+                const prize = interaction.options.getString('prize') || DEFAULT_GIVEAWAY_PRIZE;
+                const delivery = interaction.options.getString('delivery') || 'mod_message';
+                const endsAt = Date.now() + durationMin * 60 * 1000;
+                const endsUnix = Math.floor(endsAt / 1000);
+
+                const embed = new EmbedBuilder()
+                    .setTitle('🎉 GIVEAWAY 🎉')
+                    .setColor(THEME.WHITE)
+                    .setDescription('Click the button below to enter!')
+                    .addFields(
+                        { name: 'Prize', value: prize, inline: false },
+                        { name: 'Ends', value: `<t:${endsUnix}:R> (<t:${endsUnix}:f>)`, inline: false },
+                        { name: 'Entries', value: '0', inline: true },
+                        { name: 'Hosted by', value: `<@${interaction.user.id}>`, inline: true }
+                    )
+                    .setFooter({ text: BRAND_FOOTER })
+                    .setTimestamp();
+
+                const row = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId('giveaway_enter').setLabel('Enter Giveaway').setEmoji('🎉').setStyle(ButtonStyle.Success)
+                );
+
+                await interaction.reply({ content: '✅ Giveaway started!', ephemeral: true });
+                const giveawayMessage = await interaction.channel.send({ embeds: [embed], components: [row] });
+
+                activeGiveaways.set(giveawayMessage.id, {
+                    prize,
+                    delivery,
+                    hostId: interaction.user.id,
+                    channelId: interaction.channel.id,
+                    messageId: giveawayMessage.id,
+                    entrants: new Set(),
+                    endsAt,
+                    ended: false
+                });
+
+                setTimeout(() => { endGiveaway(giveawayMessage.id); }, durationMin * 60 * 1000);
                 return;
             }
         }
@@ -2375,9 +2561,15 @@ client.on('interactionCreate', async (interaction) => {
                             '`/hangar` — detailed breakdown of a user\'s hangar',
                             '`/bounty_board` — aircraft still needing better photos'
                         ].join('\n')
+                    },
+                    {
+                        name: '🎉 Events',
+                        value: [
+                            '`/giveaway` — *(staff)* start a giveaway; members tap a button to enter and a winner is drawn automatically'
+                        ].join('\n')
                     }
                 )
-                .setFooter({ text: 'Mod commands (mod_*) are restricted to staff.' });
+                .setFooter({ text: 'Mod commands (mod_*) and /giveaway are restricted to staff.' });
             await interaction.reply({ embeds: [embed], ephemeral: true });
         }
       } catch (err) {
