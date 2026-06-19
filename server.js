@@ -193,6 +193,26 @@ VirtualAirlineAdSchema.pre('save', function (next) {
 
 const VirtualAirlineAd = mongoose.model('VirtualAirlineAd', VirtualAirlineAdSchema);
 
+// --- GIVEAWAY ---
+// Giveaways used to live only in the bot's memory, so any restart (deploy,
+// crash, host cycling) wiped the entrants and the "end" timer — a multi-day
+// giveaway would silently die and the Enter button would report "already
+// ended". Persisting them lets the bot restore active giveaways on boot.
+const GiveawaySchema = new mongoose.Schema({
+    messageId: { type: String, required: true, unique: true, index: true },
+    channelId: { type: String, required: true },
+    prize: { type: String, required: true },
+    delivery: { type: String, default: 'mod_message' }, // 'mod_message' | 'ticket'
+    hostId: { type: String, required: true },
+    entrants: { type: [String], default: [] },          // Discord user IDs
+    endsAt: { type: Date, required: true },
+    ended: { type: Boolean, default: false }
+});
+// Restore on boot queries the still-running giveaways.
+GiveawaySchema.index({ ended: 1 });
+
+const Giveaway = mongoose.model('Giveaway', GiveawaySchema);
+
 // Store only the base radio callsign (e.g. "OCEAN"); the Infinite Flight VA
 // suffix "##VA" is appended at display time. Strip it here so a value entered as
 // "Ocean ##VA" or "Ocean VA" is normalized back to "OCEAN".
@@ -326,7 +346,7 @@ startDiscordBot(
     s3Client,
     process.env.AWS_S3_BUCKET_NAME,
     process.env.AWS_REGION,
-    { DailyPilotStats, DailyPilotView, VirtualAirlineAd }
+    { DailyPilotStats, DailyPilotView, VirtualAirlineAd, Giveaway }
 );
 // ---------------------
 

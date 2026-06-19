@@ -95,8 +95,9 @@ let cachedLiveries = {};
 const userSessions = new Map();
 
 // --- GIVEAWAY STATE ---
-// Keyed by the giveaway message ID. Held in memory (mirrors userSessions) —
-// active giveaways do not survive a bot restart, which is fine for short runs.
+// Keyed by the giveaway message ID. This is the live in-memory mirror; the
+// source of truth is the Giveaway collection so active giveaways survive a
+// restart (they are reloaded on `ready` and their end timers re-armed).
 const activeGiveaways = new Map();
 
 // ===================== UNIFIED VISUAL THEME =====================
@@ -379,7 +380,7 @@ const normalizeData = async (rawType, rawLivery) => {
 };
 
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, models = {}) => {
-    const { DailyPilotStats, VirtualAirlineAd } = models;
+    const { DailyPilotStats, VirtualAirlineAd, Giveaway } = models;
 
     // NOTE: `Options.cacheEverything()` is the *opposite* of what we want — it
     // caches everything with no caps and silently ignores the limits passed to
@@ -464,6 +465,51 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         } catch (error) {
             console.error('❌ Failed to log mod action:', error);
         }
+    };
+
+    // --- HELPER: PERSIST A GIVEAWAY (upsert the live state to the database) ---
+    // Called on create, on every entry, and when a giveaway ends so the DB
+    // always reflects the in-memory state and can rebuild it after a restart.
+    const persistGiveaway = async (messageId) => {
+        if (!Giveaway) return;
+        const g = activeGiveaways.get(messageId);
+        if (!g) return;
+        try {
+            await Giveaway.updateOne(
+                { messageId },
+                {
+                    messageId,
+                    channelId: g.channelId,
+                    prize: g.prize,
+                    delivery: g.delivery,
+                    hostId: g.hostId,
+                    entrants: Array.from(g.entrants),
+                    endsAt: new Date(g.endsAt),
+                    ended: g.ended
+                },
+                { upsert: true }
+            );
+        } catch (e) {
+            console.error('❌ Failed to persist giveaway:', e);
+        }
+    };
+
+    // --- HELPER: SCHEDULE A GIVEAWAY'S END ---
+    // setTimeout overflows for delays beyond ~24.8 days (its max is a signed
+    // 32-bit int of milliseconds), silently firing immediately instead. Clamp
+    // long delays and re-arm in chunks; fire now if the end time has passed.
+    const MAX_TIMEOUT_MS = 2147483647;
+    const scheduleGiveawayEnd = (messageId, endsAt) => {
+        const delay = endsAt - Date.now();
+        if (delay <= 0) {
+            endGiveaway(messageId);
+            return;
+        }
+        if (delay > MAX_TIMEOUT_MS) {
+            setTimeout(() => scheduleGiveawayEnd(messageId, endsAt), MAX_TIMEOUT_MS);
+            return;
+        }
+        setTimeout(() => endGiveaway(messageId), delay);
     };
 
     // --- HELPER: END A GIVEAWAY (pick a winner, announce, hand off to staff) ---
@@ -554,6 +600,11 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         } catch (e) {
             console.error('❌ endGiveaway error:', e);
         } finally {
+            // Mark it ended in the DB so a restart won't resurrect it, then
+            // drop the in-memory copy.
+            if (Giveaway) {
+                await Giveaway.updateOne({ messageId }, { ended: true }).catch(() => {});
+            }
             activeGiveaways.delete(messageId);
         }
     };
@@ -1368,6 +1419,34 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
     client.once('ready', async () => {
         console.log(`🤖 Discord Bot Online as ${client.user.tag}`);
         await fetchAircraftMetadata();
+
+        // Restore giveaways that were still running before this restart and
+        // re-arm their end timers (otherwise the in-memory state is lost and the
+        // Enter button reports "already ended").
+        if (Giveaway) {
+            try {
+                const pending = await Giveaway.find({ ended: false }).lean();
+                for (const doc of pending) {
+                    const endsAt = new Date(doc.endsAt).getTime();
+                    activeGiveaways.set(doc.messageId, {
+                        prize: doc.prize,
+                        delivery: doc.delivery,
+                        hostId: doc.hostId,
+                        channelId: doc.channelId,
+                        messageId: doc.messageId,
+                        entrants: new Set(doc.entrants || []),
+                        endsAt,
+                        ended: false
+                    });
+                    scheduleGiveawayEnd(doc.messageId, endsAt);
+                }
+                if (pending.length) {
+                    console.log(`🎉 Restored ${pending.length} active giveaway(s) from the database.`);
+                }
+            } catch (e) {
+                console.error('❌ Failed to restore giveaways:', e);
+            }
+        }
         
         console.log('🧹 Starting Memory Janitor...');
         setInterval(() => {
@@ -2051,6 +2130,8 @@ client.on('interactionCreate', async (interaction) => {
                     return interaction.reply({ content: 'ℹ️ You are already entered. Good luck! 🎉', ephemeral: true });
                 }
                 g.entrants.add(interaction.user.id);
+                // Persist the new entrant so it survives a restart.
+                persistGiveaway(interaction.message.id).catch(() => {});
 
                 // Live-update the entry count shown on the embed.
                 try {
@@ -2734,7 +2815,9 @@ client.on('interactionCreate', async (interaction) => {
                     ended: false
                 });
 
-                setTimeout(() => { endGiveaway(giveawayMessage.id); }, durationMin * 60 * 1000);
+                // Persist so the giveaway survives a restart, then arm the timer.
+                await persistGiveaway(giveawayMessage.id);
+                scheduleGiveawayEnd(giveawayMessage.id, endsAt);
                 return;
             }
 
