@@ -531,8 +531,10 @@ const hashIp = (ip) => {
 // Staff portal auth routes (login / logout / me / user management).
 registerAuthRoutes(app);
 
-// Health Check
-app.get('/', (req, res) => {
+// Health Check — public, unauthenticated (for uptime/platform monitors).
+// NOTE: the site is staff-only, so the homepage ("/") is gated below; point any
+// platform health check at /healthz instead of "/".
+app.get('/healthz', (req, res) => {
     res.send('Community Aircraft Backend is Running.');
 });
 
@@ -917,7 +919,7 @@ app.post('/api/trails', async (req, res) => {
 
 
 // GET: Fetch all aircraft contributions
-app.get('/api/aircraft', async (req, res) => {
+app.get('/api/aircraft', requireAuth, async (req, res) => {
     try {
         const aircraft = await CommunityAircraft.find().sort({ uploadedAt: -1 });
         res.json(aircraft);
@@ -928,7 +930,7 @@ app.get('/api/aircraft', async (req, res) => {
 });
 
 // GET: Find aircraft by Type AND Livery (or return a placeholder)
-app.get('/api/aircraft/lookup', async (req, res) => {
+app.get('/api/aircraft/lookup', requireAuth, async (req, res) => {
     try {
         // 1. Support both internal names (type/tail) and JSON names (model/registration)
         const { type, model, livery, liveryName, tail, registration } = req.query; 
@@ -981,10 +983,9 @@ app.get('/api/aircraft/lookup', async (req, res) => {
     }
 });
 
-// GET: Admin System Stats (New - Includes S3 & DB Stats)
-// NOTE: read-only and used by the public homepage stats panel — intentionally
-// left open. The write APIs below are the ones gated behind requireAuth.
-app.get('/api/admin/stats', async (req, res) => {
+// GET: Admin System Stats (S3 & DB stats) — staff-only (the homepage that uses
+// it now sits behind the staff login).
+app.get('/api/admin/stats', requireAuth, async (req, res) => {
     try {
         // 1. Get MongoDB Stats
         const dbStats = await mongoose.connection.db.stats();
@@ -1036,7 +1037,7 @@ app.get('/api/admin/stats', async (req, res) => {
 });
 
 // POST: Upload a new aircraft (supports up to MAX_AIRCRAFT_IMAGES images)
-app.post('/api/aircraft', uploadAircraftImages, async (req, res) => {
+app.post('/api/aircraft', requireAuth, uploadAircraftImages, async (req, res) => {
     const files = collectUploadedImages(req);
     try {
         if (files.length === 0) return res.status(400).json({ message: 'At least one image file is required.' });
@@ -1144,7 +1145,7 @@ const syncAircraftDatabase = async (jsonList) => {
 };
 
 // PATCH: Toggle the "needs update" flag
-app.patch('/api/aircraft/:id/flag', async (req, res) => {
+app.patch('/api/aircraft/:id/flag', requireAuth, async (req, res) => {
     try {
         const { id } = req.params;
         const entry = await CommunityAircraft.findById(id);
@@ -1163,7 +1164,7 @@ app.patch('/api/aircraft/:id/flag', async (req, res) => {
 });
 
 // PUT: Update an existing aircraft (replaces the full image set when new images are sent)
-app.put('/api/aircraft/:id', uploadAircraftImages, async (req, res) => {
+app.put('/api/aircraft/:id', requireAuth, uploadAircraftImages, async (req, res) => {
     const files = collectUploadedImages(req);
     try {
         const { id } = req.params;
@@ -1249,7 +1250,7 @@ app.put('/api/aircraft/:id', uploadAircraftImages, async (req, res) => {
 });
 
 // DELETE: Remove an aircraft
-app.delete('/api/aircraft/:id', async (req, res) => {
+app.delete('/api/aircraft/:id', requireAuth, async (req, res) => {
     try {
         const { id } = req.params;
         const entry = await CommunityAircraft.findById(id);
@@ -1273,7 +1274,7 @@ app.delete('/api/aircraft/:id', async (req, res) => {
  * ========================= */
 
 // POST: Append a new image to an aircraft (up to MAX_AIRCRAFT_IMAGES)
-app.post('/api/aircraft/:id/images', upload.single('image'), async (req, res) => {
+app.post('/api/aircraft/:id/images', requireAuth, upload.single('image'), async (req, res) => {
     const file = req.file;
     try {
         if (!file) return res.status(400).json({ message: 'Image file is required.' });
@@ -1314,7 +1315,7 @@ app.post('/api/aircraft/:id/images', upload.single('image'), async (req, res) =>
 });
 
 // PUT: Replace (or set) the image at a specific slot index
-app.put('/api/aircraft/:id/images/:index', upload.single('image'), async (req, res) => {
+app.put('/api/aircraft/:id/images/:index', requireAuth, upload.single('image'), async (req, res) => {
     const file = req.file;
     try {
         if (!file) return res.status(400).json({ message: 'Image file is required.' });
@@ -1374,7 +1375,7 @@ app.put('/api/aircraft/:id/images/:index', upload.single('image'), async (req, r
 });
 
 // DELETE: Remove the image at a specific slot index
-app.delete('/api/aircraft/:id/images/:index', async (req, res) => {
+app.delete('/api/aircraft/:id/images/:index', requireAuth, async (req, res) => {
     try {
         const index = parseInt(req.params.index, 10);
         if (isNaN(index) || index < 0) {
@@ -1409,7 +1410,7 @@ app.delete('/api/aircraft/:id/images/:index', async (req, res) => {
 
 // PATCH: Update only the contributor name of a specific slot, without touching the
 // image itself. Lets the dashboard correct/reattribute who spotted each photo.
-app.patch('/api/aircraft/:id/images/:index/contributor', async (req, res) => {
+app.patch('/api/aircraft/:id/images/:index/contributor', requireAuth, async (req, res) => {
     try {
         const index = parseInt(req.params.index, 10);
         if (isNaN(index) || index < 0 || index >= MAX_AIRCRAFT_IMAGES) {
@@ -1973,6 +1974,7 @@ app.delete('/api/va-ads/:id', requireAuth, async (req, res) => {
 // Non-sensitive frontend assets (airports.js, etc.) stay public; the data they
 // touch is protected by requireAuth on the APIs.
 const STAFF_ONLY_PATHS = new Set([
+    '/', '/index.html', '/aircraft.json',
     '/va-ads', '/va-ads.html',
     '/airports', '/airports.html',
     '/va-admin-manual', '/va-admin-manual.html',
@@ -2013,13 +2015,13 @@ app.get('/va-admin-manual', (req, res) => {
     res.sendFile(path.join(__dirname, 'va-admin-manual.html'));
 });
 
-// 3. Specific route for the Aircraft Database root
-app.get('/', (req, res) => {
+// 3. The Aircraft Database app (homepage) — staff-only.
+app.get('/', requireAuthPage, (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-
-app.get(/(.*)/, (req, res) => {
+// Catch-all for the SPA — also staff-only (the whole site sits behind login).
+app.get(/(.*)/, requireAuthPage, (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
