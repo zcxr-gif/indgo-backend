@@ -73,25 +73,25 @@
         .gallery-card:hover .gallery-overlay { opacity: 1; }
     </style>
 </head>
-<body class="bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 transition-colors duration-300 min-h-screen">
+<body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 transition-colors duration-300 min-h-screen">
 
     <!-- Navigation -->
-    <nav class="sticky top-0 z-40 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md border-b border-slate-200 dark:border-slate-800">
+    <nav class="sticky top-0 z-40 bg-white/80 dark:bg-zinc-900/80 backdrop-blur-md border-b border-zinc-200 dark:border-zinc-800">
         <div class="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
             <div class="flex items-center gap-2">
-                <div class="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white shadow-lg shadow-blue-500/20">
+                <div class="w-10 h-10 bg-zinc-900 rounded-xl flex items-center justify-center text-white shadow-lg shadow-zinc-700/20">
                     <i class="fa-solid fa-plane text-xl"></i>
                 </div>
                 <h1 class="text-xl font-bold tracking-tight hidden sm:block">AeroVista</h1>
             </div>
 
             <div class="flex items-center gap-3">
-                <button onclick="toggleDarkMode()" class="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full transition-colors">
-                    <i id="themeIcon" class="fa-solid fa-moon text-slate-600 dark:text-yellow-400 text-lg"></i>
+                <button onclick="toggleDarkMode()" class="p-2 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-full transition-colors">
+                    <i id="themeIcon" class="fa-solid fa-moon text-zinc-600 dark:text-yellow-400 text-lg"></i>
                 </button>
                 <button 
                     onclick="openUploadModal()"
-                    class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition-all active:scale-95 shadow-lg shadow-blue-600/20"
+                    class="bg-zinc-900 hover:bg-zinc-800 text-white px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition-all active:scale-95 shadow-lg shadow-zinc-900/20"
                 >
                     <i class="fa-solid fa-plus text-sm"></i>
                     <span>Upload</span>
@@ -105,27 +105,27 @@
         
         <!-- Hero Search Section -->
         <section class="mb-12 text-center">
-            <h2 class="text-4xl sm:text-5xl font-extrabold mb-4 bg-gradient-to-r from-blue-600 to-indigo-500 bg-clip-text text-transparent">
+            <h2 class="text-4xl sm:text-5xl font-extrabold tracking-tight mb-4 bg-gradient-to-r from-zinc-900 to-zinc-500 dark:from-white dark:to-zinc-400 bg-clip-text text-transparent">
                 Explore the World's Hubs
             </h2>
-            <p class="text-slate-500 dark:text-slate-400 text-lg mb-8 max-w-xl mx-auto font-medium">
+            <p class="text-zinc-500 dark:text-zinc-400 text-lg mb-8 max-w-xl mx-auto font-medium">
                 Search for an airport or browse the community gallery below.
             </p>
 
             <form onsubmit="handleSearch(event)" class="relative max-w-2xl mx-auto group">
                 <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
-                    <i class="fa-solid fa-search text-slate-400 group-focus-within:text-blue-500 transition-colors text-lg"></i>
+                    <i class="fa-solid fa-search text-zinc-400 group-focus-within:text-zinc-700 transition-colors text-lg"></i>
                 </div>
                 <input 
                     type="text"
                     id="searchQuery"
                     placeholder="Enter ICAO (e.g., EGLL, KJFK)..."
-                    class="w-full pl-12 pr-32 py-4 rounded-2xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 dark:focus:border-blue-500 outline-none transition-all text-lg font-medium shadow-xl shadow-slate-200/50 dark:shadow-none uppercase tracking-widest"
+                    class="w-full pl-12 pr-32 py-4 rounded-2xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 dark:focus:border-zinc-700 outline-none transition-all text-lg font-medium shadow-xl shadow-zinc-200/50 dark:shadow-none uppercase tracking-widest"
                 >
                 <button 
                     type="submit"
                     id="searchBtn"
-                    class="absolute right-2 top-2 bottom-2 bg-slate-900 dark:bg-blue-600 text-white px-6 rounded-xl font-semibold hover:opacity-90 transition-opacity flex items-center gap-2"
+                    class="absolute right-2 top-2 bottom-2 bg-zinc-900 dark:bg-zinc-900 text-white px-6 rounded-xl font-semibold hover:opacity-90 transition-opacity flex items-center gap-2"
                 >
                     <span id="searchBtnText">Search</span>
                     <div id="searchLoader" class="loader hidden"></div>
@@ -136,9 +136,9 @@
         <!-- Focused Record View -->
         <section id="resultsSection" class="mb-16">
             <div id="activeState" class="hidden animate-fade-in-up">
-                <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 items-start bg-white dark:bg-slate-900/50 p-6 rounded-[2.5rem] border border-slate-200 dark:border-slate-800 shadow-sm">
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 items-start bg-white dark:bg-zinc-900/50 p-6 rounded-[2.5rem] border border-zinc-200 dark:border-zinc-800 shadow-sm">
                     <!-- Image Display -->
-                    <div class="relative group overflow-hidden rounded-3xl shadow-xl bg-slate-200 dark:bg-slate-800 aspect-video">
+                    <div class="relative group overflow-hidden rounded-3xl shadow-xl bg-zinc-200 dark:bg-zinc-800 aspect-video">
                         <img id="resultImage" src="" alt="Airport" class="w-full h-full object-cover transform group-hover:scale-105 transition-transform duration-700">
                         <div class="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex items-end p-6">
                             <a id="fullSizeLink" href="#" target="_blank" class="text-white text-sm font-medium flex items-center gap-2">
@@ -151,31 +151,31 @@
                     <div class="space-y-6">
                         <div class="flex items-start justify-between">
                             <div>
-                                <span class="inline-block px-3 py-1 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 text-xs font-bold tracking-widest uppercase mb-2">
+                                <span class="inline-block px-3 py-1 rounded-full bg-zinc-200 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 text-xs font-bold tracking-widest uppercase mb-2">
                                     Active Selection
                                 </span>
                                 <h3 id="resultIcao" class="text-5xl font-black tracking-tighter"></h3>
                             </div>
                             <div class="flex gap-2">
-                                <button onclick="handleEdit()" title="Edit Record" class="p-3 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl hover:text-blue-500 transition-colors shadow-sm">
+                                <button onclick="handleEdit()" title="Edit Record" class="p-3 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-2xl hover:text-zinc-700 transition-colors shadow-sm">
                                     <i class="fa-solid fa-arrows-rotate text-lg"></i>
                                 </button>
-                                <button onclick="handleDelete()" title="Delete Record" class="p-3 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl hover:text-red-500 transition-colors shadow-sm">
+                                <button onclick="handleDelete()" title="Delete Record" class="p-3 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-2xl hover:text-red-500 transition-colors shadow-sm">
                                     <i class="fa-solid fa-trash-can text-lg"></i>
                                 </button>
                             </div>
                         </div>
 
                         <div class="grid grid-cols-2 gap-4">
-                            <div class="bg-slate-50 dark:bg-slate-800/50 p-4 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm">
-                                <div class="flex items-center gap-2 text-slate-400 mb-1">
+                            <div class="bg-zinc-50 dark:bg-zinc-800/50 p-4 rounded-2xl border border-zinc-100 dark:border-zinc-800 shadow-sm">
+                                <div class="flex items-center gap-2 text-zinc-400 mb-1">
                                     <i class="fa-solid fa-user text-xs"></i>
                                     <span class="text-xs uppercase font-bold tracking-wider">Contributor</span>
                                 </div>
                                 <p id="resultContributor" class="font-semibold"></p>
                             </div>
-                            <div class="bg-slate-50 dark:bg-slate-800/50 p-4 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm">
-                                <div class="flex items-center gap-2 text-slate-400 mb-1">
+                            <div class="bg-zinc-50 dark:bg-zinc-800/50 p-4 rounded-2xl border border-zinc-100 dark:border-zinc-800 shadow-sm">
+                                <div class="flex items-center gap-2 text-zinc-400 mb-1">
                                     <i class="fa-solid fa-camera text-xs"></i>
                                     <span class="text-xs uppercase font-bold tracking-wider">Updated</span>
                                 </div>
@@ -183,12 +183,12 @@
                             </div>
                         </div>
 
-                        <div class="p-6 bg-blue-50 dark:bg-blue-900/10 rounded-2xl border border-blue-100 dark:border-blue-900/30">
-                            <h4 class="flex items-center gap-2 text-blue-600 dark:text-blue-400 font-bold mb-2">
+                        <div class="p-6 bg-zinc-100 dark:bg-zinc-800/40 rounded-2xl border border-zinc-200 dark:border-zinc-800">
+                            <h4 class="flex items-center gap-2 text-zinc-900 dark:text-zinc-300 font-bold mb-2">
                                 <i class="fa-solid fa-location-dot"></i>
                                 Airport Intelligence
                             </h4>
-                            <p class="text-sm text-slate-600 dark:text-slate-400 leading-relaxed">
+                            <p class="text-sm text-zinc-600 dark:text-zinc-400 leading-relaxed">
                                 Visual data for this ICAO helps pilots identify terminal layouts and visual checkpoints. 
                             </p>
                         </div>
@@ -199,12 +199,12 @@
 
         <!-- Gallery Section -->
         <section id="gallerySection" class="space-y-6">
-            <div class="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-4">
+            <div class="flex items-center justify-between border-b border-zinc-200 dark:border-zinc-800 pb-4">
                 <div class="flex items-center gap-3">
                     <h3 class="text-2xl font-bold">Community Gallery</h3>
-                    <span id="galleryCount" class="bg-slate-200 dark:bg-slate-800 px-3 py-1 rounded-full text-xs font-bold">0 Airports</span>
+                    <span id="galleryCount" class="bg-zinc-200 dark:bg-zinc-800 px-3 py-1 rounded-full text-xs font-bold">0 Airports</span>
                 </div>
-                <button onclick="fetchAllAirports()" class="text-sm font-semibold text-blue-600 dark:text-blue-400 hover:underline flex items-center gap-2">
+                <button onclick="fetchAllAirports()" class="text-sm font-semibold text-zinc-900 dark:text-zinc-500 hover:underline flex items-center gap-2">
                     <i class="fa-solid fa-rotate"></i> Refresh
                 </button>
             </div>
@@ -212,21 +212,21 @@
             <!-- Gallery Grid -->
             <div id="galleryGrid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4 min-h-[200px]">
                 <!-- Skeleton Loader (Initially shown) -->
-                <div class="animate-pulse bg-slate-200 dark:bg-slate-800 rounded-2xl aspect-square"></div>
-                <div class="animate-pulse bg-slate-200 dark:bg-slate-800 rounded-2xl aspect-square"></div>
-                <div class="animate-pulse bg-slate-200 dark:bg-slate-800 rounded-2xl aspect-square"></div>
+                <div class="animate-pulse bg-zinc-200 dark:bg-zinc-800 rounded-2xl aspect-square"></div>
+                <div class="animate-pulse bg-zinc-200 dark:bg-zinc-800 rounded-2xl aspect-square"></div>
+                <div class="animate-pulse bg-zinc-200 dark:bg-zinc-800 rounded-2xl aspect-square"></div>
             </div>
         </section>
     </main>
 
     <!-- Upload Modal -->
     <div id="uploadModal" class="fixed inset-0 z-50 flex items-center justify-center p-4 hidden">
-        <div class="absolute inset-0 bg-slate-950/60 backdrop-blur-sm" onclick="closeUploadModal()"></div>
-        <div class="relative w-full max-w-xl bg-white dark:bg-slate-900 rounded-3xl shadow-2xl overflow-hidden animate-fade-in-up">
+        <div class="absolute inset-0 bg-zinc-950/60 backdrop-blur-sm" onclick="closeUploadModal()"></div>
+        <div class="relative w-full max-w-xl bg-white dark:bg-zinc-900 rounded-3xl shadow-2xl overflow-hidden animate-fade-in-up">
             
-            <div class="p-6 border-b border-slate-100 dark:border-slate-800 flex justify-between items-center">
+            <div class="p-6 border-b border-zinc-100 dark:border-zinc-800 flex justify-between items-center">
                 <h3 class="text-xl font-bold">Contribution Center</h3>
-                <button onclick="closeUploadModal()" class="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full">
+                <button onclick="closeUploadModal()" class="p-2 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-full">
                     <i class="fa-solid fa-xmark text-lg"></i>
                 </button>
             </div>
@@ -234,29 +234,29 @@
             <form id="uploadForm" onsubmit="handleUpload(event)" class="p-6 space-y-6">
                 <div class="grid grid-cols-2 gap-4">
                     <div>
-                        <label class="block text-xs font-bold uppercase tracking-widest text-slate-400 mb-2">ICAO Code</label>
+                        <label class="block text-xs font-bold uppercase tracking-widest text-zinc-400 mb-2">ICAO Code</label>
                         <input 
                             type="text" 
                             id="formIcao"
                             placeholder="EGLL"
                             maxLength="4"
                             required
-                            class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-4 py-3 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none uppercase font-mono tracking-widest"
+                            class="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 px-4 py-3 rounded-xl focus:ring-2 focus:ring-zinc-700 outline-none uppercase font-mono tracking-widest"
                         >
                     </div>
                     <div>
-                        <label class="block text-xs font-bold uppercase tracking-widest text-slate-400 mb-2">Contributor Name</label>
+                        <label class="block text-xs font-bold uppercase tracking-widest text-zinc-400 mb-2">Contributor Name</label>
                         <input 
                             type="text" 
                             id="formContributor"
                             placeholder="Anonymous"
-                            class="w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-4 py-3 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none"
+                            class="w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 px-4 py-3 rounded-xl focus:ring-2 focus:ring-zinc-700 outline-none"
                         >
                     </div>
                 </div>
 
                 <div>
-                    <label class="block text-xs font-bold uppercase tracking-widest text-slate-400 mb-2">Airport Visual</label>
+                    <label class="block text-xs font-bold uppercase tracking-widest text-zinc-400 mb-2">Airport Visual</label>
                     <div class="relative group">
                         <input 
                             type="file" 
@@ -265,7 +265,7 @@
                             onchange="handleFilePreview(event)"
                             class="hidden"
                         >
-                        <div id="previewContainer" class="hidden relative rounded-2xl overflow-hidden aspect-video border-2 border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800">
+                        <div id="previewContainer" class="hidden relative rounded-2xl overflow-hidden aspect-video border-2 border-zinc-200 dark:border-zinc-700 bg-zinc-100 dark:bg-zinc-800">
                             <img id="formPreviewImg" src="" alt="Preview" class="w-full h-full object-cover">
                             <div class="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
                                 <label for="formFile" class="cursor-pointer bg-white text-black px-4 py-2 rounded-lg font-bold text-sm">
@@ -276,11 +276,11 @@
                         <label 
                             id="dropZone"
                             for="formFile" 
-                            class="flex flex-col items-center justify-center w-full aspect-video border-2 border-dashed border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-2xl cursor-pointer hover:border-blue-500 transition-colors"
+                            class="flex flex-col items-center justify-center w-full aspect-video border-2 border-dashed border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 rounded-2xl cursor-pointer hover:border-zinc-700 transition-colors"
                         >
-                            <i class="fa-solid fa-cloud-arrow-up text-3xl text-slate-400 mb-2"></i>
+                            <i class="fa-solid fa-cloud-arrow-up text-3xl text-zinc-400 mb-2"></i>
                             <span class="text-sm font-medium">Click to select airport photo</span>
-                            <span class="text-xs text-slate-500 mt-1">PNG, JPG or WEBP up to 10MB</span>
+                            <span class="text-xs text-zinc-500 mt-1">PNG, JPG or WEBP up to 10MB</span>
                         </label>
                     </div>
                 </div>
@@ -289,14 +289,14 @@
                     <button 
                         type="button" 
                         onclick="closeUploadModal()"
-                        class="flex-1 px-6 py-4 rounded-2xl font-bold bg-slate-100 dark:bg-slate-800 hover:opacity-80 transition-opacity"
+                        class="flex-1 px-6 py-4 rounded-2xl font-bold bg-zinc-100 dark:bg-zinc-800 hover:opacity-80 transition-opacity"
                     >
                         Cancel
                     </button>
                     <button 
                         type="submit"
                         id="submitBtn"
-                        class="flex-[2] bg-blue-600 hover:bg-blue-700 text-white px-6 py-4 rounded-2xl font-bold flex items-center justify-center gap-2 shadow-lg shadow-blue-500/20 active:scale-[0.98] transition-all"
+                        class="flex-[2] bg-zinc-900 hover:bg-zinc-800 text-white px-6 py-4 rounded-2xl font-bold flex items-center justify-center gap-2 shadow-lg shadow-zinc-700/20 active:scale-[0.98] transition-all"
                     >
                         <span id="submitBtnText">Publish Record</span>
                         <div id="submitLoader" class="loader hidden !border-white !border-t-transparent"></div>
@@ -308,7 +308,7 @@
 
     <!-- Notification Toast -->
     <div id="notification" class="fixed bottom-6 right-6 z-[100] hidden">
-        <div id="notificationContent" class="flex items-center gap-3 px-6 py-4 rounded-2xl shadow-2xl border bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800">
+        <div id="notificationContent" class="flex items-center gap-3 px-6 py-4 rounded-2xl shadow-2xl border bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800">
             <i id="notificationIcon" class="fa-solid"></i>
             <span id="notificationMessage" class="font-semibold text-sm"></span>
         </div>
@@ -340,7 +340,7 @@
             if (isDarkMode) {
                 icon.className = 'fa-solid fa-sun text-yellow-400 text-lg';
             } else {
-                icon.className = 'fa-solid fa-moon text-slate-600 text-lg';
+                icon.className = 'fa-solid fa-moon text-zinc-600 text-lg';
             }
         }
 
@@ -360,8 +360,8 @@
                 content.classList.add('bg-green-50', 'dark:bg-green-900/20', 'border-green-200', 'dark:border-green-900', 'text-green-600', 'dark:text-green-400');
                 icon.className = 'fa-solid fa-circle-check';
             } else {
-                content.classList.add('bg-white', 'dark:bg-slate-900', 'border-slate-200', 'dark:border-slate-800');
-                icon.className = 'fa-solid fa-circle-info text-blue-500';
+                content.classList.add('bg-white', 'dark:bg-zinc-900', 'border-zinc-200', 'dark:border-zinc-800');
+                icon.className = 'fa-solid fa-circle-info text-zinc-700';
             }
 
             toast.classList.remove('hidden');
@@ -425,21 +425,21 @@
                 document.getElementById('galleryCount').textContent = `${airports.length} Airports`;
                 renderGallery(airports);
             } catch (err) {
-                grid.innerHTML = `<div class="col-span-full text-center py-10 text-slate-400">Failed to load gallery.</div>`;
+                grid.innerHTML = `<div class="col-span-full text-center py-10 text-zinc-400">Failed to load gallery.</div>`;
             }
         }
 
         function renderGallery(airports) {
             const grid = document.getElementById('galleryGrid');
             if (airports.length === 0) {
-                grid.innerHTML = `<div class="col-span-full text-center py-10 text-slate-400">No airport photos yet.</div>`;
+                grid.innerHTML = `<div class="col-span-full text-center py-10 text-zinc-400">No airport photos yet.</div>`;
                 return;
             }
 
             grid.innerHTML = airports.map(ap => `
                 <div 
                     onclick="selectAirport('${ap.icao}')"
-                    class="gallery-card relative group cursor-pointer overflow-hidden rounded-2xl bg-slate-200 dark:bg-slate-800 aspect-square shadow-sm transition-all hover:ring-2 hover:ring-blue-500"
+                    class="gallery-card relative group cursor-pointer overflow-hidden rounded-2xl bg-zinc-200 dark:bg-zinc-800 aspect-square shadow-sm transition-all hover:ring-2 hover:ring-zinc-700"
                 >
                     <img src="${ap.imageUrl}" alt="${ap.icao}" class="w-full h-full object-cover">
                     <div class="gallery-overlay absolute inset-0 bg-black/40 opacity-0 transition-opacity flex items-center justify-center">

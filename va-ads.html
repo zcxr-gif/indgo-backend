@@ -39,22 +39,25 @@
         .modal-scroll::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 4px; }
     </style>
 </head>
-<body class="bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 transition-colors duration-300 min-h-screen">
+<body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 transition-colors duration-300 min-h-screen">
 
     <!-- Navigation -->
-    <nav class="sticky top-0 z-40 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md border-b border-slate-200 dark:border-slate-800">
+    <nav class="sticky top-0 z-40 bg-white/80 dark:bg-zinc-900/80 backdrop-blur-md border-b border-zinc-200 dark:border-zinc-800">
         <div class="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
-            <div class="flex items-center gap-2">
-                <div class="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white shadow-lg shadow-blue-500/20">
+            <div class="flex items-center gap-2.5">
+                <a href="/staff" title="Back to hub" class="w-9 h-9 grid place-items-center rounded-xl hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition-colors">
+                    <i class="fa-solid fa-arrow-left"></i>
+                </a>
+                <div class="w-10 h-10 bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 rounded-xl flex items-center justify-center">
                     <i class="fa-solid fa-bullhorn text-lg"></i>
                 </div>
                 <h1 class="text-xl font-bold tracking-tight hidden sm:block">VA Ads Manager</h1>
             </div>
             <div class="flex items-center gap-3">
-                <button onclick="toggleDarkMode()" class="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full transition-colors">
-                    <i id="themeIcon" class="fa-solid fa-moon text-slate-600 dark:text-yellow-400 text-lg"></i>
+                <button onclick="toggleDarkMode()" class="p-2 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-full transition-colors">
+                    <i id="themeIcon" class="fa-solid fa-moon text-zinc-600 dark:text-yellow-400 text-lg"></i>
                 </button>
-                <button onclick="openModal()" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition-all active:scale-95 shadow-lg shadow-blue-600/20">
+                <button onclick="openModal()" class="bg-zinc-900 hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 text-white px-4 py-2 rounded-xl font-medium flex items-center gap-2 transition-all active:scale-95 shadow-sm">
                     <i class="fa-solid fa-plus text-sm"></i><span>Add VA</span>
                 </button>
             </div>
@@ -64,28 +67,28 @@
     <main class="max-w-7xl mx-auto px-4 py-8">
         <!-- Header + stats -->
         <section class="mb-8">
-            <h2 class="text-3xl sm:text-4xl font-extrabold mb-2 bg-gradient-to-r from-blue-600 to-indigo-500 bg-clip-text text-transparent">Virtual Airline Advertisements</h2>
-            <p class="text-slate-500 dark:text-slate-400 font-medium" id="countLabel">Loading…</p>
+            <h2 class="text-3xl sm:text-4xl font-extrabold tracking-tight mb-2 bg-gradient-to-r from-zinc-900 to-zinc-500 dark:from-white dark:to-zinc-400 bg-clip-text text-transparent">Virtual Airline Advertisements</h2>
+            <p class="text-zinc-500 dark:text-zinc-400 font-medium" id="countLabel">Loading…</p>
         </section>
 
         <!-- Filters -->
         <section class="mb-8 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
             <div class="relative sm:col-span-2 lg:col-span-1">
-                <i class="fa-solid fa-search absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"></i>
-                <input id="searchInput" oninput="debouncedLoad()" placeholder="Search name, tags…" class="w-full pl-10 pr-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none transition-all font-medium">
+                <i class="fa-solid fa-search absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400"></i>
+                <input id="searchInput" oninput="debouncedLoad()" placeholder="Search name, tags…" class="w-full pl-10 pr-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none transition-all font-medium">
             </div>
-            <select id="statusFilter" onchange="loadAds()" class="px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none font-medium">
+            <select id="statusFilter" onchange="loadAds()" class="px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none font-medium">
                 <option value="all">All statuses</option>
                 <option value="approved">Live (approved)</option>
                 <option value="pending">Draft (pending)</option>
                 <option value="rejected">Archived (rejected)</option>
             </select>
-            <select id="typeFilter" onchange="loadAds()" class="px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none font-medium">
+            <select id="typeFilter" onchange="loadAds()" class="px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none font-medium">
                 <option value="">All types</option>
                 <option value="VA">Virtual Airline (VA)</option>
                 <option value="VO">Virtual Organization (VO)</option>
             </select>
-            <select id="sortFilter" onchange="loadAds()" class="px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none font-medium">
+            <select id="sortFilter" onchange="loadAds()" class="px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none font-medium">
                 <option value="">Featured first</option>
                 <option value="newest">Newest</option>
                 <option value="oldest">Oldest</option>
@@ -99,20 +102,20 @@
 
         <!-- Empty / loading states -->
         <div id="emptyState" class="hidden text-center py-24">
-            <i class="fa-solid fa-plane-slash text-5xl text-slate-300 dark:text-slate-700 mb-4"></i>
-            <p class="text-slate-500 dark:text-slate-400 font-medium">No advertisements found. Click “Add VA” to create one.</p>
+            <i class="fa-solid fa-plane-slash text-5xl text-zinc-300 dark:text-zinc-700 mb-4"></i>
+            <p class="text-zinc-500 dark:text-zinc-400 font-medium">No advertisements found. Click “Add VA” to create one.</p>
         </div>
         <div id="loadingState" class="text-center py-24">
-            <div class="loader mx-auto border-blue-500/30 border-t-blue-500"></div>
+            <div class="loader mx-auto border-zinc-700/30 border-t-zinc-700"></div>
         </div>
     </main>
 
     <!-- ===================== MODAL ===================== -->
-    <div id="modal" class="hidden fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-start sm:items-center justify-center p-4 overflow-y-auto">
-        <div class="bg-white dark:bg-slate-900 rounded-3xl w-full max-w-2xl my-8 shadow-2xl border border-slate-200 dark:border-slate-800 animate-fade-in-up">
-            <div class="flex items-center justify-between px-6 py-4 border-b border-slate-200 dark:border-slate-800 sticky top-0 bg-white dark:bg-slate-900 rounded-t-3xl z-10">
+    <div id="modal" class="hidden fixed inset-0 z-50 bg-zinc-900/60 backdrop-blur-sm flex items-start sm:items-center justify-center p-4 overflow-y-auto">
+        <div class="bg-white dark:bg-zinc-900 rounded-3xl w-full max-w-2xl my-8 shadow-2xl border border-zinc-200 dark:border-zinc-800 animate-fade-in-up">
+            <div class="flex items-center justify-between px-6 py-4 border-b border-zinc-200 dark:border-zinc-800 sticky top-0 bg-white dark:bg-zinc-900 rounded-t-3xl z-10">
                 <h3 id="modalTitle" class="text-lg font-bold">Add VA Advertisement</h3>
-                <button onclick="closeModal()" class="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full"><i class="fa-solid fa-xmark text-lg"></i></button>
+                <button onclick="closeModal()" class="p-2 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-full"><i class="fa-solid fa-xmark text-lg"></i></button>
             </div>
 
             <form id="adForm" onsubmit="submitForm(event)" class="px-6 py-5 space-y-5 max-h-[70vh] overflow-y-auto modal-scroll">
@@ -122,17 +125,17 @@
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
                     <div class="sm:col-span-2">
                         <label class="block text-sm font-semibold mb-1.5">Banner</label>
-                        <div class="relative aspect-[8/3] rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 overflow-hidden bg-slate-50 dark:bg-slate-800/50 flex items-center justify-center">
+                        <div class="relative aspect-[8/3] rounded-xl border-2 border-dashed border-zinc-300 dark:border-zinc-700 overflow-hidden bg-zinc-50 dark:bg-zinc-800/50 flex items-center justify-center">
                             <img id="bannerPreview" class="hidden absolute inset-0 w-full h-full object-cover">
-                            <span id="bannerPlaceholder" class="text-slate-400 text-sm"><i class="fa-solid fa-image mr-1"></i>Banner image</span>
+                            <span id="bannerPlaceholder" class="text-zinc-400 text-sm"><i class="fa-solid fa-image mr-1"></i>Banner image</span>
                             <input type="file" id="bannerInput" accept="image/*" onchange="previewImage(this,'bannerPreview','bannerPlaceholder')" class="absolute inset-0 opacity-0 cursor-pointer">
                         </div>
                     </div>
                     <div>
                         <label class="block text-sm font-semibold mb-1.5">Logo</label>
-                        <div class="relative aspect-square rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 overflow-hidden bg-slate-50 dark:bg-slate-800/50 flex items-center justify-center">
+                        <div class="relative aspect-square rounded-xl border-2 border-dashed border-zinc-300 dark:border-zinc-700 overflow-hidden bg-zinc-50 dark:bg-zinc-800/50 flex items-center justify-center">
                             <img id="logoPreview" class="hidden absolute inset-0 w-full h-full object-contain">
-                            <span id="logoPlaceholder" class="text-slate-400 text-xs text-center px-2"><i class="fa-solid fa-image"></i></span>
+                            <span id="logoPlaceholder" class="text-zinc-400 text-xs text-center px-2"><i class="fa-solid fa-image"></i></span>
                             <input type="file" id="logoInput" accept="image/*" onchange="previewImage(this,'logoPreview','logoPlaceholder')" class="absolute inset-0 opacity-0 cursor-pointer">
                         </div>
                     </div>
@@ -142,85 +145,85 @@
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
                     <div class="sm:col-span-2">
                         <label class="block text-sm font-semibold mb-1.5">VA Name <span class="text-red-500">*</span></label>
-                        <input id="f_name" required class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none">
+                        <input id="f_name" required class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                     </div>
                     <div>
-                        <label class="block text-sm font-semibold mb-1.5">Callsign <span class="font-normal text-slate-400">— base only, pilots fly as "NAME ##VA"</span></label>
-                        <input id="f_callsign" placeholder="e.g. Ocean → OCEAN ##VA" class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none uppercase">
+                        <label class="block text-sm font-semibold mb-1.5">Callsign <span class="font-normal text-zinc-400">— base only, pilots fly as "NAME ##VA"</span></label>
+                        <input id="f_callsign" placeholder="e.g. Ocean → OCEAN ##VA" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
                     </div>
                 </div>
 
                 <div>
                     <label class="block text-sm font-semibold mb-1.5">Tagline</label>
-                    <input id="f_tagline" maxlength="140" placeholder="One-line hook (max 140 chars)" class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none">
+                    <input id="f_tagline" maxlength="140" placeholder="One-line hook (max 140 chars)" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                 </div>
 
                 <div>
                     <label class="block text-sm font-semibold mb-1.5">Description</label>
-                    <textarea id="f_description" rows="3" class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none resize-y"></textarea>
+                    <textarea id="f_description" rows="3" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none resize-y"></textarea>
                 </div>
 
                 <!-- Type / region / pilots / grade -->
                 <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
                     <div>
                         <label class="block text-sm font-semibold mb-1.5">Type</label>
-                        <select id="f_type" class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none">
+                        <select id="f_type" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                             <option value="VA">VA</option>
                             <option value="VO">VO</option>
                         </select>
                     </div>
                     <div>
                         <label class="block text-sm font-semibold mb-1.5">Region</label>
-                        <input id="f_region" value="Global" class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none">
+                        <input id="f_region" value="Global" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                     </div>
                     <div>
                         <label class="block text-sm font-semibold mb-1.5">Pilots</label>
-                        <input id="f_pilotCount" type="number" min="0" value="0" class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none">
+                        <input id="f_pilotCount" type="number" min="0" value="0" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                     </div>
                     <div>
                         <label class="block text-sm font-semibold mb-1.5">Min Grade</label>
-                        <input id="f_minGrade" type="number" min="1" max="5" placeholder="1–5" class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none">
+                        <input id="f_minGrade" type="number" min="1" max="5" placeholder="1–5" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                     </div>
                 </div>
 
                 <!-- Hubs / fleet / tags -->
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
                     <div>
-                        <label class="block text-sm font-semibold mb-1.5">Hubs <span class="text-slate-400 font-normal">(comma sep.)</span></label>
-                        <input id="f_hubs" placeholder="VABB, VIDP" class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none uppercase">
+                        <label class="block text-sm font-semibold mb-1.5">Hubs <span class="text-zinc-400 font-normal">(comma sep.)</span></label>
+                        <input id="f_hubs" placeholder="VABB, VIDP" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
                     </div>
                     <div>
-                        <label class="block text-sm font-semibold mb-1.5">Fleet <span class="text-slate-400 font-normal">(comma sep.)</span></label>
-                        <input id="f_fleet" placeholder="A320, B777" class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none">
+                        <label class="block text-sm font-semibold mb-1.5">Fleet <span class="text-zinc-400 font-normal">(comma sep.)</span></label>
+                        <input id="f_fleet" placeholder="A320, B777" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                     </div>
                     <div>
-                        <label class="block text-sm font-semibold mb-1.5">Tags <span class="text-slate-400 font-normal">(comma sep.)</span></label>
-                        <input id="f_tags" placeholder="realistic, events" class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none">
+                        <label class="block text-sm font-semibold mb-1.5">Tags <span class="text-zinc-400 font-normal">(comma sep.)</span></label>
+                        <input id="f_tags" placeholder="realistic, events" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                     </div>
                 </div>
 
                 <div>
                     <label class="block text-sm font-semibold mb-1.5">Joining Requirements</label>
-                    <textarea id="f_requirements" rows="2" class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none resize-y"></textarea>
+                    <textarea id="f_requirements" rows="2" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none resize-y"></textarea>
                 </div>
 
                 <!-- Links -->
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div>
-                        <label class="block text-sm font-semibold mb-1.5"><i class="fa-solid fa-globe text-slate-400 mr-1"></i>Website</label>
-                        <input id="f_websiteUrl" type="url" class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none">
+                        <label class="block text-sm font-semibold mb-1.5"><i class="fa-solid fa-globe text-zinc-400 mr-1"></i>Website</label>
+                        <input id="f_websiteUrl" type="url" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                     </div>
                     <div>
-                        <label class="block text-sm font-semibold mb-1.5"><i class="fa-brands fa-discord text-slate-400 mr-1"></i>Discord Invite</label>
-                        <input id="f_discordUrl" type="url" class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none">
+                        <label class="block text-sm font-semibold mb-1.5"><i class="fa-brands fa-discord text-zinc-400 mr-1"></i>Discord Invite</label>
+                        <input id="f_discordUrl" type="url" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                     </div>
                     <div>
-                        <label class="block text-sm font-semibold mb-1.5"><i class="fa-solid fa-comments text-slate-400 mr-1"></i>IFC Thread</label>
-                        <input id="f_ifcThreadUrl" type="url" class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none">
+                        <label class="block text-sm font-semibold mb-1.5"><i class="fa-solid fa-comments text-zinc-400 mr-1"></i>IFC Thread</label>
+                        <input id="f_ifcThreadUrl" type="url" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                     </div>
                     <div>
-                        <label class="block text-sm font-semibold mb-1.5"><i class="fa-solid fa-paper-plane text-slate-400 mr-1"></i>Application Link</label>
-                        <input id="f_applicationUrl" type="url" class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none">
+                        <label class="block text-sm font-semibold mb-1.5"><i class="fa-solid fa-paper-plane text-zinc-400 mr-1"></i>Application Link</label>
+                        <input id="f_applicationUrl" type="url" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                     </div>
                 </div>
 
@@ -228,11 +231,11 @@
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div>
                         <label class="block text-sm font-semibold mb-1.5">Owner / Contact Name</label>
-                        <input id="f_ownerName" class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none">
+                        <input id="f_ownerName" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                     </div>
                     <div>
                         <label class="block text-sm font-semibold mb-1.5">Contact Email</label>
-                        <input id="f_contactEmail" type="email" class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none">
+                        <input id="f_contactEmail" type="email" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                     </div>
                 </div>
 
@@ -240,14 +243,14 @@
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 items-end">
                     <div>
                         <label class="block text-sm font-semibold mb-1.5">Status</label>
-                        <select id="f_status" class="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:border-blue-500 outline-none">
+                        <select id="f_status" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                             <option value="approved">Live (approved)</option>
                             <option value="pending">Draft (pending)</option>
                             <option value="rejected">Archived (rejected)</option>
                         </select>
                     </div>
                     <label class="flex items-center gap-2 py-2.5 cursor-pointer">
-                        <input type="checkbox" id="f_recruiting" checked class="w-5 h-5 rounded accent-blue-600">
+                        <input type="checkbox" id="f_recruiting" checked class="w-5 h-5 rounded accent-zinc-900">
                         <span class="text-sm font-semibold">Recruiting</span>
                     </label>
                     <label class="flex items-center gap-2 py-2.5 cursor-pointer">
@@ -257,9 +260,9 @@
                 </div>
             </form>
 
-            <div class="flex items-center justify-end gap-3 px-6 py-4 border-t border-slate-200 dark:border-slate-800">
-                <button onclick="closeModal()" class="px-4 py-2.5 rounded-xl font-medium hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors">Cancel</button>
-                <button onclick="submitForm(event)" id="saveBtn" class="bg-blue-600 hover:bg-blue-700 text-white px-5 py-2.5 rounded-xl font-semibold flex items-center gap-2 transition-all active:scale-95 shadow-lg shadow-blue-600/20">
+            <div class="flex items-center justify-end gap-3 px-6 py-4 border-t border-zinc-200 dark:border-zinc-800">
+                <button onclick="closeModal()" class="px-4 py-2.5 rounded-xl font-medium hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors">Cancel</button>
+                <button onclick="submitForm(event)" id="saveBtn" class="bg-zinc-900 hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 text-white px-5 py-2.5 rounded-xl font-semibold flex items-center gap-2 transition-all active:scale-95 shadow-sm">
                     <span id="saveBtnText">Save</span>
                     <div id="saveLoader" class="loader hidden"></div>
                 </button>
@@ -279,7 +282,7 @@
             document.documentElement.classList.toggle('dark');
             const dark = document.documentElement.classList.contains('dark');
             localStorage.setItem('theme', dark ? 'dark' : 'light');
-            document.getElementById('themeIcon').className = dark ? 'fa-solid fa-sun text-yellow-400 text-lg' : 'fa-solid fa-moon text-slate-600 text-lg';
+            document.getElementById('themeIcon').className = dark ? 'fa-solid fa-sun text-yellow-400 text-lg' : 'fa-solid fa-moon text-zinc-600 text-lg';
         }
         (function initTheme() {
             const saved = localStorage.getItem('theme');
@@ -311,7 +314,7 @@
         const statusBadge = (s) => {
             const map = { approved: ['Live','bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300'],
                           pending: ['Draft','bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300'],
-                          rejected: ['Archived','bg-slate-200 text-slate-600 dark:bg-slate-800 dark:text-slate-400'] };
+                          rejected: ['Archived','bg-zinc-200 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400'] };
             const [label, cls] = map[s] || map.pending;
             return `<span class="px-2 py-0.5 rounded-full text-xs font-semibold ${cls}">${label}</span>`;
         };
@@ -352,12 +355,12 @@
         function cardHtml(ad) {
             const banner = ad.bannerUrl
                 ? `<img src="${esc(ad.bannerUrl)}" class="w-full h-full object-cover">`
-                : `<div class="w-full h-full flex items-center justify-center text-slate-300 dark:text-slate-700"><i class="fa-solid fa-plane text-4xl"></i></div>`;
-            const logo = ad.logoUrl ? `<img src="${esc(ad.logoUrl)}" class="w-12 h-12 rounded-lg object-contain bg-white border border-slate-200 dark:border-slate-700 shadow -mt-8 relative z-10">` : '';
+                : `<div class="w-full h-full flex items-center justify-center text-zinc-300 dark:text-zinc-700"><i class="fa-solid fa-plane text-4xl"></i></div>`;
+            const logo = ad.logoUrl ? `<img src="${esc(ad.logoUrl)}" class="w-12 h-12 rounded-lg object-contain bg-white border border-zinc-200 dark:border-zinc-700 shadow -mt-8 relative z-10">` : '';
             const star = ad.featured ? '<i class="fa-solid fa-star text-amber-400" title="Featured"></i>' : '';
             return `
-            <div class="bg-white dark:bg-slate-900/60 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm overflow-hidden flex flex-col animate-fade-in-up">
-                <div class="relative aspect-[8/3] bg-slate-100 dark:bg-slate-800">
+            <div class="bg-white dark:bg-zinc-900/60 rounded-2xl border border-zinc-200 dark:border-zinc-800 shadow-sm overflow-hidden flex flex-col animate-fade-in-up">
+                <div class="relative aspect-[8/3] bg-zinc-100 dark:bg-zinc-800">
                     ${banner}
                     <div class="absolute top-2 right-2 flex items-center gap-2">${star}${statusBadge(ad.status)}</div>
                 </div>
@@ -367,22 +370,22 @@
                         <div class="min-w-0 flex-1">
                             <div class="flex items-center gap-2">
                                 <h3 class="font-bold truncate">${esc(ad.name)}</h3>
-                                <span class="text-xs px-1.5 py-0.5 rounded bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300 font-semibold shrink-0">${esc(ad.type)}</span>
+                                <span class="text-xs px-1.5 py-0.5 rounded bg-zinc-200 text-zinc-800 dark:bg-zinc-800 dark:text-zinc-300 font-semibold shrink-0">${esc(ad.type)}</span>
                             </div>
-                            <p class="text-xs text-slate-500 dark:text-slate-400 truncate">${ad.callsign ? esc(fmtCallsign(ad.callsign)) + ' · ' : ''}${esc(ad.region || 'Global')}</p>
+                            <p class="text-xs text-zinc-500 dark:text-zinc-400 truncate">${ad.callsign ? esc(fmtCallsign(ad.callsign)) + ' · ' : ''}${esc(ad.region || 'Global')}</p>
                         </div>
                     </div>
-                    ${ad.tagline ? `<p class="text-sm text-slate-600 dark:text-slate-300 mt-3 line-clamp-2">${esc(ad.tagline)}</p>` : ''}
-                    <div class="flex flex-wrap gap-x-4 gap-y-1 mt-3 text-xs text-slate-500 dark:text-slate-400">
+                    ${ad.tagline ? `<p class="text-sm text-zinc-600 dark:text-zinc-300 mt-3 line-clamp-2">${esc(ad.tagline)}</p>` : ''}
+                    <div class="flex flex-wrap gap-x-4 gap-y-1 mt-3 text-xs text-zinc-500 dark:text-zinc-400">
                         <span><i class="fa-solid fa-users mr-1"></i>${ad.pilotCount ?? 0} pilots</span>
                         <span><i class="fa-solid fa-eye mr-1"></i>${ad.views ?? 0}</span>
                         <span><i class="fa-solid fa-arrow-pointer mr-1"></i>${ad.clicks ?? 0}</span>
-                        <span class="${ad.recruiting ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-400'}"><i class="fa-solid fa-${ad.recruiting ? 'door-open' : 'door-closed'} mr-1"></i>${ad.recruiting ? 'Recruiting' : 'Closed'}</span>
+                        <span class="${ad.recruiting ? 'text-emerald-600 dark:text-emerald-400' : 'text-zinc-400'}"><i class="fa-solid fa-${ad.recruiting ? 'door-open' : 'door-closed'} mr-1"></i>${ad.recruiting ? 'Recruiting' : 'Closed'}</span>
                     </div>
-                    <div class="flex items-center gap-2 mt-4 pt-3 border-t border-slate-100 dark:border-slate-800">
-                        <button onclick='openModal(${JSON.stringify(ad).replace(/'/g, "&#39;")})' class="flex-1 text-sm font-medium py-2 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"><i class="fa-solid fa-pen mr-1"></i>Edit</button>
-                        <button onclick="toggleFeature('${ad._id}')" class="px-3 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-amber-100 dark:hover:bg-amber-900/40 transition-colors" title="Toggle featured"><i class="fa-${ad.featured ? 'solid' : 'regular'} fa-star ${ad.featured ? 'text-amber-400' : ''}"></i></button>
-                        <button onclick="removeAd('${ad._id}','${esc(ad.name)}')" class="px-3 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-red-100 dark:hover:bg-red-900/40 hover:text-red-600 transition-colors" title="Delete"><i class="fa-solid fa-trash"></i></button>
+                    <div class="flex items-center gap-2 mt-4 pt-3 border-t border-zinc-100 dark:border-zinc-800">
+                        <button onclick='openModal(${JSON.stringify(ad).replace(/'/g, "&#39;")})' class="flex-1 text-sm font-medium py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"><i class="fa-solid fa-pen mr-1"></i>Edit</button>
+                        <button onclick="toggleFeature('${ad._id}')" class="px-3 py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-amber-100 dark:hover:bg-amber-900/40 transition-colors" title="Toggle featured"><i class="fa-${ad.featured ? 'solid' : 'regular'} fa-star ${ad.featured ? 'text-amber-400' : ''}"></i></button>
+                        <button onclick="removeAd('${ad._id}','${esc(ad.name)}')" class="px-3 py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-red-100 dark:hover:bg-red-900/40 hover:text-red-600 transition-colors" title="Delete"><i class="fa-solid fa-trash"></i></button>
                     </div>
                 </div>
             </div>`;
