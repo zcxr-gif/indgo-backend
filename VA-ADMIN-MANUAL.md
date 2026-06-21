@@ -49,9 +49,27 @@ A listing can only exist if **all** of these are true. If any fails, decline.
 - [ ] The VA is **IFVARB-approved**, OR qualifies under a documented exception
       in Section 3.
 
-"Active" is judged, not guessed. Reasonable signals: a live Discord with recent
-activity, a current IFC thread, recent events, a working website/application
-link. A dead Discord + a thread last touched a year ago is **not** active.
+**"Active" — concrete test.** Don't guess; apply these thresholds. A VA is
+**active** if it meets **at least two** of the following, with **no hard
+disqualifier** present:
+
+*Active signals (need ≥ 2):*
+- **Discord:** public messages in the **last 30 days** and a **working** invite.
+- **Events/operations:** at least **one event or organised flight in the last 60
+  days** (Inflight-tracked, per Terms §4).
+- **IFC thread:** an official thread updated/posted in within the **last 90 days**.
+- **Pilots:** a plausible, non-zero active roster (not a number pulled from thin
+  air).
+- **Links:** website and application/join link both **resolve and work**.
+
+*Hard disqualifiers (any one → treat as inactive, regardless of the above):*
+- Discord invite **dead/expired** or server **empty/abandoned**.
+- **No event or operation in the last 90 days.**
+- Primary application/join link **broken** with no working alternative.
+
+Borderline (exactly the minimum, or recently relaunched)? List as **Draft
+(pending)**, give them a courtesy note, and re-check in ~2 weeks before going
+Live.
 
 ---
 
@@ -208,9 +226,10 @@ links):
   announcement (Discord, IFC, anywhere) **must include a picture showing the
   event in our tracker**. Running or publicising an event **without** using
   Inflight is grounds to **suspend or remove** the listing at your discretion.
-- **Inactivity:** a VA that has gone dark (dead Discord, no events, broken links)
-  may be archived for inactivity. Courtesy-contact first where practical, then
-  archive.
+- **Inactivity:** a VA that **fails the "active" test in Section 2** (hits a hard
+  disqualifier, or drops below two active signals) may be archived. Courtesy-
+  contact first where practical, start the §8 clock if a fix is possible, then
+  archive if it stays dark.
 
 ---
 
@@ -218,6 +237,67 @@ links):
 
 The **VA Ads Manager** at `yoursite.com/va-ads` is your console. Search/filter by
 status, type, and sort; each card has **Edit**, **Feature** (star), and **Delete**.
+
+### 8.0 VA Application / Intake Template
+
+Send this to any VA before you create a listing. It collects everything the
+manager form needs (Section 5) and the proof you need to vet under Sections 2–3.
+Copy-paste it into Discord/email; don't create a Live listing until the
+**required** items are answered and verified.
+
+```
+INFLIGHT VA ADVERTISEMENT — APPLICATION
+
+— Eligibility & verification (required) —
+1. VA / VO name (exactly as approved):
+2. Are you the CEO, owner, or an authorised representative?  (yes/no + your role)
+3. IFVARB approval — link to the approval post/thread:
+   • If not IFVARB-approved: which applies?  (a) VO outside IFVARB's remit
+     (b) established legacy VA  (c) IFVARB application in progress  (d) other
+   • If "in progress", link to your submission:
+4. Do you own or have permission to use ALL logos/banners/images you're sending?
+   (yes/no)
+
+— Identity (required: name; preferred: callsign, type) —
+5. Type:  VA  /  VO
+6. Base callsign (base word only — we add "##VA" automatically, e.g. OCEAN):
+7. Region (e.g. Asia / Europe / Global):
+
+— Copy —
+8. Tagline (one line, max 140 chars):
+9. Short description:
+
+— Operations (for the "active" test, Section 2) —
+10. Primary hub ICAO code(s), comma-separated (e.g. VABB, VIDP):
+11. Fleet / aircraft types (comma-separated):
+12. Approx. active pilot count:
+13. Minimum Infinite Flight grade to join (1–5, or "none"):
+14. Joining requirements (free text):
+15. Date of your most recent event/operation, and was it tracked on Inflight?
+    (Terms §4 — every event must be tracked on Inflight)
+
+— Links (test each before submitting) —
+16. Website:
+17. Discord invite (must be live/non-expiring):
+18. IFC thread:
+19. Application / join link:
+
+— Contact —
+20. Owner / contact name:
+21. Contact email:
+
+— Assets —
+22. Attach: square LOGO (≈512px) and wide BANNER (≈1600×600). Must be yours to use.
+
+By submitting, you agree to the Inflight VA Advertisement Program Terms &
+Conditions, including the event-tracking requirement and our right to edit,
+suspend, or remove listings at our discretion.
+```
+
+**Admin vetting pass after intake:** confirm Q2 (authorised), Q3 (IFVARB or a
+valid exception), Q4 (image rights), the **active** test from Section 2, and that
+links Q16–Q19 all resolve. Then create the listing per Section 8.1, logging the
+decision (Section 10).
 
 ### 8.1 Accept a new VA (decision flow)
 
@@ -349,8 +429,9 @@ Program. We make **no guarantee** of visibility, traffic, or recruitment
 
 ## 14. Quick Reference Card
 
-**List it only if:** genuine + active + authorised rep + owns imagery + **IFVARB
-approved** (or exception **E1–E4**) + content standards pass.
+**List it only if:** genuine + **active** (≥2 signals, no hard disqualifier — §2)
++ authorised rep + owns imagery + **IFVARB approved** (or exception **E1–E4**) +
+content standards pass.
 
 **Decline if:** not IFVARB and not E1–E4 · inactive/fake · infringing branding ·
 misleading/offensive content · unauthorised submitter.
