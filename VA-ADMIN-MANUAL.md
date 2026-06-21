@@ -198,7 +198,8 @@ Statuses (one show/hide switch with three values):
 
 - **Live (approved)** — publicly visible across all surfaces.
 - **Draft (pending)** — staged, not public. Use for E3 (IFVARB pending) and for
-  anything you're still vetting.
+  anything you're still vetting. **Every `/va_apply` submission lands here
+  automatically** until a staff member approves it (Section 8B).
 - **Archived (rejected)** — hidden but **not deleted**. Use this to suspend or
   retire a listing while keeping its record and analytics.
 
@@ -240,10 +241,12 @@ status, type, and sort; each card has **Edit**, **Feature** (star), and **Delete
 
 ### 8.0 VA Application / Intake Template
 
-Send this to any VA before you create a listing. It collects everything the
-manager form needs (Section 5) and the proof you need to vet under Sections 2–3.
-Copy-paste it into Discord/email; don't create a Live listing until the
-**required** items are answered and verified.
+Send this to any VA before you create a listing **or** before you click **Approve
+& Create** on a `/va_apply` submission (Section 8B) — the Discord form only
+captures the basics, so you still need this proof either way. It collects
+everything the manager form needs (Section 5) and the proof you need to vet under
+Sections 2–3. Copy-paste it into Discord/email; don't approve or create a Live
+listing until the **required** items are answered and verified.
 
 ```
 INFLIGHT VA ADVERTISEMENT — APPLICATION
@@ -313,9 +316,17 @@ New submission / invitation
         └─ APPROVE → create listing, set Status, test all links, log decision
 ```
 
-**To create:** click **Add VA** → fill fields per Section 5 → upload banner +
+This same flow applies whether the VA reaches you via the **web manager** or a
+**Discord `/va_apply`** submission (Section 8B) — only the buttons differ. A bot
+application lands as **pending** with a review card (Approve & Create / Request
+Edits / Reject); a web listing you author directly.
+
+**To create (web):** click **Add VA** → fill fields per Section 5 → upload banner +
 logo → set **Status** (Live for verified IFVARB; Draft for E3/pending vetting) →
 Save. Names must be unique (the system blocks duplicates).
+
+**To accept (bot):** vet with the intake template first, then click **Approve &
+Create** — this also provisions the VA's Discord role + channel (Section 8B.2).
 
 ### 8.2 Edit a listing
 Click **Edit** on the card. Only the fields you change are updated; uploading a
@@ -333,6 +344,98 @@ Spam / duplicates / valid takedown / permanent clean exit only.
 ### 8.5 Recruiting toggle
 Flip **Recruiting** off when a VA says applications are closed — keeps the listing
 visible but honestly labelled "Closed".
+
+---
+
+## 8B. The Discord Bot Workflow (the other front door)
+
+Listings reach the directory **two ways**. Section 8 covered the web manager,
+where you author a listing directly (defaults to **Live**). The other path is the
+**Discord bot**, where VA owners self-apply and you approve from a review channel.
+Both write to the same `VirtualAirlineAd` records — a VA created on one shows up
+on the other. **Know both, because each does something the other doesn't.**
+
+> **The one distinction that matters most:** approving in the **bot** (the
+> **Approve & Create** button) both sets the listing Live **and provisions Discord**
+> (role + private channel + rep access). Approving in the **web manager** (setting
+> Status = Live) **only** changes visibility — it does **not** create any Discord
+> space. If a VA needs its Discord role/channel, the approval must go through the
+> bot, or be provisioned via the staff commands below.
+
+### 8B.1 How an application arrives (`/va_apply`)
+- A VA owner runs **`/va_apply`** and fills a short modal: name, base callsign,
+  type (VA/VO), tagline, and website + Discord links.
+- The bot creates (or updates) the record as **`pending`** (Draft) — never Live on
+  submission — and posts a **review card** to the staff applications channel,
+  pinging the admin role.
+- A re-application for the same name by the **same owner** updates their existing
+  pending row; a name already owned by **someone else** is refused, and an
+  already-**approved** name is rejected as a duplicate. (Name uniqueness is
+  enforced everywhere.)
+
+### 8B.2 The review card — your three buttons
+On each pending application you get:
+
+| Button | What it does | When to use it |
+|--------|--------------|----------------|
+| **✅ Approve & Create** | Sets status **approved/Live**, **provisions** the VA's Discord role + private channel, grants the owner the **VA role + shared "VA Rep" role**, DMs the owner, and posts a **setup card** in their new channel. | Only after the VA passes Sections 2–3 (active + IFVARB/exception + owns imagery). This is the real "accept". |
+| **✏️ Request Edits** | Prompts you for what needs changing; the note is **sent to the applicant**. Leaves status pending. | Borderline/incomplete — missing IFVARB proof, weak imagery rights, broken links. Pairs with the §8 7-day clock. |
+| **❌ Reject** | Prompts for a reason (sent to the applicant) and sets status **rejected** (Archived). | Ineligible, not IFVARB and no exception, infringing, or inactive. |
+
+**Vet before you click Approve & Create.** The `/va_apply` modal only captures the
+basics — it does **not** collect IFVARB proof or image-rights confirmation. Get
+those (use the intake template in Section 8.0) **before** approving, because
+approval immediately provisions real Discord space and tells the owner they're
+live.
+
+### 8B.3 What provisioning creates (and how it self-heals)
+On **Approve & Create**, the bot (`provisionVaSpace`) idempotently:
+1. Creates a **VA-specific role** (named after the VA) — or reuses the linked one.
+2. Ensures the shared **"VA Rep"** role exists and can see the reps chat.
+3. Creates a **private VA channel** under the VA category, visible to the VA role
+   and admins only; pins an info embed and posts the **setup card**.
+4. Grants the **owner** the VA role + the VA Rep role.
+5. Saves `discordRoleId` / `discordChannelId` back onto the listing.
+
+Because it's idempotent (reuses anything already linked), re-running approval or a
+rep command **repairs** missing wiring rather than duplicating it.
+
+### 8B.4 The owner's setup card (post-approval)
+Right after provisioning, the owner sees a card in their channel to fill in
+everything the short form missed — **Add Details** (description, region, hubs,
+fleet, requirements), **Links & Recruiting** (apply link, IFC thread, min grade,
+pilot count, tags), and **Upload Banner / Logo** (sent as an image message, pushed
+to S3). Only the **VA's owner or staff** (`canManageVa`) can edit it. The card
+lists what's **still missing** — a quick way for you to see if a card is
+directory-ready. You can always fill or fix the same fields yourself from the web
+manager.
+
+### 8B.5 Staff slash commands (admin-role only)
+These manage the Discord side of an already-provisioned VA:
+
+| Command | Effect | Notes |
+|---------|--------|-------|
+| **`/va_addrep`** `<va> <user>` | Grants the user the VA role **and** the shared VA Rep role → access to the VA channel + reps chat. | Use to add a CEO's authorised reps. The VA must be provisioned first. |
+| **`/va_removerep`** `<va> <user>` | Removes the **VA-specific** role only. | Keeps the shared VA Rep role (they may rep other VAs) — strip it manually if they rep none. |
+| **`/va_remove`** `<va>` | **Deletes** the VA's Discord **role and channel** and clears the linkage. | This is the **Discord teardown only** — it does **not** delete the directory listing. To pull the *listing*, set Status = Archived (or Delete) in the web manager. |
+
+If a role/command fails, it's almost always permissions: the bot needs **Manage
+Roles** + **Manage Channels**, and its own role must sit **above** the VA roles.
+
+### 8B.6 Two-front consistency (don't let the surfaces drift apart)
+Because both fronts edit the same record, keep them coherent:
+- **Reject/Archive should match teardown.** If you reject or archive a provisioned
+  VA for good, also run **`/va_remove`** so a dead listing isn't leaving a live
+  role + channel behind (and vice-versa — don't `/va_remove` a VA you intend to
+  keep listed).
+- **Web "approve" ≠ Discord provision.** If you flip a bot-originated pending VA to
+  Live from the web manager, it won't get a role/channel. Either approve it via the
+  bot button, or accept that it's directory-only by design.
+- **`ownerId`/`ownerName`** are set by the bot from the Discord user. For
+  web-created listings, capture a real **Owner/Contact** so the §8 change process
+  has someone to reach.
+- The **callsign** is stored as the base everywhere (bot and web strip `##VA`); the
+  suffix is added only at display time. Enter the base in both places.
 
 ---
 
@@ -362,6 +465,8 @@ accept / decline / edit-for-compliance / suspend / delete / takedown, record:
   06-28" / "Takedown: rights holder request")
 - **IFVARB approval reference** (link/thread) or which **exception** was used
 - For contact-clock items: **date of first contact** and the **7-day deadline**
+- For bot actions: note the **front door** (web vs `/va_apply`) and whether Discord
+  was **provisioned** (Approve & Create) or **torn down** (`/va_remove`)
 
 Keep it wherever the team already works (staff Discord channel, shared doc, or a
 pinned thread). The point is a paper trail you can stand behind.
@@ -436,8 +541,14 @@ content standards pass.
 **Decline if:** not IFVARB and not E1–E4 · inactive/fake · infringing branding ·
 misleading/offensive content · unauthorised submitter.
 
-**Status:** Live = public · Draft = staged/E3-pending · Archived = suspended (not
-deleted). **Prefer Archive over Delete.**
+**Status:** Live = public · Draft = staged/E3-pending (and every `/va_apply` lands
+here) · Archived = suspended (not deleted). **Prefer Archive over Delete.**
+
+**Two front doors:** web manager (you author, defaults Live) **and** Discord
+`/va_apply` (owner applies → pending → you **Approve & Create**). Only the bot's
+Approve **provisions Discord** (role + channel + rep access); web "Live" does not.
+`/va_remove` tears down the Discord space but **not** the listing — archive/delete
+that separately.
 
 **The clock (§8):** required change → contact CEO/rep → **7 days** → no action →
 Archive until fixed.
