@@ -5,6 +5,21 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AeroGallery | Advanced Fleet Database</title>
 
+    <script>
+        // Staff session guard: this is a staff-only page; if any API call returns
+        // 401 (session expired), bounce to the portal login and come back here.
+        (function () {
+            const _fetch = window.fetch;
+            window.fetch = async function (...args) {
+                const res = await _fetch.apply(this, args);
+                if (res.status === 401) {
+                    location.href = '/staff?next=' + encodeURIComponent(location.pathname + location.search);
+                }
+                return res;
+            };
+        })();
+    </script>
+
     <!-- Tailwind CSS (utility styling, loaded from CDN; page degrades gracefully if unavailable) -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
@@ -57,7 +72,7 @@
         .dark .skeleton::after { background: linear-gradient(90deg, transparent, rgba(255,255,255,.06), transparent); }
     </style>
 </head>
-<body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100 transition-colors duration-300 min-h-screen">
+<body class="bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100 transition-colors duration-300 min-h-screen">
     <div id="app" class="min-h-screen flex flex-col"></div>
     <div id="modal-root"></div>
 
@@ -287,7 +302,7 @@
                 <div id="banner"></div>
                 <div id="content" class="flex-1 w-full"></div>
                 <button data-action="create"
-                    class="sm:hidden fixed bottom-6 right-6 z-40 bg-blue-600 text-white p-4 rounded-full shadow-xl shadow-blue-600/30 active:scale-95 transition-transform">
+                    class="sm:hidden fixed bottom-6 right-6 z-40 bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 p-4 rounded-full shadow-xl shadow-zinc-900/30 dark:shadow-black/40 active:scale-95 transition-transform">
                     ${icon('upload', 24)}
                 </button>
             `;
@@ -300,40 +315,44 @@
                 <button data-action="view" data-view="${view}"
                     class="flex items-center gap-2 px-3 py-1.5 text-xs font-bold uppercase tracking-wide rounded-md transition-all ${
                         state.view === view
-                            ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm'
-                            : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}">
+                            ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-white shadow-sm'
+                            : 'text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300'}">
                     ${icon(ic, 14)} ${label}
                 </button>`;
             return `
-            <nav class="sticky top-0 z-30 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md border-b border-slate-200 dark:border-slate-800 transition-colors duration-300">
+            <nav class="sticky top-0 z-30 bg-white/80 dark:bg-zinc-900/80 backdrop-blur-md border-b border-zinc-200 dark:border-zinc-800 transition-colors duration-300">
               <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
                 <div class="flex items-center justify-between h-16">
                   <div class="flex items-center gap-3 cursor-pointer" data-action="home">
-                      <div class="bg-gradient-to-br from-blue-600 to-indigo-600 p-2 rounded-xl text-white shadow-lg shadow-blue-500/20">
+                      <div class="bg-gradient-to-br from-zinc-900 to-zinc-900 p-2 rounded-xl text-white shadow-lg shadow-zinc-700/20">
                           ${icon('plane', 20, '-rotate-45', { fill: true })}
                       </div>
                       <div class="hidden sm:block">
-                          <h1 class="text-lg font-extrabold tracking-tight text-slate-900 dark:text-white">AeroGallery</h1>
-                          <p class="text-[10px] uppercase font-bold text-slate-400 dark:text-slate-500 tracking-wider">Fleet Database</p>
+                          <h1 class="text-lg font-extrabold tracking-tight text-zinc-900 dark:text-white">AeroGallery</h1>
+                          <p class="text-[10px] uppercase font-bold text-zinc-400 dark:text-zinc-500 tracking-wider">Fleet Database</p>
                       </div>
                   </div>
 
-                  <div class="hidden md:flex items-center bg-slate-100 dark:bg-slate-800 p-1 rounded-lg">
+                  <div class="hidden md:flex items-center bg-zinc-100 dark:bg-zinc-800 p-1 rounded-lg">
                       ${tab('gallery', 'Gallery', 'grid')}
                       ${tab('collection', 'Checklist', 'checks')}
                   </div>
 
                   <div class="flex items-center gap-2 sm:gap-3">
+                      <a href="/staff"
+                          class="hidden lg:flex items-center gap-2 px-4 py-2 border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 font-medium rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors text-sm">
+                          ${icon('grid', 16)} <span>Staff Hub</span>
+                      </a>
                       <a href="/airports.html"
-                          class="hidden lg:flex items-center gap-2 px-4 py-2 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 font-medium rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors text-sm">
+                          class="hidden lg:flex items-center gap-2 px-4 py-2 border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 font-medium rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors text-sm">
                           ${icon('database', 16)} <span>Airport Database</span>
                       </a>
                       <button id="themeBtn" data-action="theme"
-                          class="p-2 text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800 rounded-lg transition-colors">
+                          class="p-2 text-zinc-500 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800 rounded-lg transition-colors">
                           ${icon(state.theme === 'light' ? 'moon' : 'sun', 20)}
                       </button>
                       <button data-action="create"
-                          class="hidden sm:flex items-center gap-2 bg-slate-900 dark:bg-blue-600 hover:bg-slate-800 dark:hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition-all shadow-lg hover:shadow-xl active:scale-95">
+                          class="hidden sm:flex items-center gap-2 bg-zinc-900 hover:bg-zinc-800 text-white dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 px-4 py-2 rounded-xl text-sm font-medium transition-all shadow-sm active:scale-95">
                           ${icon('upload', 16)} <span>Upload</span>
                       </button>
                   </div>
@@ -358,21 +377,21 @@
             const statChip = (ic, val, label, color = '') => `
                 <div class="flex items-center gap-2" title="${esc(label)}">
                     <span class="${color}">${icon(ic, 16)}</span>
-                    <span class="font-semibold text-slate-900 dark:text-white">${esc(val)}</span>
-                    <span class="hidden sm:inline text-xs uppercase font-bold tracking-wider text-slate-400">${esc(label)}</span>
+                    <span class="font-semibold text-zinc-900 dark:text-white">${esc(val)}</span>
+                    <span class="hidden sm:inline text-xs uppercase font-bold tracking-wider text-zinc-400">${esc(label)}</span>
                 </div>`;
 
             bar.innerHTML = `
-            <div class="bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 transition-colors duration-300">
+            <div class="bg-white dark:bg-zinc-900 border-b border-zinc-200 dark:border-zinc-800 transition-colors duration-300">
               <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
                 <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
-                  <div class="flex flex-wrap items-center gap-4 sm:gap-5 text-sm text-slate-500 dark:text-slate-400">
+                  <div class="flex flex-wrap items-center gap-4 sm:gap-5 text-sm text-zinc-500 dark:text-zinc-400">
                     ${statChip('chart', state.aircrafts.length, 'Aircraft')}
                     ${statChip('tag', Math.max(0, types.length - 1), 'Types')}
                     ${state.stats ? `
-                        <div class="hidden lg:block h-4 w-px bg-slate-200 dark:bg-slate-700"></div>
-                        ${statChip('cloud', formatBytes(state.stats.s3SizeBytes), 'Cloud', 'text-blue-500')}
-                        ${statChip('database', formatBytes(state.stats.dbSizeBytes), 'DB', 'text-indigo-500')}
+                        <div class="hidden lg:block h-4 w-px bg-zinc-200 dark:bg-zinc-700"></div>
+                        ${statChip('cloud', formatBytes(state.stats.s3SizeBytes), 'Cloud', 'text-zinc-700')}
+                        ${statChip('database', formatBytes(state.stats.dbSizeBytes), 'DB', 'text-zinc-700')}
                     ` : ''}
                   </div>
 
@@ -380,24 +399,24 @@
                     <div class="relative w-full md:w-auto">
                         <input id="searchInput" type="text" placeholder="Search tail, type, livery…"
                             value="${esc(state.search)}"
-                            class="w-full md:w-64 pl-9 pr-3 py-2 border border-slate-200 dark:border-slate-700 rounded-lg bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none text-sm transition" />
-                        <span class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">${icon('search', 15)}</span>
+                            class="w-full md:w-64 pl-9 pr-3 py-2 border border-zinc-200 dark:border-zinc-700 rounded-lg bg-zinc-50 dark:bg-zinc-800 text-zinc-900 dark:text-white focus:ring-2 focus:ring-zinc-700 outline-none text-sm transition" />
+                        <span class="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400">${icon('search', 15)}</span>
                     </div>
                     <div class="flex items-center gap-2 w-full md:w-auto overflow-x-auto no-scrollbar pb-1 md:pb-0">
                         <div class="relative shrink-0">
-                            <select id="typeSelect" class="appearance-none pl-3 pr-8 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 border border-transparent hover:border-slate-300 dark:hover:border-slate-600 text-slate-700 dark:text-slate-200 text-sm font-medium focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer">
+                            <select id="typeSelect" class="appearance-none pl-3 pr-8 py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 border border-transparent hover:border-zinc-300 dark:hover:border-zinc-600 text-zinc-700 dark:text-zinc-200 text-sm font-medium focus:ring-2 focus:ring-zinc-700 outline-none cursor-pointer">
                                 ${opt('Type', types, state.filterType)}
                             </select>
-                            <span class="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none">${icon('chevDown', 14)}</span>
+                            <span class="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-400 pointer-events-none">${icon('chevDown', 14)}</span>
                         </div>
                         <div class="relative shrink-0">
-                            <select id="contribSelect" class="appearance-none pl-3 pr-8 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 border border-transparent hover:border-slate-300 dark:hover:border-slate-600 text-slate-700 dark:text-slate-200 text-sm font-medium focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer">
+                            <select id="contribSelect" class="appearance-none pl-3 pr-8 py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 border border-transparent hover:border-zinc-300 dark:hover:border-zinc-600 text-zinc-700 dark:text-zinc-200 text-sm font-medium focus:ring-2 focus:ring-zinc-700 outline-none cursor-pointer">
                                 ${opt('By', contribs, state.filterContributor)}
                             </select>
-                            <span class="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none">${icon('chevDown', 14)}</span>
+                            <span class="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-400 pointer-events-none">${icon('chevDown', 14)}</span>
                         </div>
-                        <div class="h-6 w-px bg-slate-200 dark:bg-slate-700 mx-1 shrink-0"></div>
-                        <select id="sortSelect" class="bg-transparent text-sm font-medium text-slate-700 dark:text-slate-300 border-none focus:ring-0 cursor-pointer outline-none shrink-0">
+                        <div class="h-6 w-px bg-zinc-200 dark:bg-zinc-700 mx-1 shrink-0"></div>
+                        <select id="sortSelect" class="bg-transparent text-sm font-medium text-zinc-700 dark:text-zinc-300 border-none focus:ring-0 cursor-pointer outline-none shrink-0">
                             <option value="newest" ${state.sort === 'newest' ? 'selected' : ''}>Newest First</option>
                             <option value="oldest" ${state.sort === 'oldest' ? 'selected' : ''}>Oldest First</option>
                             <option value="az" ${state.sort === 'az' ? 'selected' : ''}>A–Z (Tail)</option>
@@ -439,7 +458,7 @@
                 <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full">
                     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
                         ${Array.from({ length: 8 }).map(() => `
-                            <div class="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 overflow-hidden">
+                            <div class="bg-white dark:bg-zinc-900 rounded-2xl border border-zinc-200 dark:border-zinc-800 overflow-hidden">
                                 <div class="aspect-[4/3] skeleton"></div>
                                 <div class="p-5 space-y-3">
                                     <div class="h-4 w-2/3 rounded skeleton"></div>
@@ -455,11 +474,11 @@
             if (list.length === 0) {
                 c.innerHTML = `
                 <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full fade-in">
-                    <div class="flex flex-col items-center justify-center py-20 bg-white dark:bg-slate-900/50 rounded-3xl border border-dashed border-slate-300 dark:border-slate-700">
-                        <div class="bg-slate-100 dark:bg-slate-800 p-4 rounded-full mb-4 text-slate-400">${icon('search', 32)}</div>
-                        <h3 class="text-lg font-semibold text-slate-900 dark:text-white">No aircraft found</h3>
-                        <p class="text-slate-500 dark:text-slate-400 text-sm mt-1 max-w-xs text-center">Try adjusting your filters or search terms, or add a new aircraft.</p>
-                        <button data-action="clear-filters" class="mt-6 text-blue-600 dark:text-blue-400 hover:underline font-medium text-sm">Clear Filters</button>
+                    <div class="flex flex-col items-center justify-center py-20 bg-white dark:bg-zinc-900/50 rounded-3xl border border-dashed border-zinc-300 dark:border-zinc-700">
+                        <div class="bg-zinc-100 dark:bg-zinc-800 p-4 rounded-full mb-4 text-zinc-400">${icon('search', 32)}</div>
+                        <h3 class="text-lg font-semibold text-zinc-900 dark:text-white">No aircraft found</h3>
+                        <p class="text-zinc-500 dark:text-zinc-400 text-sm mt-1 max-w-xs text-center">Try adjusting your filters or search terms, or add a new aircraft.</p>
+                        <button data-action="clear-filters" class="mt-6 text-zinc-900 dark:text-zinc-500 hover:underline font-medium text-sm">Clear Filters</button>
                     </div>
                 </main>`;
                 return;
@@ -482,18 +501,18 @@
             const delay = Math.min(i, 11) * 0.04;
             return `
             <div data-action="open" data-id="${esc(data._id)}" style="animation-delay:${delay}s"
-                class="group bg-white dark:bg-slate-900 rounded-2xl shadow-sm border overflow-hidden hover:shadow-xl hover:-translate-y-1 transition-all duration-300 cursor-pointer relative flex flex-col ${
-                    flagged ? 'border-amber-400 dark:border-amber-600' : 'border-slate-200 dark:border-slate-800 hover:border-blue-300 dark:hover:border-blue-800'}">
-                <div class="relative aspect-[4/3] bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                class="group bg-white dark:bg-zinc-900 rounded-2xl shadow-sm border overflow-hidden hover:shadow-xl hover:-translate-y-1 transition-all duration-300 cursor-pointer relative flex flex-col ${
+                    flagged ? 'border-amber-400 dark:border-amber-600' : 'border-zinc-200 dark:border-zinc-800 hover:border-zinc-400 dark:hover:border-zinc-700'}">
+                <div class="relative aspect-[4/3] bg-zinc-100 dark:bg-zinc-800 overflow-hidden">
                     <img src="${esc(cover)}" alt="${esc(data.tailNumber)}" loading="lazy" decoding="async"
                         class="w-full h-full object-cover transition-transform duration-700 group-hover:scale-105"
                         onerror="this.onerror=null;this.src='${PLACEHOLDER}'" />
-                    <div class="absolute inset-0 bg-gradient-to-t from-slate-900/55 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300"></div>
+                    <div class="absolute inset-0 bg-gradient-to-t from-zinc-900/55 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300"></div>
                     ${images.length > 1 ? `
                         <div class="absolute bottom-3 left-3 bg-black/60 backdrop-blur-sm px-2 py-1 rounded-md text-xs font-bold text-white flex items-center gap-1">
                             ${icon('images', 12)} ${images.length}
                         </div>` : ''}
-                    <div class="absolute top-3 right-3 bg-white/90 dark:bg-slate-950/90 backdrop-blur-sm px-2.5 py-1 rounded-md text-xs font-bold border border-white/50 dark:border-slate-800/50 text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                    <div class="absolute top-3 right-3 bg-white/90 dark:bg-zinc-950/90 backdrop-blur-sm px-2.5 py-1 rounded-md text-xs font-bold border border-white/50 dark:border-zinc-800/50 text-zinc-800 dark:text-zinc-200 flex items-center gap-1.5">
                         ${flagged ? `<span class="text-amber-500">${icon('alertCircle', 14)}</span>` : ''}${esc(data.tailNumber || '—')}
                     </div>
                     ${flagged ? `
@@ -503,21 +522,21 @@
                 </div>
                 <div class="p-5 flex-1 flex flex-col">
                     <div class="flex-1 min-w-0">
-                        <h3 class="font-bold text-slate-900 dark:text-white truncate text-lg mb-1" title="${esc(data.aircraftType)}">${esc(data.aircraftType || 'Unknown type')}</h3>
-                        <p class="text-sm text-slate-500 dark:text-slate-400 truncate flex items-center gap-1.5">${icon('camera', 12)} ${esc(data.liveryName || '—')}</p>
+                        <h3 class="font-bold text-zinc-900 dark:text-white truncate text-lg mb-1" title="${esc(data.aircraftType)}">${esc(data.aircraftType || 'Unknown type')}</h3>
+                        <p class="text-sm text-zinc-500 dark:text-zinc-400 truncate flex items-center gap-1.5">${icon('camera', 12)} ${esc(data.liveryName || '—')}</p>
                     </div>
-                    <div class="flex items-center justify-between pt-4 mt-3 border-t border-slate-100 dark:border-slate-800">
-                        <div class="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400 min-w-0">
-                            <div class="w-6 h-6 rounded-full bg-blue-100 dark:bg-blue-900/30 flex items-center justify-center text-blue-600 dark:text-blue-400 font-bold shrink-0">${esc(initial)}</div>
+                    <div class="flex items-center justify-between pt-4 mt-3 border-t border-zinc-100 dark:border-zinc-800">
+                        <div class="flex items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400 min-w-0">
+                            <div class="w-6 h-6 rounded-full bg-zinc-200 dark:bg-zinc-800/30 flex items-center justify-center text-zinc-900 dark:text-zinc-500 font-bold shrink-0">${esc(initial)}</div>
                             <span class="truncate max-w-[110px]">${esc(name)}</span>
                         </div>
                         <div class="flex items-center gap-1">
                             <button data-action="flag" data-id="${esc(data._id)}" title="${flagged ? 'Remove flag' : 'Flag for update'}"
-                                class="p-1.5 rounded-full transition-colors ${flagged ? 'text-amber-500 bg-amber-50 dark:bg-amber-900/20' : 'text-slate-400 hover:text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-900/20'}">${icon('flag', 16)}</button>
+                                class="p-1.5 rounded-full transition-colors ${flagged ? 'text-amber-500 bg-amber-50 dark:bg-amber-900/20' : 'text-zinc-400 hover:text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-900/20'}">${icon('flag', 16)}</button>
                             <button data-action="edit" data-id="${esc(data._id)}" title="Edit"
-                                class="p-1.5 rounded-full text-slate-400 hover:text-blue-500 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors">${icon('pencil', 16)}</button>
+                                class="p-1.5 rounded-full text-zinc-400 hover:text-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800/20 transition-colors">${icon('pencil', 16)}</button>
                             <button data-action="delete" data-id="${esc(data._id)}" title="Delete"
-                                class="p-1.5 rounded-full text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors">${icon('trash', 16)}</button>
+                                class="p-1.5 rounded-full text-zinc-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors">${icon('trash', 16)}</button>
                         </div>
                     </div>
                 </div>
@@ -566,8 +585,8 @@
             const d = state.dash;
 
             if (d.loadingMeta && d.master.length === 0) {
-                c.innerHTML = `<main class="max-w-5xl mx-auto px-4 py-8 w-full"><div class="flex flex-col items-center justify-center h-64 text-slate-400">
-                    <span class="spin mb-4 text-blue-600">${icon('loader', 40)}</span><p>Analysing fleet database…</p></div></main>`;
+                c.innerHTML = `<main class="max-w-5xl mx-auto px-4 py-8 w-full"><div class="flex flex-col items-center justify-center h-64 text-zinc-400">
+                    <span class="spin mb-4 text-zinc-900">${icon('loader', 40)}</span><p>Analysing fleet database…</p></div></main>`;
                 return;
             }
 
@@ -581,21 +600,21 @@
 
             c.innerHTML = `
             <main class="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full fade-up">
-                <div class="bg-white dark:bg-slate-900 rounded-2xl p-6 shadow-sm border border-slate-200 dark:border-slate-800 mb-8">
+                <div class="bg-white dark:bg-zinc-900 rounded-2xl p-6 shadow-sm border border-zinc-200 dark:border-zinc-800 mb-8">
                     <div class="flex items-center justify-between mb-4">
                         <div>
-                            <h2 class="text-xl font-bold text-slate-900 dark:text-white">Collection Status</h2>
-                            <p class="text-sm text-slate-500 dark:text-slate-400">Compare your uploads against the global database</p>
+                            <h2 class="text-xl font-bold text-zinc-900 dark:text-white">Collection Status</h2>
+                            <p class="text-sm text-zinc-500 dark:text-zinc-400">Compare your uploads against the global database</p>
                         </div>
                         <div class="text-right">
-                            <span class="text-3xl font-extrabold text-blue-600 dark:text-blue-400">${pct}%</span>
-                            <p class="text-xs font-bold text-slate-400 uppercase tracking-wider">Completion</p>
+                            <span class="text-3xl font-extrabold text-zinc-900 dark:text-zinc-500">${pct}%</span>
+                            <p class="text-xs font-bold text-zinc-400 uppercase tracking-wider">Completion</p>
                         </div>
                     </div>
-                    <div class="w-full bg-slate-100 dark:bg-slate-800 rounded-full h-3 overflow-hidden">
-                        <div class="bg-gradient-to-r from-blue-600 to-indigo-500 h-full rounded-full transition-all duration-700 ease-out" style="width:${pct}%"></div>
+                    <div class="w-full bg-zinc-100 dark:bg-zinc-800 rounded-full h-3 overflow-hidden">
+                        <div class="bg-gradient-to-r from-zinc-900 to-zinc-700 h-full rounded-full transition-all duration-700 ease-out" style="width:${pct}%"></div>
                     </div>
-                    <div class="mt-2 text-xs text-slate-500 text-right">${collected} of ${d.master.length} aircraft types collected</div>
+                    <div class="mt-2 text-xs text-zinc-500 text-right">${collected} of ${d.master.length} aircraft types collected</div>
                 </div>
 
                 <div class="grid gap-4">
@@ -605,42 +624,42 @@
                         const count = typeCount(ac.name);
                         const livs = d.liveries[ac.id];
                         return `
-                        <div class="bg-white dark:bg-slate-900 rounded-xl border transition-all duration-300 overflow-hidden ${collectedType ? 'border-slate-200 dark:border-slate-800' : 'border-amber-200 dark:border-amber-900/50'}">
-                            <div data-action="expand" data-id="${esc(ac.id)}" class="p-4 flex items-center justify-between cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors ${expanded ? 'bg-slate-50 dark:bg-slate-800/50' : ''}">
+                        <div class="bg-white dark:bg-zinc-900 rounded-xl border transition-all duration-300 overflow-hidden ${collectedType ? 'border-zinc-200 dark:border-zinc-800' : 'border-amber-200 dark:border-amber-900/50'}">
+                            <div data-action="expand" data-id="${esc(ac.id)}" class="p-4 flex items-center justify-between cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-800/50 transition-colors ${expanded ? 'bg-zinc-50 dark:bg-zinc-800/50' : ''}">
                                 <div class="flex items-center gap-4 min-w-0">
-                                    <div class="w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${collectedType ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-600' : 'bg-slate-100 dark:bg-slate-800 text-slate-400'}">
+                                    <div class="w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${collectedType ? 'bg-zinc-200 dark:bg-zinc-800/30 text-zinc-900' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-400'}">
                                         ${collectedType ? icon('check', 20) : icon('plane', 20)}
                                     </div>
                                     <div class="min-w-0">
-                                        <h3 class="font-bold text-lg truncate ${collectedType ? 'text-slate-900 dark:text-white' : 'text-slate-500 dark:text-slate-400'}">${esc(ac.name)}</h3>
+                                        <h3 class="font-bold text-lg truncate ${collectedType ? 'text-zinc-900 dark:text-white' : 'text-zinc-500 dark:text-zinc-400'}">${esc(ac.name)}</h3>
                                         <p class="text-xs flex items-center gap-1">${collectedType
-                                            ? `<span class="text-blue-600 dark:text-blue-400 font-medium">${count} photo${count === 1 ? '' : 's'} in fleet</span>`
+                                            ? `<span class="text-zinc-900 dark:text-zinc-500 font-medium">${count} photo${count === 1 ? '' : 's'} in fleet</span>`
                                             : `<span class="text-amber-600 dark:text-amber-500 font-medium">Missing from fleet</span>`}</p>
                                     </div>
                                 </div>
                                 <div class="flex items-center gap-2 shrink-0">
-                                    <span class="text-xs font-semibold text-slate-400 uppercase tracking-wide hidden sm:block">${expanded ? 'Hide' : 'Liveries'}</span>
-                                    <span class="text-slate-400 transition-transform duration-300 ${expanded ? 'rotate-180' : ''} inline-block">${icon('chevDown', 20)}</span>
+                                    <span class="text-xs font-semibold text-zinc-400 uppercase tracking-wide hidden sm:block">${expanded ? 'Hide' : 'Liveries'}</span>
+                                    <span class="text-zinc-400 transition-transform duration-300 ${expanded ? 'rotate-180' : ''} inline-block">${icon('chevDown', 20)}</span>
                                 </div>
                             </div>
                             ${expanded ? `
-                            <div class="border-t border-slate-100 dark:border-slate-800 p-4 bg-slate-50/50 dark:bg-slate-950/30">
+                            <div class="border-t border-zinc-100 dark:border-zinc-800 p-4 bg-zinc-50/50 dark:bg-zinc-950/30">
                                 ${!livs ? `
-                                    <div class="flex items-center gap-2 text-slate-400 text-sm py-4"><span class="spin">${icon('loader', 16)}</span> Fetching known liveries…</div>
+                                    <div class="flex items-center gap-2 text-zinc-400 text-sm py-4"><span class="spin">${icon('loader', 16)}</span> Fetching known liveries…</div>
                                 ` : livs.length === 0 ? `
-                                    <div class="text-slate-400 text-sm italic">No specific liveries listed in database.</div>
+                                    <div class="text-zinc-400 text-sm italic">No specific liveries listed in database.</div>
                                 ` : `
                                     <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
                                         ${livs.map(liv => {
                                             const have = hasLivery(ac.name, liv.name);
                                             return `
-                                            <div class="flex items-center justify-between p-3 bg-white dark:bg-slate-900 rounded-lg border border-slate-200 dark:border-slate-800">
+                                            <div class="flex items-center justify-between p-3 bg-white dark:bg-zinc-900 rounded-lg border border-zinc-200 dark:border-zinc-800">
                                                 <div class="flex items-center gap-2 overflow-hidden">
-                                                    <span class="w-2 h-2 rounded-full shrink-0 ${have ? 'bg-green-500' : 'bg-slate-300 dark:bg-slate-700'}"></span>
-                                                    <span class="text-sm truncate ${have ? 'text-slate-900 dark:text-white font-medium' : 'text-slate-500 dark:text-slate-400'}">${esc(liv.name)}</span>
+                                                    <span class="w-2 h-2 rounded-full shrink-0 ${have ? 'bg-green-500' : 'bg-zinc-300 dark:bg-zinc-700'}"></span>
+                                                    <span class="text-sm truncate ${have ? 'text-zinc-900 dark:text-white font-medium' : 'text-zinc-500 dark:text-zinc-400'}">${esc(liv.name)}</span>
                                                 </div>
                                                 ${have ? '' : `<button data-action="prefill" data-acid="${esc(ac.id)}" data-acname="${esc(ac.name)}" data-livery="${esc(liv.name)}"
-                                                    class="text-xs bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 px-2 py-1 rounded-md hover:bg-blue-100 dark:hover:bg-blue-900/40 transition-colors font-medium whitespace-nowrap ml-2">Upload</button>`}
+                                                    class="text-xs bg-zinc-100 dark:bg-zinc-800/20 text-zinc-900 dark:text-zinc-500 px-2 py-1 rounded-md hover:bg-zinc-200 dark:hover:bg-zinc-800/40 transition-colors font-medium whitespace-nowrap ml-2">Upload</button>`}
                                             </div>`;
                                         }).join('')}
                                     </div>
@@ -658,7 +677,7 @@
         function closeModal() { el('modal-root').innerHTML = ''; document.body.style.overflow = ''; }
         function openModalWrap(innerHTML) {
             const root = el('modal-root');
-            root.innerHTML = `<div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/80 backdrop-blur-md fade-in" data-modal-overlay>${innerHTML}</div>`;
+            root.innerHTML = `<div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-zinc-900/80 backdrop-blur-md fade-in" data-modal-overlay>${innerHTML}</div>`;
             document.body.style.overflow = 'hidden';
             root.firstElementChild.addEventListener('mousedown', (e) => { if (e.target.hasAttribute('data-modal-overlay')) closeModal(); });
             return root.firstElementChild;
@@ -666,10 +685,10 @@
 
         function infoRow(ic, label, value) {
             return `<div class="flex items-start gap-4 group">
-                <div class="p-3 bg-slate-50 dark:bg-slate-800 rounded-xl text-slate-400 dark:text-slate-500 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">${icon(ic, 20)}</div>
+                <div class="p-3 bg-zinc-50 dark:bg-zinc-800 rounded-xl text-zinc-400 dark:text-zinc-500 group-hover:text-zinc-900 dark:group-hover:text-zinc-500 transition-colors">${icon(ic, 20)}</div>
                 <div class="min-w-0">
-                    <p class="text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wide mb-0.5">${esc(label)}</p>
-                    <p class="text-base font-medium text-slate-900 dark:text-slate-200 break-words">${esc(value)}</p>
+                    <p class="text-xs font-bold text-zinc-400 dark:text-zinc-500 uppercase tracking-wide mb-0.5">${esc(label)}</p>
+                    <p class="text-base font-medium text-zinc-900 dark:text-zinc-200 break-words">${esc(value)}</p>
                 </div>
             </div>`;
         }
@@ -684,9 +703,9 @@
             const multi = images.length > 1;
 
             const overlay = openModalWrap(`
-                <div class="bg-white dark:bg-slate-900 rounded-3xl w-full max-w-5xl max-h-[90vh] overflow-hidden shadow-2xl flex flex-col md:flex-row relative zoom-in border border-slate-200 dark:border-slate-700">
+                <div class="bg-white dark:bg-zinc-900 rounded-3xl w-full max-w-5xl max-h-[90vh] overflow-hidden shadow-2xl flex flex-col md:flex-row relative zoom-in border border-zinc-200 dark:border-zinc-700">
                     <button data-action="close-modal" class="absolute top-4 right-4 z-20 p-2 bg-black/40 hover:bg-black/60 text-white rounded-full backdrop-blur-md transition-all">${icon('x', 20)}</button>
-                    <div class="w-full md:w-3/5 bg-slate-950 flex flex-col">
+                    <div class="w-full md:w-3/5 bg-zinc-950 flex flex-col">
                         <div class="flex-1 flex items-center justify-center relative group min-h-0">
                             <img id="detailImg" src="${esc(images[0] || ac.imageUrl || PLACEHOLDER)}" alt="${esc(ac.tailNumber)}"
                                 class="w-full h-full object-contain max-h-[40vh] md:max-h-full" onerror="this.onerror=null;this.src='${PLACEHOLDER}'" />
@@ -696,21 +715,21 @@
                                 <div id="detailCounter" class="absolute bottom-3 left-1/2 -translate-x-1/2 bg-black/50 backdrop-blur-sm px-2.5 py-1 rounded-full text-xs font-semibold text-white">1 / ${images.length}</div>
                             ` : ''}
                         </div>
-                        ${multi ? `<div class="flex gap-2 p-3 justify-center bg-slate-950/80 flex-shrink-0 overflow-x-auto no-scrollbar">
-                            ${images.map((img, idx) => `<button data-thumb="${idx}" class="thumb relative w-16 h-12 rounded-lg overflow-hidden border-2 transition-all shrink-0 ${idx === 0 ? 'border-blue-500 ring-2 ring-blue-500/40' : 'border-transparent opacity-60 hover:opacity-100'}">
+                        ${multi ? `<div class="flex gap-2 p-3 justify-center bg-zinc-950/80 flex-shrink-0 overflow-x-auto no-scrollbar">
+                            ${images.map((img, idx) => `<button data-thumb="${idx}" class="thumb relative w-16 h-12 rounded-lg overflow-hidden border-2 transition-all shrink-0 ${idx === 0 ? 'border-zinc-700 ring-2 ring-zinc-700/40' : 'border-transparent opacity-60 hover:opacity-100'}">
                                 <img src="${esc(img)}" class="w-full h-full object-cover" onerror="this.onerror=null;this.src='${PLACEHOLDER}'" /></button>`).join('')}
                         </div>` : ''}
                     </div>
-                    <div class="w-full md:w-2/5 p-8 flex flex-col bg-white dark:bg-slate-900 overflow-y-auto">
+                    <div class="w-full md:w-2/5 p-8 flex flex-col bg-white dark:bg-zinc-900 overflow-y-auto">
                         <div class="mb-8">
                             <div class="flex justify-between items-start">
                                 <div>
-                                    <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 text-xs font-bold uppercase tracking-wider mb-3">${icon('plane', 12)} Aircraft Profile</div>
-                                    <h2 class="text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight break-words">${esc(ac.tailNumber || '—')}</h2>
+                                    <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-zinc-200 dark:bg-zinc-800/30 text-zinc-800 dark:text-zinc-400 text-xs font-bold uppercase tracking-wider mb-3">${icon('plane', 12)} Aircraft Profile</div>
+                                    <h2 class="text-4xl font-extrabold text-zinc-900 dark:text-white tracking-tight break-words">${esc(ac.tailNumber || '—')}</h2>
                                 </div>
-                                <button data-action="edit" data-id="${esc(ac._id)}" class="p-2 bg-slate-100 dark:bg-slate-800 rounded-full text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 transition-colors">${icon('pencil', 20)}</button>
+                                <button data-action="edit" data-id="${esc(ac._id)}" class="p-2 bg-zinc-100 dark:bg-zinc-800 rounded-full text-zinc-600 dark:text-zinc-300 hover:text-zinc-900 dark:hover:text-zinc-500 transition-colors">${icon('pencil', 20)}</button>
                             </div>
-                            <p class="text-xl text-slate-500 dark:text-slate-400 mt-2">${esc(ac.aircraftType || 'Unknown type')}</p>
+                            <p class="text-xl text-zinc-500 dark:text-zinc-400 mt-2">${esc(ac.aircraftType || 'Unknown type')}</p>
                         </div>
                         <div class="space-y-5 flex-1">
                             ${infoRow('camera', 'Livery', ac.liveryName || '—')}
@@ -718,8 +737,8 @@
                             ${infoRow('calendar', 'Uploaded', fullDate(ac.uploadedAt))}
                             ${infoRow('activity', 'Status', ac.needsUpdate ? 'Flagged for update' : 'Active in fleet')}
                         </div>
-                        <div class="mt-8 pt-6 border-t border-slate-100 dark:border-slate-800">
-                            <button data-action="close-modal" class="w-full py-3 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-900 dark:text-white font-semibold rounded-xl transition-colors">Close Details</button>
+                        <div class="mt-8 pt-6 border-t border-zinc-100 dark:border-zinc-800">
+                            <button data-action="close-modal" class="w-full py-3 bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 text-zinc-900 dark:text-white font-semibold rounded-xl transition-colors">Close Details</button>
                         </div>
                     </div>
                 </div>
@@ -737,7 +756,7 @@
                     contribEl.innerHTML = infoRow('user', `Spotted By (Photo ${active + 1})`, contributors[active] || ac.contributorName || 'Unknown');
                     thumbs.forEach((t, i) => {
                         t.className = 'thumb relative w-16 h-12 rounded-lg overflow-hidden border-2 transition-all shrink-0 ' +
-                            (i === active ? 'border-blue-500 ring-2 ring-blue-500/40' : 'border-transparent opacity-60 hover:opacity-100');
+                            (i === active ? 'border-zinc-700 ring-2 ring-zinc-700/40' : 'border-transparent opacity-60 hover:opacity-100');
                     });
                 };
                 overlay.querySelector('[data-nav="prev"]').addEventListener('click', () => show(active - 1));
@@ -767,41 +786,41 @@
             const aircraftId = isEdit ? initial._id : null;
 
             const overlay = openModalWrap(`
-                <div class="bg-white dark:bg-slate-900 rounded-2xl w-full max-w-2xl shadow-xl overflow-hidden zoom-in flex flex-col max-h-[90vh] border border-slate-200 dark:border-slate-800">
-                    <div class="px-6 py-4 border-b border-slate-100 dark:border-slate-800 flex justify-between items-center bg-slate-50/50 dark:bg-slate-900/50 flex-shrink-0">
-                        <h2 class="text-lg font-bold text-slate-800 dark:text-white flex items-center gap-2">
-                            <span class="text-blue-600 dark:text-blue-400">${icon(isEdit ? 'pencil' : 'upload', 20)}</span>
+                <div class="bg-white dark:bg-zinc-900 rounded-2xl w-full max-w-2xl shadow-xl overflow-hidden zoom-in flex flex-col max-h-[90vh] border border-zinc-200 dark:border-zinc-800">
+                    <div class="px-6 py-4 border-b border-zinc-100 dark:border-zinc-800 flex justify-between items-center bg-zinc-50/50 dark:bg-zinc-900/50 flex-shrink-0">
+                        <h2 class="text-lg font-bold text-zinc-800 dark:text-white flex items-center gap-2">
+                            <span class="text-zinc-900 dark:text-zinc-500">${icon(isEdit ? 'pencil' : 'upload', 20)}</span>
                             ${isEdit ? 'Edit Aircraft' : 'Upload Aircraft'}
                         </h2>
-                        <button data-action="close-modal" class="p-2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full transition-all">${icon('x', 20)}</button>
+                        <button data-action="close-modal" class="p-2 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-full transition-all">${icon('x', 20)}</button>
                     </div>
                     <div class="flex-1 overflow-y-auto p-6">
                         <form id="acForm" class="space-y-6" novalidate>
                             <div id="imageSection"></div>
                             <div class="grid grid-cols-2 gap-4">
                                 <div class="space-y-1">
-                                    <label class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wide">Tail Number</label>
+                                    <label class="text-xs font-bold text-zinc-500 dark:text-zinc-400 uppercase tracking-wide">Tail Number</label>
                                     <input required name="tailNumber" placeholder="e.g. N12345" value="${esc(initial ? initial.tailNumber : '')}"
-                                        class="w-full px-4 py-3 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all uppercase text-slate-900 dark:text-white placeholder-slate-400" />
+                                        class="w-full px-4 py-3 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-xl focus:ring-2 focus:ring-zinc-700 outline-none transition-all uppercase text-zinc-900 dark:text-white placeholder-zinc-400" />
                                 </div>
                                 <div class="space-y-1">
-                                    <label class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wide">Contributor</label>
+                                    <label class="text-xs font-bold text-zinc-500 dark:text-zinc-400 uppercase tracking-wide">Contributor</label>
                                     <input required name="contributorName" placeholder="Your Name" value="${esc(initial ? initial.contributorName : '')}"
-                                        class="w-full px-4 py-3 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all text-slate-900 dark:text-white placeholder-slate-400" />
+                                        class="w-full px-4 py-3 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-xl focus:ring-2 focus:ring-zinc-700 outline-none transition-all text-zinc-900 dark:text-white placeholder-zinc-400" />
                                 </div>
                             </div>
                             <div class="space-y-1">
-                                <label class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wide">Aircraft Type</label>
+                                <label class="text-xs font-bold text-zinc-500 dark:text-zinc-400 uppercase tracking-wide">Aircraft Type</label>
                                 <div id="typeWrap"></div>
                             </div>
                             <div class="space-y-1">
-                                <label class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wide">Livery Name <span id="livLoading" class="text-blue-500 ml-2 text-[10px] hidden">(Loading…)</span></label>
+                                <label class="text-xs font-bold text-zinc-500 dark:text-zinc-400 uppercase tracking-wide">Livery Name <span id="livLoading" class="text-zinc-700 ml-2 text-[10px] hidden">(Loading…)</span></label>
                                 <div id="liveryWrap"></div>
                             </div>
                             <input type="hidden" name="aircraftType" value="${esc(initial ? initial.aircraftType : (prefill ? prefill.aircraftType : ''))}" />
                             <input type="hidden" name="liveryName" value="${esc(initial ? initial.liveryName : (prefill ? prefill.liveryName : ''))}" />
                             <button type="submit" id="submitBtn"
-                                class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3.5 rounded-xl transition-all shadow-lg shadow-blue-600/20 active:scale-[0.98] disabled:opacity-70 disabled:cursor-not-allowed flex justify-center items-center gap-2 mt-2">
+                                class="w-full bg-zinc-900 hover:bg-zinc-800 text-white dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 font-bold py-3.5 rounded-xl transition-all shadow-sm active:scale-[0.98] disabled:opacity-70 disabled:cursor-not-allowed flex justify-center items-center gap-2 mt-2">
                                 ${icon('check', 20)} <span>${isEdit ? 'Update Aircraft' : 'Submit Contribution'}</span>
                             </button>
                         </form>
@@ -821,38 +840,38 @@
                     sec.innerHTML = `
                         <div class="space-y-2">
                             <div class="flex items-center justify-between">
-                                <label class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wide">Photos (${formState.currentImages.length}/${MAX_IMAGES})</label>
-                                ${formState.slotBusy ? `<span class="spin text-blue-500">${icon('loader', 16)}</span>` : ''}
+                                <label class="text-xs font-bold text-zinc-500 dark:text-zinc-400 uppercase tracking-wide">Photos (${formState.currentImages.length}/${MAX_IMAGES})</label>
+                                ${formState.slotBusy ? `<span class="spin text-zinc-700">${icon('loader', 16)}</span>` : ''}
                             </div>
                             <input type="file" id="slotFile" accept="image/*" class="hidden" />
                             <div class="grid grid-cols-3 gap-2">
                                 ${formState.currentImages.map((src, idx) => `
-                                    <div class="relative aspect-[4/3] rounded-xl overflow-hidden bg-slate-100 dark:bg-slate-800 group/slot border border-slate-200 dark:border-slate-700">
+                                    <div class="relative aspect-[4/3] rounded-xl overflow-hidden bg-zinc-100 dark:bg-zinc-800 group/slot border border-zinc-200 dark:border-zinc-700">
                                         <img src="${esc(src)}" class="absolute inset-0 w-full h-full object-cover" onerror="this.onerror=null;this.src='${PLACEHOLDER}'" />
-                                        ${idx === 0 ? `<span class="absolute top-1 left-1 bg-blue-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded z-10">PRIMARY</span>` : ''}
-                                        <div class="absolute inset-0 bg-slate-900/60 opacity-0 group-hover/slot:opacity-100 transition-opacity flex items-center justify-center gap-2">
-                                            <button type="button" data-slot-edit="${idx}" ${formState.slotBusy ? 'disabled' : ''} title="Replace" class="p-2 bg-white/90 text-slate-900 rounded-lg hover:scale-110 transition-transform disabled:opacity-50">${icon('pencil', 16)}</button>
+                                        ${idx === 0 ? `<span class="absolute top-1 left-1 bg-zinc-900 text-white text-[10px] font-bold px-1.5 py-0.5 rounded z-10">PRIMARY</span>` : ''}
+                                        <div class="absolute inset-0 bg-zinc-900/60 opacity-0 group-hover/slot:opacity-100 transition-opacity flex items-center justify-center gap-2">
+                                            <button type="button" data-slot-edit="${idx}" ${formState.slotBusy ? 'disabled' : ''} title="Replace" class="p-2 bg-white/90 text-zinc-900 rounded-lg hover:scale-110 transition-transform disabled:opacity-50">${icon('pencil', 16)}</button>
                                             <button type="button" data-slot-del="${idx}" ${formState.slotBusy ? 'disabled' : ''} title="Remove" class="p-2 bg-red-500/90 text-white rounded-lg hover:scale-110 transition-transform disabled:opacity-50">${icon('trash', 16)}</button>
                                         </div>
                                     </div>`).join('')}
                                 ${formState.currentImages.length < MAX_IMAGES ? `
                                     <button type="button" id="slotAdd" ${formState.slotBusy ? 'disabled' : ''}
-                                        class="aspect-[4/3] rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 hover:border-blue-400 hover:bg-slate-50 dark:hover:bg-slate-800/50 flex flex-col items-center justify-center text-slate-400 hover:text-blue-500 transition-colors disabled:opacity-50">
+                                        class="aspect-[4/3] rounded-xl border-2 border-dashed border-zinc-300 dark:border-zinc-700 hover:border-zinc-500 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 flex flex-col items-center justify-center text-zinc-400 hover:text-zinc-700 transition-colors disabled:opacity-50">
                                         ${icon('camera', 24)}<span class="text-xs font-semibold mt-1">Add photo</span></button>` : ''}
                             </div>
-                            <p class="text-xs text-slate-400 dark:text-slate-500">Hover a photo to replace or remove it. Changes save instantly. The first photo is the cover.</p>
+                            <p class="text-xs text-zinc-400 dark:text-zinc-500">Hover a photo to replace or remove it. Changes save instantly. The first photo is the cover.</p>
                             ${formState.currentImages.length > 0 ? `
-                            <div class="space-y-2 pt-2 mt-1 border-t border-slate-100 dark:border-slate-800">
-                                <label class="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wide">Photo Contributors</label>
+                            <div class="space-y-2 pt-2 mt-1 border-t border-zinc-100 dark:border-zinc-800">
+                                <label class="text-xs font-bold text-zinc-500 dark:text-zinc-400 uppercase tracking-wide">Photo Contributors</label>
                                 ${formState.currentImages.map((_, idx) => `
                                     <div class="flex items-center gap-2">
-                                        <span class="text-xs font-semibold text-slate-400 dark:text-slate-500 w-14 shrink-0">Photo ${idx + 1}</span>
+                                        <span class="text-xs font-semibold text-zinc-400 dark:text-zinc-500 w-14 shrink-0">Photo ${idx + 1}</span>
                                         <input type="text" data-contrib-input="${idx}" value="${esc(formState.currentContributors[idx] || '')}" placeholder="Contributor name"
-                                            class="flex-1 px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none transition-all text-sm text-slate-900 dark:text-white placeholder-slate-400" />
+                                            class="flex-1 px-3 py-2 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg focus:ring-2 focus:ring-zinc-700 outline-none transition-all text-sm text-zinc-900 dark:text-white placeholder-zinc-400" />
                                         <button type="button" data-contrib-save="${idx}" ${formState.slotBusy ? 'disabled' : ''} title="Save contributor"
-                                            class="px-3 py-2 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-lg text-xs font-bold hover:bg-blue-600 hover:text-white transition-colors disabled:opacity-50 shrink-0">Save</button>
+                                            class="px-3 py-2 bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200 rounded-lg text-xs font-bold hover:bg-zinc-900 hover:text-white transition-colors disabled:opacity-50 shrink-0">Save</button>
                                     </div>`).join('')}
-                                <p class="text-xs text-slate-400 dark:text-slate-500">Correct who spotted each photo. Saves instantly per photo.</p>
+                                <p class="text-xs text-zinc-400 dark:text-zinc-500">Correct who spotted each photo. Saves instantly per photo.</p>
                             </div>` : ''}
                         </div>`;
                     wireSlots();
@@ -862,21 +881,21 @@
                         <div class="relative group w-full">
                             <input type="file" id="createFiles" accept="image/*" multiple class="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-20 ${p.length > 0 ? 'pointer-events-none' : ''}" />
                             ${p.length > 0 ? `
-                                <div class="rounded-2xl border border-slate-200 dark:border-slate-700 p-3">
+                                <div class="rounded-2xl border border-zinc-200 dark:border-zinc-700 p-3">
                                     <div class="grid grid-cols-3 gap-2">
-                                        ${p.map((src, idx) => `<div class="relative aspect-[4/3] rounded-xl overflow-hidden bg-slate-100 dark:bg-slate-800">
+                                        ${p.map((src, idx) => `<div class="relative aspect-[4/3] rounded-xl overflow-hidden bg-zinc-100 dark:bg-zinc-800">
                                             <img src="${esc(src)}" class="absolute inset-0 w-full h-full object-cover" />
-                                            ${idx === 0 ? `<span class="absolute top-1 left-1 bg-blue-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded">PRIMARY</span>` : ''}</div>`).join('')}
+                                            ${idx === 0 ? `<span class="absolute top-1 left-1 bg-zinc-900 text-white text-[10px] font-bold px-1.5 py-0.5 rounded">PRIMARY</span>` : ''}</div>`).join('')}
                                     </div>
                                     <div class="flex items-center justify-between mt-3">
-                                        <p class="text-xs text-slate-400 dark:text-slate-500">${p.length} photo${p.length > 1 ? 's' : ''} selected</p>
-                                        <button type="button" id="changePhotos" class="z-30 bg-slate-100 dark:bg-slate-800 text-slate-900 dark:text-white px-4 py-2 rounded-xl text-sm font-semibold shadow-sm hover:scale-105 transition-transform">Change Photos</button>
+                                        <p class="text-xs text-zinc-400 dark:text-zinc-500">${p.length} photo${p.length > 1 ? 's' : ''} selected</p>
+                                        <button type="button" id="changePhotos" class="z-30 bg-zinc-100 dark:bg-zinc-800 text-zinc-900 dark:text-white px-4 py-2 rounded-xl text-sm font-semibold shadow-sm hover:scale-105 transition-transform">Change Photos</button>
                                     </div>
                                 </div>` : `
-                                <div class="relative w-full overflow-hidden rounded-2xl transition-all duration-300 h-48 border-2 border-dashed border-slate-300 dark:border-slate-700 hover:border-blue-400 hover:bg-slate-50 dark:hover:bg-slate-800/50 flex flex-col items-center justify-center">
-                                    <div class="p-4 bg-slate-100 dark:bg-slate-800 rounded-full mb-3 text-slate-400 group-hover:text-blue-500 transition-colors">${icon('camera', 32)}</div>
-                                    <p class="text-sm font-semibold text-slate-500 dark:text-slate-400 group-hover:text-blue-500 transition-colors">Click to select up to ${MAX_IMAGES} photos</p>
-                                    <p class="text-xs text-slate-400 dark:text-slate-500 mt-1">PNG, JPG · first photo becomes the cover</p>
+                                <div class="relative w-full overflow-hidden rounded-2xl transition-all duration-300 h-48 border-2 border-dashed border-zinc-300 dark:border-zinc-700 hover:border-zinc-500 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 flex flex-col items-center justify-center">
+                                    <div class="p-4 bg-zinc-100 dark:bg-zinc-800 rounded-full mb-3 text-zinc-400 group-hover:text-zinc-700 transition-colors">${icon('camera', 32)}</div>
+                                    <p class="text-sm font-semibold text-zinc-500 dark:text-zinc-400 group-hover:text-zinc-700 transition-colors">Click to select up to ${MAX_IMAGES} photos</p>
+                                    <p class="text-xs text-zinc-400 dark:text-zinc-500 mt-1">PNG, JPG · first photo becomes the cover</p>
                                 </div>`}
                         </div>`;
                     const filesInput = $('#createFiles', overlay);
@@ -962,11 +981,11 @@
                 if (formState.fetchingMeta) { wrap.innerHTML = `<div class="h-12 rounded-xl skeleton"></div>`; return; }
                 wrap.innerHTML = `
                     <div class="relative">
-                        <select id="typeSelectForm" required class="w-full px-4 py-3 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all appearance-none text-slate-900 dark:text-white cursor-pointer">
+                        <select id="typeSelectForm" required class="w-full px-4 py-3 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-xl focus:ring-2 focus:ring-zinc-700 outline-none transition-all appearance-none text-zinc-900 dark:text-white cursor-pointer">
                             <option value="">Select Aircraft…</option>
                             ${formState.metaAircraft.map(a => `<option value="${esc(a.id)}" ${a.id === formState.aircraftId ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}
                         </select>
-                        <span class="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400">${icon('chevDown', 16)}</span>
+                        <span class="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-zinc-400">${icon('chevDown', 16)}</span>
                     </div>`;
                 $('#typeSelectForm', overlay).addEventListener('change', (e) => {
                     const selId = e.target.value;
@@ -985,11 +1004,11 @@
                 const disabled = !formState.aircraftId || formState.loadingLiveries;
                 wrap.innerHTML = `
                     <div class="relative">
-                        <select id="liverySelectForm" required ${disabled ? 'disabled' : ''} class="w-full px-4 py-3 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all appearance-none text-slate-900 dark:text-white disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer">
+                        <select id="liverySelectForm" required ${disabled ? 'disabled' : ''} class="w-full px-4 py-3 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-xl focus:ring-2 focus:ring-zinc-700 outline-none transition-all appearance-none text-zinc-900 dark:text-white disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer">
                             <option value="">${formState.loadingLiveries ? 'Fetching liveries…' : (!formState.aircraftId ? 'Select aircraft first' : 'Select livery…')}</option>
                             ${formState.liveries.map(l => `<option value="${esc(l.name)}" ${l.name === liveryHidden.value ? 'selected' : ''}>${esc(l.name)}</option>`).join('')}
                         </select>
-                        <span class="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400">${formState.loadingLiveries ? `<span class="spin inline-block">${icon('loader', 16)}</span>` : icon('chevDown', 16)}</span>
+                        <span class="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-zinc-400">${formState.loadingLiveries ? `<span class="spin inline-block">${icon('loader', 16)}</span>` : icon('chevDown', 16)}</span>
                     </div>`;
                 const ll = $('#livLoading', overlay); if (ll) ll.classList.toggle('hidden', !formState.loadingLiveries);
                 $('#liverySelectForm', overlay).addEventListener('change', (e) => { liveryHidden.value = e.target.value; });

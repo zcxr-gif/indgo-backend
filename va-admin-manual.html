@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VA Admin Manual — Inflight</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script>
+        tailwind.config = { darkMode: 'class' };
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+        :root { color-scheme: light dark; }
+        body { font-family: 'Inter', sans-serif; -webkit-font-smoothing: antialiased; }
+        [data-lucide] { width: 1.15em; height: 1.15em; }
+        svg.lucide { stroke-width: 1.75; }
+        html { scroll-behavior: smooth; }
+
+        .surface { background: #fff; border: 1px solid rgba(0,0,0,.06); box-shadow: 0 1px 2px rgba(0,0,0,.03); }
+        .dark .surface { background: #18181b; border-color: rgba(255,255,255,.07); box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+
+        .loader { border: 2.5px solid rgba(120,120,128,.25); border-top-color: currentColor; border-radius: 50%; width: 30px; height: 30px; animation: spin .7s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+        /* ---- Markdown ("prose") — premium neutral ---- */
+        .prose { color: #3f3f46; line-height: 1.75; font-size: .975rem; }
+        .dark .prose { color: #d4d4d8; }
+        .prose > *:first-child { margin-top: 0; }
+        .prose h1 { font-size: 2rem; font-weight: 800; letter-spacing: -.025em; margin: 0 0 1rem; line-height: 1.15; color: #18181b; }
+        .dark .prose h1 { color: #fafafa; }
+        .prose h2 { font-size: 1.4rem; font-weight: 700; letter-spacing: -.015em; margin: 3rem 0 1rem; padding-top: 1.75rem; border-top: 1px solid #f0f0f1; color: #18181b; scroll-margin-top: 5.5rem; }
+        .dark .prose h2 { color: #fafafa; border-color: #27272a; }
+        .prose h3 { font-size: 1.15rem; font-weight: 700; letter-spacing: -.01em; margin: 2rem 0 .75rem; color: #27272a; scroll-margin-top: 5.5rem; }
+        .dark .prose h3 { color: #e4e4e7; }
+        .prose p { margin: 1rem 0; }
+        .prose a { color: #18181b; text-decoration: underline; text-decoration-color: #d4d4d8; text-underline-offset: 3px; font-weight: 500; transition: text-decoration-color .15s; }
+        .prose a:hover { text-decoration-color: #18181b; }
+        .dark .prose a { color: #fafafa; text-decoration-color: #52525b; }
+        .dark .prose a:hover { text-decoration-color: #fafafa; }
+        .prose strong { font-weight: 700; color: #18181b; }
+        .dark .prose strong { color: #fafafa; }
+        .prose ul, .prose ol { margin: 1rem 0; padding-left: 1.4rem; }
+        .prose ul { list-style: none; padding-left: 1.4rem; }
+        .prose ul > li { position: relative; }
+        .prose ul > li::before { content: ""; position: absolute; left: -1rem; top: .7em; width: 5px; height: 5px; border-radius: 50%; background: #a1a1aa; }
+        .prose ol { list-style: decimal; }
+        .prose li { margin: .4rem 0; }
+        .prose li input[type=checkbox] { margin-right: .5rem; }
+        .prose code { background: #f4f4f5; color: #18181b; padding: .15rem .45rem; border-radius: .4rem; font-size: .85em; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; border: 1px solid #ececee; }
+        .dark .prose code { background: #27272a; color: #f4f4f5; border-color: #3f3f46; }
+        .prose pre { background: #18181b; color: #e4e4e7; padding: 1.25rem 1.4rem; border-radius: 1rem; overflow-x: auto; margin: 1.4rem 0; font-size: .82rem; line-height: 1.6; border: 1px solid #27272a; }
+        .dark .prose pre { background: #09090b; border-color: #27272a; }
+        .prose pre code { background: none; color: inherit; padding: 0; font-size: inherit; border: none; }
+        .prose blockquote { border-left: 3px solid #d4d4d8; background: #fafafa; padding: .85rem 1.25rem; margin: 1.4rem 0; border-radius: 0 .75rem .75rem 0; color: #52525b; }
+        .dark .prose blockquote { background: #1c1c1f; color: #a1a1aa; border-color: #52525b; }
+        .prose blockquote p { margin: .35rem 0; }
+        .prose hr { border: none; border-top: 1px solid #f0f0f1; margin: 3rem 0; }
+        .dark .prose hr { border-color: #27272a; }
+        .prose table { width: 100%; border-collapse: separate; border-spacing: 0; margin: 1.6rem 0; font-size: .88rem; display: block; overflow-x: auto; border: 1px solid #ececee; border-radius: .85rem; }
+        .dark .prose table { border-color: #27272a; }
+        .prose th, .prose td { padding: .7rem .9rem; text-align: left; vertical-align: top; border-bottom: 1px solid #f0f0f1; }
+        .dark .prose th, .dark .prose td { border-color: #27272a; }
+        .prose tr:last-child td { border-bottom: none; }
+        .prose th { background: #fafafa; font-weight: 600; color: #27272a; font-size: .8rem; letter-spacing: .01em; }
+        .dark .prose th { background: #1c1c1f; color: #e4e4e7; }
+        .prose tbody tr:hover td { background: #fafafa; }
+        .dark .prose tbody tr:hover td { background: #1c1c1f; }
+
+        .toc-link.active { color: #18181b; font-weight: 600; }
+        .dark .toc-link.active { color: #fafafa; }
+        .toc-link.active .toc-bar { background: #18181b; }
+        .dark .toc-link.active .toc-bar { background: #fafafa; }
+    </style>
+</head>
+<body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 antialiased min-h-screen transition-colors duration-300">
+
+    <!-- Top bar -->
+    <header class="sticky top-0 z-40 backdrop-blur-xl bg-zinc-50/80 dark:bg-zinc-950/80 border-b border-zinc-200/70 dark:border-zinc-800/70">
+        <div class="max-w-7xl mx-auto px-5 h-16 flex items-center justify-between">
+            <div class="flex items-center gap-2.5">
+                <a href="/staff" title="Back to hub" class="w-9 h-9 grid place-items-center rounded-xl hover:bg-zinc-200/70 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition">
+                    <i data-lucide="arrow-left" class="w-[18px] h-[18px]"></i>
+                </a>
+                <div class="w-9 h-9 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 flex items-center justify-center">
+                    <i data-lucide="book-open" class="w-5 h-5"></i>
+                </div>
+                <span class="font-semibold tracking-tight hidden sm:block">VA Admin Manual</span>
+            </div>
+            <div class="flex items-center gap-2">
+                <a href="/va-ads" class="hidden sm:flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-medium text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200/70 dark:hover:bg-zinc-800 transition">
+                    <i data-lucide="megaphone" class="w-[17px] h-[17px]"></i><span>VA Ads</span>
+                </a>
+                <a href="/VA-ADMIN-MANUAL.md" title="View raw Markdown" class="hidden sm:flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-medium text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200/70 dark:hover:bg-zinc-800 transition">
+                    <i data-lucide="file-text" class="w-[17px] h-[17px]"></i><span>Markdown</span>
+                </a>
+                <button onclick="toggleDarkMode()" title="Toggle theme" class="w-9 h-9 grid place-items-center rounded-full hover:bg-zinc-200/70 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition">
+                    <span id="themeIcon"></span>
+                </button>
+                <button onclick="toggleToc()" title="Contents" class="lg:hidden w-9 h-9 grid place-items-center rounded-full hover:bg-zinc-200/70 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition">
+                    <i data-lucide="list" class="w-[18px] h-[18px]"></i>
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <div class="max-w-7xl mx-auto px-5 py-8 flex gap-10">
+        <!-- Sidebar TOC -->
+        <aside class="hidden lg:block w-64 shrink-0">
+            <div class="sticky top-24 max-h-[calc(100vh-7rem)] overflow-y-auto no-scrollbar">
+                <p class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-3 px-3">On this page</p>
+                <nav id="toc" class="flex flex-col text-sm"></nav>
+            </div>
+        </aside>
+
+        <!-- Content -->
+        <main class="flex-1 min-w-0">
+            <article id="content" class="prose max-w-none surface rounded-3xl p-6 sm:p-12">
+                <div class="flex flex-col items-center justify-center py-24 gap-4 text-zinc-400">
+                    <div class="loader"></div>
+                    <p class="text-sm font-medium">Loading manual…</p>
+                </div>
+            </article>
+        </main>
+    </div>
+
+    <!-- Mobile TOC -->
+    <div id="tocOverlay" class="fixed inset-0 z-50 hidden lg:hidden">
+        <div class="absolute inset-0 bg-zinc-900/40 dark:bg-black/60 backdrop-blur-sm" onclick="toggleToc()"></div>
+        <div class="absolute right-0 top-0 bottom-0 w-72 bg-white dark:bg-zinc-900 p-6 overflow-y-auto no-scrollbar shadow-2xl">
+            <div class="flex items-center justify-between mb-4">
+                <p class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Contents</p>
+                <button onclick="toggleToc()" class="w-8 h-8 grid place-items-center rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800"><i data-lucide="x" class="w-[18px] h-[18px]"></i></button>
+            </div>
+            <nav id="tocMobile" class="flex flex-col text-sm"></nav>
+        </div>
+    </div>
+
+    <script>
+        function drawIcons() { if (window.lucide) lucide.createIcons(); }
+
+        function setThemeIcon() {
+            const dark = document.documentElement.classList.contains('dark');
+            const el = document.getElementById('themeIcon');
+            if (el) { el.innerHTML = `<i data-lucide="${dark ? 'sun' : 'moon'}" class="w-[18px] h-[18px]"></i>`; drawIcons(); }
+        }
+        function applyTheme() {
+            const dark = localStorage.getItem('theme') !== 'light';
+            document.documentElement.classList.toggle('dark', dark);
+            setThemeIcon();
+        }
+        function toggleDarkMode() {
+            const dark = !document.documentElement.classList.contains('dark');
+            localStorage.setItem('theme', dark ? 'dark' : 'light');
+            document.documentElement.classList.toggle('dark', dark);
+            setThemeIcon();
+        }
+        applyTheme();
+
+        function toggleToc() { document.getElementById('tocOverlay').classList.toggle('hidden'); }
+
+        function slugify(text) {
+            return text.toLowerCase().trim().replace(/[^\w\s-]/g, '').replace(/\s+/g, '-').replace(/-+/g, '-');
+        }
+
+        async function loadManual() {
+            const content = document.getElementById('content');
+            try {
+                const res = await fetch('/VA-ADMIN-MANUAL.md', { cache: 'no-cache' });
+                if (res.redirected && res.url.includes('/staff')) {
+                    location.href = '/staff?next=' + encodeURIComponent('/va-admin-manual');
+                    return;
+                }
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const md = await res.text();
+                marked.setOptions({ gfm: true, breaks: false });
+                content.innerHTML = marked.parse(md);
+                content.classList.remove('flex', 'flex-col', 'items-center', 'justify-center');
+                buildToc();
+            } catch (err) {
+                content.innerHTML = '<div class="text-center py-16 not-prose">'
+                    + '<div class="w-12 h-12 mx-auto mb-4 rounded-2xl bg-amber-100 dark:bg-amber-950/40 text-amber-600 grid place-items-center"><i data-lucide="triangle-alert"></i></div>'
+                    + '<h2 style="border:none;margin:0 0 .5rem;">Could not load the manual</h2>'
+                    + '<p class="text-zinc-500">' + (err.message || err) + '</p>'
+                    + '<p class="text-zinc-500">Open the raw file: <a href="/VA-ADMIN-MANUAL.md">VA-ADMIN-MANUAL.md</a></p>'
+                    + '</div>';
+                drawIcons();
+            }
+        }
+
+        function buildToc() {
+            const headings = document.querySelectorAll('#content h2, #content h3');
+            const toc = document.getElementById('toc');
+            const tocMobile = document.getElementById('tocMobile');
+            const used = {};
+            const links = [];
+
+            headings.forEach(h => {
+                let slug = slugify(h.textContent);
+                if (used[slug] != null) { used[slug]++; slug = slug + '-' + used[slug]; }
+                else { used[slug] = 0; }
+                h.id = slug;
+
+                const pad = h.tagName === 'H3' ? 'pl-7' : 'pl-3';
+                const make = () => {
+                    const a = document.createElement('a');
+                    a.href = '#' + slug;
+                    a.dataset.target = slug;
+                    a.className = `toc-link group flex items-center gap-2.5 py-1.5 ${pad} pr-2 rounded-lg text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-zinc-100/70 dark:hover:bg-zinc-800/50 transition truncate`;
+                    a.innerHTML = `<span class="toc-bar w-0.5 h-3.5 rounded-full bg-transparent shrink-0"></span><span class="truncate">${h.textContent}</span>`;
+                    return a;
+                };
+                const a1 = make(); toc.appendChild(a1); links.push(a1);
+                const a2 = make(); a2.addEventListener('click', toggleToc); tocMobile.appendChild(a2);
+            });
+
+            const linkMap = {};
+            links.forEach(l => linkMap[l.dataset.target] = l);
+            const observer = new IntersectionObserver((entries) => {
+                entries.forEach(e => {
+                    if (e.isIntersecting) {
+                        links.forEach(l => l.classList.remove('active'));
+                        const active = linkMap[e.target.id];
+                        if (active) active.classList.add('active');
+                    }
+                });
+            }, { rootMargin: '-90px 0px -70% 0px' });
+            headings.forEach(h => observer.observe(h));
+        }
+
+        drawIcons();
+        loadManual();
+    </script>
+</body>
+</html>
