@@ -11,6 +11,14 @@ const {
 // VA Advertisement image helpers (banner + logo -> S3 as WebP)
 const { uploadVaImage, deleteVaImage } = require('./vaAds');
 
+// Staff portal authentication (per-user accounts, JWT cookie).
+const {
+    registerAuthRoutes,
+    bootstrapAdmin,
+    requireAuth,
+    requireAuthPage,
+} = require('./staffAuth');
+
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
@@ -62,7 +70,11 @@ app.set('trust proxy', 1);
 
 // 2. CONNECT TO MONGODB
 mongoose.connect(process.env.MONGO_URI)
-    .then(() => console.log('✅ MongoDB Connected'))
+    .then(() => {
+        console.log('✅ MongoDB Connected');
+        // Create the first staff admin from env vars if no accounts exist yet.
+        bootstrapAdmin();
+    })
     .catch(err => console.error('❌ MongoDB Connection Error:', err));
 
 const CommunityAircraftSchema = new mongoose.Schema({
@@ -516,6 +528,9 @@ const hashIp = (ip) => {
 
 // 5. API ROUTES
 
+// Staff portal auth routes (login / logout / me / user management).
+registerAuthRoutes(app);
+
 // Health Check
 app.get('/', (req, res) => {
     res.send('Community Aircraft Backend is Running.');
@@ -527,7 +542,7 @@ app.get('/', (req, res) => {
  * ========================= */
 
 // POST: Import gates.json into MongoDB using fast Bulk Upsert
-app.post('/api/gates/import', upload.single('file'), async (req, res) => {
+app.post('/api/gates/import', requireAuth, upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
             return res.status(400).json({ message: 'JSON file is required.' });
@@ -967,6 +982,8 @@ app.get('/api/aircraft/lookup', async (req, res) => {
 });
 
 // GET: Admin System Stats (New - Includes S3 & DB Stats)
+// NOTE: read-only and used by the public homepage stats panel — intentionally
+// left open. The write APIs below are the ones gated behind requireAuth.
 app.get('/api/admin/stats', async (req, res) => {
     try {
         // 1. Get MongoDB Stats
@@ -1434,7 +1451,7 @@ app.patch('/api/aircraft/:id/images/:index/contributor', async (req, res) => {
  * ========================= */
 
 // POST: Upload Airport Image
-app.post('/api/airports', upload.single('image'), async (req, res) => {
+app.post('/api/airports', requireAuth, upload.single('image'), async (req, res) => {
     try {
         const { icao, contributorName } = req.body;
 
@@ -1473,7 +1490,7 @@ app.get('/api/airports/:icao', async (req, res) => {
 /**
  * DELETE: Remove all images/data for an airport
  */
-app.delete('/api/airports/:icao', async (req, res) => {
+app.delete('/api/airports/:icao', requireAuth, async (req, res) => {
     try {
         const success = await deleteAirportImages(s3Client, req.params.icao);
         if (!success) return res.status(404).json({ message: 'No images found for this ICAO.' });
@@ -1524,7 +1541,7 @@ app.get('/api/airports', async (req, res) => {
 /**
  * PUT: Update airport data or replace image
  */
-app.put('/api/airports/:icao', upload.single('image'), async (req, res) => {
+app.put('/api/airports/:icao', requireAuth, upload.single('image'), async (req, res) => {
     try {
         const { icao } = req.params;
         const { contributorName } = req.body;
@@ -1752,7 +1769,7 @@ app.get('/api/va-ads/:id', async (req, res) => {
 });
 
 // POST: Submit a new VA ad (multipart: banner + logo + fields).
-app.post('/api/va-ads', uploadVaImages, async (req, res) => {
+app.post('/api/va-ads', requireAuth, uploadVaImages, async (req, res) => {
     const bannerFile = getUploadedField(req, 'banner');
     const logoFile = getUploadedField(req, 'logo');
     try {
@@ -1817,7 +1834,7 @@ app.post('/api/va-ads', uploadVaImages, async (req, res) => {
 
 // PUT: Update an existing VA ad. Any provided field is updated; banner/logo are
 // replaced (old S3 image deleted) only when a new file is uploaded.
-app.put('/api/va-ads/:id', uploadVaImages, async (req, res) => {
+app.put('/api/va-ads/:id', requireAuth, uploadVaImages, async (req, res) => {
     const bannerFile = getUploadedField(req, 'banner');
     const logoFile = getUploadedField(req, 'logo');
     try {
@@ -1878,7 +1895,7 @@ app.put('/api/va-ads/:id', uploadVaImages, async (req, res) => {
 });
 
 // PATCH: Moderate an ad — set its status to approved/rejected/pending.
-app.patch('/api/va-ads/:id/status', async (req, res) => {
+app.patch('/api/va-ads/:id/status', requireAuth, async (req, res) => {
     try {
         const { status } = req.body;
         if (!VA_AD_STATUSES.includes(status)) {
@@ -1896,7 +1913,7 @@ app.patch('/api/va-ads/:id/status', async (req, res) => {
 });
 
 // PATCH: Toggle (or set) the featured flag to pin an ad to the top.
-app.patch('/api/va-ads/:id/feature', async (req, res) => {
+app.patch('/api/va-ads/:id/feature', requireAuth, async (req, res) => {
     try {
         const ad = await VirtualAirlineAd.findById(req.params.id);
         if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
@@ -1931,7 +1948,7 @@ app.post('/api/va-ads/:id/click', async (req, res) => {
 });
 
 // DELETE: Remove a VA ad and clean up its S3 images.
-app.delete('/api/va-ads/:id', async (req, res) => {
+app.delete('/api/va-ads/:id', requireAuth, async (req, res) => {
     try {
         const ad = await VirtualAirlineAd.findById(req.params.id);
         if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
@@ -1951,24 +1968,47 @@ app.delete('/api/va-ads/:id', async (req, res) => {
 
 // server.js
 
+// Staff-only surfaces — gate both the clean route and the raw file (and the
+// manual's Markdown source) BEFORE express.static can serve them by filename.
+// Non-sensitive frontend assets (airports.js, etc.) stay public; the data they
+// touch is protected by requireAuth on the APIs.
+const STAFF_ONLY_PATHS = new Set([
+    '/va-ads', '/va-ads.html',
+    '/airports', '/airports.html',
+    '/va-admin-manual', '/va-admin-manual.html',
+    '/VA-ADMIN-MANUAL.md',
+]);
+app.use((req, res, next) => {
+    if (req.method === 'GET' && STAFF_ONLY_PATHS.has(req.path)) {
+        return requireAuthPage(req, res, next);
+    }
+    next();
+});
+
+// The staff portal itself (login + tool launcher + user admin). Public so staff
+// can reach the login form; the page calls /api/auth/me to decide what to show.
+app.get('/staff', (req, res) => {
+    res.sendFile(path.join(__dirname, 'staff.html'));
+});
+
 // 1. Serve static files from the root directory
 // This allows the browser to find airports.js, images, and CSS
 app.use(express.static(__dirname));
 
 // 2. Specific route for the Airport Manager
-// Accessible via yoursite.com/airports
+// Accessible via yoursite.com/airports (staff-only — see guard above)
 app.get('/airports', (req, res) => {
     res.sendFile(path.join(__dirname, 'airports.html'));
 });
 
 // Specific route for the VA Advertisement Manager (admin/staff dashboard)
-// Accessible via yoursite.com/va-ads
+// Accessible via yoursite.com/va-ads (staff-only — see guard above)
 app.get('/va-ads', (req, res) => {
     res.sendFile(path.join(__dirname, 'va-ads.html'));
 });
 
 // Specific route for the VA Admin Manual (staff reference, rendered from Markdown)
-// Accessible via yoursite.com/va-admin-manual
+// Accessible via yoursite.com/va-admin-manual (staff-only — see guard above)
 app.get('/va-admin-manual', (req, res) => {
     res.sendFile(path.join(__dirname, 'va-admin-manual.html'));
 });

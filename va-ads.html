@@ -4,6 +4,20 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VA Ads Manager</title>
+    <script>
+        // Staff session guard: if any API call comes back 401 (session expired),
+        // bounce to the portal login, preserving where we were.
+        (function () {
+            const _fetch = window.fetch;
+            window.fetch = async function (...args) {
+                const res = await _fetch.apply(this, args);
+                if (res.status === 401) {
+                    location.href = '/staff?next=' + encodeURIComponent(location.pathname + location.search);
+                }
+                return res;
+            };
+        })();
+    </script>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet">
     <script>

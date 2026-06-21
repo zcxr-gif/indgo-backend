@@ -159,6 +159,11 @@
             const content = document.getElementById('content');
             try {
                 const res = await fetch('/VA-ADMIN-MANUAL.md', { cache: 'no-cache' });
+                // Session expired mid-view: the gated .md redirects to the portal.
+                if (res.redirected && res.url.includes('/staff')) {
+                    location.href = '/staff?next=' + encodeURIComponent('/va-admin-manual');
+                    return;
+                }
                 if (!res.ok) throw new Error('HTTP ' + res.status);
                 const md = await res.text();
 

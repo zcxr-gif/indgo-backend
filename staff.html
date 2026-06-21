@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Staff Portal — Inflight</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: { extend: { colors: { slate: { 950: '#020617' } } } }
+        }
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .loader { border: 3px solid rgba(148,163,184,.3); border-top-color: #2563eb; border-radius: 50%; width: 32px; height: 32px; animation: spin .8s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .animate-fade-in { animation: fadeIn .3s ease-out forwards; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body class="bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 transition-colors duration-300 min-h-screen">
+
+    <!-- ============ INITIAL LOADING ============ -->
+    <div id="bootLoader" class="min-h-screen flex flex-col items-center justify-center gap-4">
+        <div class="loader"></div>
+        <p class="text-slate-500 dark:text-slate-400 font-medium">Loading portal…</p>
+    </div>
+
+    <!-- ============ LOGIN VIEW ============ -->
+    <div id="loginView" class="hidden min-h-screen flex items-center justify-center px-4">
+        <div class="w-full max-w-sm animate-fade-in">
+            <div class="text-center mb-8">
+                <div class="w-14 h-14 bg-blue-600 rounded-2xl flex items-center justify-center text-white shadow-lg shadow-blue-500/20 mx-auto mb-4">
+                    <i class="fa-solid fa-shield-halved text-2xl"></i>
+                </div>
+                <h1 class="text-2xl font-extrabold tracking-tight">Staff Portal</h1>
+                <p class="text-slate-500 dark:text-slate-400 text-sm mt-1">Sign in to access staff tools</p>
+            </div>
+            <form id="loginForm" class="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm space-y-4">
+                <div>
+                    <label class="block text-sm font-medium mb-1.5">Username</label>
+                    <input id="loginUsername" type="text" autocomplete="username" required
+                        class="w-full px-3 py-2.5 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 transition">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium mb-1.5">Password</label>
+                    <input id="loginPassword" type="password" autocomplete="current-password" required
+                        class="w-full px-3 py-2.5 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 transition">
+                </div>
+                <p id="loginError" class="hidden text-sm text-red-600 dark:text-red-400 font-medium"></p>
+                <button type="submit" id="loginBtn"
+                    class="w-full bg-blue-600 hover:bg-blue-700 text-white py-2.5 rounded-lg font-semibold flex items-center justify-center gap-2 transition active:scale-[.98] shadow-lg shadow-blue-600/20">
+                    <span>Sign in</span>
+                </button>
+            </form>
+            <p class="text-center text-xs text-slate-400 dark:text-slate-600 mt-6">Authorised staff only · access is logged</p>
+        </div>
+    </div>
+
+    <!-- ============ PORTAL VIEW ============ -->
+    <div id="portalView" class="hidden">
+        <nav class="sticky top-0 z-40 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md border-b border-slate-200 dark:border-slate-800">
+            <div class="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                    <div class="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white shadow-lg shadow-blue-500/20">
+                        <i class="fa-solid fa-shield-halved text-lg"></i>
+                    </div>
+                    <h1 class="text-xl font-bold tracking-tight hidden sm:block">Staff Portal</h1>
+                </div>
+                <div class="flex items-center gap-3">
+                    <span id="whoami" class="text-sm text-slate-500 dark:text-slate-400 hidden sm:inline"></span>
+                    <button onclick="toggleDarkMode()" class="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full transition-colors">
+                        <i id="themeIcon" class="fa-solid fa-moon text-slate-600 dark:text-yellow-400 text-lg"></i>
+                    </button>
+                    <button onclick="logout()" class="bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 px-3 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition">
+                        <i class="fa-solid fa-right-from-bracket"></i><span class="hidden sm:inline">Log out</span>
+                    </button>
+                </div>
+            </div>
+        </nav>
+
+        <main class="max-w-6xl mx-auto px-4 py-8 animate-fade-in">
+            <section class="mb-8">
+                <h2 class="text-3xl font-extrabold mb-1">Welcome back, <span id="greetName">staff</span> 👋</h2>
+                <p class="text-slate-500 dark:text-slate-400">Your staff tools, all in one place.</p>
+            </section>
+
+            <!-- Tool launcher -->
+            <section class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-10">
+                <a href="/va-ads" class="group bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 hover:border-blue-400 dark:hover:border-blue-600 hover:shadow-lg transition">
+                    <div class="w-11 h-11 rounded-xl bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-blue-400 flex items-center justify-center mb-3"><i class="fa-solid fa-bullhorn text-lg"></i></div>
+                    <h3 class="font-bold text-lg mb-1">VA Ads Manager <i class="fa-solid fa-arrow-right text-sm opacity-0 group-hover:opacity-100 -translate-x-1 group-hover:translate-x-0 transition"></i></h3>
+                    <p class="text-sm text-slate-500 dark:text-slate-400">Review, approve, edit, feature and remove VA listings.</p>
+                </a>
+                <a href="/va-admin-manual" class="group bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 hover:border-blue-400 dark:hover:border-blue-600 hover:shadow-lg transition">
+                    <div class="w-11 h-11 rounded-xl bg-indigo-100 dark:bg-indigo-900/40 text-indigo-600 dark:text-indigo-400 flex items-center justify-center mb-3"><i class="fa-solid fa-book text-lg"></i></div>
+                    <h3 class="font-bold text-lg mb-1">VA Admin Manual <i class="fa-solid fa-arrow-right text-sm opacity-0 group-hover:opacity-100 -translate-x-1 group-hover:translate-x-0 transition"></i></h3>
+                    <p class="text-sm text-slate-500 dark:text-slate-400">The staff reference for vetting and moderating VAs.</p>
+                </a>
+                <a href="/airports" class="group bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 hover:border-blue-400 dark:hover:border-blue-600 hover:shadow-lg transition">
+                    <div class="w-11 h-11 rounded-xl bg-emerald-100 dark:bg-emerald-900/40 text-emerald-600 dark:text-emerald-400 flex items-center justify-center mb-3"><i class="fa-solid fa-tower-control text-lg"></i></div>
+                    <h3 class="font-bold text-lg mb-1">Airport Manager <i class="fa-solid fa-arrow-right text-sm opacity-0 group-hover:opacity-100 -translate-x-1 group-hover:translate-x-0 transition"></i></h3>
+                    <p class="text-sm text-slate-500 dark:text-slate-400">Manage airport metadata, gates and imagery.</p>
+                </a>
+            </section>
+
+            <!-- Account -->
+            <section class="mb-10">
+                <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400 dark:text-slate-500 mb-3">Your account</h3>
+                <div class="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 max-w-md">
+                    <form id="pwForm" class="space-y-3">
+                        <p class="font-semibold text-sm mb-1"><i class="fa-solid fa-key mr-1.5 text-slate-400"></i>Change password</p>
+                        <input id="pwCurrent" type="password" placeholder="Current password" autocomplete="current-password" required
+                            class="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm">
+                        <input id="pwNew" type="password" placeholder="New password (min 8 chars)" autocomplete="new-password" required
+                            class="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm">
+                        <p id="pwMsg" class="hidden text-sm font-medium"></p>
+                        <button type="submit" class="bg-slate-800 dark:bg-slate-100 text-white dark:text-slate-900 px-4 py-2 rounded-lg text-sm font-semibold hover:opacity-90 transition">Update password</button>
+                    </form>
+                </div>
+            </section>
+
+            <!-- Admin: user management -->
+            <section id="adminSection" class="hidden">
+                <div class="flex items-center justify-between mb-3">
+                    <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400 dark:text-slate-500">Staff accounts <span class="text-slate-300 dark:text-slate-600">(admin)</span></h3>
+                    <button onclick="openCreate()" class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-lg text-sm font-medium flex items-center gap-2 transition active:scale-95">
+                        <i class="fa-solid fa-user-plus text-xs"></i><span>Add staff</span>
+                    </button>
+                </div>
+                <div class="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl overflow-hidden">
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead class="bg-slate-50 dark:bg-slate-800/50 text-slate-500 dark:text-slate-400">
+                                <tr>
+                                    <th class="text-left font-semibold px-4 py-3">User</th>
+                                    <th class="text-left font-semibold px-4 py-3">Role</th>
+                                    <th class="text-left font-semibold px-4 py-3">Status</th>
+                                    <th class="text-left font-semibold px-4 py-3 hidden sm:table-cell">Last login</th>
+                                    <th class="text-right font-semibold px-4 py-3">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="usersBody" class="divide-y divide-slate-100 dark:divide-slate-800"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- ============ CREATE USER MODAL ============ -->
+    <div id="createModal" class="hidden fixed inset-0 z-50 flex items-center justify-center px-4">
+        <div class="absolute inset-0 bg-black/50" onclick="closeCreate()"></div>
+        <div class="relative bg-white dark:bg-slate-900 rounded-2xl p-6 w-full max-w-sm shadow-2xl animate-fade-in">
+            <h3 class="text-lg font-bold mb-4">Add staff account</h3>
+            <form id="createForm" class="space-y-3">
+                <input id="newUsername" type="text" placeholder="Username" required
+                    class="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm">
+                <input id="newDisplay" type="text" placeholder="Display name (optional)"
+                    class="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm">
+                <input id="newPassword" type="text" placeholder="Temporary password (min 8 chars)" required
+                    class="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm">
+                <select id="newRole" class="w-full px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm">
+                    <option value="staff">Staff</option>
+                    <option value="admin">Admin</option>
+                </select>
+                <p id="createError" class="hidden text-sm text-red-600 dark:text-red-400 font-medium"></p>
+                <div class="flex gap-2 pt-1">
+                    <button type="button" onclick="closeCreate()" class="flex-1 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 py-2 rounded-lg text-sm font-medium transition">Cancel</button>
+                    <button type="submit" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg text-sm font-semibold transition">Create</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        // ---- Dark mode ----
+        function applyTheme() {
+            const dark = localStorage.getItem('theme') !== 'light';
+            document.documentElement.classList.toggle('dark', dark);
+            const icon = document.getElementById('themeIcon');
+            if (icon) icon.className = dark ? 'fa-solid fa-sun text-yellow-400 text-lg' : 'fa-solid fa-moon text-slate-600 text-lg';
+        }
+        function toggleDarkMode() {
+            const dark = !document.documentElement.classList.contains('dark');
+            localStorage.setItem('theme', dark ? 'dark' : 'light');
+            applyTheme();
+        }
+        applyTheme();
+
+        let currentUser = null;
+
+        function show(id) { document.getElementById(id).classList.remove('hidden'); }
+        function hide(id) { document.getElementById(id).classList.add('hidden'); }
+
+        function getNextParam() {
+            const p = new URLSearchParams(location.search).get('next');
+            // Only allow same-site relative paths to avoid open-redirect.
+            if (p && p.startsWith('/') && !p.startsWith('//')) return p;
+            return null;
+        }
+
+        async function api(path, opts = {}) {
+            const res = await fetch(path, {
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+                ...opts,
+            });
+            let data = null;
+            try { data = await res.json(); } catch {}
+            return { ok: res.ok, status: res.status, data };
+        }
+
+        // ---- Boot: decide login vs portal ----
+        async function boot() {
+            const { ok, data } = await api('/api/auth/me');
+            hide('bootLoader');
+            if (ok && data.user) {
+                currentUser = data.user;
+                // If we arrived here only to authenticate before a deep link, go there.
+                const next = getNextParam();
+                if (next) { location.replace(next); return; }
+                renderPortal();
+            } else {
+                show('loginView');
+                document.getElementById('loginUsername').focus();
+            }
+        }
+
+        // ---- Login ----
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = document.getElementById('loginBtn');
+            const err = document.getElementById('loginError');
+            err.classList.add('hidden');
+            btn.disabled = true; btn.innerHTML = '<span class="loader" style="width:18px;height:18px;border-width:2px;"></span>';
+            const { ok, data } = await api('/api/auth/login', {
+                method: 'POST',
+                body: JSON.stringify({
+                    username: document.getElementById('loginUsername').value,
+                    password: document.getElementById('loginPassword').value,
+                }),
+            });
+            btn.disabled = false; btn.innerHTML = '<span>Sign in</span>';
+            if (ok) {
+                const next = getNextParam();
+                if (next) { location.replace(next); return; }
+                currentUser = data.user;
+                hide('loginView');
+                renderPortal();
+            } else {
+                err.textContent = (data && data.error) || 'Login failed.';
+                err.classList.remove('hidden');
+            }
+        });
+
+        // ---- Logout ----
+        async function logout() {
+            await api('/api/auth/logout', { method: 'POST' });
+            location.reload();
+        }
+
+        // ---- Render portal ----
+        function renderPortal() {
+            show('portalView');
+            const name = currentUser.displayName || currentUser.username;
+            document.getElementById('greetName').textContent = name;
+            document.getElementById('whoami').textContent = `${name} · ${currentUser.role}`;
+            if (currentUser.role === 'admin') {
+                show('adminSection');
+                loadUsers();
+            }
+        }
+
+        // ---- Change own password ----
+        document.getElementById('pwForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const msg = document.getElementById('pwMsg');
+            const { ok, data } = await api('/api/auth/change-password', {
+                method: 'POST',
+                body: JSON.stringify({
+                    currentPassword: document.getElementById('pwCurrent').value,
+                    newPassword: document.getElementById('pwNew').value,
+                }),
+            });
+            msg.classList.remove('hidden');
+            if (ok) {
+                msg.textContent = 'Password updated.';
+                msg.className = 'text-sm font-medium text-emerald-600 dark:text-emerald-400';
+                document.getElementById('pwForm').reset();
+            } else {
+                msg.textContent = (data && data.error) || 'Could not update password.';
+                msg.className = 'text-sm font-medium text-red-600 dark:text-red-400';
+            }
+        });
+
+        // ---- Admin: users ----
+        function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+        function fmtDate(d) { return d ? new Date(d).toLocaleString() : '—'; }
+
+        async function loadUsers() {
+            const { ok, data } = await api('/api/auth/users');
+            const body = document.getElementById('usersBody');
+            if (!ok) { body.innerHTML = '<tr><td colspan="5" class="px-4 py-6 text-center text-slate-400">Could not load users.</td></tr>'; return; }
+            body.innerHTML = data.users.map(u => {
+                const isSelf = u.id === currentUser.id;
+                const roleBadge = u.role === 'admin'
+                    ? '<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300">admin</span>'
+                    : '<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">staff</span>';
+                const statusBadge = u.active
+                    ? '<span class="text-emerald-600 dark:text-emerald-400 font-medium">Active</span>'
+                    : '<span class="text-slate-400">Disabled</span>';
+                return `<tr>
+                    <td class="px-4 py-3">
+                        <div class="font-medium">${esc(u.displayName || u.username)}${isSelf ? ' <span class="text-xs text-slate-400">(you)</span>' : ''}</div>
+                        <div class="text-xs text-slate-400">@${esc(u.username)}</div>
+                    </td>
+                    <td class="px-4 py-3">${roleBadge}</td>
+                    <td class="px-4 py-3">${statusBadge}</td>
+                    <td class="px-4 py-3 hidden sm:table-cell text-slate-500 dark:text-slate-400">${fmtDate(u.lastLoginAt)}</td>
+                    <td class="px-4 py-3">
+                        <div class="flex items-center justify-end gap-1.5">
+                            <button title="Reset password" onclick="resetPw('${u.id}','${esc(u.username)}')" class="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition"><i class="fa-solid fa-key text-slate-500"></i></button>
+                            ${isSelf ? '' : `
+                            <button title="Toggle role" onclick="toggleRole('${u.id}','${u.role}')" class="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition"><i class="fa-solid fa-user-shield text-slate-500"></i></button>
+                            <button title="${u.active ? 'Disable' : 'Enable'}" onclick="toggleActive('${u.id}',${u.active})" class="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition"><i class="fa-solid ${u.active ? 'fa-ban' : 'fa-circle-check'} text-slate-500"></i></button>
+                            <button title="Delete" onclick="delUser('${u.id}','${esc(u.username)}')" class="p-2 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-lg transition"><i class="fa-solid fa-trash text-red-500"></i></button>`}
+                        </div>
+                    </td>
+                </tr>`;
+            }).join('');
+        }
+
+        async function patchUser(id, payload) {
+            const { ok, data } = await api('/api/auth/users/' + id, { method: 'PATCH', body: JSON.stringify(payload) });
+            if (!ok) alert((data && data.error) || 'Update failed.');
+            loadUsers();
+        }
+        function toggleRole(id, role) { patchUser(id, { role: role === 'admin' ? 'staff' : 'admin' }); }
+        function toggleActive(id, active) { patchUser(id, { active: !active }); }
+        function resetPw(id, username) {
+            const pw = prompt(`New password for "${username}" (min 8 chars):`);
+            if (pw == null) return;
+            if (pw.length < 8) { alert('Password must be at least 8 characters.'); return; }
+            patchUser(id, { password: pw });
+        }
+        async function delUser(id, username) {
+            if (!confirm(`Delete staff account "${username}"? This cannot be undone.`)) return;
+            const { ok, data } = await api('/api/auth/users/' + id, { method: 'DELETE' });
+            if (!ok) alert((data && data.error) || 'Delete failed.');
+            loadUsers();
+        }
+
+        // ---- Create user modal ----
+        function openCreate() { show('createModal'); document.getElementById('newUsername').focus(); }
+        function closeCreate() { hide('createModal'); document.getElementById('createForm').reset(); document.getElementById('createError').classList.add('hidden'); }
+        document.getElementById('createForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const err = document.getElementById('createError');
+            err.classList.add('hidden');
+            const { ok, data } = await api('/api/auth/users', {
+                method: 'POST',
+                body: JSON.stringify({
+                    username: document.getElementById('newUsername').value,
+                    displayName: document.getElementById('newDisplay').value,
+                    password: document.getElementById('newPassword').value,
+                    role: document.getElementById('newRole').value,
+                }),
+            });
+            if (ok) { closeCreate(); loadUsers(); }
+            else { err.textContent = (data && data.error) || 'Could not create user.'; err.classList.remove('hidden'); }
+        });
+
+        boot();
+    </script>
+</body>
+</html>
