@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VA Admin Manual — Inflight</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: { extend: { colors: { slate: { 950: '#020617' } } } }
+        }
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .loader { border: 3px solid rgba(148,163,184,.3); border-top-color: #2563eb; border-radius: 50%; width: 32px; height: 32px; animation: spin .8s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+        /* Markdown rendering ("prose") */
+        .prose { color: #334155; line-height: 1.7; }
+        .dark .prose { color: #cbd5e1; }
+        .prose > *:first-child { margin-top: 0; }
+        .prose h1 { font-size: 2rem; font-weight: 800; letter-spacing: -.02em; margin: 0 0 1rem; line-height: 1.2; color: #0f172a; }
+        .dark .prose h1 { color: #f1f5f9; }
+        .prose h2 { font-size: 1.5rem; font-weight: 700; letter-spacing: -.01em; margin: 2.5rem 0 1rem; padding-top: 1rem; border-top: 1px solid #e2e8f0; color: #0f172a; scroll-margin-top: 5rem; }
+        .dark .prose h2 { color: #f1f5f9; border-color: #1e293b; }
+        .prose h3 { font-size: 1.2rem; font-weight: 700; margin: 1.75rem 0 .75rem; color: #1e293b; scroll-margin-top: 5rem; }
+        .dark .prose h3 { color: #e2e8f0; }
+        .prose p { margin: 1rem 0; }
+        .prose a { color: #2563eb; text-decoration: none; font-weight: 500; }
+        .prose a:hover { text-decoration: underline; }
+        .dark .prose a { color: #60a5fa; }
+        .prose strong { font-weight: 700; color: #0f172a; }
+        .dark .prose strong { color: #f8fafc; }
+        .prose ul, .prose ol { margin: 1rem 0; padding-left: 1.5rem; }
+        .prose ul { list-style: disc; }
+        .prose ol { list-style: decimal; }
+        .prose li { margin: .4rem 0; }
+        .prose li input[type=checkbox] { margin-right: .5rem; }
+        .prose code { background: #f1f5f9; color: #be123c; padding: .15rem .4rem; border-radius: .35rem; font-size: .875em; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+        .dark .prose code { background: #1e293b; color: #fda4af; }
+        .prose pre { background: #0f172a; color: #e2e8f0; padding: 1.25rem; border-radius: .75rem; overflow-x: auto; margin: 1.25rem 0; font-size: .85rem; line-height: 1.6; border: 1px solid #1e293b; }
+        .prose pre code { background: none; color: inherit; padding: 0; font-size: inherit; }
+        .prose blockquote { border-left: 4px solid #3b82f6; background: #eff6ff; padding: .75rem 1.25rem; margin: 1.25rem 0; border-radius: 0 .5rem .5rem 0; color: #1e3a8a; }
+        .dark .prose blockquote { background: #1e293b; color: #bfdbfe; border-color: #3b82f6; }
+        .prose blockquote p { margin: .35rem 0; }
+        .prose hr { border: none; border-top: 1px solid #e2e8f0; margin: 2.5rem 0; }
+        .dark .prose hr { border-color: #1e293b; }
+        .prose table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; font-size: .9rem; display: block; overflow-x: auto; }
+        .prose th, .prose td { border: 1px solid #e2e8f0; padding: .6rem .8rem; text-align: left; vertical-align: top; }
+        .dark .prose th, .dark .prose td { border-color: #1e293b; }
+        .prose th { background: #f8fafc; font-weight: 700; color: #0f172a; }
+        .dark .prose th { background: #0f172a; color: #f1f5f9; }
+        .dark .prose tr:nth-child(even) td { background: #0b1220; }
+        .prose tr:nth-child(even) td { background: #f8fafc; }
+
+        /* Active TOC link */
+        .toc-link.active { color: #2563eb; font-weight: 600; border-left-color: #2563eb; }
+        .dark .toc-link.active { color: #60a5fa; border-left-color: #60a5fa; }
+
+        html { scroll-behavior: smooth; }
+    </style>
+</head>
+<body class="bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 transition-colors duration-300 min-h-screen">
+
+    <!-- Navigation -->
+    <nav class="sticky top-0 z-40 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md border-b border-slate-200 dark:border-slate-800">
+        <div class="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
+            <div class="flex items-center gap-2">
+                <div class="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white shadow-lg shadow-blue-500/20">
+                    <i class="fa-solid fa-book text-lg"></i>
+                </div>
+                <h1 class="text-xl font-bold tracking-tight hidden sm:block">VA Admin Manual</h1>
+            </div>
+            <div class="flex items-center gap-3">
+                <a href="/va-ads" class="hidden sm:flex items-center gap-2 text-sm font-medium text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 transition-colors">
+                    <i class="fa-solid fa-bullhorn"></i><span>VA Ads Manager</span>
+                </a>
+                <a href="/VA-ADMIN-MANUAL.md" class="hidden sm:flex items-center gap-2 text-sm font-medium text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 transition-colors" title="View / download the raw Markdown">
+                    <i class="fa-solid fa-file-lines"></i><span>Markdown</span>
+                </a>
+                <button onclick="toggleDarkMode()" class="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full transition-colors">
+                    <i id="themeIcon" class="fa-solid fa-moon text-slate-600 dark:text-yellow-400 text-lg"></i>
+                </button>
+                <button onclick="toggleToc()" class="lg:hidden p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full transition-colors">
+                    <i class="fa-solid fa-list text-slate-600 dark:text-slate-300 text-lg"></i>
+                </button>
+            </div>
+        </div>
+    </nav>
+
+    <div class="max-w-7xl mx-auto px-4 py-8 flex gap-8">
+        <!-- Sidebar TOC -->
+        <aside id="tocSidebar" class="hidden lg:block w-64 shrink-0">
+            <div class="sticky top-24 max-h-[calc(100vh-7rem)] overflow-y-auto no-scrollbar">
+                <p class="text-xs font-bold uppercase tracking-wider text-slate-400 dark:text-slate-500 mb-3 px-3">On this page</p>
+                <nav id="toc" class="flex flex-col gap-0.5 text-sm"></nav>
+            </div>
+        </aside>
+
+        <!-- Content -->
+        <main class="flex-1 min-w-0">
+            <article id="content" class="prose max-w-none bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 p-6 sm:p-10 shadow-sm">
+                <div class="flex flex-col items-center justify-center py-24 gap-4">
+                    <div class="loader"></div>
+                    <p class="text-slate-500 dark:text-slate-400 font-medium">Loading manual…</p>
+                </div>
+            </article>
+        </main>
+    </div>
+
+    <!-- Mobile TOC overlay -->
+    <div id="tocOverlay" class="fixed inset-0 z-50 hidden lg:hidden">
+        <div class="absolute inset-0 bg-black/50" onclick="toggleToc()"></div>
+        <div class="absolute right-0 top-0 bottom-0 w-72 bg-white dark:bg-slate-900 p-6 overflow-y-auto no-scrollbar shadow-2xl">
+            <div class="flex items-center justify-between mb-4">
+                <p class="text-xs font-bold uppercase tracking-wider text-slate-400 dark:text-slate-500">Contents</p>
+                <button onclick="toggleToc()" class="p-1.5 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            <nav id="tocMobile" class="flex flex-col gap-0.5 text-sm"></nav>
+        </div>
+    </div>
+
+    <script>
+        // ---- Dark mode ----
+        function applyTheme() {
+            const dark = localStorage.getItem('theme') !== 'light';
+            document.documentElement.classList.toggle('dark', dark);
+            const icon = document.getElementById('themeIcon');
+            if (icon) icon.className = dark ? 'fa-solid fa-sun text-yellow-400 text-lg' : 'fa-solid fa-moon text-slate-600 text-lg';
+        }
+        function toggleDarkMode() {
+            const dark = !document.documentElement.classList.contains('dark');
+            localStorage.setItem('theme', dark ? 'dark' : 'light');
+            applyTheme();
+        }
+        applyTheme();
+
+        // ---- Mobile TOC ----
+        function toggleToc() {
+            document.getElementById('tocOverlay').classList.toggle('hidden');
+        }
+
+        // ---- Build slug from heading text ----
+        function slugify(text) {
+            return text.toLowerCase().trim()
+                .replace(/[^\w\s-]/g, '')
+                .replace(/\s+/g, '-')
+                .replace(/-+/g, '-');
+        }
+
+        // ---- Render the manual ----
+        async function loadManual() {
+            const content = document.getElementById('content');
+            try {
+                const res = await fetch('/VA-ADMIN-MANUAL.md', { cache: 'no-cache' });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const md = await res.text();
+
+                marked.setOptions({ gfm: true, breaks: false });
+                content.innerHTML = marked.parse(md);
+                content.classList.remove('flex', 'flex-col', 'items-center', 'justify-center');
+
+                buildToc();
+            } catch (err) {
+                content.innerHTML = '<div class="text-center py-16">'
+                    + '<i class="fa-solid fa-triangle-exclamation text-4xl text-amber-500 mb-4"></i>'
+                    + '<h2 style="border:none;margin-top:0;">Could not load the manual</h2>'
+                    + '<p>' + (err.message || err) + '</p>'
+                    + '<p>You can still open the raw file: <a href="/VA-ADMIN-MANUAL.md">VA-ADMIN-MANUAL.md</a></p>'
+                    + '</div>';
+            }
+        }
+
+        // ---- Table of contents from H2/H3 ----
+        function buildToc() {
+            const headings = document.querySelectorAll('#content h2, #content h3');
+            const toc = document.getElementById('toc');
+            const tocMobile = document.getElementById('tocMobile');
+            const used = {};
+            const links = [];
+
+            headings.forEach(h => {
+                let slug = slugify(h.textContent);
+                if (used[slug] != null) { used[slug]++; slug = slug + '-' + used[slug]; }
+                else { used[slug] = 0; }
+                h.id = slug;
+
+                const indent = h.tagName === 'H3' ? 'pl-6' : 'pl-3';
+                const make = () => {
+                    const a = document.createElement('a');
+                    a.href = '#' + slug;
+                    a.textContent = h.textContent;
+                    a.className = 'toc-link block py-1 ' + indent + ' border-l-2 border-transparent text-slate-500 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 hover:border-slate-300 dark:hover:border-slate-600 transition-colors truncate';
+                    a.dataset.target = slug;
+                    return a;
+                };
+                const a1 = make();
+                toc.appendChild(a1);
+                links.push(a1);
+                const a2 = make();
+                a2.addEventListener('click', () => toggleToc());
+                tocMobile.appendChild(a2);
+            });
+
+            // Scroll spy
+            const linkMap = {};
+            links.forEach(l => linkMap[l.dataset.target] = l);
+            const observer = new IntersectionObserver((entries) => {
+                entries.forEach(e => {
+                    if (e.isIntersecting) {
+                        links.forEach(l => l.classList.remove('active'));
+                        const active = linkMap[e.target.id];
+                        if (active) active.classList.add('active');
+                    }
+                });
+            }, { rootMargin: '-80px 0px -70% 0px' });
+            headings.forEach(h => observer.observe(h));
+        }
+
+        loadManual();
+    </script>
+</body>
+</html>

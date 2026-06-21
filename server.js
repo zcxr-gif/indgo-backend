@@ -1967,6 +1967,12 @@ app.get('/va-ads', (req, res) => {
     res.sendFile(path.join(__dirname, 'va-ads.html'));
 });
 
+// Specific route for the VA Admin Manual (staff reference, rendered from Markdown)
+// Accessible via yoursite.com/va-admin-manual
+app.get('/va-admin-manual', (req, res) => {
+    res.sendFile(path.join(__dirname, 'va-admin-manual.html'));
+});
+
 // 3. Specific route for the Aircraft Database root
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
