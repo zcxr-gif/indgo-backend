@@ -919,7 +919,7 @@ app.post('/api/trails', async (req, res) => {
 
 
 // GET: Fetch all aircraft contributions
-app.get('/api/aircraft', requireAuth, async (req, res) => {
+app.get('/api/aircraft', async (req, res) => {
     try {
         const aircraft = await CommunityAircraft.find().sort({ uploadedAt: -1 });
         res.json(aircraft);
@@ -930,7 +930,7 @@ app.get('/api/aircraft', requireAuth, async (req, res) => {
 });
 
 // GET: Find aircraft by Type AND Livery (or return a placeholder)
-app.get('/api/aircraft/lookup', requireAuth, async (req, res) => {
+app.get('/api/aircraft/lookup', async (req, res) => {
     try {
         // 1. Support both internal names (type/tail) and JSON names (model/registration)
         const { type, model, livery, liveryName, tail, registration } = req.query; 
@@ -983,9 +983,10 @@ app.get('/api/aircraft/lookup', requireAuth, async (req, res) => {
     }
 });
 
-// GET: Admin System Stats (S3 & DB stats) — staff-only (the homepage that uses
-// it now sits behind the staff login).
-app.get('/api/admin/stats', requireAuth, async (req, res) => {
+// GET: Admin System Stats (S3 & DB stats) — public read, like the other GET
+// data endpoints (va-ads, airports). Consumed by external frontends; the
+// write APIs and the homepage UI remain staff-only.
+app.get('/api/admin/stats', async (req, res) => {
     try {
         // 1. Get MongoDB Stats
         const dbStats = await mongoose.connection.db.stats();
