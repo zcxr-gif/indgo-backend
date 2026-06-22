@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Embed Manager</title>
+    <script>
+        // Staff session guard: if any API call comes back 401 (session expired),
+        // bounce to the portal login, preserving where we were.
+        (function () {
+            const _fetch = window.fetch;
+            window.fetch = async function (...args) {
+                const res = await _fetch.apply(this, args);
+                if (res.status === 401) {
+                    location.href = '/staff?next=' + encodeURIComponent(location.pathname + location.search);
+                }
+                return res;
+            };
+        })();
+    </script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: { extend: { colors: { slate: { 950: '#020617' } } } }
+        }
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .animate-fade-in-up { animation: fadeInUp 0.4s ease-out forwards; }
+        @keyframes fadeInUp { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
+        .loader { border: 2px solid rgba(255,255,255,.3); border-top-color: #fff; border-radius: 50%; width: 18px; height: 18px; animation: spin 1s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .modal-scroll::-webkit-scrollbar { width: 8px; }
+        .modal-scroll::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 4px; }
+        .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    </style>
+</head>
+<body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 transition-colors duration-300 min-h-screen">
+
+    <!-- Navigation -->
+    <nav class="sticky top-0 z-40 bg-white/80 dark:bg-zinc-900/80 backdrop-blur-md border-b border-zinc-200 dark:border-zinc-800">
+        <div class="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
+            <div class="flex items-center gap-2.5">
+                <a href="/staff" title="Back to hub" class="w-9 h-9 grid place-items-center rounded-xl hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition-colors">
+                    <i class="fa-solid fa-arrow-left"></i>
+                </a>
+                <div class="w-10 h-10 bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 rounded-xl flex items-center justify-center">
+                    <i class="fa-solid fa-code text-lg"></i>
+                </div>
+                <h1 class="text-xl font-bold tracking-tight hidden sm:block">Embed Manager</h1>
+            </div>
+            <div class="flex items-center gap-3">
+                <button onclick="toggleDarkMode()" class="p-2 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-full transition-colors">
+                    <i id="themeIcon" class="fa-solid fa-moon text-zinc-600 dark:text-yellow-400 text-lg"></i>
+                </button>
+                <button onclick="openModal()" class="bg-zinc-900 hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 text-white px-4 py-2 rounded-xl font-medium flex items-center gap-2 transition-all active:scale-95 shadow-sm">
+                    <i class="fa-solid fa-plus text-sm"></i><span>New embed</span>
+                </button>
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-7xl mx-auto px-4 py-8">
+        <section class="mb-8">
+            <h2 class="text-3xl sm:text-4xl font-extrabold tracking-tight mb-2 bg-gradient-to-r from-zinc-900 to-zinc-500 dark:from-white dark:to-zinc-400 bg-clip-text text-transparent">Embed Tokens</h2>
+            <p class="text-zinc-500 dark:text-zinc-400 font-medium" id="countLabel">Loading…</p>
+        </section>
+
+        <section class="mb-6">
+            <div class="relative max-w-md">
+                <i class="fa-solid fa-search absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400"></i>
+                <input id="searchInput" oninput="render()" placeholder="Search by VA code, name or label…" class="w-full pl-10 pr-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none transition-all font-medium">
+            </div>
+        </section>
+
+        <!-- Grid -->
+        <section id="grid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6"></section>
+
+        <!-- Empty / loading states -->
+        <div id="emptyState" class="hidden text-center py-24">
+            <i class="fa-solid fa-code text-5xl text-zinc-300 dark:text-zinc-700 mb-4"></i>
+            <p class="text-zinc-500 dark:text-zinc-400 font-medium">No embed tokens yet. Click "New embed" to mint one.</p>
+        </div>
+        <div id="loadingState" class="text-center py-24">
+            <div class="loader mx-auto border-zinc-700/30 border-t-zinc-700"></div>
+        </div>
+    </main>
+
+    <!-- ===================== MODAL ===================== -->
+    <div id="modal" class="hidden fixed inset-0 z-50 bg-zinc-900/60 backdrop-blur-sm flex items-start sm:items-center justify-center p-4 overflow-y-auto">
+        <div class="bg-white dark:bg-zinc-900 rounded-3xl w-full max-w-2xl my-8 shadow-2xl border border-zinc-200 dark:border-zinc-800 animate-fade-in-up">
+            <div class="flex items-center justify-between px-6 py-4 border-b border-zinc-200 dark:border-zinc-800 sticky top-0 bg-white dark:bg-zinc-900 rounded-t-3xl z-10">
+                <h3 id="modalTitle" class="text-lg font-bold">New embed</h3>
+                <button onclick="closeModal()" class="p-2 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-full"><i class="fa-solid fa-xmark text-lg"></i></button>
+            </div>
+            <form id="form" onsubmit="save(event)" class="px-6 py-5 space-y-5 max-h-[70vh] overflow-y-auto modal-scroll">
+                <input type="hidden" id="f_id">
+
+                <div>
+                    <label class="block text-sm font-semibold mb-1.5">Internal label</label>
+                    <input id="f_label" placeholder="e.g. Ocean Virtual — production" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                    <p class="text-xs text-zinc-400 mt-1">Only shown here in the manager — never sent to the widget.</p>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div>
+                        <label class="block text-sm font-semibold mb-1.5">VA code <span class="text-red-500">*</span></label>
+                        <input id="f_va_code" required placeholder="OCEAN" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
+                    </div>
+                    <div class="sm:col-span-2">
+                        <label class="block text-sm font-semibold mb-1.5">Display name</label>
+                        <input id="f_va_name" placeholder="Ocean Virtual" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                    </div>
+                </div>
+
+                <div>
+                    <label class="block text-sm font-semibold mb-1.5">Logo URL</label>
+                    <input id="f_va_logo" placeholder="https://…/logo.png (optional — auto-resolved from VA-Ads if blank)" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-sm font-semibold mb-1.5">Callsign prefixes</label>
+                        <input id="f_prefixes" placeholder="OCEAN, OCN" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
+                        <p class="text-xs text-zinc-400 mt-1">Leading token. Blank = the VA code.</p>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-semibold mb-1.5">Callsign suffixes</label>
+                        <input id="f_suffixes" placeholder="EX, VA" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
+                        <p class="text-xs text-zinc-400 mt-1">Trailing tag (e.g. matches "UPS 01EX").</p>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div>
+                        <label class="block text-sm font-semibold mb-1.5">Mode</label>
+                        <select id="f_mode" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                            <option value="roster">Roster</option>
+                            <option value="map">Map</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-semibold mb-1.5">Provider</label>
+                        <select id="f_provider" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                            <option value="">Auto (free unless token set)</option>
+                            <option value="mapbox">Mapbox</option>
+                            <option value="free">Free (OpenFreeMap)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-semibold mb-1.5">Theme</label>
+                        <select id="f_theme" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                            <option value="dark">Dark</option>
+                            <option value="light">Light</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-sm font-semibold mb-1.5">Mapbox token</label>
+                        <input id="f_mapboxToken" placeholder="pk.eyJ… (the VA's own token)" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none mono text-sm">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-semibold mb-1.5">Mapbox style URL</label>
+                        <input id="f_mapStyle" placeholder="mapbox://styles/mapbox/dark-v11" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none mono text-sm">
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-sm font-semibold mb-1.5">Free style</label>
+                        <select id="f_freeStyle" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                            <option value="dark">dark</option>
+                            <option value="liberty">liberty</option>
+                            <option value="bright">bright</option>
+                            <option value="positron">positron</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-semibold mb-1.5">Servers (IF sessions)</label>
+                        <input id="f_servers" placeholder="Expert (blank = all)" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-sm font-semibold mb-1.5">Allowed origins</label>
+                        <input id="f_allowedOrigins" placeholder="https://oceanva.org, https://www.oceanva.org" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none text-sm">
+                        <p class="text-xs text-zinc-400 mt-1">Blank = any site may embed this token.</p>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-semibold mb-1.5">Expires at</label>
+                        <input id="f_expiresAt" type="datetime-local" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                        <p class="text-xs text-zinc-400 mt-1">Blank = never expires.</p>
+                    </div>
+                </div>
+
+                <div id="formError" class="hidden text-sm font-medium text-red-500"></div>
+
+                <div class="flex items-center justify-end gap-3 pt-2">
+                    <button type="button" onclick="closeModal()" class="px-4 py-2.5 rounded-xl font-medium hover:bg-zinc-100 dark:hover:bg-zinc-800 transition">Cancel</button>
+                    <button type="submit" id="saveBtn" class="bg-zinc-900 hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 text-white px-5 py-2.5 rounded-xl font-semibold flex items-center gap-2 transition active:scale-95">
+                        <span id="saveLabel">Create token</span>
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Toast -->
+    <div id="toast" class="hidden fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 px-4 py-2.5 rounded-xl shadow-lg font-medium text-sm"></div>
+
+    <script>
+        const EMBED_BASE = 'https://indgo-va.netlify.app/embed.html';
+        let CONFIGS = [];
+
+        // ---- theme ----
+        function toggleDarkMode() {
+            document.documentElement.classList.toggle('dark');
+            const dark = document.documentElement.classList.contains('dark');
+            localStorage.setItem('embedTheme', dark ? 'dark' : 'light');
+            document.getElementById('themeIcon').className = dark ? 'fa-solid fa-sun text-yellow-400 text-lg' : 'fa-solid fa-moon text-zinc-600 text-lg';
+        }
+        (function () {
+            const saved = localStorage.getItem('embedTheme');
+            const dark = saved ? saved === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
+            if (dark) document.documentElement.classList.add('dark');
+            document.getElementById('themeIcon').className = dark ? 'fa-solid fa-sun text-yellow-400 text-lg' : 'fa-solid fa-moon text-zinc-600 text-lg';
+        })();
+
+        function toast(msg) {
+            const t = document.getElementById('toast');
+            t.textContent = msg;
+            t.classList.remove('hidden');
+            clearTimeout(t._timer);
+            t._timer = setTimeout(() => t.classList.add('hidden'), 2200);
+        }
+
+        const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+        const iframeFor = (token) =>
+`<iframe
+  src="${EMBED_BASE}?token=${token}"
+  style="width:100%;height:520px;border:0;border-radius:12px;overflow:hidden"
+  loading="lazy"
+  title="Live Flights">
+</iframe>`;
+
+        async function copyText(text, label) {
+            try {
+                await navigator.clipboard.writeText(text);
+                toast((label || 'Copied') + ' to clipboard');
+            } catch {
+                // Fallback for non-secure contexts
+                const ta = document.createElement('textarea');
+                ta.value = text; document.body.appendChild(ta); ta.select();
+                document.execCommand('copy'); ta.remove();
+                toast((label || 'Copied') + ' to clipboard');
+            }
+        }
+        window.copyIframe = (token) => copyText(iframeFor(token), 'iframe snippet');
+        window.copyToken = (token) => copyText(token, 'Token');
+
+        // ---- load + render ----
+        async function load() {
+            document.getElementById('loadingState').classList.remove('hidden');
+            try {
+                const res = await fetch('/api/embed/configs');
+                if (!res.ok) throw new Error('Failed to load');
+                const json = await res.json();
+                CONFIGS = json.data || [];
+            } catch (e) {
+                CONFIGS = [];
+            }
+            document.getElementById('loadingState').classList.add('hidden');
+            render();
+        }
+
+        function statusOf(c) {
+            if (c.revoked) return { label: 'Revoked', cls: 'bg-red-100 text-red-700 dark:bg-red-500/15 dark:text-red-400' };
+            if (c.expiresAt && Date.now() > new Date(c.expiresAt).getTime())
+                return { label: 'Expired', cls: 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-400' };
+            return { label: 'Live', cls: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-400' };
+        }
+
+        function render() {
+            const q = document.getElementById('searchInput').value.trim().toLowerCase();
+            const list = CONFIGS.filter(c => {
+                if (!q) return true;
+                return [c.label, c.va && c.va.code, c.va && c.va.name].filter(Boolean).join(' ').toLowerCase().includes(q);
+            });
+
+            document.getElementById('countLabel').textContent =
+                CONFIGS.length === 0 ? 'No tokens yet' : `${list.length} of ${CONFIGS.length} token${CONFIGS.length === 1 ? '' : 's'}`;
+
+            const grid = document.getElementById('grid');
+            document.getElementById('emptyState').classList.toggle('hidden', CONFIGS.length !== 0);
+
+            grid.innerHTML = list.map(c => {
+                const st = statusOf(c);
+                const provider = c.provider || (c.mapboxToken ? 'mapbox' : 'free');
+                const origins = (c.allowedOrigins && c.allowedOrigins.length) ? c.allowedOrigins.join(', ') : 'Any site';
+                return `
+                <div class="surface rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 flex flex-col animate-fade-in-up">
+                    <div class="flex items-start justify-between gap-2 mb-3">
+                        <div class="min-w-0">
+                            <div class="flex items-center gap-2">
+                                <h3 class="font-bold text-lg tracking-tight truncate">${esc(c.va && c.va.name ? c.va.name : (c.va && c.va.code) || '—')}</h3>
+                                <span class="text-xs font-mono px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500">${esc(c.va && c.va.code)}</span>
+                            </div>
+                            ${c.label ? `<p class="text-sm text-zinc-400 truncate">${esc(c.label)}</p>` : ''}
+                        </div>
+                        <span class="shrink-0 text-xs font-semibold px-2 py-1 rounded-full ${st.cls}">${st.label}</span>
+                    </div>
+
+                    <div class="flex flex-wrap gap-1.5 mb-3 text-xs">
+                        <span class="px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 font-medium"><i class="fa-solid ${c.mode === 'map' ? 'fa-map' : 'fa-list'} mr-1"></i>${esc(c.mode || 'roster')}</span>
+                        <span class="px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 font-medium"><i class="fa-solid fa-layer-group mr-1"></i>${esc(provider)}</span>
+                        <span class="px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 font-medium" title="Resolve hits"><i class="fa-solid fa-bolt mr-1"></i>${c.resolveCount || 0}</span>
+                    </div>
+
+                    <div class="text-xs text-zinc-400 mb-1 truncate" title="${esc(origins)}"><i class="fa-solid fa-globe mr-1"></i>${esc(origins)}</div>
+                    <div class="flex items-center gap-2 mb-4">
+                        <code class="mono text-xs px-2 py-1 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500 truncate flex-1">${esc(c.token)}</code>
+                    </div>
+
+                    <div class="mt-auto grid grid-cols-2 gap-2">
+                        <button onclick="copyIframe('${c.token}')" class="col-span-2 bg-zinc-900 hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 text-white px-3 py-2 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition active:scale-95">
+                            <i class="fa-solid fa-copy"></i> Copy iframe
+                        </button>
+                        <button onclick="copyToken('${c.token}')" class="px-3 py-2 rounded-xl text-sm font-medium border-2 border-zinc-200 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition">Copy token</button>
+                        <button onclick="edit('${c._id}')" class="px-3 py-2 rounded-xl text-sm font-medium border-2 border-zinc-200 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition">Edit</button>
+                        <button onclick="rotate('${c._id}')" class="px-3 py-2 rounded-xl text-sm font-medium border-2 border-zinc-200 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition" title="Issue a new token (breaks the old iframe URL)">Rotate</button>
+                        ${c.revoked
+                            ? `<button onclick="setRevoked('${c._id}', false)" class="px-3 py-2 rounded-xl text-sm font-medium border-2 border-emerald-200 dark:border-emerald-900 text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-500/10 transition">Restore</button>`
+                            : `<button onclick="setRevoked('${c._id}', true)" class="px-3 py-2 rounded-xl text-sm font-medium border-2 border-amber-200 dark:border-amber-900 text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-500/10 transition">Revoke</button>`}
+                        <button onclick="del('${c._id}')" class="col-span-2 px-3 py-2 rounded-xl text-sm font-medium border-2 border-red-200 dark:border-red-900 text-red-600 hover:bg-red-50 dark:hover:bg-red-500/10 transition">Delete</button>
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        // ---- modal ----
+        function openModal() {
+            document.getElementById('form').reset();
+            document.getElementById('f_id').value = '';
+            document.getElementById('formError').classList.add('hidden');
+            document.getElementById('modalTitle').textContent = 'New embed';
+            document.getElementById('saveLabel').textContent = 'Create token';
+            document.getElementById('modal').classList.remove('hidden');
+        }
+        function closeModal() { document.getElementById('modal').classList.add('hidden'); }
+
+        function edit(id) {
+            const c = CONFIGS.find(x => x._id === id);
+            if (!c) return;
+            document.getElementById('form').reset();
+            document.getElementById('f_id').value = c._id;
+            document.getElementById('f_label').value = c.label || '';
+            document.getElementById('f_va_code').value = (c.va && c.va.code) || '';
+            document.getElementById('f_va_name').value = (c.va && c.va.name) || '';
+            document.getElementById('f_va_logo').value = (c.va && c.va.logo) || '';
+            document.getElementById('f_prefixes').value = (c.callsignPrefixes || []).join(', ');
+            document.getElementById('f_suffixes').value = (c.callsignSuffixes || []).join(', ');
+            document.getElementById('f_mode').value = c.mode || 'roster';
+            document.getElementById('f_provider').value = c.provider || '';
+            document.getElementById('f_theme').value = c.theme || 'dark';
+            document.getElementById('f_mapboxToken').value = c.mapboxToken || '';
+            document.getElementById('f_mapStyle').value = c.mapStyle || '';
+            document.getElementById('f_freeStyle').value = c.freeStyle || 'dark';
+            document.getElementById('f_servers').value = (c.servers || []).join(', ');
+            document.getElementById('f_allowedOrigins').value = (c.allowedOrigins || []).join(', ');
+            document.getElementById('f_expiresAt').value = c.expiresAt ? toLocalInput(c.expiresAt) : '';
+            document.getElementById('formError').classList.add('hidden');
+            document.getElementById('modalTitle').textContent = 'Edit embed';
+            document.getElementById('saveLabel').textContent = 'Save changes';
+            document.getElementById('modal').classList.remove('hidden');
+        }
+
+        function toLocalInput(iso) {
+            const d = new Date(iso);
+            const pad = (n) => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        }
+
+        function collect() {
+            const v = (id) => document.getElementById(id).value.trim();
+            return {
+                label: v('f_label'),
+                va: { code: v('f_va_code'), name: v('f_va_name'), logo: v('f_va_logo') },
+                callsignPrefixes: v('f_prefixes'),
+                callsignSuffixes: v('f_suffixes'),
+                mode: v('f_mode'),
+                provider: v('f_provider'),
+                theme: v('f_theme'),
+                mapboxToken: v('f_mapboxToken'),
+                mapStyle: v('f_mapStyle'),
+                freeStyle: v('f_freeStyle'),
+                servers: v('f_servers'),
+                allowedOrigins: v('f_allowedOrigins'),
+                expiresAt: v('f_expiresAt') ? new Date(v('f_expiresAt')).toISOString() : null,
+            };
+        }
+
+        async function save(e) {
+            e.preventDefault();
+            const id = document.getElementById('f_id').value;
+            const body = collect();
+            const btn = document.getElementById('saveBtn');
+            btn.disabled = true;
+            try {
+                const res = await fetch(id ? `/api/embed/configs/${id}` : '/api/embed/configs', {
+                    method: id ? 'PATCH' : 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    throw new Error(err.message || 'Save failed');
+                }
+                closeModal();
+                toast(id ? 'Saved' : 'Token created');
+                await load();
+            } catch (err) {
+                const box = document.getElementById('formError');
+                box.textContent = err.message;
+                box.classList.remove('hidden');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        async function setRevoked(id, revoked) {
+            const res = await fetch(`/api/embed/configs/${id}/revoke`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ revoked }),
+            });
+            if (res.ok) { toast(revoked ? 'Revoked' : 'Restored'); await load(); }
+        }
+
+        async function rotate(id) {
+            if (!confirm('Issue a new token? The current iframe URL will stop working until the VA updates it.')) return;
+            const res = await fetch(`/api/embed/configs/${id}/rotate`, { method: 'POST' });
+            if (res.ok) { toast('New token issued'); await load(); }
+        }
+
+        async function del(id) {
+            if (!confirm('Delete this embed token permanently? The VA widget will immediately stop working.')) return;
+            const res = await fetch(`/api/embed/configs/${id}`, { method: 'DELETE' });
+            if (res.ok) { toast('Deleted'); await load(); }
+        }
+
+        load();
+    </script>
+</body>
+</html>
