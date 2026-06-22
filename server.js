@@ -205,6 +205,72 @@ VirtualAirlineAdSchema.pre('save', function (next) {
 
 const VirtualAirlineAd = mongoose.model('VirtualAirlineAd', VirtualAirlineAdSchema);
 
+/* =========================
+ * EMBED CONFIG SCHEMA
+ *
+ * Backs the Inflight embed widget (hosted at indgo-va.netlify.app/embed.html).
+ * Each document is one distributable token-link config for a VA: the widget is
+ * handed only an opaque ?token=… and calls GET /api/embed/resolve to fetch the
+ * real settings. This keeps the VA's Mapbox token off the public URL, lets a
+ * token be locked to specific sites, and lets staff revoke a VA instantly.
+ *
+ * See EMBEDBACKEND.md / the staff embed manager (/embeds) for the distribution
+ * flow. The resolve response contract is mirrored field-for-field below.
+ * ========================= */
+const EMBED_MODES = ['roster', 'map'];
+const EMBED_PROVIDERS = ['mapbox', 'free'];
+const EMBED_THEMES = ['dark', 'light'];
+
+const EmbedConfigSchema = new mongoose.Schema({
+    // Opaque token the VA embeds in their iframe URL. Generated on create.
+    token: { type: String, required: true, unique: true, index: true },
+
+    // Internal label so staff can tell entries apart in the manager (not exposed).
+    label: { type: String, trim: true, default: '' },
+
+    // --- VA identity (va.code is the only required field for resolution) ---
+    va: {
+        code: { type: String, required: true, trim: true, uppercase: true },
+        name: { type: String, trim: true, default: '' },
+        logo: { type: String, trim: true, default: '' },
+    },
+
+    // --- Callsign matching (see EMBEDBACKEND.md §2) ---
+    callsignPrefixes: { type: [String], default: [] }, // empty => widget falls back to [va.code]
+    callsignSuffixes: { type: [String], default: [] },
+
+    // --- Widget appearance / data source ---
+    mode: { type: String, enum: EMBED_MODES, default: 'roster' },
+    provider: { type: String, enum: EMBED_PROVIDERS, default: null }, // null => auto from mapboxToken
+    mapboxToken: { type: String, trim: true, default: '' },           // the VA's own Mapbox token
+    mapStyle: { type: String, trim: true, default: '' },
+    freeStyle: { type: String, trim: true, default: 'dark' },
+    theme: { type: String, enum: EMBED_THEMES, default: 'dark' },
+    servers: { type: [String], default: [] },                         // IF session names to scan
+
+    // --- Access control ---
+    allowedOrigins: { type: [String], default: [] }, // empty => any site may embed
+    revoked: { type: Boolean, default: false },
+    expiresAt: { type: Date, default: null },
+
+    // --- Analytics ---
+    resolveCount: { type: Number, default: 0 },
+    lastResolvedAt: { type: Date, default: null },
+
+    createdAt: { type: Date, default: Date.now },
+    updatedAt: { type: Date, default: Date.now },
+});
+
+EmbedConfigSchema.index({ 'va.code': 1 });
+EmbedConfigSchema.index({ createdAt: -1 });
+
+EmbedConfigSchema.pre('save', function (next) {
+    this.updatedAt = new Date();
+    next();
+});
+
+const EmbedConfig = mongoose.model('EmbedConfig', EmbedConfigSchema);
+
 // --- GIVEAWAY ---
 // Giveaways used to live only in the bot's memory, so any restart (deploy,
 // crash, host cycling) wiped the entrants and the "end" timer — a multi-day
@@ -1968,6 +2034,199 @@ app.delete('/api/va-ads/:id', requireAuth, async (req, res) => {
     }
 });
 
+/* =========================
+ * EMBED WIDGET ENDPOINTS
+ *
+ * Public resolver (called cross-origin by the embed widget on the VA's site)
+ * plus staff-only CRUD to mint, edit, revoke and delete token configs.
+ * ========================= */
+
+// Normalize a "list" field that may arrive as an array, a comma-separated
+// string, or be missing. Trims, drops blanks, and dedupes.
+const toStringList = (raw) => {
+    let arr;
+    if (Array.isArray(raw)) arr = raw;
+    else if (typeof raw === 'string') arr = raw.split(',');
+    else return [];
+    const seen = new Set();
+    const out = [];
+    for (const item of arr) {
+        const v = String(item).trim();
+        if (v && !seen.has(v)) { seen.add(v); out.push(v); }
+    }
+    return out;
+};
+
+// Build the public resolve payload from a stored config — only the fields the
+// widget needs, with the same defaults documented in EMBEDBACKEND.md.
+const toResolvePayload = (cfg) => ({
+    ok: true,
+    va: { code: cfg.va.code, name: cfg.va.name || cfg.va.code, logo: cfg.va.logo || '' },
+    callsignPrefixes: (cfg.callsignPrefixes && cfg.callsignPrefixes.length) ? cfg.callsignPrefixes : [cfg.va.code],
+    callsignSuffixes: cfg.callsignSuffixes || [],
+    mode: cfg.mode || 'roster',
+    provider: cfg.provider || (cfg.mapboxToken ? 'mapbox' : 'free'),
+    mapboxToken: cfg.mapboxToken || '',
+    mapStyle: cfg.mapStyle || 'mapbox://styles/mapbox/dark-v11',
+    freeStyle: cfg.freeStyle || 'dark',
+    theme: cfg.theme || 'dark',
+    servers: cfg.servers || [],
+});
+
+// GET /api/embed/resolve?token=…&origin=… — PUBLIC. The widget runs in the VA's
+// browser on their own domain, so this is called cross-origin (global cors()
+// already sends Access-Control-Allow-Origin: *). Never cache it.
+app.get('/api/embed/resolve', async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+
+    const token = String(req.query.token || '').trim();
+    const origin = String(req.query.origin || '').trim();
+    if (!token) return res.status(404).json({ ok: false, error: 'unknown token' });
+
+    try {
+        const cfg = await EmbedConfig.findOne({ token }).lean();
+        if (!cfg)        return res.status(404).json({ ok: false, error: 'unknown token' });
+        if (cfg.revoked) return res.status(410).json({ ok: false, error: 'revoked' });
+        if (cfg.expiresAt && Date.now() > new Date(cfg.expiresAt).getTime())
+                         return res.status(410).json({ ok: false, error: 'expired' });
+
+        // Optional per-token origin lock. We only enforce it when the widget
+        // actually reports an origin (some browsers strip the referrer).
+        if (Array.isArray(cfg.allowedOrigins) && cfg.allowedOrigins.length &&
+            origin && !cfg.allowedOrigins.includes(origin)) {
+            return res.status(403).json({ ok: false, error: 'origin not allowed' });
+        }
+
+        // Best-effort usage tally — don't block the response on it.
+        EmbedConfig.updateOne(
+            { _id: cfg._id },
+            { $inc: { resolveCount: 1 }, $set: { lastResolvedAt: new Date() } }
+        ).catch(() => {});
+
+        return res.json(toResolvePayload(cfg));
+    } catch (error) {
+        console.error('Embed Resolve Error:', error);
+        return res.status(500).json({ ok: false, error: 'server error' });
+    }
+});
+
+// Apply the writable fields from a request body onto a config doc (create/edit).
+const applyEmbedFields = (cfg, body) => {
+    if (body.label !== undefined) cfg.label = String(body.label || '').trim();
+
+    const va = body.va || {};
+    if (va.code !== undefined) cfg.va.code = String(va.code || '').trim().toUpperCase();
+    if (va.name !== undefined) cfg.va.name = String(va.name || '').trim();
+    if (va.logo !== undefined) cfg.va.logo = String(va.logo || '').trim();
+
+    if (body.callsignPrefixes !== undefined) cfg.callsignPrefixes = toStringList(body.callsignPrefixes).map(s => s.toUpperCase());
+    if (body.callsignSuffixes !== undefined) cfg.callsignSuffixes = toStringList(body.callsignSuffixes).map(s => s.toUpperCase());
+
+    if (body.mode !== undefined) cfg.mode = EMBED_MODES.includes(body.mode) ? body.mode : 'roster';
+    if (body.provider !== undefined) cfg.provider = EMBED_PROVIDERS.includes(body.provider) ? body.provider : null;
+    if (body.mapboxToken !== undefined) cfg.mapboxToken = String(body.mapboxToken || '').trim();
+    if (body.mapStyle !== undefined) cfg.mapStyle = String(body.mapStyle || '').trim();
+    if (body.freeStyle !== undefined) cfg.freeStyle = String(body.freeStyle || '').trim() || 'dark';
+    if (body.theme !== undefined) cfg.theme = EMBED_THEMES.includes(body.theme) ? body.theme : 'dark';
+    if (body.servers !== undefined) cfg.servers = toStringList(body.servers);
+
+    if (body.allowedOrigins !== undefined) cfg.allowedOrigins = toStringList(body.allowedOrigins);
+    if (body.revoked !== undefined) cfg.revoked = !!body.revoked;
+    if (body.expiresAt !== undefined) {
+        const v = body.expiresAt;
+        cfg.expiresAt = v ? new Date(v) : null;
+        if (cfg.expiresAt && isNaN(cfg.expiresAt.getTime())) cfg.expiresAt = null;
+    }
+};
+
+// GET /api/embed/configs — STAFF. List every token config (newest first).
+app.get('/api/embed/configs', requireAuth, async (req, res) => {
+    try {
+        const configs = await EmbedConfig.find().sort({ createdAt: -1 }).lean();
+        res.json({ data: configs });
+    } catch (error) {
+        console.error('Embed Config List Error:', error);
+        res.status(500).json({ message: 'Error fetching embed configs.' });
+    }
+});
+
+// POST /api/embed/configs — STAFF. Mint a new token config.
+app.post('/api/embed/configs', requireAuth, async (req, res) => {
+    try {
+        const body = req.body || {};
+        if (!body.va || !String(body.va.code || '').trim()) {
+            return res.status(400).json({ message: 'va.code is required.' });
+        }
+        const cfg = new EmbedConfig({ token: 'tok_' + crypto.randomBytes(16).toString('hex'), va: {} });
+        applyEmbedFields(cfg, body);
+        await cfg.save();
+        res.status(201).json(cfg.toObject());
+    } catch (error) {
+        console.error('Embed Config Create Error:', error);
+        res.status(500).json({ message: 'Error creating embed config.' });
+    }
+});
+
+// PATCH /api/embed/configs/:id — STAFF. Update a config (token stays the same).
+app.patch('/api/embed/configs/:id', requireAuth, async (req, res) => {
+    try {
+        const cfg = await EmbedConfig.findById(req.params.id);
+        if (!cfg) return res.status(404).json({ message: 'Embed config not found.' });
+        applyEmbedFields(cfg, req.body || {});
+        if (!cfg.va.code) return res.status(400).json({ message: 'va.code is required.' });
+        await cfg.save();
+        res.json(cfg.toObject());
+    } catch (error) {
+        console.error('Embed Config Update Error:', error);
+        res.status(500).json({ message: 'Error updating embed config.' });
+    }
+});
+
+// POST /api/embed/configs/:id/revoke — STAFF. Toggle the kill switch.
+// Body: { revoked: true|false } (defaults to true).
+app.post('/api/embed/configs/:id/revoke', requireAuth, async (req, res) => {
+    try {
+        const revoked = req.body && req.body.revoked === false ? false : true;
+        const cfg = await EmbedConfig.findByIdAndUpdate(
+            req.params.id, { $set: { revoked, updatedAt: new Date() } }, { new: true }
+        ).lean();
+        if (!cfg) return res.status(404).json({ message: 'Embed config not found.' });
+        res.json(cfg);
+    } catch (error) {
+        console.error('Embed Config Revoke Error:', error);
+        res.status(500).json({ message: 'Error updating embed config.' });
+    }
+});
+
+// POST /api/embed/configs/:id/rotate — STAFF. Issue a fresh token (invalidates
+// the old iframe URL while keeping all other settings).
+app.post('/api/embed/configs/:id/rotate', requireAuth, async (req, res) => {
+    try {
+        const cfg = await EmbedConfig.findByIdAndUpdate(
+            req.params.id,
+            { $set: { token: 'tok_' + crypto.randomBytes(16).toString('hex'), updatedAt: new Date() } },
+            { new: true }
+        ).lean();
+        if (!cfg) return res.status(404).json({ message: 'Embed config not found.' });
+        res.json(cfg);
+    } catch (error) {
+        console.error('Embed Config Rotate Error:', error);
+        res.status(500).json({ message: 'Error rotating embed token.' });
+    }
+});
+
+// DELETE /api/embed/configs/:id — STAFF. Remove a config entirely.
+app.delete('/api/embed/configs/:id', requireAuth, async (req, res) => {
+    try {
+        const cfg = await EmbedConfig.findByIdAndDelete(req.params.id).lean();
+        if (!cfg) return res.status(404).json({ message: 'Embed config not found.' });
+        res.json({ message: 'Embed config deleted.' });
+    } catch (error) {
+        console.error('Embed Config Delete Error:', error);
+        res.status(500).json({ message: 'Error deleting embed config.' });
+    }
+});
+
 // server.js
 
 // Staff-only surfaces — gate both the clean route and the raw file (and the
@@ -1980,6 +2239,8 @@ const STAFF_ONLY_PATHS = new Set([
     '/airports', '/airports.html',
     '/va-admin-manual', '/va-admin-manual.html',
     '/VA-ADMIN-MANUAL.md',
+    '/embeds', '/embeds.html',
+    '/EMBEDBACKEND.md',
 ]);
 app.use((req, res, next) => {
     if (req.method === 'GET' && STAFF_ONLY_PATHS.has(req.path)) {
@@ -2008,6 +2269,12 @@ app.get('/airports', (req, res) => {
 // Accessible via yoursite.com/va-ads (staff-only — see guard above)
 app.get('/va-ads', (req, res) => {
     res.sendFile(path.join(__dirname, 'va-ads.html'));
+});
+
+// Specific route for the Embed Manager (mint/revoke embed widget tokens)
+// Accessible via yoursite.com/embeds (staff-only — see guard above)
+app.get('/embeds', (req, res) => {
+    res.sendFile(path.join(__dirname, 'embeds.html'));
 });
 
 // Specific route for the VA Admin Manual (staff reference, rendered from Markdown)
