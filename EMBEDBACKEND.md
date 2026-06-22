@@ -3,7 +3,7 @@
 The embed widget lives at:
 
 ```
-https://indgo-va.netlify.app/embed.html
+https://inflight.info/embed.html
 ```
 
 There are **two ways** to drive it:
@@ -22,14 +22,14 @@ There are **two ways** to drive it:
 Hand a VA a URL like this (URL-encode spaces as `%20`):
 
 ```
-https://indgo-va.netlify.app/embed.html?va=OCEAN&name=Ocean%20Virtual&mode=map
+https://inflight.info/embed.html?va=OCEAN&name=Ocean%20Virtual&mode=map
 ```
 
 To embed it on their site, they paste this iframe:
 
 ```html
 <iframe
-  src="https://indgo-va.netlify.app/embed.html?va=OCEAN&name=Ocean%20Virtual&mode=map"
+  src="https://inflight.info/embed.html?va=OCEAN&name=Ocean%20Virtual&mode=map"
   style="width:100%;height:520px;border:0;border-radius:12px;overflow:hidden"
   loading="lazy"
   title="Ocean Virtual — Live Flights">
@@ -82,7 +82,7 @@ This covers the common cases:
 Example URL using a suffix tag:
 
 ```
-https://indgo-va.netlify.app/embed.html?va=OCEAN&name=Ocean%20Virtual&mode=map&suffixes=EX,VA
+https://inflight.info/embed.html?va=OCEAN&name=Ocean%20Virtual&mode=map&suffixes=EX,VA
 ```
 
 ---
@@ -215,7 +215,7 @@ module.exports = router;
 
 ```html
 <iframe
-  src="https://indgo-va.netlify.app/embed.html?token=tok_ocean_a1b2c3"
+  src="https://inflight.info/embed.html?token=tok_ocean_a1b2c3"
   style="width:100%;height:520px;border:0;border-radius:12px;overflow:hidden"
   loading="lazy"
   title="Ocean Virtual — Live Flights">

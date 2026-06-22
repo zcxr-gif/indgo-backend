@@ -208,7 +208,7 @@ const VirtualAirlineAd = mongoose.model('VirtualAirlineAd', VirtualAirlineAdSche
 /* =========================
  * EMBED CONFIG SCHEMA
  *
- * Backs the Inflight embed widget (hosted at indgo-va.netlify.app/embed.html).
+ * Backs the Inflight embed widget (hosted at inflight.info/embed.html).
  * Each document is one distributable token-link config for a VA: the widget is
  * handed only an opaque ?token=… and calls GET /api/embed/resolve to fetch the
  * real settings. This keeps the VA's Mapbox token off the public URL, lets a
