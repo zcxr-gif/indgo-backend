@@ -740,22 +740,29 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
     // Version this so a future ToS revision can re-prompt previous accepters.
     const VA_PARTNERSHIP_TOS_VERSION = 'v1';
 
-    // The partnership Terms of Service shown inside the ticket. Kept short enough
-    // to fit an embed description.
+    // The official VA Advertisement Program Terms & Conditions, shipped as a PDF
+    // in the repo and attached to the partnership ticket so VAs get the real
+    // contract (not a paraphrase). Path resolves next to this file.
+    const VA_TERMS_PDF_PATH = path.join(__dirname, 'VA-Advertisement-Terms.pdf');
+
+    // The partnership Terms of Service shown inside the ticket. The full contract
+    // is attached as a PDF; the embed summarises the key obligations and points
+    // users at it + the Inflight VA Rep for questions.
     const buildPartnershipTosCard = () => {
         const embed = new EmbedBuilder()
-            .setTitle('🤝 Inflight VA Partnership — Terms of Service')
+            .setTitle('📄 Inflight VA Advertisement Program — Terms & Conditions')
             .setColor(THEME.WHITE)
             .setDescription(
-                "Thanks for your interest in partnering with **Inflight**! Please read these terms carefully before continuing.\n\n" +
-                "**1. Conduct** — Your VA and its members agree to follow Infinite Flight's rules and the Inflight community guidelines at all times.\n" +
-                "**2. Representation** — You will represent your VA accurately. Listings, fleet, hubs and recruiting info must be truthful and kept up to date.\n" +
-                "**3. Branding** — You won't impersonate Inflight staff or imply official endorsement beyond the agreed partnership.\n" +
-                "**4. Conduct in channels** — Spam, advertising of unrelated services, and harassment in your VA channel or the reps chat are not permitted.\n" +
-                "**5. Removal** — Inflight may pause or remove a partnership and its channel/roles for violations of these terms.\n" +
-                "**6. Changes** — These terms may be updated; continued participation means you accept the current version.\n\n" +
+                "Please read our **Terms & Conditions** (attached as a PDF above) before continuing. " +
+                "By accepting, your VA agrees to the full contract. Key points:\n\n" +
+                "• **Free program** — a directory advertising your VA across our platform, subject to staff approval.\n" +
+                "• **Event tracking** — any event you announce or run **must be tracked using Inflight**, with a screenshot from our tracker.\n" +
+                "• **Accurate content** — listing info, logos and banners must be accurate, owned by you, and not offensive or infringing.\n" +
+                "• **Staff authority** — Inflight may review, edit, approve, decline, feature or remove any listing at our discretion.\n" +
+                "• **iOS app** — VA listings are **not** shown in our iOS app for copyright-compliance reasons.\n" +
+                "• **Changes/suspension** — required changes not made within **7 days** of contact may lead to suspension.\n\n" +
                 "If you have **any questions**, please inquire our Inflight VA Rep <@&" + INFLIGHT_VA_REP_ROLE_ID + "> right here in this ticket.\n\n" +
-                "When you've read and agree, tap **I Accept** below."
+                "When you've read the attached Terms and agree, tap **I Accept** below."
             )
             .setFooter({ text: `${BRAND_FOOTER} • Terms ${VA_PARTNERSHIP_TOS_VERSION}` });
 
@@ -763,7 +770,15 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             new ButtonBuilder().setCustomId('partnership_accept_tos').setLabel('I Accept').setStyle(ButtonStyle.Success).setEmoji('✅'),
             new ButtonBuilder().setCustomId('close_ticket_action').setLabel('Close Ticket').setStyle(ButtonStyle.Danger)
         );
-        return { embeds: [embed], components: [row] };
+
+        const payload = { embeds: [embed], components: [row] };
+        // Attach the real contract if the PDF is present (best-effort).
+        try {
+            if (fs.existsSync(VA_TERMS_PDF_PATH)) {
+                payload.files = [new AttachmentBuilder(VA_TERMS_PDF_PATH, { name: 'Inflight-VA-Advertisement-Terms.pdf' })];
+            }
+        } catch (_) { /* ship the embed without the attachment */ }
+        return payload;
     };
 
     // Pull the Inflight VA Rep(s) into a (private) ticket thread so the role
