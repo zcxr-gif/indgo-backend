@@ -43,6 +43,35 @@ const { uploadAirportImage, getAirportInfo, deleteAirportImages } = require('./a
 // and push them to S3, exactly like the web dashboard does.
 const { uploadVaImage, deleteVaImage } = require('./vaAds');
 
+// Anthropic (Claude) powers the /va_help assistant — answers VA reps'
+// "what do I do?" questions grounded in the VA Admin Manual + Terms. Required
+// lazily and guarded so the bot still boots if the package/key is absent.
+let Anthropic = null;
+try { Anthropic = require('@anthropic-ai/sdk'); }
+catch (_) { console.warn('⚠️  @anthropic-ai/sdk not installed — /va_help is disabled until you run npm install.'); }
+
+let _anthropicClient = null;
+const getAnthropic = () => {
+    if (!Anthropic || !process.env.ANTHROPIC_API_KEY) return null;
+    if (!_anthropicClient) _anthropicClient = new Anthropic();
+    return _anthropicClient;
+};
+
+// Read the VA Admin Manual + Terms once and cache them as the assistant's
+// knowledge base. Self-heals if the files change on disk between calls is not
+// needed — a restart reloads them.
+let _vaKnowledgeCache = null;
+const loadVaKnowledge = () => {
+    if (_vaKnowledgeCache) return _vaKnowledgeCache;
+    const read = (f) => { try { return fs.readFileSync(path.join(__dirname, f), 'utf8'); } catch { return ''; } };
+    const manual = read('VA-ADMIN-MANUAL.md');
+    const terms = read('VA-Advertisement-Terms.txt');
+    _vaKnowledgeCache =
+        '===== VA ADMIN MANUAL (staff playbook — how to handle VAs) =====\n\n' + manual +
+        '\n\n===== VA ADVERTISEMENT PROGRAM TERMS & CONDITIONS (the governing contract) =====\n\n' + terms;
+    return _vaKnowledgeCache;
+};
+
 // Promisify pipeline for efficient stream handling
 const pipeline = util.promisify(stream.pipeline);
 
@@ -1709,6 +1738,11 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 .addStringOption(o => o.setName('va').setDescription('VA name').setRequired(true).setAutocomplete(true))
                 .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageRoles),
 
+            // No default-permission gate so the Inflight VA Rep can see it; the
+            // handler enforces access via canReviewVa() and replies privately.
+            new SlashCommandBuilder().setName('va_help').setDescription('[STAFF/VA REP] Ask the AI what to do, answered from the VA manual + Terms')
+                .addStringOption(o => o.setName('question').setDescription('Your question about handling a VA, the Terms, or the process').setRequired(true)),
+
             // Moderator Commands
             new SlashCommandBuilder().setName('mod_kick').setDescription('[MOD] Kick a user')
                 .addUserOption(o => o.setName('user').setDescription('User to kick').setRequired(true))
@@ -3052,6 +3086,70 @@ client.on('interactionCreate', async (interaction) => {
                 }
                 await interaction.showModal(buildVaApplyModal());
                 return;
+            }
+
+            // --- VA HELP: AI assistant grounded in the manual + Terms ---
+            if (commandName === 'va_help') {
+                // Staff or the Inflight VA Rep — same audience that reviews VAs.
+                if (!canReviewVa(interaction.member)) {
+                    return interaction.reply({ content: '❌ Staff or Inflight VA Rep only.', ephemeral: true });
+                }
+                const client_ = getAnthropic();
+                if (!client_) {
+                    return interaction.reply({ content: '❌ The AI assistant is not configured (set `ANTHROPIC_API_KEY` and `npm install`).', ephemeral: true });
+                }
+                const question = interaction.options.getString('question');
+                await interaction.deferReply({ ephemeral: true });
+
+                try {
+                    const knowledge = loadVaKnowledge();
+                    const msg = await client_.messages.create({
+                        model: 'claude-opus-4-8',
+                        max_tokens: 1024,
+                        thinking: { type: 'adaptive' },
+                        output_config: { effort: 'medium' },
+                        system: [
+                            {
+                                type: 'text',
+                                text:
+                                    "You are the Inflight VA Program assistant for staff and Inflight VA Reps. " +
+                                    "Answer the user's question about how to handle virtual airlines (VAs/VOs) — vetting, accepting, " +
+                                    "editing, featuring, suspending, removing, partnerships, Discord provisioning, and the Terms — " +
+                                    "grounded ONLY in the VA Admin Manual and the Terms & Conditions provided below. " +
+                                    "Be concise and practical (a few sentences or short bullets). Cite the relevant manual section " +
+                                    "or Terms clause number when you can (e.g. \"§8B.2\" or \"Terms §4\"). " +
+                                    "If the answer is not covered by these documents, say so plainly and suggest escalating to " +
+                                    "inflightcustomer@gmail.com — do not invent policy.",
+                            },
+                            {
+                                type: 'text',
+                                text: knowledge,
+                                cache_control: { type: 'ephemeral' },
+                            },
+                        ],
+                        messages: [{ role: 'user', content: question }],
+                    });
+
+                    if (msg.stop_reason === 'refusal') {
+                        return interaction.editReply("❌ I couldn't answer that one. Please rephrase, or escalate to inflightcustomer@gmail.com.");
+                    }
+                    const answer = (msg.content || [])
+                        .filter(b => b.type === 'text')
+                        .map(b => b.text)
+                        .join('\n')
+                        .trim() || "I couldn't produce an answer — please try rephrasing.";
+
+                    const embed = new EmbedBuilder()
+                        .setTitle('🤖 VA Assistant')
+                        .setColor(THEME.WHITE)
+                        .setDescription(answer.slice(0, 4000))
+                        .addFields({ name: 'Question', value: question.slice(0, 1024) })
+                        .setFooter({ text: `${BRAND_FOOTER} • AI-generated from the VA manual + Terms — verify before acting` });
+                    return interaction.editReply({ embeds: [embed] });
+                } catch (e) {
+                    console.error('❌ va_help error:', e);
+                    return interaction.editReply('❌ The assistant had a problem answering. Please try again shortly.');
+                }
             }
 
             // --- VA: STAFF MANAGEMENT (add/remove rep, remove VA) ---

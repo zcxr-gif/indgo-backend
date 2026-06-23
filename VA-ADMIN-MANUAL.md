@@ -509,6 +509,21 @@ ticket (description modal → private thread pinging the admin role) — they ar
 **not** part of the VA flow and don't touch the directory. Triage them like any
 other support ticket; loop in the relevant owner/admin for billing.
 
+### 8C.4 `/va_help` — the AI assistant
+
+Not sure how to handle something? Run **`/va_help question:<your question>`** in
+Discord. It answers **from this manual and the Terms** — vetting, the Add/Replace
+slot rules, the 7-day suspension clock, partnership flow, Discord provisioning,
+the IFVARB exceptions, etc. — cites the relevant section/clause, and tells you to
+escalate (inflightcustomer@gmail.com) when something isn't covered rather than
+guessing. Usable by **admins and the Inflight VA Rep**; replies are private
+(ephemeral).
+
+It's a **convenience, not an authority**: answers are AI-generated from the docs
+and flagged "verify before acting." When the assistant and this manual (or the
+Terms) disagree, the documents win. Requires `ANTHROPIC_API_KEY` to be set; if it
+isn't, the command politely says it's unavailable.
+
 ---
 
 ## 9. Featuring (promotion)
