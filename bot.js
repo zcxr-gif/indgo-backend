@@ -829,6 +829,13 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         return thread;
     };
 
+    // Who may review VA applications (Approve & Create / Request Edits / Reject):
+    // admins, anyone with the Administrator permission, or the Inflight VA Rep.
+    const canReviewVa = (member) =>
+        !!member?.roles?.cache?.has(ADMIN_ROLE_ID) ||
+        !!member?.roles?.cache?.has(INFLIGHT_VA_REP_ROLE_ID) ||
+        !!member?.permissions?.has(PermissionsBitField.Flags.Administrator);
+
     // Only the VA's owner (or staff) may edit its listing.
     const canManageVa = (interaction, ad) =>
         (ad.ownerId && interaction.user.id === ad.ownerId) ||
@@ -2284,9 +2291,9 @@ client.on('interactionCreate', async (interaction) => {
 
             // --- VA APPLICATION REVIEW BUTTONS ---
             if (customId.startsWith('va_approve_') || customId.startsWith('va_reject_') || customId.startsWith('va_edit_')) {
-                // Staff only.
-                if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID) && !interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-                    return interaction.reply({ content: '❌ Staff only.', ephemeral: true });
+                // Staff or the Inflight VA Rep may review applications.
+                if (!canReviewVa(interaction.member)) {
+                    return interaction.reply({ content: '❌ Staff or Inflight VA Rep only.', ephemeral: true });
                 }
                 if (!VirtualAirlineAd) {
                     return interaction.reply({ content: '❌ VA system unavailable (database not connected).', ephemeral: true });
@@ -2764,8 +2771,15 @@ client.on('interactionCreate', async (interaction) => {
 
                     const reviewChannel = await client.channels.fetch(VA_APPLICATION_CHANNEL_ID).catch(() => null);
                     if (reviewChannel) {
+                        // Self-heal: make sure the Inflight VA Rep can see (and act on)
+                        // the review channel, since they can now review applications.
+                        if (reviewChannel.permissionOverwrites && !reviewChannel.permissionOverwrites.cache.get(INFLIGHT_VA_REP_ROLE_ID)) {
+                            await reviewChannel.permissionOverwrites.edit(INFLIGHT_VA_REP_ROLE_ID, {
+                                ViewChannel: true, SendMessages: true, ReadMessageHistory: true
+                            }).catch(() => {});
+                        }
                         await reviewChannel.send({
-                            content: `<@&${ADMIN_ROLE_ID}> new VA application`,
+                            content: `<@&${ADMIN_ROLE_ID}> <@&${INFLIGHT_VA_REP_ROLE_ID}> new VA application`,
                             embeds: [buildVaReviewEmbed(ad)],
                             components: [buildVaReviewButtons(ad._id)]
                         });

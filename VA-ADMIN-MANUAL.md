@@ -390,6 +390,9 @@ On each pending application you get:
 | **✏️ Request Edits** | Prompts you for what needs changing; the note is **sent to the applicant**. Leaves status pending. | Borderline/incomplete — missing IFVARB proof, weak imagery rights, broken links. Pairs with the §8 7-day clock. |
 | **❌ Reject** | Prompts for a reason (sent to the applicant) and sets status **rejected** (Archived). | Ineligible, not IFVARB and no exception, infringing, or inactive. |
 
+These three buttons are usable by **admins and the Inflight VA Rep** (Section
+8C.1); the Discord-teardown slash commands in 8B.5 stay admin-only.
+
 **Vet before you click Approve & Create.** The `/va_apply` modal only captures the
 basics — it does **not** collect IFVARB proof or image-rights confirmation. Get
 those (use the intake template in Section 8.0) **before** approving, because
@@ -462,7 +465,7 @@ relations):
 
 | Where | What it grants | Scope |
 |-------|----------------|-------|
-| **Discord role** (`Inflight VA Rep`, ID `1518665927254605925`) | Auto-added to **every provisioned VA channel** (and self-heals onto older channels on the next approval/rep command), and is **pinged + pulled into** every VA Partnership ticket. | Lets the rep see and answer questions in all VA channels + partnership tickets. Does **not** grant admin/teardown powers — staff slash commands (Section 8B.5) remain admin-role only. |
+| **Discord role** (`Inflight VA Rep`, ID `1518665927254605925`) | Auto-added to **every provisioned VA channel** (and self-heals onto older channels on the next approval/rep command), is **pinged + pulled into** every VA Partnership ticket, and **may review `/va_apply` applications** — the **Approve & Create / Request Edits / Reject** buttons (Section 8B.2). The bot self-heals their view access to the applications channel and pings them on each new application. | Lets the rep run the full review/approval flow and answer questions in all VA channels + partnership tickets. Does **not** grant **teardown** powers — staff slash commands (`/va_addrep`, `/va_removerep`, `/va_remove`, Section 8B.5) remain admin-role only. |
 | **Staff-portal role** (`va_rep`) | A scoped login to the web Staff Hub. | Sees **only** the **VA Ads Manager** (`/va-ads`) and **this manual** (`/va-admin-manual`). The Aircraft Database, Airport Manager, Embed Manager, and staff-account admin are hidden and blocked. Create it from the Staff Hub's **Add staff** dialog (role = *Inflight VA Rep*), or cycle an existing account's role from the staff table. |
 
 Use the staff-portal `va_rep` role when you want someone managing VA listings
