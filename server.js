@@ -206,6 +206,25 @@ VirtualAirlineAdSchema.pre('save', function (next) {
 const VirtualAirlineAd = mongoose.model('VirtualAirlineAd', VirtualAirlineAdSchema);
 
 /* =========================
+ * VA PARTNERSHIP TERMS ACCEPTANCE
+ *
+ * Written by the ticket bot when a user clicks "I accept" on the VA partnership
+ * Terms of Service inside their partnership ticket. One row per Discord user
+ * (the latest acceptance wins). Lets us prove a user agreed before they were
+ * walked into the VA application, without re-prompting on every ticket.
+ * ========================= */
+const VaTermsAcceptanceSchema = new mongoose.Schema({
+    userId: { type: String, required: true, unique: true, index: true }, // Discord user ID
+    username: { type: String, default: '' },                            // Discord username at accept time
+    termsVersion: { type: String, default: 'v1' },                      // bump when the ToS text changes
+    channelId: { type: String, default: null },                         // ticket thread it was accepted in
+    acceptedAt: { type: Date, default: Date.now },
+}, { timestamps: true });
+
+const VaTermsAcceptance = mongoose.models.VaTermsAcceptance
+    || mongoose.model('VaTermsAcceptance', VaTermsAcceptanceSchema);
+
+/* =========================
  * EMBED CONFIG SCHEMA
  *
  * Backs the Inflight embed widget (hosted at inflight.info/embed.html).
@@ -424,7 +443,7 @@ startDiscordBot(
     s3Client,
     process.env.AWS_S3_BUCKET_NAME,
     process.env.AWS_REGION,
-    { DailyPilotStats, DailyPilotView, VirtualAirlineAd, Giveaway }
+    { DailyPilotStats, DailyPilotView, VirtualAirlineAd, Giveaway, VaTermsAcceptance }
 );
 // ---------------------
 
@@ -602,6 +621,33 @@ registerAuthRoutes(app);
 // platform health check at /healthz instead of "/".
 app.get('/healthz', (req, res) => {
     res.send('Community Aircraft Backend is Running.');
+});
+
+// At-a-glance counters for the Staff Hub overview cards. Cheap countDocuments
+// calls — no heavy aggregation. Any signed-in staff member (incl. VA reps) may
+// read this; the figures are non-sensitive operational totals.
+app.get('/api/staff/overview', requireAuth, async (req, res) => {
+    try {
+        const [vaTotal, vaPending, vaApproved, vaFeatured, aircraft, airports, partnerships] =
+            await Promise.all([
+                VirtualAirlineAd.countDocuments({}),
+                VirtualAirlineAd.countDocuments({ status: 'pending' }),
+                VirtualAirlineAd.countDocuments({ status: 'approved' }),
+                VirtualAirlineAd.countDocuments({ featured: true }),
+                CommunityAircraft.countDocuments({}),
+                AirportGate.countDocuments({}),
+                VaTermsAcceptance.countDocuments({}),
+            ]);
+        res.json({
+            va: { total: vaTotal, pending: vaPending, approved: vaApproved, featured: vaFeatured },
+            aircraft,
+            airports,
+            partnerships,
+        });
+    } catch (err) {
+        console.error('Staff overview error:', err);
+        res.status(500).json({ error: 'Could not load overview.' });
+    }
 });
 
 
