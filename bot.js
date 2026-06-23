@@ -83,6 +83,11 @@ const VA_REPS_CHAT_ID = '1517174670334361732';           // shared reps general 
 const VA_APPLICATION_CHANNEL_ID = '1517177121422835852'; // where applications post for review
 const VA_REP_ROLE_NAME = 'VA Rep';                       // shared role gating the reps chat
 
+// The "Inflight VA Rep" staff role. Added to every per-VA channel the bot
+// provisions, and pinged + pulled into VA partnership tickets so they can field
+// questions about the partnership and our Inflight Pro subscription.
+const INFLIGHT_VA_REP_ROLE_ID = '1518665927254605925';
+
 const METADATA_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api/metadata';
 const BASE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api';
 
@@ -380,7 +385,7 @@ const normalizeData = async (rawType, rawLivery) => {
 };
 
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, models = {}) => {
-    const { DailyPilotStats, VirtualAirlineAd, Giveaway } = models;
+    const { DailyPilotStats, VirtualAirlineAd, Giveaway, VaTermsAcceptance } = models;
 
     // NOTE: `Options.cacheEverything()` is the *opposite* of what we want — it
     // caches everything with no caps and silently ignores the limits passed to
@@ -717,6 +722,98 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         return { embeds: [embed], components: [row] };
     };
 
+    // ---- VA PARTNERSHIP TICKET FLOW ------------------------------------------
+    // The /va_apply modal, factored out so both the slash command and the
+    // partnership ticket's "Start VA Application" button can present it.
+    const buildVaApplyModal = () => {
+        const modal = new ModalBuilder().setCustomId('va_apply_modal').setTitle('VA / VO Application');
+        modal.addComponents(
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_name').setLabel('VA / VO Name').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(80)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_callsign').setLabel('Radio Callsign (pilots fly as NAME ##VA)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(20).setPlaceholder('e.g. Ocean (pilots fly as OCEAN ##VA)')),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_type').setLabel('Type — VA or VO').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(2).setPlaceholder('VA')),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_tagline').setLabel('Short description / tagline').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(140)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_links').setLabel('Website + Discord (one per line)').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(300))
+        );
+        return modal;
+    };
+
+    // Version this so a future ToS revision can re-prompt previous accepters.
+    const VA_PARTNERSHIP_TOS_VERSION = 'v1';
+
+    // The partnership Terms of Service shown inside the ticket. Kept short enough
+    // to fit an embed description.
+    const buildPartnershipTosCard = () => {
+        const embed = new EmbedBuilder()
+            .setTitle('🤝 Inflight VA Partnership — Terms of Service')
+            .setColor(THEME.WHITE)
+            .setDescription(
+                "Thanks for your interest in partnering with **Inflight**! Please read these terms carefully before continuing.\n\n" +
+                "**1. Conduct** — Your VA and its members agree to follow Infinite Flight's rules and the Inflight community guidelines at all times.\n" +
+                "**2. Representation** — You will represent your VA accurately. Listings, fleet, hubs and recruiting info must be truthful and kept up to date.\n" +
+                "**3. Branding** — You won't impersonate Inflight staff or imply official endorsement beyond the agreed partnership.\n" +
+                "**4. Conduct in channels** — Spam, advertising of unrelated services, and harassment in your VA channel or the reps chat are not permitted.\n" +
+                "**5. Removal** — Inflight may pause or remove a partnership and its channel/roles for violations of these terms.\n" +
+                "**6. Changes** — These terms may be updated; continued participation means you accept the current version.\n\n" +
+                "If you have **any questions**, please inquire our Inflight VA Rep <@&" + INFLIGHT_VA_REP_ROLE_ID + "> right here in this ticket.\n\n" +
+                "When you've read and agree, tap **I Accept** below."
+            )
+            .setFooter({ text: `${BRAND_FOOTER} • Terms ${VA_PARTNERSHIP_TOS_VERSION}` });
+
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('partnership_accept_tos').setLabel('I Accept').setStyle(ButtonStyle.Success).setEmoji('✅'),
+            new ButtonBuilder().setCustomId('close_ticket_action').setLabel('Close Ticket').setStyle(ButtonStyle.Danger)
+        );
+        return { embeds: [embed], components: [row] };
+    };
+
+    // Pull the Inflight VA Rep(s) into a (private) ticket thread so the role
+    // mention actually reaches people who can see the channel. Best-effort and
+    // capped so we never iterate a huge member list.
+    const addInflightRepsToThread = async (thread, guild) => {
+        try {
+            const role = guild.roles.cache.get(INFLIGHT_VA_REP_ROLE_ID)
+                || await guild.roles.fetch(INFLIGHT_VA_REP_ROLE_ID).catch(() => null);
+            if (!role) return;
+            // role.members is populated from the guild member cache; fetch members
+            // first so it isn't empty on a cold cache.
+            await guild.members.fetch().catch(() => {});
+            let added = 0;
+            for (const member of role.members.values()) {
+                if (added >= 25) break;
+                await thread.members.add(member.id).catch(() => {});
+                added++;
+            }
+        } catch (e) {
+            console.error('❌ addInflightRepsToThread error:', e);
+        }
+    };
+
+    // Create and seed a VA partnership ticket: private thread, rep pinged + added,
+    // then the ToS card.
+    const openPartnershipTicket = async (interaction) => {
+        const thread = await interaction.channel.threads.create({
+            name: `partnership-${interaction.user.username}`.slice(0, 90),
+            type: ChannelType.PrivateThread,
+            reason: 'VA Partnership ticket'
+        });
+        await thread.members.add(interaction.user.id).catch(() => {});
+        await addInflightRepsToThread(thread, interaction.guild);
+
+        await thread.send({
+            content: `<@${interaction.user.id}> <@&${INFLIGHT_VA_REP_ROLE_ID}>`,
+            embeds: [new EmbedBuilder()
+                .setTitle('🤝 VA Partnership Request')
+                .setColor(THEME.WHITE)
+                .setDescription(
+                    `Welcome <@${interaction.user.id}>! Our Inflight VA Rep has been pinged and will help you set up a partnership.\n\n` +
+                    `Partnering with Inflight gets your VA a private channel, a directory listing, and access to our reps chat.`
+                )
+                .setFooter({ text: BRAND_FOOTER })]
+        });
+        await thread.send(buildPartnershipTosCard());
+        return thread;
+    };
+
     // Only the VA's owner (or staff) may edit its listing.
     const canManageVa = (interaction, ad) =>
         (ad.ownerId && interaction.user.id === ad.ownerId) ||
@@ -822,6 +919,8 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 permissionOverwrites: [
                     { id: guild.id, deny: [PermissionsBitField.Flags.ViewChannel] },
                     { id: vaRole.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] },
+                    // Inflight VA Rep gets eyes on every VA channel.
+                    { id: INFLIGHT_VA_REP_ROLE_ID, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] },
                     { id: ADMIN_ROLE_ID, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.ManageMessages] }
                 ],
                 reason: `VA space for ${ad.name}`
@@ -839,6 +938,14 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             } catch (_) { /* pin/send best-effort */ }
         }
         result.channel = channel;
+
+        // 3b. Self-heal: make sure the Inflight VA Rep can see this channel even
+        // if it was provisioned before this role existed.
+        if (channel && !channel.permissionOverwrites.cache.get(INFLIGHT_VA_REP_ROLE_ID)) {
+            await channel.permissionOverwrites.edit(INFLIGHT_VA_REP_ROLE_ID, {
+                ViewChannel: true, SendMessages: true, ReadMessageHistory: true
+            }).catch(() => {});
+        }
 
         // 4. Give the owner the VA role + the shared rep role.
         if (ad.ownerId) {
@@ -2267,6 +2374,8 @@ client.on('interactionCreate', async (interaction) => {
                     .addOptions(
                         { label: 'Database Correction', value: 'db_correction', emoji: '📝' },
                         { label: 'Submission Issue', value: 'submission_issue', emoji: '📸' },
+                        { label: 'VA Partnership', value: 'va_partnership', emoji: '🤝', description: 'Partner your VA with Inflight' },
+                        { label: 'Subscription Issue (Inflight Pro)', value: 'subscription', emoji: '💳', description: 'Problems with your Inflight Pro subscription' },
                         { label: 'Other Inquiry', value: 'other', emoji: '❓' }
                     );
                 await interaction.reply({ content: 'Select a topic:', components: [new ActionRowBuilder().addComponents(topicSelect)], ephemeral: true });
@@ -2289,6 +2398,67 @@ client.on('interactionCreate', async (interaction) => {
                 } catch (e) { console.error(e); }
                 return;
             }
+
+            // --- VA PARTNERSHIP: ACCEPT TERMS ---
+            if (customId === 'partnership_accept_tos') {
+                await interaction.deferUpdate();
+
+                // Persist the acceptance (latest wins). Best-effort — never block
+                // the user if the DB is briefly unavailable.
+                if (VaTermsAcceptance) {
+                    try {
+                        await VaTermsAcceptance.findOneAndUpdate(
+                            { userId: interaction.user.id },
+                            {
+                                userId: interaction.user.id,
+                                username: interaction.user.username,
+                                termsVersion: VA_PARTNERSHIP_TOS_VERSION,
+                                channelId: interaction.channelId,
+                                acceptedAt: new Date(),
+                            },
+                            { upsert: true, setDefaultsOnInsert: true }
+                        );
+                    } catch (e) {
+                        console.error('❌ Save terms acceptance error:', e);
+                    }
+                }
+
+                // Lock the ToS card so it can't be re-accepted.
+                try {
+                    const lockedRow = new ActionRowBuilder().addComponents(
+                        new ButtonBuilder().setCustomId('partnership_accepted_done').setLabel('Terms Accepted').setStyle(ButtonStyle.Success).setEmoji('✅').setDisabled(true),
+                        new ButtonBuilder().setCustomId('close_ticket_action').setLabel('Close Ticket').setStyle(ButtonStyle.Danger)
+                    );
+                    await interaction.editReply({ components: [lockedRow] });
+                } catch (_) { /* card may have been deleted */ }
+
+                // Walk them straight into the VA application — no /va_apply needed.
+                const setupRow = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId('partnership_apply_va').setLabel('Start VA Application').setStyle(ButtonStyle.Primary).setEmoji('🛫')
+                );
+                await interaction.followUp({
+                    embeds: [new EmbedBuilder()
+                        .setTitle('✅ Terms accepted — let’s set up your VA')
+                        .setColor(THEME.WHITE)
+                        .setDescription(
+                            `Thanks <@${interaction.user.id}>! We’ve recorded that you accepted our partnership terms.\n\n` +
+                            "Tap **Start VA Application** below to register your VA — no need to run `/va_apply`. " +
+                            `Once submitted, our Inflight VA Rep <@&${INFLIGHT_VA_REP_ROLE_ID}> will review and approve it.`
+                        )
+                        .setFooter({ text: BRAND_FOOTER })],
+                    components: [setupRow]
+                }).catch(() => {});
+                return;
+            }
+
+            // --- VA PARTNERSHIP: START APPLICATION ---
+            if (customId === 'partnership_apply_va') {
+                if (!VirtualAirlineAd) {
+                    return interaction.reply({ content: '❌ VA system unavailable right now.', ephemeral: true });
+                }
+                await interaction.showModal(buildVaApplyModal());
+                return;
+            }
         }
 
         // --- 3. SELECT MENU HANDLERS ---
@@ -2309,6 +2479,20 @@ client.on('interactionCreate', async (interaction) => {
             }
 
             if (interaction.customId === 'ticket_topic_select') {
+                // VA Partnership runs its own flow: a ticket that pings the
+                // Inflight VA Rep and walks the user through the ToS + setup,
+                // so it skips the generic "describe your issue" modal.
+                if (interaction.values[0] === 'va_partnership') {
+                    await interaction.deferReply({ ephemeral: true });
+                    try {
+                        const thread = await openPartnershipTicket(interaction);
+                        await interaction.editReply(`✅ Partnership ticket opened: <#${thread.id}>`);
+                    } catch (e) {
+                        console.error('❌ Partnership ticket error:', e);
+                        await interaction.editReply('❌ Could not open a partnership ticket. Please try again or contact staff.');
+                    }
+                    return;
+                }
                 const modal = new ModalBuilder().setCustomId(`ticket_modal_${interaction.values[0]}`).setTitle('Ticket Details');
                 modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('ticket_desc').setLabel("Description").setStyle(TextInputStyle.Paragraph).setRequired(false)));
                 await interaction.showModal(modal);
@@ -2826,15 +3010,7 @@ client.on('interactionCreate', async (interaction) => {
                 if (!VirtualAirlineAd) {
                     return interaction.reply({ content: '❌ VA system unavailable right now.', ephemeral: true });
                 }
-                const modal = new ModalBuilder().setCustomId('va_apply_modal').setTitle('VA / VO Application');
-                modal.addComponents(
-                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_name').setLabel('VA / VO Name').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(80)),
-                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_callsign').setLabel('Radio Callsign (pilots fly as NAME ##VA)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(20).setPlaceholder('e.g. Ocean (pilots fly as OCEAN ##VA)')),
-                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_type').setLabel('Type — VA or VO').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(2).setPlaceholder('VA')),
-                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_tagline').setLabel('Short description / tagline').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(140)),
-                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_links').setLabel('Website + Discord (one per line)').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(300))
-                );
-                await interaction.showModal(modal);
+                await interaction.showModal(buildVaApplyModal());
                 return;
             }
 
@@ -2903,7 +3079,7 @@ client.on('interactionCreate', async (interaction) => {
 
             const ticketEmbed = new EmbedBuilder()
                 .setTitle('🎫 Inflight Support')
-                .setDescription('Click the button below to open a private support ticket.\n\nYou can ask about:\n• Database corrections\n• Submission issues\n• Role/Account help')
+                .setDescription('Click the button below to open a private support ticket.\n\nYou can ask about:\n• Database corrections\n• Submission issues\n• 🤝 VA partnerships\n• 💳 Inflight Pro subscription issues\n• Role/Account help')
                 .setColor(THEME.WHITE)
                 .setFooter({ text: 'Our team will assist you as soon as possible.' });
 

@@ -21,6 +21,30 @@ const COOKIE_NAME = 'staff_token';
 const TOKEN_TTL = '7d';
 const COOKIE_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days
 
+// Roles a staff account can hold.
+//   admin   - full access + staff-account management
+//   staff   - full tool access, no account management
+//   va_rep  - "Inflight VA Rep": scoped access to the VA Ads Manager and the
+//             VA Admin Manual only. Everything else (Aircraft DB, Airports,
+//             Embeds, account admin) is hidden and blocked.
+const ROLES = ['admin', 'staff', 'va_rep'];
+
+// Pages an Inflight VA Rep is allowed to open. Any other staff page redirects
+// them back to the hub. (Admin/staff bypass this — they see everything.)
+const VA_REP_ALLOWED_PAGES = new Set([
+    '/staff',
+    '/va-ads', '/va-ads.html',
+    '/va-admin-manual', '/va-admin-manual.html',
+    '/VA-ADMIN-MANUAL.md',
+]);
+
+// Decide whether a resolved user may open a given page path.
+function canAccessPage(user, pathname) {
+    if (!user) return false;
+    if (user.role === 'va_rep') return VA_REP_ALLOWED_PAGES.has(pathname);
+    return true; // admin + staff: full access
+}
+
 // A stable secret is required so sessions survive restarts. Fall back to a
 // random per-process secret (with a loud warning) so the app still boots.
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString('hex');
@@ -36,7 +60,7 @@ const StaffUserSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true, lowercase: true, trim: true },
     displayName: { type: String, default: '' },
     passwordHash: { type: String, required: true },
-    role: { type: String, enum: ['admin', 'staff'], default: 'staff' },
+    role: { type: String, enum: ROLES, default: 'staff' },
     active: { type: Boolean, default: true },
     lastLoginAt: { type: Date, default: null },
 }, { timestamps: true });
@@ -146,6 +170,11 @@ async function requireAuthPage(req, res, next) {
     if (!user) {
         const next_ = encodeURIComponent(req.originalUrl || '/');
         return res.redirect(`/staff?next=${next_}`);
+    }
+    // Role-scoped pages: an Inflight VA Rep hitting a page outside their lane
+    // is bounced back to the hub rather than shown the tool.
+    if (!canAccessPage(user, req.path)) {
+        return res.redirect('/staff');
     }
     req.staff = user;
     next();
@@ -267,7 +296,7 @@ function registerAuthRoutes(app) {
                 username: uname,
                 displayName: displayName || username,
                 passwordHash,
-                role: role === 'admin' ? 'admin' : 'staff',
+                role: ROLES.includes(role) ? role : 'staff',
                 active: true,
             });
             res.status(201).json({ user: publicUser(user) });
@@ -299,7 +328,7 @@ function registerAuthRoutes(app) {
                 }
             }
 
-            if (role === 'admin' || role === 'staff') user.role = role;
+            if (ROLES.includes(role)) user.role = role;
             if (typeof active === 'boolean') user.active = active;
             if (typeof displayName === 'string') user.displayName = displayName;
             if (password) {
