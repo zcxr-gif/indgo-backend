@@ -740,22 +740,29 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
     // Version this so a future ToS revision can re-prompt previous accepters.
     const VA_PARTNERSHIP_TOS_VERSION = 'v1';
 
-    // The partnership Terms of Service shown inside the ticket. Kept short enough
-    // to fit an embed description.
+    // The official VA Advertisement Program Terms & Conditions, shipped as a PDF
+    // in the repo and attached to the partnership ticket so VAs get the real
+    // contract (not a paraphrase). Path resolves next to this file.
+    const VA_TERMS_PDF_PATH = path.join(__dirname, 'VA-Advertisement-Terms.pdf');
+
+    // The partnership Terms of Service shown inside the ticket. The full contract
+    // is attached as a PDF; the embed summarises the key obligations and points
+    // users at it + the Inflight VA Rep for questions.
     const buildPartnershipTosCard = () => {
         const embed = new EmbedBuilder()
-            .setTitle('🤝 Inflight VA Partnership — Terms of Service')
+            .setTitle('📄 Inflight VA Advertisement Program — Terms & Conditions')
             .setColor(THEME.WHITE)
             .setDescription(
-                "Thanks for your interest in partnering with **Inflight**! Please read these terms carefully before continuing.\n\n" +
-                "**1. Conduct** — Your VA and its members agree to follow Infinite Flight's rules and the Inflight community guidelines at all times.\n" +
-                "**2. Representation** — You will represent your VA accurately. Listings, fleet, hubs and recruiting info must be truthful and kept up to date.\n" +
-                "**3. Branding** — You won't impersonate Inflight staff or imply official endorsement beyond the agreed partnership.\n" +
-                "**4. Conduct in channels** — Spam, advertising of unrelated services, and harassment in your VA channel or the reps chat are not permitted.\n" +
-                "**5. Removal** — Inflight may pause or remove a partnership and its channel/roles for violations of these terms.\n" +
-                "**6. Changes** — These terms may be updated; continued participation means you accept the current version.\n\n" +
+                "Please read our **Terms & Conditions** (attached as a PDF above) before continuing. " +
+                "By accepting, your VA agrees to the full contract. Key points:\n\n" +
+                "• **Free program** — a directory advertising your VA across our platform, subject to staff approval.\n" +
+                "• **Event tracking** — any event you announce or run **must be tracked using Inflight**, with a screenshot from our tracker.\n" +
+                "• **Accurate content** — listing info, logos and banners must be accurate, owned by you, and not offensive or infringing.\n" +
+                "• **Staff authority** — Inflight may review, edit, approve, decline, feature or remove any listing at our discretion.\n" +
+                "• **iOS app** — VA listings are **not** shown in our iOS app for copyright-compliance reasons.\n" +
+                "• **Changes/suspension** — required changes not made within **7 days** of contact may lead to suspension.\n\n" +
                 "If you have **any questions**, please inquire our Inflight VA Rep <@&" + INFLIGHT_VA_REP_ROLE_ID + "> right here in this ticket.\n\n" +
-                "When you've read and agree, tap **I Accept** below."
+                "When you've read the attached Terms and agree, tap **I Accept** below."
             )
             .setFooter({ text: `${BRAND_FOOTER} • Terms ${VA_PARTNERSHIP_TOS_VERSION}` });
 
@@ -763,7 +770,15 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             new ButtonBuilder().setCustomId('partnership_accept_tos').setLabel('I Accept').setStyle(ButtonStyle.Success).setEmoji('✅'),
             new ButtonBuilder().setCustomId('close_ticket_action').setLabel('Close Ticket').setStyle(ButtonStyle.Danger)
         );
-        return { embeds: [embed], components: [row] };
+
+        const payload = { embeds: [embed], components: [row] };
+        // Attach the real contract if the PDF is present (best-effort).
+        try {
+            if (fs.existsSync(VA_TERMS_PDF_PATH)) {
+                payload.files = [new AttachmentBuilder(VA_TERMS_PDF_PATH, { name: 'Inflight-VA-Advertisement-Terms.pdf' })];
+            }
+        } catch (_) { /* ship the embed without the attachment */ }
+        return payload;
     };
 
     // Pull the Inflight VA Rep(s) into a (private) ticket thread so the role
@@ -814,6 +829,13 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         return thread;
     };
 
+    // Who may review VA applications (Approve & Create / Request Edits / Reject):
+    // admins, anyone with the Administrator permission, or the Inflight VA Rep.
+    const canReviewVa = (member) =>
+        !!member?.roles?.cache?.has(ADMIN_ROLE_ID) ||
+        !!member?.roles?.cache?.has(INFLIGHT_VA_REP_ROLE_ID) ||
+        !!member?.permissions?.has(PermissionsBitField.Flags.Administrator);
+
     // Only the VA's owner (or staff) may edit its listing.
     const canManageVa = (interaction, ad) =>
         (ad.ownerId && interaction.user.id === ad.ownerId) ||
@@ -843,12 +865,23 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 const url = await uploadVaImage(s3Client, { buffer: Buffer.from(resp.data) }, ref, kind);
 
                 // Swap out the old image so we don't orphan it in the bucket.
-                const oldUrl = kind === 'banner' ? ad.bannerUrl : ad.logoUrl;
-                if (oldUrl) await deleteVaImage(s3Client, oldUrl).catch(() => {});
-                if (kind === 'banner') ad.bannerUrl = url; else ad.logoUrl = url;
-                await ad.save();
+                // Re-read the live doc so we delete the CURRENT image (not a stale
+                // one captured when the button was clicked) and write only this
+                // single field — a stale full-document save could otherwise
+                // resurrect a just-replaced image URL and leak the new one.
+                const field = kind === 'banner' ? 'bannerUrl' : 'logoUrl';
+                const fresh = VirtualAirlineAd ? await VirtualAirlineAd.findById(ad._id).catch(() => null) : null;
+                const oldUrl = fresh ? fresh[field] : (kind === 'banner' ? ad.bannerUrl : ad.logoUrl);
+                if (oldUrl && oldUrl !== url) await deleteVaImage(s3Client, oldUrl).catch(() => {});
 
-                await channel.send({ content: `✅ ${kind === 'banner' ? 'Banner' : 'Logo'} updated!`, embeds: [buildVaInfoEmbed(ad)] }).catch(() => {});
+                const updated = VirtualAirlineAd
+                    ? await VirtualAirlineAd.findByIdAndUpdate(ad._id, { [field]: url, updatedAt: new Date() }, { new: true }).catch(() => null)
+                    : null;
+                // Keep the in-memory ad in sync for the confirmation embed.
+                if (updated) { ad.bannerUrl = updated.bannerUrl; ad.logoUrl = updated.logoUrl; }
+                else { ad[field] = url; await ad.save().catch(() => {}); }
+
+                await channel.send({ content: `✅ ${kind === 'banner' ? 'Banner' : 'Logo'} updated!`, embeds: [buildVaInfoEmbed(updated || ad)] }).catch(() => {});
             } catch (e) {
                 console.error(`❌ VA ${kind} upload error:`, e);
                 await channel.send(`❌ Couldn't process that image. Please try again.`).catch(() => {});
@@ -2258,9 +2291,9 @@ client.on('interactionCreate', async (interaction) => {
 
             // --- VA APPLICATION REVIEW BUTTONS ---
             if (customId.startsWith('va_approve_') || customId.startsWith('va_reject_') || customId.startsWith('va_edit_')) {
-                // Staff only.
-                if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID) && !interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-                    return interaction.reply({ content: '❌ Staff only.', ephemeral: true });
+                // Staff or the Inflight VA Rep may review applications.
+                if (!canReviewVa(interaction.member)) {
+                    return interaction.reply({ content: '❌ Staff or Inflight VA Rep only.', ephemeral: true });
                 }
                 if (!VirtualAirlineAd) {
                     return interaction.reply({ content: '❌ VA system unavailable (database not connected).', ephemeral: true });
@@ -2738,8 +2771,15 @@ client.on('interactionCreate', async (interaction) => {
 
                     const reviewChannel = await client.channels.fetch(VA_APPLICATION_CHANNEL_ID).catch(() => null);
                     if (reviewChannel) {
+                        // Self-heal: make sure the Inflight VA Rep can see (and act on)
+                        // the review channel, since they can now review applications.
+                        if (reviewChannel.permissionOverwrites && !reviewChannel.permissionOverwrites.cache.get(INFLIGHT_VA_REP_ROLE_ID)) {
+                            await reviewChannel.permissionOverwrites.edit(INFLIGHT_VA_REP_ROLE_ID, {
+                                ViewChannel: true, SendMessages: true, ReadMessageHistory: true
+                            }).catch(() => {});
+                        }
                         await reviewChannel.send({
-                            content: `<@&${ADMIN_ROLE_ID}> new VA application`,
+                            content: `<@&${ADMIN_ROLE_ID}> <@&${INFLIGHT_VA_REP_ROLE_ID}> new VA application`,
                             embeds: [buildVaReviewEmbed(ad)],
                             components: [buildVaReviewButtons(ad._id)]
                         });
