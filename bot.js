@@ -858,12 +858,23 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 const url = await uploadVaImage(s3Client, { buffer: Buffer.from(resp.data) }, ref, kind);
 
                 // Swap out the old image so we don't orphan it in the bucket.
-                const oldUrl = kind === 'banner' ? ad.bannerUrl : ad.logoUrl;
-                if (oldUrl) await deleteVaImage(s3Client, oldUrl).catch(() => {});
-                if (kind === 'banner') ad.bannerUrl = url; else ad.logoUrl = url;
-                await ad.save();
+                // Re-read the live doc so we delete the CURRENT image (not a stale
+                // one captured when the button was clicked) and write only this
+                // single field — a stale full-document save could otherwise
+                // resurrect a just-replaced image URL and leak the new one.
+                const field = kind === 'banner' ? 'bannerUrl' : 'logoUrl';
+                const fresh = VirtualAirlineAd ? await VirtualAirlineAd.findById(ad._id).catch(() => null) : null;
+                const oldUrl = fresh ? fresh[field] : (kind === 'banner' ? ad.bannerUrl : ad.logoUrl);
+                if (oldUrl && oldUrl !== url) await deleteVaImage(s3Client, oldUrl).catch(() => {});
 
-                await channel.send({ content: `✅ ${kind === 'banner' ? 'Banner' : 'Logo'} updated!`, embeds: [buildVaInfoEmbed(ad)] }).catch(() => {});
+                const updated = VirtualAirlineAd
+                    ? await VirtualAirlineAd.findByIdAndUpdate(ad._id, { [field]: url, updatedAt: new Date() }, { new: true }).catch(() => null)
+                    : null;
+                // Keep the in-memory ad in sync for the confirmation embed.
+                if (updated) { ad.bannerUrl = updated.bannerUrl; ad.logoUrl = updated.logoUrl; }
+                else { ad[field] = url; await ad.save().catch(() => {}); }
+
+                await channel.send({ content: `✅ ${kind === 'banner' ? 'Banner' : 'Logo'} updated!`, embeds: [buildVaInfoEmbed(updated || ad)] }).catch(() => {});
             } catch (e) {
                 console.error(`❌ VA ${kind} upload error:`, e);
                 await channel.send(`❌ Couldn't process that image. Please try again.`).catch(() => {});
