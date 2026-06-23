@@ -229,7 +229,10 @@ When a `token` is present it always wins; any other URL params are ignored.
 ## 4. Distribution checklist
 
 1. Create a config entry for the VA (code, name, logo, prefixes/suffixes,
-   Mapbox token or free provider, allowed origins).
+   Mapbox token or free provider, allowed origins). Tip: in the staff embed
+   manager, use **Connect to a VA** at the top of the form to search the VA
+   directory and auto-fill the code, name, logo and callsign — no need to type
+   them by hand.
 2. Generate an opaque token and store it against that config.
 3. Send the VA the **iframe snippet** with their token.
 4. (Optional) Lock the token to their domain via `allowedOrigins`.
