@@ -6,7 +6,9 @@ edit, suspend, and remove virtual airlines (VAs) and virtual organisations (VOs)
 **on their own authority**, without escalating every decision.
 **Governing documents:** This manual operationalises the *Inflight VA
 Advertisement Program — Terms & Conditions* ("the Terms"). Where this manual and
-the Terms disagree, the Terms win.
+the Terms disagree, the Terms win. The full Terms ship as a PDF
+(**[VA-Advertisement-Terms.pdf](/VA-Advertisement-Terms.pdf)**) and are attached
+automatically to every **VA Partnership** ticket the bot opens (Section 8C).
 **Contact of record:** inflightcustomer@gmail.com
 
 > **One-line policy:** We list **IFVARB-approved** Infinite Flight VAs/VOs, plus
@@ -355,6 +357,12 @@ where you author a listing directly (defaults to **Live**). The other path is th
 Both write to the same `VirtualAirlineAd` records — a VA created on one shows up
 on the other. **Know both, because each does something the other doesn't.**
 
+> **A guided front door, too:** new VAs can also reach the bot's `/va_apply`
+> form **without typing a command** by opening a **VA Partnership** ticket, which
+> walks them through the Terms first. That flow — plus the **Inflight VA Rep**
+> role — is documented in **Section 8C**. It still lands as a `pending`
+> application you review exactly as below.
+
 > **The one distinction that matters most:** approving in the **bot** (the
 > **Approve & Create** button) both sets the listing Live **and provisions Discord**
 > (role + private channel + rep access). Approving in the **web manager** (setting
@@ -439,6 +447,67 @@ Because both fronts edit the same record, keep them coherent:
 
 ---
 
+## 8C. The Inflight VA Rep & VA Partnership Tickets
+
+A third, **guided** intake path sits in front of `/va_apply`: the **VA
+Partnership** ticket. It exists so a prospective VA reads and accepts the Terms
+**before** anything is provisioned, and so a dedicated **Inflight VA Rep** can
+shepherd them through it. Nothing here bypasses your review — a partnership
+ticket still ends in a normal `pending` `/va_apply` application (Section 8B).
+
+### 8C.1 The "Inflight VA Rep" role — two hats
+
+The name covers **two distinct roles** that share a purpose (front-line VA
+relations):
+
+| Where | What it grants | Scope |
+|-------|----------------|-------|
+| **Discord role** (`Inflight VA Rep`, ID `1518665927254605925`) | Auto-added to **every provisioned VA channel** (and self-heals onto older channels on the next approval/rep command), and is **pinged + pulled into** every VA Partnership ticket. | Lets the rep see and answer questions in all VA channels + partnership tickets. Does **not** grant admin/teardown powers — staff slash commands (Section 8B.5) remain admin-role only. |
+| **Staff-portal role** (`va_rep`) | A scoped login to the web Staff Hub. | Sees **only** the **VA Ads Manager** (`/va-ads`) and **this manual** (`/va-admin-manual`). The Aircraft Database, Airport Manager, Embed Manager, and staff-account admin are hidden and blocked. Create it from the Staff Hub's **Add staff** dialog (role = *Inflight VA Rep*), or cycle an existing account's role from the staff table. |
+
+Use the staff-portal `va_rep` role when you want someone managing VA listings
+and reading this manual **without** handing them the rest of the database.
+
+### 8C.2 The VA Partnership ticket flow
+
+From the **🎫 Inflight Support** ticket panel (`/setup_tickets`), a user picks
+**🤝 VA Partnership**. The bot then:
+
+1. Opens a **private partnership ticket** (thread) and adds the user.
+2. **Pings the Inflight VA Rep** and pulls the rep(s) into the ticket so they can
+   help in real time.
+3. **Drops the Terms** — the full **[VA-Advertisement-Terms.pdf](/VA-Advertisement-Terms.pdf)**
+   is attached, with a summary card telling the user to read it and to ask the
+   Inflight VA Rep **here in the ticket** if they have questions.
+4. Shows an **✅ I Accept** button.
+
+When the user clicks **I Accept**:
+
+- The acceptance is **saved to the database** (`VaTermsAcceptance` — Discord user
+  ID, username, terms version, ticket channel, timestamp). This is our **proof of
+  agreement** to the Terms, recorded before any listing exists.
+- The ToS card locks (it can't be re-accepted), and a follow-up card appears with
+  a **🛫 Start VA Application** button.
+- **Start VA Application** opens the same `/va_apply` form (Section 8B.1) — so the
+  user never has to type the command. From there it's the **normal pending review
+  flow**: it posts a review card to the staff applications channel for you to
+  **Approve & Create / Request Edits / Reject**.
+
+> **Your job is unchanged.** Acceptance of the Terms is **not** approval. A
+> partnership ticket only guarantees the user has seen and agreed to the Terms —
+> you still vet IFVARB/exception status, image rights, and the "active" test
+> (Sections 2–3) before clicking **Approve & Create**.
+
+### 8C.3 Subscription (Inflight Pro) tickets
+
+The same ticket panel offers **💳 Subscription Issue (Inflight Pro)** for users
+with problems on our **Inflight Pro** subscription. These open a standard support
+ticket (description modal → private thread pinging the admin role) — they are
+**not** part of the VA flow and don't touch the directory. Triage them like any
+other support ticket; loop in the relevant owner/admin for billing.
+
+---
+
 ## 9. Featuring (promotion)
 
 **Featured** pins a listing to the top of the directory (and is sorted first).
@@ -483,8 +552,10 @@ Handle everything else yourself. **Escalate to the owner
 2. A **new exception** you think is justified but that isn't E1–E4. Don't invent
    exceptions on your own.
 3. **Owner-directed special cases** (E4) — confirm the instruction in writing.
-4. Anything touching **money, partnerships, or platform features** beyond
-   listing management.
+4. Anything touching **money, paid/business partnerships, or platform features**
+   beyond listing management. (Routine **VA partnership onboarding** via tickets
+   is normal §8C work — this means commercial deals, not a VA joining the
+   directory.)
 5. A **dispute** with a VA that escalates beyond a routine decline/suspension
    (threats, public callouts, harassment).
 
@@ -545,10 +616,17 @@ misleading/offensive content · unauthorised submitter.
 here) · Archived = suspended (not deleted). **Prefer Archive over Delete.**
 
 **Two front doors:** web manager (you author, defaults Live) **and** Discord
-`/va_apply` (owner applies → pending → you **Approve & Create**). Only the bot's
-Approve **provisions Discord** (role + channel + rep access); web "Live" does not.
-`/va_remove` tears down the Discord space but **not** the listing — archive/delete
-that separately.
+`/va_apply` (owner applies → pending → you **Approve & Create**). A **🤝 VA
+Partnership** ticket is a guided third entry (Terms PDF → **I Accept** recorded in
+the DB → **Start VA Application**) that funnels into the same `/va_apply` pending
+review (§8C). Only the bot's Approve **provisions Discord** (role + channel + rep
+access); web "Live" does not. `/va_remove` tears down the Discord space but
+**not** the listing — archive/delete that separately.
+
+**Inflight VA Rep (§8C):** Discord role `1518665927254605925` is auto-added to
+every VA channel + pinged into partnership tickets; the `va_rep` **staff-portal**
+role logs in to **VA Ads + this manual only**. Terms acceptance is logged
+(`VaTermsAcceptance`) but is **not** approval — still vet before Approve & Create.
 
 **The clock (§8):** required change → contact CEO/rep → **7 days** → no action →
 Archive until fixed.
