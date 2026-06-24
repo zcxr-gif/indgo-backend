@@ -44,8 +44,9 @@ To embed it on their site, they paste this iframe:
 | `name`       | `Ocean%20Virtual`                         | Display name. Defaults to the code. |
 | `logo`       | `https://…/logo.png`                      | Optional. Auto-resolved from the VA-Ads roster if omitted. |
 | `mode`       | `map` or `roster`                         | Defaults to `roster`. |
-| `prefixes`   | `OCEAN,OCN`                               | Leading-token prefixes (see Callsign matching). Defaults to `[va]`. |
-| `suffixes`   | `EX,VA`                                    | Trailing-token tags (see Callsign matching). |
+| `prefixes`   | `Air%20Canada,United`                     | **Full airline name(s)** you fly under (see Callsign matching). Defaults to `[va]`. |
+| `suffixes`   | `VA,EX`                                    | Your trailing tag(s) (see Callsign matching). |
+| `hubs`       | `CYYZ,CYUL,CYVR`                          | Hub ICAOs. Each becomes a map marker listing your inbound pilots. |
 | `provider`   | `mapbox` or `free`                        | Auto: `free` when no Mapbox token. |
 | `mapboxToken`| `pk.eyJ…`                                 | The VA's own Mapbox token (mapbox provider only). |
 | `mapStyle`   | `mapbox://styles/mapbox/dark-v11`         | Mapbox style URL (mapbox provider). |
@@ -61,29 +62,52 @@ To embed it on their site, they paste this iframe:
 
 ## 2. Callsign matching (important)
 
-A flight is shown when its callsign matches **either** rule — so a VA can mix
-styles or run several tags:
+A flight counts as yours only when it matches the **full airline name** you fly
+under — and, *if* you use a tag, also carries that tag. This stops the embed from
+grabbing every callsign that merely ends in a common tag like `VA`.
 
-- **Prefix rule** — the *leading* token starts with one of `prefixes`.
-  `prefix "OCEAN"` → `OCEAN 01`, `OCEAN123`.
-- **Suffix rule** — the *last* token ends with one of `suffixes`.
-  `suffix "EX"` → `OCEAN 01EX` **and** `UPS 01EX`.
+- **Prefix rule** — `prefixes` are the *complete* airline name, e.g.
+  `"Air Canada"` (not the ICAO code `ACA`). `"Air Canada"` matches
+  `Air Canada 001VA` and **only** Air Canada — never Air France or AirAsia.
+- **Suffix rule** — `suffixes` are your tag(s), e.g. `"VA"`, `"EX"`. A bare tag
+  never matches on its own.
 
-This covers the common cases:
+Combining them:
 
-- VA flies its own callsign → set `prefixes=OCEAN`.
-- VA flies *other airlines'* callsigns but tags the end → set `suffixes=EX`
-  (matches `UPS 01EX`, `AAL 22EX`, …).
-- VA uses several tags → `suffixes=EX,VA` (matches both `OCEAN 01EX` and
-  `OCEAN 01VA`).
-- Mix of both → set `prefixes` **and** `suffixes`; a flight matching either is
-  included.
+- `prefixes` only → matches any callsign starting with that full airline name.
+- `prefixes` + `suffixes` → must match the airline **and** carry the tag.
 
-Example URL using a suffix tag:
+Examples (`prefixes: ["Air Canada"]`, `suffixes: ["VA"]`):
+
+| Callsign            | Result                       |
+|---------------------|------------------------------|
+| `Air Canada 001VA`  | ✅ match                     |
+| `Air Canada 001`    | ❌ missing tag               |
+| `Air France 045VA`  | ❌ airline not declared      |
+
+Fly one tag across several airlines → list each full name:
 
 ```
-https://inflight.info/embed.html?va=OCEAN&name=Ocean%20Virtual&mode=map&suffixes=EX,VA
+prefixes=Air Canada,United,Lufthansa  &  suffixes=VA
+→ matches "Air Canada 001VA", "United 045VA", "Lufthansa 12VA"
+→ not     "Delta 010VA"  (Delta not declared)
 ```
+
+> Use the full airline name and keep its spaces/case (encode spaces as `%20` in
+> URLs). ICAO codes like `ACA` will **not** match the in-game callsign.
+
+Example URL using a name + tag:
+
+```
+https://inflight.info/embed.html?va=Air%20Canada%20Virtual&name=Air%20Canada%20Virtual&prefixes=Air%20Canada&suffixes=VA&mode=map
+```
+
+### Hubs + inbound VA pilots
+
+Pass `hubs` (comma-separated ICAOs in a preview URL, or a `hubs` array in the
+resolve payload). Each hub becomes a map marker; tapping it opens an airport
+window listing your pilots inbound to that airport (callsign · route · pilot
+name) plus a live "VA Inbound" count. No extra backend endpoint is needed.
 
 ---
 
@@ -105,9 +129,10 @@ so you can lock a token to one or more domains.
 ```json
 {
   "ok": true,
-  "va":   { "code": "OCEAN", "name": "Ocean Virtual", "logo": "https://…/logo.png" },
-  "callsignPrefixes": ["OCEAN"],
-  "callsignSuffixes": ["EX", "VA"],
+  "va":   { "code": "Air Canada Virtual", "name": "Air Canada Virtual", "logo": "https://…/logo.png" },
+  "callsignPrefixes": ["Air Canada"],
+  "callsignSuffixes": ["VA"],
+  "hubs": ["CYYZ", "CYUL", "CYVR"],
   "mode": "map",
   "provider": "mapbox",
   "mapboxToken": "pk.eyJ…",
@@ -117,6 +142,9 @@ so you can lock a token to one or more domains.
   "servers": ["Expert"]
 }
 ```
+
+`hubs` also accepts the alternate keys `icao` or `hub`. Prefixes are full airline
+names (case preserved); suffixes are tags.
 
 Every field except `va.code` is optional and falls back to a sensible default.
 Omit `mapboxToken` (or set `provider:"free"`) to serve the free map.
@@ -156,10 +184,11 @@ const router = express.Router();
 // Your VA embed configs, keyed by opaque token. Store these in a DB in prod.
 // Generate tokens with e.g. crypto.randomUUID() or crypto.randomBytes(16).hex.
 const EMBED_CONFIGS = {
-  'tok_ocean_a1b2c3': {
-    va: { code: 'OCEAN', name: 'Ocean Virtual', logo: 'https://cdn.example.com/ocean.png' },
-    callsignPrefixes: ['OCEAN'],
-    callsignSuffixes: ['EX', 'VA'],
+  'tok_aircanada_a1b2c3': {
+    va: { code: 'Air Canada Virtual', name: 'Air Canada Virtual', logo: 'https://cdn.example.com/acav.png' },
+    callsignPrefixes: ['Air Canada'], // full airline name(s), case preserved
+    callsignSuffixes: ['VA'],
+    hubs: ['CYYZ', 'CYUL', 'CYVR'],   // hub ICAOs → markers + inbound pilots
     mode: 'map',
     provider: 'mapbox',
     mapboxToken: 'pk.eyJ...the-vas-own-token...',
@@ -198,6 +227,7 @@ router.get('/api/embed/resolve', (req, res) => {
     va: cfg.va,
     callsignPrefixes: cfg.callsignPrefixes || [cfg.va.code],
     callsignSuffixes: cfg.callsignSuffixes || [],
+    hubs: cfg.hubs || [],
     mode: cfg.mode || 'roster',
     provider: cfg.provider || (cfg.mapboxToken ? 'mapbox' : 'free'),
     mapboxToken: cfg.mapboxToken || '',

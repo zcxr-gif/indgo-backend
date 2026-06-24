@@ -139,14 +139,20 @@
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div>
                         <label class="block text-sm font-semibold mb-1.5">Callsign prefixes</label>
-                        <input id="f_prefixes" placeholder="OCEAN, OCN" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
-                        <p class="text-xs text-zinc-400 mt-1">Leading token. Blank = the VA code.</p>
+                        <input id="f_prefixes" placeholder="Air Canada, United" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                        <p class="text-xs text-zinc-400 mt-1">Full airline name(s) you fly under — not an ICAO code. Blank = the VA code.</p>
                     </div>
                     <div>
                         <label class="block text-sm font-semibold mb-1.5">Callsign suffixes</label>
-                        <input id="f_suffixes" placeholder="EX, VA" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
-                        <p class="text-xs text-zinc-400 mt-1">Trailing tag (e.g. matches "UPS 01EX").</p>
+                        <input id="f_suffixes" placeholder="VA, EX" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
+                        <p class="text-xs text-zinc-400 mt-1">Your tag(s), e.g. matches "Air Canada 001VA". A bare tag never matches alone.</p>
                     </div>
+                </div>
+
+                <div>
+                    <label class="block text-sm font-semibold mb-1.5">Hubs (ICAO)</label>
+                    <input id="f_hubs" placeholder="CYYZ, CYUL, CYVR" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
+                    <p class="text-xs text-zinc-400 mt-1">Each becomes a map marker; tapping one lists your inbound pilots. Blank = no hub markers.</p>
                 </div>
 
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -468,8 +474,13 @@
             document.getElementById('f_va_code').value = code;
             document.getElementById('f_va_name').value = v.name || '';
             document.getElementById('f_va_logo').value = v.logoUrl || '';
-            // Prefix rule matches the leading token, so the callsign is the prefix.
-            if (code) document.getElementById('f_prefixes').value = code;
+            // Prefix rule matches the full airline name, so the VA's callsign is
+            // the prefix (preserve its case for an exact in-game match).
+            if (v.callsign) document.getElementById('f_prefixes').value = v.callsign.trim();
+            // Pull the VA's hubs straight from the directory record if it has any.
+            if (Array.isArray(v.hubs) && v.hubs.length) {
+                document.getElementById('f_hubs').value = v.hubs.join(', ');
+            }
 
             const note = document.getElementById('vaConnected');
             note.innerHTML = `<i class="fa-solid fa-circle-check mr-1"></i> Connected to ${esc(v.name || code)}${code ? ` (${esc(code)})` : ''}`;
@@ -517,6 +528,7 @@
             document.getElementById('f_va_logo').value = (c.va && c.va.logo) || '';
             document.getElementById('f_prefixes').value = (c.callsignPrefixes || []).join(', ');
             document.getElementById('f_suffixes').value = (c.callsignSuffixes || []).join(', ');
+            document.getElementById('f_hubs').value = (c.hubs || []).join(', ');
             document.getElementById('f_mode').value = c.mode || 'roster';
             document.getElementById('f_provider').value = c.provider || '';
             document.getElementById('f_theme').value = c.theme || 'dark';
@@ -545,6 +557,7 @@
                 va: { code: v('f_va_code'), name: v('f_va_name'), logo: v('f_va_logo') },
                 callsignPrefixes: v('f_prefixes'),
                 callsignSuffixes: v('f_suffixes'),
+                hubs: v('f_hubs'),
                 mode: v('f_mode'),
                 provider: v('f_provider'),
                 theme: v('f_theme'),
