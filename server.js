@@ -255,8 +255,14 @@ const EmbedConfigSchema = new mongoose.Schema({
     },
 
     // --- Callsign matching (see EMBEDBACKEND.md §2) ---
+    // Prefixes are the FULL airline name flown (e.g. "Air Canada"), not a short
+    // ICAO code. Case is preserved so it matches the in-game callsign exactly.
     callsignPrefixes: { type: [String], default: [] }, // empty => widget falls back to [va.code]
-    callsignSuffixes: { type: [String], default: [] },
+    callsignSuffixes: { type: [String], default: [] }, // tag(s) carried after the number, e.g. "VA"
+
+    // Hub ICAOs. Each becomes a map marker whose window lists the VA's inbound
+    // pilots. Stored uppercase, e.g. ["CYYZ", "CYUL", "CYVR"].
+    hubs: { type: [String], default: [] },
 
     // --- Widget appearance / data source ---
     mode: { type: String, enum: EMBED_MODES, default: 'roster' },
@@ -2110,6 +2116,7 @@ const toResolvePayload = (cfg) => ({
     va: { code: cfg.va.code, name: cfg.va.name || cfg.va.code, logo: cfg.va.logo || '' },
     callsignPrefixes: (cfg.callsignPrefixes && cfg.callsignPrefixes.length) ? cfg.callsignPrefixes : [cfg.va.code],
     callsignSuffixes: cfg.callsignSuffixes || [],
+    hubs: cfg.hubs || [],
     mode: cfg.mode || 'roster',
     provider: cfg.provider || (cfg.mapboxToken ? 'mapbox' : 'free'),
     mapboxToken: cfg.mapboxToken || '',
@@ -2165,8 +2172,14 @@ const applyEmbedFields = (cfg, body) => {
     if (va.name !== undefined) cfg.va.name = String(va.name || '').trim();
     if (va.logo !== undefined) cfg.va.logo = String(va.logo || '').trim();
 
-    if (body.callsignPrefixes !== undefined) cfg.callsignPrefixes = toStringList(body.callsignPrefixes).map(s => s.toUpperCase());
+    // Prefixes are full airline names ("Air Canada") — preserve case so they
+    // match the in-game callsign. Suffixes are short tags, normalized uppercase.
+    if (body.callsignPrefixes !== undefined) cfg.callsignPrefixes = toStringList(body.callsignPrefixes);
     if (body.callsignSuffixes !== undefined) cfg.callsignSuffixes = toStringList(body.callsignSuffixes).map(s => s.toUpperCase());
+    // hubs accepts the body keys "hubs", "icao" or "hub"; stored uppercase ICAO.
+    if (body.hubs !== undefined || body.icao !== undefined || body.hub !== undefined) {
+        cfg.hubs = toStringList(body.hubs ?? body.icao ?? body.hub).map(s => s.toUpperCase());
+    }
 
     if (body.mode !== undefined) cfg.mode = EMBED_MODES.includes(body.mode) ? body.mode : 'roster';
     if (body.provider !== undefined) cfg.provider = EMBED_PROVIDERS.includes(body.provider) ? body.provider : null;

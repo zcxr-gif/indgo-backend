@@ -99,6 +99,21 @@
             <form id="form" onsubmit="save(event)" class="px-6 py-5 space-y-5 max-h-[70vh] overflow-y-auto modal-scroll">
                 <input type="hidden" id="f_id">
 
+                <!-- Connect to a VA: search the VA directory and auto-fill the
+                     code, name, logo and callsign so they don't have to be typed. -->
+                <div class="rounded-2xl border-2 border-dashed border-zinc-200 dark:border-zinc-800 p-4">
+                    <label class="block text-sm font-semibold mb-1.5 flex items-center gap-2">
+                        <i class="fa-solid fa-link text-emerald-600"></i> Connect to a VA
+                    </label>
+                    <p class="text-xs text-zinc-400 mb-2">Search the VA directory to paste in its callsign, name and logo automatically. You can still edit everything below.</p>
+                    <div class="relative">
+                        <i class="fa-solid fa-search absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400 text-sm"></i>
+                        <input id="f_va_connect" autocomplete="off" oninput="onVaSearch()" onfocus="onVaSearch()" placeholder="Search by VA name or callsign…" class="w-full pl-9 pr-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-emerald-500 outline-none">
+                        <div id="vaResults" class="hidden absolute z-20 mt-1 w-full max-h-64 overflow-y-auto modal-scroll rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-xl"></div>
+                    </div>
+                    <p id="vaConnected" class="hidden text-xs font-medium text-emerald-600 mt-2"></p>
+                </div>
+
                 <div>
                     <label class="block text-sm font-semibold mb-1.5">Internal label</label>
                     <input id="f_label" placeholder="e.g. Ocean Virtual — production" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
@@ -124,14 +139,20 @@
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div>
                         <label class="block text-sm font-semibold mb-1.5">Callsign prefixes</label>
-                        <input id="f_prefixes" placeholder="OCEAN, OCN" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
-                        <p class="text-xs text-zinc-400 mt-1">Leading token. Blank = the VA code.</p>
+                        <input id="f_prefixes" placeholder="Air Canada, United" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                        <p class="text-xs text-zinc-400 mt-1">Full airline name(s) you fly under — not an ICAO code. Blank = the VA code.</p>
                     </div>
                     <div>
                         <label class="block text-sm font-semibold mb-1.5">Callsign suffixes</label>
-                        <input id="f_suffixes" placeholder="EX, VA" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
-                        <p class="text-xs text-zinc-400 mt-1">Trailing tag (e.g. matches "UPS 01EX").</p>
+                        <input id="f_suffixes" placeholder="VA, EX" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
+                        <p class="text-xs text-zinc-400 mt-1">Your tag(s), e.g. matches "Air Canada 001VA". A bare tag never matches alone.</p>
                     </div>
+                </div>
+
+                <div>
+                    <label class="block text-sm font-semibold mb-1.5">Hubs (ICAO)</label>
+                    <input id="f_hubs" placeholder="CYYZ, CYUL, CYVR" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
+                    <p class="text-xs text-zinc-400 mt-1">Each becomes a map marker; tapping one lists your inbound pilots. Blank = no hub markers.</p>
                 </div>
 
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -388,11 +409,107 @@
             }).join('');
         }
 
+        // ---- VA directory connector ----
+        // Pulls the VA-Ads directory once, then filters client-side so picking a
+        // VA pastes its callsign/name/logo straight into the form.
+        let VA_DIRECTORY = null;
+        let vaDirLoading = null;
+
+        async function loadVaDirectory() {
+            if (VA_DIRECTORY) return VA_DIRECTORY;
+            if (vaDirLoading) return vaDirLoading;
+            vaDirLoading = (async () => {
+                try {
+                    // status=all so staff can connect even pending/unlisted VAs.
+                    const res = await fetch('/api/va-ads?status=all&sort=name&limit=100');
+                    if (!res.ok) throw new Error('load failed');
+                    const json = await res.json();
+                    VA_DIRECTORY = (json.data || []).filter(v => v && (v.callsign || v.name));
+                } catch {
+                    VA_DIRECTORY = [];
+                }
+                return VA_DIRECTORY;
+            })();
+            return vaDirLoading;
+        }
+
+        async function onVaSearch() {
+            const box = document.getElementById('vaResults');
+            const q = document.getElementById('f_va_connect').value.trim().toLowerCase();
+            const dir = await loadVaDirectory();
+
+            const list = (q
+                ? dir.filter(v => `${v.name || ''} ${v.callsign || ''}`.toLowerCase().includes(q))
+                : dir
+            ).slice(0, 30);
+
+            if (!list.length) {
+                box.innerHTML = `<div class="px-3 py-3 text-sm text-zinc-400">${dir.length ? 'No matching VAs.' : 'No VAs in the directory yet.'}</div>`;
+                box.classList.remove('hidden');
+                return;
+            }
+
+            box.innerHTML = list.map((v, i) => {
+                const idx = dir.indexOf(v);
+                const logo = v.logoUrl
+                    ? `<img src="${esc(v.logoUrl)}" alt="" class="w-8 h-8 rounded-lg object-cover bg-zinc-100 dark:bg-zinc-800 shrink-0">`
+                    : `<div class="w-8 h-8 rounded-lg bg-zinc-100 dark:bg-zinc-800 grid place-items-center text-zinc-400 shrink-0"><i class="fa-solid fa-plane"></i></div>`;
+                return `
+                <button type="button" onmousedown="event.preventDefault()" onclick="pickVa(${idx})" class="w-full flex items-center gap-3 px-3 py-2.5 text-left hover:bg-zinc-50 dark:hover:bg-zinc-800 transition ${i ? 'border-t border-zinc-100 dark:border-zinc-800' : ''}">
+                    ${logo}
+                    <div class="min-w-0 flex-1">
+                        <div class="font-medium truncate">${esc(v.name || v.callsign)}</div>
+                        <div class="text-xs text-zinc-400 truncate">${v.callsign ? esc(v.callsign) : 'no callsign on file'}${v.region ? ' · ' + esc(v.region) : ''}</div>
+                    </div>
+                    ${v.callsign ? `<span class="text-xs font-mono px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500 shrink-0">${esc(v.callsign)}</span>` : ''}
+                </button>`;
+            }).join('');
+            box.classList.remove('hidden');
+        }
+
+        function pickVa(idx) {
+            const v = (VA_DIRECTORY || [])[idx];
+            if (!v) return;
+            const code = (v.callsign || '').trim().toUpperCase();
+            document.getElementById('f_va_code').value = code;
+            document.getElementById('f_va_name').value = v.name || '';
+            document.getElementById('f_va_logo').value = v.logoUrl || '';
+            // Prefix rule matches the full airline name, so the VA's callsign is
+            // the prefix (preserve its case for an exact in-game match).
+            if (v.callsign) document.getElementById('f_prefixes').value = v.callsign.trim();
+            // Pull the VA's hubs straight from the directory record if it has any.
+            if (Array.isArray(v.hubs) && v.hubs.length) {
+                document.getElementById('f_hubs').value = v.hubs.join(', ');
+            }
+
+            const note = document.getElementById('vaConnected');
+            note.innerHTML = `<i class="fa-solid fa-circle-check mr-1"></i> Connected to ${esc(v.name || code)}${code ? ` (${esc(code)})` : ''}`;
+            note.classList.remove('hidden');
+            document.getElementById('vaResults').classList.add('hidden');
+            document.getElementById('f_va_connect').value = '';
+        }
+
+        // Hide the results dropdown when clicking away from the connector.
+        document.addEventListener('click', (e) => {
+            const box = document.getElementById('vaResults');
+            if (!box || box.classList.contains('hidden')) return;
+            if (!e.target.closest('#vaResults') && e.target.id !== 'f_va_connect') {
+                box.classList.add('hidden');
+            }
+        });
+
+        function resetVaConnector() {
+            document.getElementById('f_va_connect').value = '';
+            document.getElementById('vaResults').classList.add('hidden');
+            document.getElementById('vaConnected').classList.add('hidden');
+        }
+
         // ---- modal ----
         function openModal() {
             document.getElementById('form').reset();
             document.getElementById('f_id').value = '';
             document.getElementById('formError').classList.add('hidden');
+            resetVaConnector();
             document.getElementById('modalTitle').textContent = 'New embed';
             document.getElementById('saveLabel').textContent = 'Create token';
             document.getElementById('modal').classList.remove('hidden');
@@ -403,6 +520,7 @@
             const c = CONFIGS.find(x => x._id === id);
             if (!c) return;
             document.getElementById('form').reset();
+            resetVaConnector();
             document.getElementById('f_id').value = c._id;
             document.getElementById('f_label').value = c.label || '';
             document.getElementById('f_va_code').value = (c.va && c.va.code) || '';
@@ -410,6 +528,7 @@
             document.getElementById('f_va_logo').value = (c.va && c.va.logo) || '';
             document.getElementById('f_prefixes').value = (c.callsignPrefixes || []).join(', ');
             document.getElementById('f_suffixes').value = (c.callsignSuffixes || []).join(', ');
+            document.getElementById('f_hubs').value = (c.hubs || []).join(', ');
             document.getElementById('f_mode').value = c.mode || 'roster';
             document.getElementById('f_provider').value = c.provider || '';
             document.getElementById('f_theme').value = c.theme || 'dark';
@@ -438,6 +557,7 @@
                 va: { code: v('f_va_code'), name: v('f_va_name'), logo: v('f_va_logo') },
                 callsignPrefixes: v('f_prefixes'),
                 callsignSuffixes: v('f_suffixes'),
+                hubs: v('f_hubs'),
                 mode: v('f_mode'),
                 provider: v('f_provider'),
                 theme: v('f_theme'),
