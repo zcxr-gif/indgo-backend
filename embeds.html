@@ -180,6 +180,15 @@
                     </div>
                 </div>
 
+                <div>
+                    <label class="block text-sm font-semibold mb-1.5">Header colour</label>
+                    <div class="flex items-center gap-2">
+                        <input id="f_brandColorPicker" type="color" value="#1d4ed8" oninput="syncBrandColor('picker')" class="h-11 w-12 shrink-0 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 cursor-pointer p-1">
+                        <input id="f_brandColor" placeholder="#1d4ed8 (blank = sample the logo)" oninput="syncBrandColor('text')" class="flex-1 px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none mono text-sm">
+                    </div>
+                    <p class="text-xs text-zinc-400 mt-1">Hex colour for the embed header. Blank = the widget samples the VA logo.</p>
+                </div>
+
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div>
                         <label class="block text-sm font-semibold mb-1.5">Mapbox token</label>
@@ -508,6 +517,7 @@
         function openModal() {
             document.getElementById('form').reset();
             document.getElementById('f_id').value = '';
+            setBrandColor('');
             document.getElementById('formError').classList.add('hidden');
             resetVaConnector();
             document.getElementById('modalTitle').textContent = 'New embed';
@@ -532,6 +542,7 @@
             document.getElementById('f_mode').value = c.mode || 'roster';
             document.getElementById('f_provider').value = c.provider || '';
             document.getElementById('f_theme').value = c.theme || 'dark';
+            setBrandColor(c.brandColor || '');
             document.getElementById('f_mapboxToken').value = c.mapboxToken || '';
             document.getElementById('f_mapStyle').value = c.mapStyle || '';
             document.getElementById('f_freeStyle').value = c.freeStyle || 'dark';
@@ -550,6 +561,25 @@
             return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
         }
 
+        // Keep the hex text field and the native colour swatch in step. The text
+        // field is the source of truth (blank = let the widget sample the logo);
+        // the swatch just mirrors it and offers a picker.
+        function syncBrandColor(from) {
+            const text = document.getElementById('f_brandColor');
+            const picker = document.getElementById('f_brandColorPicker');
+            if (from === 'picker') { text.value = picker.value; return; }
+            if (/^#?[0-9a-fA-F]{6}$/.test(text.value.trim())) {
+                picker.value = '#' + text.value.trim().replace(/^#/, '');
+            }
+        }
+        function setBrandColor(hex) {
+            const text = document.getElementById('f_brandColor');
+            const picker = document.getElementById('f_brandColorPicker');
+            text.value = hex || '';
+            picker.value = /^#?[0-9a-fA-F]{6}$/.test((hex || '').trim())
+                ? '#' + hex.trim().replace(/^#/, '') : '#1d4ed8';
+        }
+
         function collect() {
             const v = (id) => document.getElementById(id).value.trim();
             return {
@@ -561,6 +591,7 @@
                 mode: v('f_mode'),
                 provider: v('f_provider'),
                 theme: v('f_theme'),
+                brandColor: v('f_brandColor'),
                 mapboxToken: v('f_mapboxToken'),
                 mapStyle: v('f_mapStyle'),
                 freeStyle: v('f_freeStyle'),
