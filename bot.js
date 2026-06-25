@@ -83,6 +83,11 @@ const VA_REPS_CHAT_ID = '1517174670334361732';           // shared reps general 
 const VA_APPLICATION_CHANNEL_ID = '1517177121422835852'; // where applications post for review
 const VA_REP_ROLE_NAME = 'VA Rep';                       // shared role gating the reps chat
 
+// Public partnership channel. When an approved VA finally has BOTH a banner and
+// a logo, the bot posts a one-time "new partner" announcement here. It also
+// echoes a VA member's banner when they post in this channel (see messageCreate).
+const PARTNERSHIP_ANNOUNCE_CHANNEL_ID = '1517984939742597210';
+
 // The "Inflight VA Rep" staff role. Added to every per-VA channel the bot
 // provisions, and pinged + pulled into VA partnership tickets so they can field
 // questions about the partnership and our Inflight Pro subscription.
@@ -664,6 +669,89 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         return embed;
     };
 
+    // The celebratory embed posted to the public partnership channel when an
+    // approved VA is fully kitted out (banner + logo). Leads with the banner.
+    const buildVaPartnershipEmbed = (ad) => {
+        const embed = new EmbedBuilder()
+            .setTitle(`🤝 New VA Partner — ${ad.name}`)
+            .setColor(THEME.WHITE)
+            .setFooter({ text: BRAND_FOOTER })
+            .setTimestamp();
+
+        const intro = [];
+        if (ad.tagline) intro.push(`*${ad.tagline}*`);
+        intro.push(`We're proud to welcome **${ad.name}** to our network of partnered Virtual Airlines! 🛫`);
+        embed.setDescription(intro.join('\n\n'));
+
+        const fields = [{ name: 'Type', value: ad.type || 'VA', inline: true }];
+        if (ad.callsign) fields.push({ name: 'Callsign', value: formatVaCallsign(ad.callsign), inline: true });
+        if (ad.region) fields.push({ name: 'Region', value: ad.region, inline: true });
+        if (ad.hubs && ad.hubs.length) fields.push({ name: 'Hubs', value: ad.hubs.join(', '), inline: true });
+        fields.push({ name: 'Recruiting', value: ad.recruiting ? 'Yes ✅' : 'No', inline: true });
+
+        const links = [];
+        if (ad.websiteUrl) links.push(`[Website](${ad.websiteUrl})`);
+        if (ad.applicationUrl) links.push(`[Apply](${ad.applicationUrl})`);
+        if (ad.discordUrl) links.push(`[Discord](${ad.discordUrl})`);
+        if (ad.ifcThreadUrl) links.push(`[IFC Thread](${ad.ifcThreadUrl})`);
+        if (links.length) fields.push({ name: 'Links', value: links.join(' • '), inline: false });
+
+        embed.addFields(fields);
+        if (ad.logoUrl) { try { embed.setThumbnail(ad.logoUrl); } catch (_) {} }
+        if (ad.bannerUrl) { try { embed.setImage(ad.bannerUrl); } catch (_) {} }
+        return embed;
+    };
+
+    // Post the one-time partnership announcement for a VA. No-ops unless the VA
+    // is approved AND has both a banner and a logo. The announcement is claimed
+    // atomically via `partnershipAnnouncedAt` so the approval path and the
+    // image-upload path (or a re-approval) can never double-post.
+    const announceVaPartnership = async (ad) => {
+        try {
+            if (!ad || ad.status !== 'approved') return false;
+            if (!ad.bannerUrl || !ad.logoUrl) return false;
+
+            let claimed = ad;
+            if (VirtualAirlineAd) {
+                // Only the writer that flips partnershipAnnouncedAt from null wins.
+                claimed = await VirtualAirlineAd.findOneAndUpdate(
+                    { _id: ad._id, partnershipAnnouncedAt: null },
+                    { partnershipAnnouncedAt: new Date() },
+                    { new: true }
+                ).catch(() => null);
+                if (!claimed) return false; // already announced, or lost the race
+            } else if (ad.partnershipAnnouncedAt) {
+                return false;
+            } else {
+                ad.partnershipAnnouncedAt = new Date();
+                claimed = ad;
+            }
+            ad.partnershipAnnouncedAt = claimed.partnershipAnnouncedAt;
+
+            try {
+                const channel = await client.channels.fetch(PARTNERSHIP_ANNOUNCE_CHANNEL_ID);
+                await channel.send({
+                    content: claimed.ownerId
+                        ? `🎉 Please welcome our newest VA partner — <@${claimed.ownerId}>'s **${claimed.name}**!`
+                        : `🎉 Please welcome our newest VA partner — **${claimed.name}**!`,
+                    embeds: [buildVaPartnershipEmbed(claimed)]
+                });
+                return true;
+            } catch (sendErr) {
+                console.error('❌ VA partnership announce send error:', sendErr);
+                // Revert the claim so a later trigger can retry the announcement.
+                if (VirtualAirlineAd) {
+                    await VirtualAirlineAd.findByIdAndUpdate(ad._id, { partnershipAnnouncedAt: null }).catch(() => {});
+                }
+                ad.partnershipAnnouncedAt = null;
+                return false;
+            }
+        } catch (e) {
+            console.error('❌ announceVaPartnership error:', e);
+            return false;
+        }
+    };
+
     // The embed staff see in the review channel for a pending application.
     const buildVaReviewEmbed = (ad) => new EmbedBuilder()
         .setTitle('🆕 VA Application — Pending Review')
@@ -761,7 +849,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 "• **Staff authority** — Inflight may review, edit, approve, decline, feature or remove any listing at our discretion.\n" +
                 "• **iOS app** — VA listings are **not** shown in our iOS app for copyright-compliance reasons.\n" +
                 "• **Changes/suspension** — required changes not made within **7 days** of contact may lead to suspension.\n\n" +
-                "If you have **any questions**, please inquire our Inflight VA Rep <@&" + INFLIGHT_VA_REP_ROLE_ID + "> right here in this ticket.\n\n" +
+                "If you have **any questions**, please inquire our Inflight VA Rep <@&" + INFLIGHT_VA_REP_ROLE_ID + "> or our moderators <@&" + ADMIN_ROLE_ID + "> right here in this ticket.\n\n" +
                 "When you've read the attached Terms and agree, tap **I Accept** below."
             )
             .setFooter({ text: `${BRAND_FOOTER} • Terms ${VA_PARTNERSHIP_TOS_VERSION}` });
@@ -781,25 +869,31 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         return payload;
     };
 
-    // Pull the Inflight VA Rep(s) into a (private) ticket thread so the role
-    // mention actually reaches people who can see the channel. Best-effort and
-    // capped so we never iterate a huge member list.
-    const addInflightRepsToThread = async (thread, guild) => {
+    // Pull staff (Inflight VA Rep + mods) into a (private) ticket thread so the
+    // role mentions actually reach people who can see the channel. Best-effort,
+    // deduped across roles, and capped so we never iterate a huge member list.
+    const addStaffToThread = async (thread, guild, roleIds) => {
         try {
-            const role = guild.roles.cache.get(INFLIGHT_VA_REP_ROLE_ID)
-                || await guild.roles.fetch(INFLIGHT_VA_REP_ROLE_ID).catch(() => null);
-            if (!role) return;
             // role.members is populated from the guild member cache; fetch members
             // first so it isn't empty on a cold cache.
             await guild.members.fetch().catch(() => {});
+            const seen = new Set();
             let added = 0;
-            for (const member of role.members.values()) {
+            for (const roleId of roleIds) {
                 if (added >= 25) break;
-                await thread.members.add(member.id).catch(() => {});
-                added++;
+                const role = guild.roles.cache.get(roleId)
+                    || await guild.roles.fetch(roleId).catch(() => null);
+                if (!role) continue;
+                for (const member of role.members.values()) {
+                    if (added >= 25) break;
+                    if (seen.has(member.id)) continue; // a mod could also be a rep
+                    seen.add(member.id);
+                    await thread.members.add(member.id).catch(() => {});
+                    added++;
+                }
             }
         } catch (e) {
-            console.error('❌ addInflightRepsToThread error:', e);
+            console.error('❌ addStaffToThread error:', e);
         }
     };
 
@@ -812,15 +906,15 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             reason: 'VA Partnership ticket'
         });
         await thread.members.add(interaction.user.id).catch(() => {});
-        await addInflightRepsToThread(thread, interaction.guild);
+        await addStaffToThread(thread, interaction.guild, [INFLIGHT_VA_REP_ROLE_ID, ADMIN_ROLE_ID]);
 
         await thread.send({
-            content: `<@${interaction.user.id}> <@&${INFLIGHT_VA_REP_ROLE_ID}>`,
+            content: `<@${interaction.user.id}> <@&${INFLIGHT_VA_REP_ROLE_ID}> <@&${ADMIN_ROLE_ID}>`,
             embeds: [new EmbedBuilder()
                 .setTitle('🤝 VA Partnership Request')
                 .setColor(THEME.WHITE)
                 .setDescription(
-                    `Welcome <@${interaction.user.id}>! Our Inflight VA Rep has been pinged and will help you set up a partnership.\n\n` +
+                    `Welcome <@${interaction.user.id}>! Our Inflight VA Rep and moderators have been pinged and will help you set up a partnership.\n\n` +
                     `Partnering with Inflight gets your VA a private channel, a directory listing, and access to our reps chat.`
                 )
                 .setFooter({ text: BRAND_FOOTER })]
@@ -882,6 +976,12 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 else { ad[field] = url; await ad.save().catch(() => {}); }
 
                 await channel.send({ content: `✅ ${kind === 'banner' ? 'Banner' : 'Logo'} updated!`, embeds: [buildVaInfoEmbed(updated || ad)] }).catch(() => {});
+
+                // This upload may have completed the banner + logo pair — if the
+                // VA is approved and now fully kitted, announce the partnership.
+                // announceVaPartnership no-ops if either image is still missing or
+                // it was already announced.
+                await announceVaPartnership(updated || ad).catch(() => {});
             } catch (e) {
                 console.error(`❌ VA ${kind} upload error:`, e);
                 await channel.send(`❌ Couldn't process that image. Please try again.`).catch(() => {});
@@ -1784,9 +1884,57 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         } catch (e) {}
     });
 
+    // Per-user cooldown for the partnership-channel banner echo, so a chatty VA
+    // member doesn't trigger a banner on every single message.
+    const vaBannerCooldown = new Map(); // userId -> last-posted timestamp (ms)
+    const VA_BANNER_COOLDOWN_MS = 10 * 60 * 1000;
+
+    // When a member who belongs to an approved VA posts in the partnership
+    // channel, drop just that VA's banner. A user "belongs" to a VA if they own
+    // it or hold its VA-specific role.
+    const maybePostVaBanner = async (message) => {
+        try {
+            if (!VirtualAirlineAd) return;
+
+            const now = Date.now();
+            const last = vaBannerCooldown.get(message.author.id) || 0;
+            if (now - last < VA_BANNER_COOLDOWN_MS) return;
+
+            // Owned VA first (cheap, exact), then any VA whose role they hold.
+            let ad = await VirtualAirlineAd.findOne({
+                status: 'approved', ownerId: message.author.id, bannerUrl: { $ne: null }
+            }).catch(() => null);
+
+            if (!ad) {
+                const member = message.member
+                    || await message.guild.members.fetch(message.author.id).catch(() => null);
+                const roleIds = member ? [...member.roles.cache.keys()] : [];
+                if (roleIds.length) {
+                    ad = await VirtualAirlineAd.findOne({
+                        status: 'approved', discordRoleId: { $in: roleIds }, bannerUrl: { $ne: null }
+                    }).catch(() => null);
+                }
+            }
+
+            if (!ad || !ad.bannerUrl) return;
+
+            vaBannerCooldown.set(message.author.id, now);
+            // Just the banner — no embed, no text.
+            await message.channel.send({ files: [ad.bannerUrl] }).catch(() => {});
+        } catch (e) {
+            console.error('❌ maybePostVaBanner error:', e);
+        }
+    };
+
     client.on('messageCreate', async (message) => {
       try {
         if (message.author.bot) return;
+
+        // --- HANDLER: VA PARTNERSHIP CHANNEL — echo a member's VA banner ---
+        if (message.channelId === PARTNERSHIP_ANNOUNCE_CHANNEL_ID) {
+            await maybePostVaBanner(message);
+            return;
+        }
 
         // --- CHECK CHANNELS ---
         const isAircraftChannel = message.channelId === SUBMISSION_CHANNEL_ID || 
@@ -2339,6 +2487,11 @@ client.on('interactionCreate', async (interaction) => {
                         const owner = await client.users.fetch(ad.ownerId).catch(() => null);
                         if (owner) await owner.send(`🎉 Your VA **${ad.name}** has been approved! Your private channel is ${channel ? `<#${channel.id}>` : 'ready'}.`).catch(() => {});
                     }
+
+                    // If the VA already shipped a banner + logo (e.g. submitted via
+                    // the web dashboard), announce the partnership now. Otherwise the
+                    // image-upload flow will fire it once both are in place.
+                    await announceVaPartnership(ad).catch(() => {});
 
                     return interaction.editReply(`✅ Provisioned **${ad.name}** — ${channel ? `<#${channel.id}>` : 'channel'} and role created.`);
                 } catch (e) {

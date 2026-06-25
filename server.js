@@ -178,6 +178,10 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // --- Discord provisioning (set by the bot when a VA is approved) ---
     discordRoleId: { type: String, default: null },     // VA-specific role
     discordChannelId: { type: String, default: null },  // VA's private channel
+    // Timestamp of the one-time public partnership announcement. Stays null
+    // until the bot posts it (VA approved + banner + logo all present), which
+    // doubles as the guard that keeps the announcement from firing twice.
+    partnershipAnnouncedAt: { type: Date, default: null },
 
     // --- Analytics ---
     views: { type: Number, default: 0 },                            // detail-page impressions
