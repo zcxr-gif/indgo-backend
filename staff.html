@@ -29,6 +29,11 @@
         .fade-in { animation: fade .4s cubic-bezier(.2,.8,.2,1) forwards; }
         @keyframes fade { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 
+        /* Floating partner-logo halo behind the login card */
+        @keyframes floaty { 0%,100% { transform: translate(-50%, -50%); } 50% { transform: translate(-50%, calc(-50% - 10px)); } }
+        .halo-logo { animation: floaty 7s ease-in-out infinite; }
+        .partner-chip { animation: fade .5s cubic-bezier(.2,.8,.2,1) backwards; }
+
         /* Subtle grid texture behind the hero */
         .hub-bg { background-image: radial-gradient(rgba(0,0,0,.025) 1px, transparent 1px); background-size: 22px 22px; }
         .dark .hub-bg { background-image: radial-gradient(rgba(255,255,255,.03) 1px, transparent 1px); }
@@ -46,8 +51,11 @@
     </div>
 
     <!-- ============ LOGIN ============ -->
-    <div id="loginView" class="hidden min-h-screen hub-bg flex items-center justify-center px-5">
-        <div class="w-full max-w-sm fade-in">
+    <div id="loginView" class="hidden min-h-screen hub-bg relative overflow-hidden flex items-center justify-center px-5">
+        <!-- Decorative constellation of partnered-VA logos, filled by loadPartnerLogos() -->
+        <div id="partnerHalo" class="pointer-events-none absolute inset-0 z-0"></div>
+
+        <div class="relative z-10 w-full max-w-sm fade-in">
             <div class="text-center mb-8">
                 <div class="w-16 h-16 rounded-2xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 flex items-center justify-center mx-auto mb-5 shadow-lg shadow-zinc-900/10">
                     <i data-lucide="shield-check" class="w-7 h-7"></i>
@@ -74,6 +82,16 @@
                 </button>
             </form>
             <p class="text-center text-xs text-zinc-400 dark:text-zinc-600 mt-6">Authorised staff only · access is logged</p>
+
+            <!-- Partnered VA logos (crisp strip under the card) -->
+            <div id="partnerStrip" class="hidden mt-9">
+                <div class="flex items-center gap-3 mb-4">
+                    <div class="h-px flex-1 bg-zinc-200 dark:bg-zinc-800"></div>
+                    <p class="text-[11px] font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-600">Our partnered VAs</p>
+                    <div class="h-px flex-1 bg-zinc-200 dark:bg-zinc-800"></div>
+                </div>
+                <div id="partnerLogos" class="flex flex-wrap items-center justify-center gap-2.5"></div>
+            </div>
         </div>
     </div>
 
@@ -312,7 +330,61 @@
                 show('loginView');
                 drawIcons();
                 document.getElementById('loginUsername').focus();
+                loadPartnerLogos();
             }
+        }
+
+        // Pull our approved/partnered VAs and dress the login screen with their
+        // logos — a crisp strip under the card plus a soft floating halo behind
+        // it. Public endpoint (defaults to status=approved), so it runs pre-auth.
+        async function loadPartnerLogos() {
+            try {
+                const { ok, data } = await api('/api/va-ads?limit=60&sort=newest');
+                if (!ok || !data || !Array.isArray(data.data)) return;
+                const partners = data.data.filter(v => v && v.logoUrl);
+                if (!partners.length) return;
+
+                // 1) Crisp strip beneath the card (up to 18, with name tooltips).
+                const logos = document.getElementById('partnerLogos');
+                logos.innerHTML = '';
+                partners.slice(0, 18).forEach((v, i) => {
+                    const chip = document.createElement('div');
+                    chip.className = 'partner-chip group relative';
+                    chip.style.animationDelay = (i * 45) + 'ms';
+                    chip.innerHTML =
+                        '<div class="w-10 h-10 rounded-full surface lift overflow-hidden grid place-items-center bg-white dark:bg-zinc-900">' +
+                            '<img src="' + esc(v.logoUrl) + '" alt="' + esc(v.name || 'VA') + '" loading="lazy" class="w-full h-full object-cover" onerror="this.closest(\'.partner-chip\').remove()">' +
+                        '</div>' +
+                        '<span class="pointer-events-none absolute -top-8 left-1/2 -translate-x-1/2 whitespace-nowrap px-2 py-1 rounded-md bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-[11px] font-medium opacity-0 group-hover:opacity-100 transition shadow-lg z-20">' + esc(v.name || 'VA') + '</span>';
+                    logos.appendChild(chip);
+                });
+                document.getElementById('partnerStrip').classList.remove('hidden');
+
+                // 2) Soft floating halo behind the card (desktop only). Fixed,
+                // edge-biased positions so logos never sit on top of the form.
+                const halo = document.getElementById('partnerHalo');
+                if (halo) {
+                    const spots = [
+                        { t: '12%', l: '12%', s: 68 }, { t: '20%', l: '84%', s: 54 },
+                        { t: '74%', l: '10%', s: 60 }, { t: '82%', l: '82%', s: 66 },
+                        { t: '46%', l: '5%',  s: 46 }, { t: '52%', l: '93%', s: 50 },
+                        { t: '8%',  l: '50%', s: 42 }, { t: '90%', l: '46%', s: 46 },
+                        { t: '32%', l: '70%', s: 40 }, { t: '66%', l: '26%', s: 44 },
+                    ];
+                    halo.innerHTML = '';
+                    // Shuffle so the halo varies between visits.
+                    const pool = partners.slice().sort(() => Math.random() - 0.5);
+                    spots.forEach((sp, i) => {
+                        const v = pool[i % pool.length];
+                        if (!v) return;
+                        const el = document.createElement('div');
+                        el.className = 'halo-logo absolute hidden lg:block rounded-2xl overflow-hidden opacity-[.16] dark:opacity-[.12] blur-[1px] saturate-150';
+                        el.style.cssText += 'top:' + sp.t + ';left:' + sp.l + ';width:' + sp.s + 'px;height:' + sp.s + 'px;animation-delay:' + (i * 600) + 'ms;';
+                        el.innerHTML = '<img src="' + esc(v.logoUrl) + '" alt="" class="w-full h-full object-cover" onerror="this.closest(\'.halo-logo\').remove()">';
+                        halo.appendChild(el);
+                    });
+                }
+            } catch (_) { /* decorative only — never block login */ }
         }
 
         // ---- Login ----

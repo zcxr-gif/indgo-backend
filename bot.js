@@ -849,7 +849,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 "• **Staff authority** — Inflight may review, edit, approve, decline, feature or remove any listing at our discretion.\n" +
                 "• **iOS app** — VA listings are **not** shown in our iOS app for copyright-compliance reasons.\n" +
                 "• **Changes/suspension** — required changes not made within **7 days** of contact may lead to suspension.\n\n" +
-                "If you have **any questions**, please inquire our Inflight VA Rep <@&" + INFLIGHT_VA_REP_ROLE_ID + "> right here in this ticket.\n\n" +
+                "If you have **any questions**, please inquire our Inflight VA Rep <@&" + INFLIGHT_VA_REP_ROLE_ID + "> or our moderators <@&" + ADMIN_ROLE_ID + "> right here in this ticket.\n\n" +
                 "When you've read the attached Terms and agree, tap **I Accept** below."
             )
             .setFooter({ text: `${BRAND_FOOTER} • Terms ${VA_PARTNERSHIP_TOS_VERSION}` });
@@ -869,25 +869,31 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         return payload;
     };
 
-    // Pull the Inflight VA Rep(s) into a (private) ticket thread so the role
-    // mention actually reaches people who can see the channel. Best-effort and
-    // capped so we never iterate a huge member list.
-    const addInflightRepsToThread = async (thread, guild) => {
+    // Pull staff (Inflight VA Rep + mods) into a (private) ticket thread so the
+    // role mentions actually reach people who can see the channel. Best-effort,
+    // deduped across roles, and capped so we never iterate a huge member list.
+    const addStaffToThread = async (thread, guild, roleIds) => {
         try {
-            const role = guild.roles.cache.get(INFLIGHT_VA_REP_ROLE_ID)
-                || await guild.roles.fetch(INFLIGHT_VA_REP_ROLE_ID).catch(() => null);
-            if (!role) return;
             // role.members is populated from the guild member cache; fetch members
             // first so it isn't empty on a cold cache.
             await guild.members.fetch().catch(() => {});
+            const seen = new Set();
             let added = 0;
-            for (const member of role.members.values()) {
+            for (const roleId of roleIds) {
                 if (added >= 25) break;
-                await thread.members.add(member.id).catch(() => {});
-                added++;
+                const role = guild.roles.cache.get(roleId)
+                    || await guild.roles.fetch(roleId).catch(() => null);
+                if (!role) continue;
+                for (const member of role.members.values()) {
+                    if (added >= 25) break;
+                    if (seen.has(member.id)) continue; // a mod could also be a rep
+                    seen.add(member.id);
+                    await thread.members.add(member.id).catch(() => {});
+                    added++;
+                }
             }
         } catch (e) {
-            console.error('❌ addInflightRepsToThread error:', e);
+            console.error('❌ addStaffToThread error:', e);
         }
     };
 
@@ -900,15 +906,15 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             reason: 'VA Partnership ticket'
         });
         await thread.members.add(interaction.user.id).catch(() => {});
-        await addInflightRepsToThread(thread, interaction.guild);
+        await addStaffToThread(thread, interaction.guild, [INFLIGHT_VA_REP_ROLE_ID, ADMIN_ROLE_ID]);
 
         await thread.send({
-            content: `<@${interaction.user.id}> <@&${INFLIGHT_VA_REP_ROLE_ID}>`,
+            content: `<@${interaction.user.id}> <@&${INFLIGHT_VA_REP_ROLE_ID}> <@&${ADMIN_ROLE_ID}>`,
             embeds: [new EmbedBuilder()
                 .setTitle('🤝 VA Partnership Request')
                 .setColor(THEME.WHITE)
                 .setDescription(
-                    `Welcome <@${interaction.user.id}>! Our Inflight VA Rep has been pinged and will help you set up a partnership.\n\n` +
+                    `Welcome <@${interaction.user.id}>! Our Inflight VA Rep and moderators have been pinged and will help you set up a partnership.\n\n` +
                     `Partnering with Inflight gets your VA a private channel, a directory listing, and access to our reps chat.`
                 )
                 .setFooter({ text: BRAND_FOOTER })]
