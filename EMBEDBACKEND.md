@@ -52,6 +52,7 @@ To embed it on their site, they paste this iframe:
 | `mapStyle`   | `mapbox://styles/mapbox/dark-v11`         | Mapbox style URL (mapbox provider). |
 | `freeStyle`  | `dark` \| `liberty` \| `bright` \| `positron` \| URL | Free style (free provider). Defaults to `dark`. |
 | `theme`      | `dark` or `light`                         | UI chrome theme. |
+| `brandColor` | `%231d4ed8`                               | Header colour as a hex value (encode `#` as `%23`). Blank = the widget samples the VA logo. |
 | `servers`    | `Expert`                                  | IF session names to scan (substring match). Empty = all. |
 
 > **Free vs Mapbox:** if you don't pass a `mapboxToken`, the map automatically
@@ -139,6 +140,7 @@ so you can lock a token to one or more domains.
   "mapStyle": "mapbox://styles/mapbox/dark-v11",
   "freeStyle": "dark",
   "theme": "dark",
+  "brandColor": "#1d4ed8",
   "servers": ["Expert"]
 }
 ```
@@ -194,6 +196,7 @@ const EMBED_CONFIGS = {
     mapboxToken: 'pk.eyJ...the-vas-own-token...',
     mapStyle: 'mapbox://styles/mapbox/dark-v11',
     theme: 'dark',
+    brandColor: '#1d4ed8',            // header colour; omit/'' to sample the logo
     servers: ['Expert'],
     // Optional allow-list of sites that may embed this token. Empty/undefined = any.
     allowedOrigins: ['https://oceanva.org', 'https://www.oceanva.org'],
@@ -234,6 +237,7 @@ router.get('/api/embed/resolve', (req, res) => {
     mapStyle: cfg.mapStyle || 'mapbox://styles/mapbox/dark-v11',
     freeStyle: cfg.freeStyle || 'dark',
     theme: cfg.theme || 'dark',
+    brandColor: cfg.brandColor || '',  // header colour; '' lets the widget sample the logo
     servers: cfg.servers || [],
   });
 });

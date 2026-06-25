@@ -271,6 +271,9 @@ const EmbedConfigSchema = new mongoose.Schema({
     mapStyle: { type: String, trim: true, default: '' },
     freeStyle: { type: String, trim: true, default: 'dark' },
     theme: { type: String, enum: EMBED_THEMES, default: 'dark' },
+    // Header/accent colour, stored as a hex string like "#1d4ed8". Empty lets the
+    // widget fall back to sampling the VA logo for its header colour.
+    brandColor: { type: String, trim: true, default: '' },
     servers: { type: [String], default: [] },                         // IF session names to scan
 
     // --- Access control ---
@@ -2109,6 +2112,16 @@ const toStringList = (raw) => {
     return out;
 };
 
+// Normalize a header/brand colour to a "#rrggbb" hex string. Accepts "#rgb",
+// "#rrggbb" or the same without the leading "#" (case-insensitive). Anything
+// that isn't a valid hex colour — including a blank value — becomes '', which
+// tells the widget to fall back to sampling the VA logo.
+const normalizeHexColor = (raw) => {
+    let v = String(raw == null ? '' : raw).trim().replace(/^#/, '');
+    if (/^[0-9a-fA-F]{3}$/.test(v)) v = v.split('').map(c => c + c).join(''); // #abc -> #aabbcc
+    return /^[0-9a-fA-F]{6}$/.test(v) ? '#' + v.toLowerCase() : '';
+};
+
 // Build the public resolve payload from a stored config — only the fields the
 // widget needs, with the same defaults documented in EMBEDBACKEND.md.
 const toResolvePayload = (cfg) => ({
@@ -2123,6 +2136,7 @@ const toResolvePayload = (cfg) => ({
     mapStyle: cfg.mapStyle || 'mapbox://styles/mapbox/dark-v11',
     freeStyle: cfg.freeStyle || 'dark',
     theme: cfg.theme || 'dark',
+    brandColor: cfg.brandColor || '',   // header colour; '' lets the widget sample the logo
     servers: cfg.servers || [],
 });
 
@@ -2187,6 +2201,7 @@ const applyEmbedFields = (cfg, body) => {
     if (body.mapStyle !== undefined) cfg.mapStyle = String(body.mapStyle || '').trim();
     if (body.freeStyle !== undefined) cfg.freeStyle = String(body.freeStyle || '').trim() || 'dark';
     if (body.theme !== undefined) cfg.theme = EMBED_THEMES.includes(body.theme) ? body.theme : 'dark';
+    if (body.brandColor !== undefined) cfg.brandColor = normalizeHexColor(body.brandColor);
     if (body.servers !== undefined) cfg.servers = toStringList(body.servers);
 
     if (body.allowedOrigins !== undefined) cfg.allowedOrigins = toStringList(body.allowedOrigins);
