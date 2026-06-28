@@ -28,8 +28,10 @@ const COOKIE_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days
 //                      and the VA Admin Manual only. Everything else (Aircraft
 //                      DB, Airports, Embeds, account admin) is hidden/blocked.
 //   graphic_designer - "Graphic Designer": scoped access to the Graphic Designer
-//                      workspace (brand assets, logo + banner specs/guidelines).
-//                      Everything else is hidden and blocked.
+//                      workspace (brand assets, logo + banner specs/guidelines)
+//                      plus the VA Ads Manager, where the VA logo/banner source
+//                      artwork they design around lives. Everything else
+//                      (Aircraft DB, Airports, Embeds, account admin) is blocked.
 const ROLES = ['admin', 'staff', 'va_rep', 'graphic_designer'];
 
 // Pages an Inflight VA Rep is allowed to open. Any other staff page redirects
@@ -44,10 +46,12 @@ const VA_REP_ALLOWED_PAGES = new Set([
 // Pages a Graphic Designer is allowed to open. Like the VA Rep, anything else
 // bounces them back to the hub. The brand assets they need live under /assets,
 // which is served publicly by express.static (logo branding is not sensitive),
-// so it doesn't need to be listed here.
+// so it doesn't need to be listed here. They also get the VA Ads Manager so
+// they can pull the VA logo/banner artwork they design around.
 const GRAPHIC_DESIGNER_ALLOWED_PAGES = new Set([
     '/staff',
     '/graphic-designer', '/graphic-designer.html',
+    '/va-ads', '/va-ads.html',
 ]);
 
 // Decide whether a resolved user may open a given page path.

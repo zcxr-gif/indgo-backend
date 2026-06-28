@@ -97,6 +97,7 @@
         <!-- Quick nav -->
         <nav class="flex flex-wrap gap-2 pt-7 pb-2 text-sm">
             <a href="#logo" class="px-3.5 py-1.5 rounded-full surface lift font-medium">Logo &amp; downloads</a>
+            <a href="#va-artwork" class="px-3.5 py-1.5 rounded-full surface lift font-medium">VA artwork</a>
             <a href="#palette" class="px-3.5 py-1.5 rounded-full surface lift font-medium">Colour palette</a>
             <a href="#guidelines" class="px-3.5 py-1.5 rounded-full surface lift font-medium">Usage guidelines</a>
             <a href="#banners" class="px-3.5 py-1.5 rounded-full surface lift font-medium">Banner specs</a>
@@ -141,6 +142,46 @@
                 </a>
             </div>
             <p class="text-xs text-zinc-400 dark:text-zinc-500 mt-3">Need vector (SVG/AI) or a square/mono variant that isn't here yet? Note it in the brief checklist below and an admin can add it to the kit.</p>
+        </section>
+
+        <!-- ===================== VA ARTWORK ===================== -->
+        <section id="va-artwork" class="pt-12 fade-in scroll-mt-20">
+            <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+                <div class="flex items-center gap-2">
+                    <i data-lucide="plane" class="text-inflight dark:text-inflight-light"></i>
+                    <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Partner VA artwork</h3>
+                    <span id="vaCount" class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400"></span>
+                </div>
+                <a href="/va-ads" class="inline-flex items-center gap-2 bg-inflight hover:bg-inflight-deep text-white px-3.5 py-2 rounded-xl text-sm font-semibold transition active:scale-95">
+                    <i data-lucide="external-link" class="w-4 h-4"></i><span>Open VA Ads Manager</span>
+                </a>
+            </div>
+            <p class="text-sm text-zinc-500 dark:text-zinc-400 mb-4 max-w-2xl">Every partner VA's logo and banner, pulled live from the directory — grab the source artwork you need to design around. Hover an image for download / copy-link / open.</p>
+
+            <!-- Controls -->
+            <div class="flex flex-wrap items-center gap-3 mb-5">
+                <div class="relative flex-1 min-w-[220px]">
+                    <i data-lucide="search" class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400"></i>
+                    <input id="vaSearch" type="search" placeholder="Search VAs by name, callsign or region…"
+                        class="w-full pl-9 pr-3.5 py-2.5 rounded-xl bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 focus:border-inflight focus:outline-none focus:ring-4 focus:ring-inflight/10 transition text-sm">
+                </div>
+                <label class="inline-flex items-center gap-2 text-sm text-zinc-600 dark:text-zinc-300 cursor-pointer select-none">
+                    <input id="vaArtworkOnly" type="checkbox" checked
+                        class="w-4 h-4 rounded border-zinc-300 dark:border-zinc-600 text-inflight focus:ring-inflight cursor-pointer">
+                    Only with artwork
+                </label>
+            </div>
+
+            <div id="vaGrid" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                <!-- Skeletons until loaded -->
+                <div class="surface rounded-2xl h-64 animate-pulse"></div>
+                <div class="surface rounded-2xl h-64 animate-pulse"></div>
+                <div class="surface rounded-2xl h-64 animate-pulse"></div>
+            </div>
+            <div id="vaEmpty" class="hidden surface rounded-2xl p-10 text-center">
+                <i data-lucide="image-off" class="w-8 h-8 mx-auto text-zinc-300 dark:text-zinc-600 mb-3"></i>
+                <p id="vaEmptyMsg" class="text-sm text-zinc-500 dark:text-zinc-400">No VA artwork to show yet.</p>
+            </div>
         </section>
 
         <!-- ===================== PALETTE ===================== -->
@@ -359,11 +400,126 @@
             });
         }
 
+        // ---- Partner VA artwork (pulled live from the VA directory) ----
+        let VA_ADS = [];
+        function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+        function slug(s) { return String(s || 'va').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'va'; }
+        function extOf(url) { const m = /\.([a-z0-9]{2,4})(?:\?|$)/i.exec(url || ''); return m ? m[1].toLowerCase() : 'png'; }
+
+        async function loadVaArtwork() {
+            try {
+                const res = await fetch('/api/va-ads?limit=100&sort=name', { credentials: 'same-origin' });
+                if (!res.ok) throw new Error('http ' + res.status);
+                const json = await res.json();
+                VA_ADS = Array.isArray(json.data) ? json.data : [];
+            } catch (_) {
+                VA_ADS = [];
+                document.getElementById('vaEmptyMsg').textContent = 'Could not load VA artwork right now. Try the VA Ads Manager.';
+            }
+            renderVa();
+        }
+
+        function renderVa() {
+            const grid = document.getElementById('vaGrid');
+            const empty = document.getElementById('vaEmpty');
+            const q = (document.getElementById('vaSearch').value || '').trim().toLowerCase();
+            const artworkOnly = document.getElementById('vaArtworkOnly').checked;
+
+            let list = VA_ADS.slice();
+            if (artworkOnly) list = list.filter(v => v.logoUrl || v.bannerUrl);
+            if (q) list = list.filter(v => {
+                const hay = [v.name, v.callsign, v.region, (v.tags || []).join(' ')].join(' ').toLowerCase();
+                return hay.includes(q);
+            });
+
+            const logos = VA_ADS.filter(v => v.logoUrl).length;
+            const banners = VA_ADS.filter(v => v.bannerUrl).length;
+            document.getElementById('vaCount').textContent = `${VA_ADS.length} VAs · ${logos} logos · ${banners} banners`;
+
+            if (!list.length) {
+                grid.classList.add('hidden');
+                empty.classList.remove('hidden');
+                drawIcons();
+                return;
+            }
+            empty.classList.add('hidden');
+            grid.classList.remove('hidden');
+
+            grid.innerHTML = list.map(v => {
+                const name = esc(v.name || 'Unnamed VA');
+                const meta = [v.callsign, v.region].filter(Boolean).map(esc).join(' · ');
+                const sl = slug(v.name);
+                // Hover action buttons for an asset (download / copy / open).
+                const actions = (url, kind) => !url ? '' : `
+                    <div class="absolute inset-0 flex items-center justify-center gap-1.5 bg-zinc-900/55 opacity-0 group-hover/asset:opacity-100 transition">
+                        <button data-action="download" data-url="${esc(url)}" data-fn="${sl}-${kind}.${extOf(url)}" title="Download ${kind}" class="w-8 h-8 grid place-items-center rounded-lg bg-white/95 text-zinc-800 hover:bg-white transition"><i data-lucide="download" class="w-4 h-4"></i></button>
+                        <button data-action="copy" data-url="${esc(url)}" title="Copy ${kind} URL" class="w-8 h-8 grid place-items-center rounded-lg bg-white/95 text-zinc-800 hover:bg-white transition"><i data-lucide="link" class="w-4 h-4"></i></button>
+                        <button data-action="open" data-url="${esc(url)}" title="Open ${kind}" class="w-8 h-8 grid place-items-center rounded-lg bg-white/95 text-zinc-800 hover:bg-white transition"><i data-lucide="external-link" class="w-4 h-4"></i></button>
+                    </div>`;
+
+                const banner = v.bannerUrl
+                    ? `<div class="group/asset relative h-32 checker"><img src="${esc(v.bannerUrl)}" alt="${name} banner" loading="lazy" class="w-full h-full object-cover">${actions(v.bannerUrl, 'banner')}</div>`
+                    : `<div class="h-32 grid place-items-center bg-zinc-100 dark:bg-zinc-800/60 text-zinc-400 dark:text-zinc-600"><div class="text-center"><i data-lucide="image-off" class="w-5 h-5 mx-auto mb-1"></i><span class="text-[11px] font-medium">No banner</span></div></div>`;
+
+                const logo = v.logoUrl
+                    ? `<div class="group/asset relative w-14 h-14 rounded-xl overflow-hidden border border-zinc-200 dark:border-zinc-700 checker shrink-0"><img src="${esc(v.logoUrl)}" alt="${name} logo" loading="lazy" class="w-full h-full object-cover">${actions(v.logoUrl, 'logo')}</div>`
+                    : `<div class="w-14 h-14 rounded-xl bg-inflight/10 text-inflight dark:text-inflight-light grid place-items-center font-bold text-lg shrink-0">${esc((v.name || 'V')[0].toUpperCase())}</div>`;
+
+                return `<div class="surface lift rounded-2xl overflow-hidden flex flex-col">
+                    ${banner}
+                    <div class="p-4 flex items-center gap-3">
+                        ${logo}
+                        <div class="min-w-0">
+                            <p class="font-semibold truncate">${name}</p>
+                            <p class="text-xs text-zinc-500 dark:text-zinc-400 truncate">${meta || '&nbsp;'}</p>
+                        </div>
+                    </div>
+                </div>`;
+            }).join('');
+            drawIcons();
+        }
+
+        // Download an asset; fall back to opening it if cross-origin fetch is blocked.
+        async function downloadAsset(url, filename) {
+            if (!url) return;
+            try {
+                const res = await fetch(url, { mode: 'cors' });
+                if (!res.ok) throw new Error('http ' + res.status);
+                const blob = await res.blob();
+                const obj = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = obj; a.download = filename || 'asset';
+                document.body.appendChild(a); a.click(); a.remove();
+                setTimeout(() => URL.revokeObjectURL(obj), 1000);
+                toast('Downloaded ' + (filename || 'asset'));
+            } catch (_) {
+                window.open(url, '_blank', 'noopener');
+                toast('Opened in a new tab — right-click to save');
+            }
+        }
+        function copyUrl(url) {
+            navigator.clipboard?.writeText(url).then(() => toast('Link copied'), () => window.open(url, '_blank', 'noopener'));
+        }
+
+        // Delegated actions for every asset button in the grid.
+        document.getElementById('vaGrid').addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-action]');
+            if (!btn) return;
+            const url = btn.dataset.url;
+            if (!url) return;
+            if (btn.dataset.action === 'download') downloadAsset(url, btn.dataset.fn);
+            else if (btn.dataset.action === 'copy') copyUrl(url);
+            else window.open(url, '_blank', 'noopener');
+        });
+        document.getElementById('vaSearch').addEventListener('input', renderVa);
+        document.getElementById('vaArtworkOnly').addEventListener('change', renderVa);
+
         // ---- Boot ----
         renderPalette();
         renderGuidelines();
         renderBanners();
         renderBrief();
+        loadVaArtwork();
         setThemeIcon();
         drawIcons();
         whoami();
