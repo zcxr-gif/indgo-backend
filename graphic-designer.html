@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Graphic Designer — Inflight</title>
+    <script>
+        // Staff session guard: if any API call comes back 401 (session expired),
+        // bounce to the portal login, preserving where we were.
+        (function () {
+            const _fetch = window.fetch;
+            window.fetch = async function (...args) {
+                const res = await _fetch.apply(this, args);
+                if (res.status === 401) {
+                    location.href = '/staff?next=' + encodeURIComponent(location.pathname + location.search);
+                }
+                return res;
+            };
+        })();
+    </script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: { extend: { colors: {
+                inflight: { DEFAULT: '#2050C0', light: '#3358D8', deep: '#1E3A8A' }
+            } } }
+        };
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+        :root { color-scheme: light dark; }
+        * { -webkit-tap-highlight-color: transparent; }
+        body { font-family: 'Inter', sans-serif; -webkit-font-smoothing: antialiased; }
+        [data-lucide] { width: 1.15em; height: 1.15em; }
+        svg.lucide { stroke-width: 1.75; }
+
+        .surface { background: #fff; border: 1px solid rgba(0,0,0,.06); box-shadow: 0 1px 2px rgba(0,0,0,.03), 0 1px 1px rgba(0,0,0,.02); }
+        .dark .surface { background: #18181b; border-color: rgba(255,255,255,.07); box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+        .lift { transition: transform .25s cubic-bezier(.2,.8,.2,1), box-shadow .25s, border-color .25s; }
+        .lift:hover { transform: translateY(-3px); box-shadow: 0 18px 40px -18px rgba(0,0,0,.25); border-color: rgba(0,0,0,.14); }
+        .dark .lift:hover { border-color: rgba(255,255,255,.18); box-shadow: 0 18px 50px -20px rgba(0,0,0,.7); }
+        .fade-in { animation: fade .4s cubic-bezier(.2,.8,.2,1) forwards; }
+        @keyframes fade { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+        /* Checkerboard so a transparent PNG reads clearly */
+        .checker { background-image:
+            linear-gradient(45deg, rgba(0,0,0,.06) 25%, transparent 25%),
+            linear-gradient(-45deg, rgba(0,0,0,.06) 25%, transparent 25%),
+            linear-gradient(45deg, transparent 75%, rgba(0,0,0,.06) 75%),
+            linear-gradient(-45deg, transparent 75%, rgba(0,0,0,.06) 75%);
+            background-size: 18px 18px;
+            background-position: 0 0, 0 9px, 9px -9px, -9px 0; }
+
+        .hero-bg { background-image: radial-gradient(rgba(32,80,192,.07) 1px, transparent 1px); background-size: 22px 22px; }
+        .dark .hero-bg { background-image: radial-gradient(rgba(51,88,216,.10) 1px, transparent 1px); }
+    </style>
+</head>
+<body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 antialiased min-h-screen transition-colors duration-300">
+
+    <!-- Navigation -->
+    <nav class="sticky top-0 z-40 bg-white/80 dark:bg-zinc-900/80 backdrop-blur-md border-b border-zinc-200 dark:border-zinc-800">
+        <div class="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
+            <div class="flex items-center gap-2.5">
+                <a href="/staff" title="Back to hub" class="w-9 h-9 grid place-items-center rounded-xl hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition-colors">
+                    <i data-lucide="arrow-left" class="w-[18px] h-[18px]"></i>
+                </a>
+                <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-inflight-light to-inflight-deep text-white flex items-center justify-center">
+                    <i data-lucide="palette" class="w-5 h-5"></i>
+                </div>
+                <h1 class="text-xl font-bold tracking-tight hidden sm:block">Graphic Designer</h1>
+            </div>
+            <div class="flex items-center gap-2">
+                <span id="whoami" class="hidden sm:inline text-sm font-medium text-zinc-500 dark:text-zinc-400 mr-1"></span>
+                <button onclick="toggleDarkMode()" title="Toggle theme" class="w-9 h-9 grid place-items-center rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition">
+                    <span id="themeIcon"></span>
+                </button>
+                <button onclick="logout()" title="Log out" class="w-9 h-9 grid place-items-center rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition">
+                    <i data-lucide="log-out" class="w-[18px] h-[18px]"></i>
+                </button>
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-6xl mx-auto px-4 pb-24">
+
+        <!-- Hero -->
+        <section class="hero-bg -mx-4 px-4 pt-12 pb-10 mb-2 border-b border-zinc-200/60 dark:border-zinc-800/60">
+            <div class="max-w-6xl mx-auto">
+                <p class="text-sm font-medium text-inflight dark:text-inflight-light mb-2">Inflight · Brand workspace</p>
+                <h2 class="text-3xl sm:text-4xl font-bold tracking-tight">Graphic Designer workspace</h2>
+                <p class="text-zinc-500 dark:text-zinc-400 mt-2 max-w-2xl">Everything you need to design for Inflight in one place — the official logo, our colour palette, usage guidelines, and ready-to-use banner specs for the VA, Discord and social updates.</p>
+            </div>
+        </section>
+
+        <!-- Quick nav -->
+        <nav class="flex flex-wrap gap-2 pt-7 pb-2 text-sm">
+            <a href="#logo" class="px-3.5 py-1.5 rounded-full surface lift font-medium">Logo &amp; downloads</a>
+            <a href="#va-artwork" class="px-3.5 py-1.5 rounded-full surface lift font-medium">VA artwork</a>
+            <a href="#palette" class="px-3.5 py-1.5 rounded-full surface lift font-medium">Colour palette</a>
+            <a href="#guidelines" class="px-3.5 py-1.5 rounded-full surface lift font-medium">Usage guidelines</a>
+            <a href="#banners" class="px-3.5 py-1.5 rounded-full surface lift font-medium">Banner specs</a>
+            <a href="#brief" class="px-3.5 py-1.5 rounded-full surface lift font-medium">Brief checklist</a>
+        </nav>
+
+        <!-- ===================== LOGO ===================== -->
+        <section id="logo" class="pt-10 fade-in scroll-mt-20">
+            <div class="flex items-center gap-2 mb-4">
+                <i data-lucide="image" class="text-inflight dark:text-inflight-light"></i>
+                <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Logo &amp; downloads</h3>
+            </div>
+            <div class="grid lg:grid-cols-2 gap-4">
+                <!-- On light -->
+                <div class="surface rounded-2xl p-6">
+                    <p class="text-xs font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-500 mb-3">On light</p>
+                    <div class="rounded-xl bg-white border border-zinc-200/70 grid place-items-center p-8 min-h-[180px]">
+                        <img src="/assets/brand/inflight-logo.png" alt="Inflight logo on light background" class="max-h-28 w-auto">
+                    </div>
+                </div>
+                <!-- On dark -->
+                <div class="surface rounded-2xl p-6">
+                    <p class="text-xs font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-500 mb-3">On dark</p>
+                    <div class="rounded-xl bg-zinc-900 border border-zinc-800 grid place-items-center p-8 min-h-[180px]">
+                        <img src="/assets/brand/inflight-logo.png" alt="Inflight logo on dark background" class="max-h-28 w-auto">
+                    </div>
+                </div>
+            </div>
+            <div class="surface rounded-2xl p-5 mt-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+                <div class="flex items-center gap-4">
+                    <div class="w-14 h-14 rounded-xl checker grid place-items-center shrink-0 overflow-hidden">
+                        <img src="/assets/brand/inflight-logo.png" alt="" class="max-h-10 w-auto">
+                    </div>
+                    <div>
+                        <p class="font-semibold">Primary logo — full colour</p>
+                        <p class="text-sm text-zinc-500 dark:text-zinc-400">Transparent PNG · 794 × 314 · use this as the master asset</p>
+                    </div>
+                </div>
+                <a href="/assets/brand/inflight-logo.png" download="inflight-logo.png"
+                    class="inline-flex items-center justify-center gap-2 bg-inflight hover:bg-inflight-deep text-white px-4 py-2.5 rounded-xl text-sm font-semibold transition active:scale-95">
+                    <i data-lucide="download" class="w-4 h-4"></i><span>Download PNG</span>
+                </a>
+            </div>
+            <p class="text-xs text-zinc-400 dark:text-zinc-500 mt-3">Need vector (SVG/AI) or a square/mono variant that isn't here yet? Note it in the brief checklist below and an admin can add it to the kit.</p>
+        </section>
+
+        <!-- ===================== VA ARTWORK ===================== -->
+        <section id="va-artwork" class="pt-12 fade-in scroll-mt-20">
+            <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+                <div class="flex items-center gap-2">
+                    <i data-lucide="plane" class="text-inflight dark:text-inflight-light"></i>
+                    <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Partner VA artwork</h3>
+                    <span id="vaCount" class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400"></span>
+                </div>
+                <a href="/va-ads" class="inline-flex items-center gap-2 bg-inflight hover:bg-inflight-deep text-white px-3.5 py-2 rounded-xl text-sm font-semibold transition active:scale-95">
+                    <i data-lucide="external-link" class="w-4 h-4"></i><span>Open VA Ads Manager</span>
+                </a>
+            </div>
+            <p class="text-sm text-zinc-500 dark:text-zinc-400 mb-4 max-w-2xl">Every partner VA's logo and banner, pulled live from the directory — grab the source artwork you need to design around. Hover an image for download / copy-link / open.</p>
+
+            <!-- Controls -->
+            <div class="flex flex-wrap items-center gap-3 mb-5">
+                <div class="relative flex-1 min-w-[220px]">
+                    <i data-lucide="search" class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400"></i>
+                    <input id="vaSearch" type="search" placeholder="Search VAs by name, callsign or region…"
+                        class="w-full pl-9 pr-3.5 py-2.5 rounded-xl bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 focus:border-inflight focus:outline-none focus:ring-4 focus:ring-inflight/10 transition text-sm">
+                </div>
+                <label class="inline-flex items-center gap-2 text-sm text-zinc-600 dark:text-zinc-300 cursor-pointer select-none">
+                    <input id="vaArtworkOnly" type="checkbox" checked
+                        class="w-4 h-4 rounded border-zinc-300 dark:border-zinc-600 text-inflight focus:ring-inflight cursor-pointer">
+                    Only with artwork
+                </label>
+            </div>
+
+            <div id="vaGrid" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                <!-- Skeletons until loaded -->
+                <div class="surface rounded-2xl h-64 animate-pulse"></div>
+                <div class="surface rounded-2xl h-64 animate-pulse"></div>
+                <div class="surface rounded-2xl h-64 animate-pulse"></div>
+            </div>
+            <div id="vaEmpty" class="hidden surface rounded-2xl p-10 text-center">
+                <i data-lucide="image-off" class="w-8 h-8 mx-auto text-zinc-300 dark:text-zinc-600 mb-3"></i>
+                <p id="vaEmptyMsg" class="text-sm text-zinc-500 dark:text-zinc-400">No VA artwork to show yet.</p>
+            </div>
+        </section>
+
+        <!-- ===================== PALETTE ===================== -->
+        <section id="palette" class="pt-12 fade-in scroll-mt-20">
+            <div class="flex items-center gap-2 mb-4">
+                <i data-lucide="swatch-book" class="text-inflight dark:text-inflight-light"></i>
+                <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Colour palette</h3>
+            </div>
+            <div id="paletteGrid" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3"></div>
+            <p class="text-xs text-zinc-400 dark:text-zinc-500 mt-3">Tap any swatch to copy its HEX. Blues are sampled straight from the logo.</p>
+        </section>
+
+        <!-- ===================== GUIDELINES ===================== -->
+        <section id="guidelines" class="pt-12 fade-in scroll-mt-20">
+            <div class="flex items-center gap-2 mb-4">
+                <i data-lucide="book-open" class="text-inflight dark:text-inflight-light"></i>
+                <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Logo usage guidelines</h3>
+            </div>
+            <div class="grid md:grid-cols-2 gap-4">
+                <div class="surface rounded-2xl p-6">
+                    <div class="flex items-center gap-2 mb-3 text-emerald-600 dark:text-emerald-400">
+                        <i data-lucide="check-circle-2"></i><p class="font-semibold">Do</p>
+                    </div>
+                    <ul id="doList" class="space-y-2.5 text-sm text-zinc-600 dark:text-zinc-300"></ul>
+                </div>
+                <div class="surface rounded-2xl p-6">
+                    <div class="flex items-center gap-2 mb-3 text-red-500">
+                        <i data-lucide="x-circle"></i><p class="font-semibold">Don't</p>
+                    </div>
+                    <ul id="dontList" class="space-y-2.5 text-sm text-zinc-600 dark:text-zinc-300"></ul>
+                </div>
+            </div>
+        </section>
+
+        <!-- ===================== BANNERS ===================== -->
+        <section id="banners" class="pt-12 fade-in scroll-mt-20">
+            <div class="flex items-center gap-2 mb-4">
+                <i data-lucide="layout-template" class="text-inflight dark:text-inflight-light"></i>
+                <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Banner &amp; asset specs</h3>
+            </div>
+            <div id="bannerGrid" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3"></div>
+            <p class="text-xs text-zinc-400 dark:text-zinc-500 mt-3">All sizes in pixels. Export at 2× for crisp results on retina displays; keep files under Discord's 8&nbsp;MB upload limit.</p>
+        </section>
+
+        <!-- ===================== BRIEF ===================== -->
+        <section id="brief" class="pt-12 fade-in scroll-mt-20">
+            <div class="flex items-center gap-2 mb-4">
+                <i data-lucide="clipboard-list" class="text-inflight dark:text-inflight-light"></i>
+                <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Brief checklist</h3>
+            </div>
+            <div class="surface rounded-2xl p-6">
+                <p class="text-sm text-zinc-500 dark:text-zinc-400 mb-4">A quick checklist to run through before shipping any banner, logo lockup or update graphic. Your ticks are saved on this device.</p>
+                <ul id="briefList" class="space-y-3"></ul>
+            </div>
+            <p class="text-xs text-zinc-400 dark:text-zinc-500 mt-4">Questions on a request, or want a new master asset added to the kit? Reach an admin in the staff Discord — finished files usually live in the brand drive / #design channel.</p>
+        </section>
+
+    </main>
+
+    <!-- toast -->
+    <div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 translate-y-4 opacity-0 pointer-events-none transition-all duration-300 bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 px-4 py-2.5 rounded-xl text-sm font-medium shadow-lg z-50"></div>
+
+    <script>
+        // ---- Icons ----
+        function drawIcons() { if (window.lucide) lucide.createIcons(); }
+
+        // ---- Dark mode (shares the hub's 'theme' key) ----
+        function setThemeIcon() {
+            const dark = document.documentElement.classList.contains('dark');
+            const el = document.getElementById('themeIcon');
+            if (el) { el.innerHTML = `<i data-lucide="${dark ? 'sun' : 'moon'}" class="w-[18px] h-[18px]"></i>`; drawIcons(); }
+        }
+        function applyTheme() {
+            const dark = localStorage.getItem('theme') !== 'light';
+            document.documentElement.classList.toggle('dark', dark);
+        }
+        function toggleDarkMode() {
+            const dark = !document.documentElement.classList.contains('dark');
+            localStorage.setItem('theme', dark ? 'dark' : 'light');
+            document.documentElement.classList.toggle('dark', dark);
+            setThemeIcon();
+        }
+        applyTheme();
+
+        function toast(msg) {
+            const t = document.getElementById('toast');
+            t.textContent = msg;
+            t.classList.remove('translate-y-4', 'opacity-0');
+            clearTimeout(t._t);
+            t._t = setTimeout(() => t.classList.add('translate-y-4', 'opacity-0'), 1600);
+        }
+
+        async function logout() {
+            try { await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' }); } catch (_) {}
+            location.href = '/staff';
+        }
+
+        // Greet the signed-in designer (page is already gated server-side).
+        async function whoami() {
+            try {
+                const res = await fetch('/api/auth/me', { credentials: 'same-origin' });
+                if (!res.ok) return;
+                const { user } = await res.json();
+                if (user) document.getElementById('whoami').textContent = user.displayName || user.username;
+            } catch (_) {}
+        }
+
+        // ---- Colour palette (blues sampled from the logo) ----
+        const PALETTE = [
+            { name: 'Inflight Blue', hex: '#2050C0', note: 'Primary' },
+            { name: 'Sky Blue',      hex: '#3358D8', note: 'Highlight' },
+            { name: 'Deep Navy',     hex: '#1E3A8A', note: 'Shadow / depth' },
+            { name: 'Ink',           hex: '#18181B', note: 'Text on light' },
+            { name: 'Cloud',         hex: '#F4F4F5', note: 'Light surface' },
+        ];
+        function renderPalette() {
+            document.getElementById('paletteGrid').innerHTML = PALETTE.map(c => {
+                // Pick readable label colour for the swatch.
+                const r = parseInt(c.hex.slice(1,3),16), g = parseInt(c.hex.slice(3,5),16), b = parseInt(c.hex.slice(5,7),16);
+                const lum = (0.299*r + 0.587*g + 0.114*b);
+                const fg = lum > 150 ? '#18181b' : '#ffffff';
+                return `<button onclick="copyHex('${c.hex}')" class="surface lift rounded-2xl overflow-hidden text-left group">
+                    <div class="h-24 flex items-end p-3" style="background:${c.hex};color:${fg}">
+                        <span class="text-[11px] font-semibold uppercase tracking-wide opacity-80 inline-flex items-center gap-1">
+                            <i data-lucide="copy" class="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 transition"></i>${c.note}
+                        </span>
+                    </div>
+                    <div class="p-3">
+                        <p class="font-semibold text-sm">${c.name}</p>
+                        <p class="text-xs text-zinc-500 dark:text-zinc-400 font-mono">${c.hex}</p>
+                    </div>
+                </button>`;
+            }).join('');
+            drawIcons();
+        }
+        function copyHex(hex) {
+            navigator.clipboard?.writeText(hex).then(() => toast(hex + ' copied'), () => toast(hex));
+        }
+
+        // ---- Guidelines ----
+        const DOS = [
+            'Keep clear space around the logo — at least the height of the plane icon on every side.',
+            'Use the full-colour logo on white or very light backgrounds, and on solid dark backgrounds.',
+            'Scale proportionally; hold Shift so the pin and wordmark never stretch.',
+            'Pair the logo with the Inter typeface (or a clean geometric sans) for headings.',
+        ];
+        const DONTS = [
+            'Don\'t recolour the logo or swap the blues for off-brand colours.',
+            'Don\'t place it on busy photos without a panel or scrim behind it.',
+            'Don\'t add drop shadows, outlines, glows or 3-D effects to the mark.',
+            'Don\'t squash, rotate, or rebuild the wordmark from a different font.',
+        ];
+        function renderGuidelines() {
+            const li = (txt, ok) =>
+                `<li class="flex gap-2.5"><i data-lucide="${ok ? 'check' : 'x'}" class="w-4 h-4 mt-0.5 shrink-0 ${ok ? 'text-emerald-500' : 'text-red-500'}"></i><span>${txt}</span></li>`;
+            document.getElementById('doList').innerHTML = DOS.map(t => li(t, true)).join('');
+            document.getElementById('dontList').innerHTML = DONTS.map(t => li(t, false)).join('');
+            drawIcons();
+        }
+
+        // ---- Banner / asset specs ----
+        const BANNERS = [
+            { icon: 'message-square', name: 'Discord server banner', size: '960 × 540', ratio: '16:9', use: 'Server profile banner shown under the server name.' },
+            { icon: 'image', name: 'Discord invite splash', size: '1920 × 1080', ratio: '16:9', use: 'Background on invite links and the join screen.' },
+            { icon: 'megaphone', name: 'Announcement / update', size: '1200 × 628', ratio: '1.91:1', use: 'Update posts in #announcements and link embeds.' },
+            { icon: 'user-circle', name: 'Profile / avatar', size: '800 × 800', ratio: '1:1', use: 'Square mark for Discord, socials and the VA listing.' },
+            { icon: 'twitter', name: 'X / Twitter header', size: '1500 × 500', ratio: '3:1', use: 'Profile header across social.' },
+            { icon: 'youtube', name: 'YouTube channel art', size: '2560 × 1440', ratio: '16:9', use: 'Channel banner — keep key art in the safe centre 1546 × 423.' },
+        ];
+        function renderBanners() {
+            document.getElementById('bannerGrid').innerHTML = BANNERS.map(b =>
+                `<div class="surface lift rounded-2xl p-5">
+                    <div class="flex items-center justify-between mb-3">
+                        <div class="w-10 h-10 rounded-xl bg-inflight/10 text-inflight dark:text-inflight-light grid place-items-center"><i data-lucide="${b.icon}" class="w-5 h-5"></i></div>
+                        <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400">${b.ratio}</span>
+                    </div>
+                    <p class="font-semibold">${b.name}</p>
+                    <p class="font-mono text-sm text-inflight dark:text-inflight-light mt-0.5">${b.size}px</p>
+                    <p class="text-sm text-zinc-500 dark:text-zinc-400 mt-2">${b.use}</p>
+                </div>`
+            ).join('');
+            drawIcons();
+        }
+
+        // ---- Brief checklist (persisted per device) ----
+        const BRIEF = [
+            'Right asset for the channel? (banner vs square vs link card)',
+            'Exact pixel size from the spec list above, exported at 2×.',
+            'Logo has clear space and sits on an on-brand background.',
+            'Only the Inflight blues + neutrals — no off-brand colours.',
+            'Text is legible at small sizes and inside Discord\'s crop.',
+            'File under 8 MB; PNG for graphics with the logo, JPG for photos.',
+            'Shared the source file so it can be edited again later.',
+        ];
+        const BRIEF_KEY = 'gd_brief_checks_v1';
+        function loadChecks() { try { return JSON.parse(localStorage.getItem(BRIEF_KEY) || '{}'); } catch { return {}; } }
+        function saveChecks(c) { localStorage.setItem(BRIEF_KEY, JSON.stringify(c)); }
+        function renderBrief() {
+            const checks = loadChecks();
+            document.getElementById('briefList').innerHTML = BRIEF.map((t, i) =>
+                `<li>
+                    <label class="flex items-start gap-3 cursor-pointer group">
+                        <input type="checkbox" data-i="${i}" ${checks[i] ? 'checked' : ''}
+                            class="mt-0.5 w-4 h-4 rounded border-zinc-300 dark:border-zinc-600 text-inflight focus:ring-inflight cursor-pointer">
+                        <span class="text-sm text-zinc-700 dark:text-zinc-200 ${checks[i] ? 'line-through text-zinc-400 dark:text-zinc-500' : ''}">${t}</span>
+                    </label>
+                </li>`
+            ).join('');
+            document.querySelectorAll('#briefList input[type=checkbox]').forEach(cb => {
+                cb.addEventListener('change', () => {
+                    const checks = loadChecks();
+                    checks[cb.dataset.i] = cb.checked;
+                    saveChecks(checks);
+                    renderBrief();
+                });
+            });
+        }
+
+        // ---- Partner VA artwork (pulled live from the VA directory) ----
+        let VA_ADS = [];
+        function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+        function slug(s) { return String(s || 'va').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'va'; }
+        function extOf(url) { const m = /\.([a-z0-9]{2,4})(?:\?|$)/i.exec(url || ''); return m ? m[1].toLowerCase() : 'png'; }
+
+        async function loadVaArtwork() {
+            try {
+                const res = await fetch('/api/va-ads?limit=100&sort=name', { credentials: 'same-origin' });
+                if (!res.ok) throw new Error('http ' + res.status);
+                const json = await res.json();
+                VA_ADS = Array.isArray(json.data) ? json.data : [];
+            } catch (_) {
+                VA_ADS = [];
+                document.getElementById('vaEmptyMsg').textContent = 'Could not load VA artwork right now. Try the VA Ads Manager.';
+            }
+            renderVa();
+        }
+
+        function renderVa() {
+            const grid = document.getElementById('vaGrid');
+            const empty = document.getElementById('vaEmpty');
+            const q = (document.getElementById('vaSearch').value || '').trim().toLowerCase();
+            const artworkOnly = document.getElementById('vaArtworkOnly').checked;
+
+            let list = VA_ADS.slice();
+            if (artworkOnly) list = list.filter(v => v.logoUrl || v.bannerUrl);
+            if (q) list = list.filter(v => {
+                const hay = [v.name, v.callsign, v.region, (v.tags || []).join(' ')].join(' ').toLowerCase();
+                return hay.includes(q);
+            });
+
+            const logos = VA_ADS.filter(v => v.logoUrl).length;
+            const banners = VA_ADS.filter(v => v.bannerUrl).length;
+            document.getElementById('vaCount').textContent = `${VA_ADS.length} VAs · ${logos} logos · ${banners} banners`;
+
+            if (!list.length) {
+                grid.classList.add('hidden');
+                empty.classList.remove('hidden');
+                drawIcons();
+                return;
+            }
+            empty.classList.add('hidden');
+            grid.classList.remove('hidden');
+
+            grid.innerHTML = list.map(v => {
+                const name = esc(v.name || 'Unnamed VA');
+                const meta = [v.callsign, v.region].filter(Boolean).map(esc).join(' · ');
+                const sl = slug(v.name);
+                // Hover action buttons for an asset (download / copy / open).
+                const actions = (url, kind) => !url ? '' : `
+                    <div class="absolute inset-0 flex items-center justify-center gap-1.5 bg-zinc-900/55 opacity-0 group-hover/asset:opacity-100 transition">
+                        <button data-action="download" data-url="${esc(url)}" data-fn="${sl}-${kind}.${extOf(url)}" title="Download ${kind}" class="w-8 h-8 grid place-items-center rounded-lg bg-white/95 text-zinc-800 hover:bg-white transition"><i data-lucide="download" class="w-4 h-4"></i></button>
+                        <button data-action="copy" data-url="${esc(url)}" title="Copy ${kind} URL" class="w-8 h-8 grid place-items-center rounded-lg bg-white/95 text-zinc-800 hover:bg-white transition"><i data-lucide="link" class="w-4 h-4"></i></button>
+                        <button data-action="open" data-url="${esc(url)}" title="Open ${kind}" class="w-8 h-8 grid place-items-center rounded-lg bg-white/95 text-zinc-800 hover:bg-white transition"><i data-lucide="external-link" class="w-4 h-4"></i></button>
+                    </div>`;
+
+                const banner = v.bannerUrl
+                    ? `<div class="group/asset relative h-32 checker"><img src="${esc(v.bannerUrl)}" alt="${name} banner" loading="lazy" class="w-full h-full object-cover">${actions(v.bannerUrl, 'banner')}</div>`
+                    : `<div class="h-32 grid place-items-center bg-zinc-100 dark:bg-zinc-800/60 text-zinc-400 dark:text-zinc-600"><div class="text-center"><i data-lucide="image-off" class="w-5 h-5 mx-auto mb-1"></i><span class="text-[11px] font-medium">No banner</span></div></div>`;
+
+                const logo = v.logoUrl
+                    ? `<div class="group/asset relative w-14 h-14 rounded-xl overflow-hidden border border-zinc-200 dark:border-zinc-700 checker shrink-0"><img src="${esc(v.logoUrl)}" alt="${name} logo" loading="lazy" class="w-full h-full object-cover">${actions(v.logoUrl, 'logo')}</div>`
+                    : `<div class="w-14 h-14 rounded-xl bg-inflight/10 text-inflight dark:text-inflight-light grid place-items-center font-bold text-lg shrink-0">${esc((v.name || 'V')[0].toUpperCase())}</div>`;
+
+                return `<div class="surface lift rounded-2xl overflow-hidden flex flex-col">
+                    ${banner}
+                    <div class="p-4 flex items-center gap-3">
+                        ${logo}
+                        <div class="min-w-0">
+                            <p class="font-semibold truncate">${name}</p>
+                            <p class="text-xs text-zinc-500 dark:text-zinc-400 truncate">${meta || '&nbsp;'}</p>
+                        </div>
+                    </div>
+                </div>`;
+            }).join('');
+            drawIcons();
+        }
+
+        // Download an asset; fall back to opening it if cross-origin fetch is blocked.
+        async function downloadAsset(url, filename) {
+            if (!url) return;
+            try {
+                const res = await fetch(url, { mode: 'cors' });
+                if (!res.ok) throw new Error('http ' + res.status);
+                const blob = await res.blob();
+                const obj = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = obj; a.download = filename || 'asset';
+                document.body.appendChild(a); a.click(); a.remove();
+                setTimeout(() => URL.revokeObjectURL(obj), 1000);
+                toast('Downloaded ' + (filename || 'asset'));
+            } catch (_) {
+                window.open(url, '_blank', 'noopener');
+                toast('Opened in a new tab — right-click to save');
+            }
+        }
+        function copyUrl(url) {
+            navigator.clipboard?.writeText(url).then(() => toast('Link copied'), () => window.open(url, '_blank', 'noopener'));
+        }
+
+        // Delegated actions for every asset button in the grid.
+        document.getElementById('vaGrid').addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-action]');
+            if (!btn) return;
+            const url = btn.dataset.url;
+            if (!url) return;
+            if (btn.dataset.action === 'download') downloadAsset(url, btn.dataset.fn);
+            else if (btn.dataset.action === 'copy') copyUrl(url);
+            else window.open(url, '_blank', 'noopener');
+        });
+        document.getElementById('vaSearch').addEventListener('input', renderVa);
+        document.getElementById('vaArtworkOnly').addEventListener('change', renderVa);
+
+        // ---- Boot ----
+        renderPalette();
+        renderGuidelines();
+        renderBanners();
+        renderBrief();
+        loadVaArtwork();
+        setThemeIcon();
+        drawIcons();
+        whoami();
+    </script>
+</body>
+</html>

@@ -2319,6 +2319,7 @@ const STAFF_ONLY_PATHS = new Set([
     '/VA-ADMIN-MANUAL.md',
     '/embeds', '/embeds.html',
     '/EMBEDBACKEND.md',
+    '/graphic-designer', '/graphic-designer.html',
 ]);
 app.use((req, res, next) => {
     if (req.method === 'GET' && STAFF_ONLY_PATHS.has(req.path)) {
@@ -2359,6 +2360,13 @@ app.get('/embeds', (req, res) => {
 // Accessible via yoursite.com/va-admin-manual (staff-only — see guard above)
 app.get('/va-admin-manual', (req, res) => {
     res.sendFile(path.join(__dirname, 'va-admin-manual.html'));
+});
+
+// Specific route for the Graphic Designer workspace (brand assets, logo +
+// banner specs and usage guidelines). Accessible via yoursite.com/graphic-designer
+// (staff-only — see guard above; scoped to admin/staff/graphic_designer).
+app.get('/graphic-designer', (req, res) => {
+    res.sendFile(path.join(__dirname, 'graphic-designer.html'));
 });
 
 // 3. The Aircraft Database app (homepage) — staff-only.

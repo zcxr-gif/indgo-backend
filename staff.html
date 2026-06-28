@@ -131,24 +131,24 @@
                 </div>
             </section>
 
-            <!-- At a glance -->
-            <section class="pt-8 fade-in">
+            <!-- At a glance (VA stats shown to VA reps + designers; DB stats are staff/admin) -->
+            <section data-roles="admin,staff,va_rep,graphic_designer" class="pt-8 fade-in">
                 <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-4">At a glance</h2>
                 <div id="glanceGrid" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-                    <!-- VA stats — visible to everyone incl. VA reps -->
-                    <div data-roles="admin,staff,va_rep" class="surface rounded-2xl p-4">
+                    <!-- VA stats — visible to everyone incl. VA reps + designers -->
+                    <div data-roles="admin,staff,va_rep,graphic_designer" class="surface rounded-2xl p-4">
                         <div class="flex items-center gap-2 text-zinc-400 dark:text-zinc-500 mb-1.5"><i data-lucide="building-2" class="w-4 h-4"></i><span class="text-[11px] font-semibold uppercase tracking-wide">Total VAs</span></div>
                         <p class="text-2xl font-bold tracking-tight" id="statVaTotal">—</p>
                     </div>
-                    <div data-roles="admin,staff,va_rep" class="surface rounded-2xl p-4">
+                    <div data-roles="admin,staff,va_rep,graphic_designer" class="surface rounded-2xl p-4">
                         <div class="flex items-center gap-2 text-zinc-400 dark:text-zinc-500 mb-1.5"><i data-lucide="clock" class="w-4 h-4"></i><span class="text-[11px] font-semibold uppercase tracking-wide">Pending</span></div>
                         <p class="text-2xl font-bold tracking-tight text-amber-500" id="statVaPending">—</p>
                     </div>
-                    <div data-roles="admin,staff,va_rep" class="surface rounded-2xl p-4">
+                    <div data-roles="admin,staff,va_rep,graphic_designer" class="surface rounded-2xl p-4">
                         <div class="flex items-center gap-2 text-zinc-400 dark:text-zinc-500 mb-1.5"><i data-lucide="badge-check" class="w-4 h-4"></i><span class="text-[11px] font-semibold uppercase tracking-wide">Approved</span></div>
                         <p class="text-2xl font-bold tracking-tight text-emerald-500" id="statVaApproved">—</p>
                     </div>
-                    <div data-roles="admin,staff,va_rep" class="surface rounded-2xl p-4">
+                    <div data-roles="admin,staff,va_rep,graphic_designer" class="surface rounded-2xl p-4">
                         <div class="flex items-center gap-2 text-zinc-400 dark:text-zinc-500 mb-1.5"><i data-lucide="handshake" class="w-4 h-4"></i><span class="text-[11px] font-semibold uppercase tracking-wide">Partnerships</span></div>
                         <p class="text-2xl font-bold tracking-tight" id="statPartnerships">—</p>
                     </div>
@@ -174,7 +174,7 @@
                         <p class="text-sm text-zinc-500 dark:text-zinc-400 mt-1 flex-1">Browse and manage the community fleet gallery and contributions.</p>
                         <span class="mt-5 inline-flex items-center gap-1.5 text-sm font-medium text-zinc-700 dark:text-zinc-300">Open <i data-lucide="arrow-right" class="w-4 h-4 transition-transform group-hover:translate-x-1"></i></span>
                     </a>
-                    <a href="/va-ads" data-roles="admin,staff,va_rep" class="surface lift rounded-2xl p-6 flex flex-col group">
+                    <a href="/va-ads" data-roles="admin,staff,va_rep,graphic_designer" class="surface lift rounded-2xl p-6 flex flex-col group">
                         <div class="w-12 h-12 rounded-2xl bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200 grid place-items-center mb-5"><i data-lucide="megaphone" class="w-[22px] h-[22px]"></i></div>
                         <h3 class="font-semibold text-lg tracking-tight flex items-center gap-1.5">VA Ads Manager</h3>
                         <p class="text-sm text-zinc-500 dark:text-zinc-400 mt-1 flex-1">Review, approve, edit, feature and remove VA listings.</p>
@@ -196,6 +196,12 @@
                         <div class="w-12 h-12 rounded-2xl bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200 grid place-items-center mb-5"><i data-lucide="code-2" class="w-[22px] h-[22px]"></i></div>
                         <h3 class="font-semibold text-lg tracking-tight">Embed Manager</h3>
                         <p class="text-sm text-zinc-500 dark:text-zinc-400 mt-1 flex-1">Mint, configure, revoke and copy embed widget tokens for VAs.</p>
+                        <span class="mt-5 inline-flex items-center gap-1.5 text-sm font-medium text-zinc-700 dark:text-zinc-300">Open <i data-lucide="arrow-right" class="w-4 h-4 transition-transform group-hover:translate-x-1"></i></span>
+                    </a>
+                    <a href="/graphic-designer" data-roles="admin,staff,graphic_designer" class="surface lift rounded-2xl p-6 flex flex-col group">
+                        <div class="w-12 h-12 rounded-2xl bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200 grid place-items-center mb-5"><i data-lucide="palette" class="w-[22px] h-[22px]"></i></div>
+                        <h3 class="font-semibold text-lg tracking-tight">Graphic Designer</h3>
+                        <p class="text-sm text-zinc-500 dark:text-zinc-400 mt-1 flex-1">Brand kit, logo downloads, colour palette, banner specs and every partner VA's artwork.</p>
                         <span class="mt-5 inline-flex items-center gap-1.5 text-sm font-medium text-zinc-700 dark:text-zinc-300">Open <i data-lucide="arrow-right" class="w-4 h-4 transition-transform group-hover:translate-x-1"></i></span>
                     </a>
                 </div>
@@ -263,6 +269,7 @@
                 <select id="newRole" class="w-full px-3.5 py-2.5 rounded-xl bg-zinc-100/70 dark:bg-zinc-800/70 border border-transparent focus:outline-none focus:ring-4 focus:ring-zinc-900/5 dark:focus:ring-white/5 transition text-sm">
                     <option value="staff">Staff</option>
                     <option value="va_rep">Inflight VA Rep — VA tools only</option>
+                    <option value="graphic_designer">Graphic Designer — brand workspace only</option>
                     <option value="admin">Admin</option>
                 </select>
                 <p id="createError" class="hidden text-sm text-red-500 font-medium"></p>
@@ -425,6 +432,7 @@
         function roleLabel(role) {
             return role === 'admin' ? 'Admin'
                 : role === 'va_rep' ? 'Inflight VA Rep'
+                : role === 'graphic_designer' ? 'Graphic Designer'
                 : 'Staff';
         }
 
@@ -502,6 +510,8 @@
                     ? '<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-zinc-900 dark:bg-white text-white dark:text-zinc-900">admin</span>'
                     : u.role === 'va_rep'
                     ? '<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-indigo-100 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300">VA rep</span>'
+                    : u.role === 'graphic_designer'
+                    ? '<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-violet-100 dark:bg-violet-950/60 text-violet-700 dark:text-violet-300">Designer</span>'
                     : '<span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300">staff</span>';
                 const statusBadge = u.active
                     ? '<span class="inline-flex items-center gap-1.5 text-zinc-600 dark:text-zinc-300 font-medium"><span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>Active</span>'
@@ -526,7 +536,7 @@
                         <div class="flex items-center justify-end gap-1">
                             ${iconBtn('key-round', 'Reset password', `resetPw('${u.id}','${esc(u.username)}')`)}
                             ${isSelf ? '' :
-                                iconBtn('shield', 'Cycle role (staff → VA rep → admin)', `cycleRole('${u.id}','${u.role}')`) +
+                                iconBtn('shield', 'Cycle role (staff → VA rep → Designer → admin)', `cycleRole('${u.id}','${u.role}')`) +
                                 iconBtn(u.active ? 'ban' : 'badge-check', u.active ? 'Disable' : 'Enable', `toggleActive('${u.id}',${u.active})`) +
                                 iconBtn('trash-2', 'Delete', `delUser('${u.id}','${esc(u.username)}')`, true)
                             }
@@ -542,9 +552,9 @@
             if (!ok) alert((data && data.error) || 'Update failed.');
             loadUsers();
         }
-        // Cycle staff → va_rep → admin → staff.
+        // Cycle staff → va_rep → graphic_designer → admin → staff.
         function cycleRole(id, role) {
-            const next = { staff: 'va_rep', va_rep: 'admin', admin: 'staff' };
+            const next = { staff: 'va_rep', va_rep: 'graphic_designer', graphic_designer: 'admin', admin: 'staff' };
             patchUser(id, { role: next[role] || 'staff' });
         }
         function toggleActive(id, active) { patchUser(id, { active: !active }); }
