@@ -332,6 +332,24 @@ const normalizeCallsignBase = (raw) => {
     return clean || null;
 };
 
+// The live-flight matcher keys off callsign prefix(es) + suffix(es): the radio
+// callsign word carried before the flight number, and the Infinite Flight VA tag
+// carried after it. VA ads only persist a single base callsign (e.g. "OCEAN"),
+// so derive the arrays the matcher expects on the read path. normalizeCallsignBase
+// strips any inline "##VA"/"VA" tag, so older records stored as "OCEAN ##VA"
+// resolve to the same shape as normalized ones. Returns empty arrays for ads
+// with no callsign so the matcher simply skips them rather than mis-matching.
+const deriveCallsignMatch = (ad) => {
+    const base = normalizeCallsignBase(ad && ad.callsign);
+    return {
+        callsignPrefixes: base ? [base] : [],
+        callsignSuffixes: base ? ['VA'] : []
+    };
+};
+
+// Attach the derived matcher arrays to a lean ad object for API responses.
+const withCallsignMatch = (ad) => (ad ? { ...ad, ...deriveCallsignMatch(ad) } : ad);
+
 /* =========================
  * LEADERBOARD SCHEMAS
  *
@@ -1826,7 +1844,7 @@ app.get('/api/va-ads', async (req, res) => {
         ]);
 
         res.json({
-            data: ads,
+            data: ads.map(withCallsignMatch),
             pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
         });
     } catch (error) {
@@ -1860,7 +1878,7 @@ app.get('/api/va-ads/banner/:icao', async (req, res) => {
                 { $sample: { size: 1 } }
             ]);
             if (!ad) return res.status(404).json({ message: `No VA banners found for ${code}.` });
-            return res.json({ icao: code, data: ad });
+            return res.json({ icao: code, data: withCallsignMatch(ad) });
         }
 
         const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 10, 50));
@@ -1870,7 +1888,7 @@ app.get('/api/va-ads/banner/:icao', async (req, res) => {
             .limit(limit)
             .lean();
 
-        res.json({ icao: code, count: ads.length, data: ads });
+        res.json({ icao: code, count: ads.length, data: ads.map(withCallsignMatch) });
     } catch (error) {
         console.error('VA Ad Banner Error:', error);
         res.status(500).json({ message: 'Error fetching VA banners for airport.' });
@@ -1888,7 +1906,7 @@ app.get('/api/va-ads/:id', async (req, res) => {
             : await VirtualAirlineAd.findById(req.params.id).lean();
 
         if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
-        res.json(ad);
+        res.json(withCallsignMatch(ad));
     } catch (error) {
         console.error('VA Ad Fetch Error:', error);
         res.status(500).json({ message: 'Error fetching VA advertisement.' });
