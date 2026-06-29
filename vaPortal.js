@@ -177,15 +177,30 @@ const VaPortalActivity = mongoose.models.VaPortalActivity
     || mongoose.model('VaPortalActivity', VaPortalActivitySchema);
 
 // Fire-and-forget activity logging (never block a request on the audit write).
+// Portal activity is no longer persisted to the database — every event is
+// streamed to a Discord log channel instead (VA_PORTAL_LOG_CHANNEL_ID, default
+// the dedicated VA logs channel). Fire-and-forget so logging never blocks or
+// fails a request. bot.js is required lazily to dodge load-order coupling.
+const VA_PORTAL_LOG_CHANNEL_ID = process.env.VA_PORTAL_LOG_CHANNEL_ID || '1521208457812774942';
 function logActivity({ vaAdId, vaName, actorName, actorRole, action, detail }) {
-    VaPortalActivity.create({
-        vaAdId: vaAdId || null,
-        vaName: vaName || '',
-        actorName: actorName || '',
-        actorRole: actorRole || '',
-        action: action || '',
-        detail: detail || '',
-    }).catch(err => console.error('VA portal activity log error:', err.message));
+    try {
+        const { postToChannel } = require('./bot');
+        const fields = [];
+        if (vaName) fields.push({ name: 'VA', value: String(vaName).slice(0, 256), inline: true });
+        if (actorName) fields.push({ name: 'By', value: `${actorName}${actorRole ? ` (${actorRole})` : ''}`.slice(0, 256), inline: true });
+        if (action) fields.push({ name: 'Action', value: String(action).slice(0, 256), inline: true });
+        postToChannel(VA_PORTAL_LOG_CHANNEL_ID, {
+            embeds: [{
+                title: '📋 VA Portal activity',
+                description: detail ? String(detail).slice(0, 2000) : undefined,
+                color: 0x6366f1,
+                fields,
+                timestamp: new Date().toISOString(),
+            }],
+        });
+    } catch (err) {
+        console.error('VA portal activity log error:', err.message);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -443,7 +458,16 @@ async function uploadSubmissionFile(s3Client, file) {
  * @param {Function} [deps.uploadVaImage] (s3Client, file, ref, kind) => url
  * @param {Function} [deps.deleteVaImage] (s3Client, url) => Promise
  */
-function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage }) {
+function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl }) {
+    // Webhook URLs are secrets, so the profile API never echoes one back in full.
+    // Surface just enough for the owner to recognise what's saved: the trailing
+    // chars of the webhook id. Defensive against malformed stored values.
+    const maskWebhookUrl = (url) => {
+        if (!url) return '';
+        const m = String(url).match(/webhooks\/(\d+)/);
+        const id = m && m[1];
+        return id ? `…/webhooks/${id.slice(-4).padStart(id.length > 4 ? 8 : id.length, '•')}/…` : '…';
+    };
     // multipart parser for the VA-profile editor (optional new logo + banner).
     const uploadVaProfileImages = upload.fields([
         { name: 'logo', maxCount: 1 },
@@ -491,6 +515,14 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, 
             minGrade: ad.minGrade || null,
             requirements: ad.requirements || '',
             status: ad.status,
+            // Flight-event delivery (request → staff approval). Never return the
+            // raw webhook — only whether one is set, a masked hint, the on/off
+            // toggle, and the request/approval state that drives the portal card.
+            flightEventsConfigured: !!ad.flightEventsWebhookUrl,
+            flightEventsEnabled: !!ad.flightEventsEnabled,
+            flightEventsApproved: !!ad.flightEventsApproved,
+            flightEventsRequested: !!ad.flightEventsRequestedAt,
+            flightEventsWebhookHint: ad.flightEventsWebhookUrl ? maskWebhookUrl(ad.flightEventsWebhookUrl) : '',
         };
     };
 
@@ -587,7 +619,7 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, 
             if (!req.portal.vaAdId) {
                 return res.json({ va: null, embeds: [], editable: false });
             }
-            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId);
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId).select('+flightEventsWebhookUrl');
             if (!ad) return res.json({ va: null, embeds: [], editable: false });
             const embeds = await embedLinksForVa(ad);
             res.json({ va: portalVa(ad), embeds, editable: req.portal.role === 'owner' });
@@ -607,7 +639,7 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, 
         const cleanup = () => [logoFile, bannerFile].forEach(f => { if (f && f.path) fs.unlink(f.path, () => {}); });
         try {
             if (!req.portal.vaAdId) { cleanup(); return res.status(404).json({ error: 'No VA is linked to this account.' }); }
-            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId);
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId).select('+flightEventsWebhookUrl');
             if (!ad) { cleanup(); return res.status(404).json({ error: 'Your VA listing could not be found.' }); }
 
             const b = req.body || {};
@@ -620,6 +652,9 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, 
             if (b.discordUrl !== undefined) ad.discordUrl = String(b.discordUrl).trim() || null;
             if (b.ifcThreadUrl !== undefined) ad.ifcThreadUrl = String(b.ifcThreadUrl).trim() || null;
             if (b.applicationUrl !== undefined) ad.applicationUrl = String(b.applicationUrl).trim() || null;
+            // NOTE: flight-event delivery is intentionally NOT editable here — it
+            // goes through the request → staff-approval flow (see the
+            // /flight-events/request and /flight-events/toggle routes below).
             // List fields.
             if (b.callsigns !== undefined) ad.callsigns = parseList(b.callsigns); // pre-save normalises + syncs callsign
             if (b.hubs !== undefined) ad.hubs = parseList(b.hubs).map(h => h.toUpperCase());
@@ -657,6 +692,103 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, 
             cleanup();
             console.error('VA portal update profile error:', err);
             res.status(500).json({ error: 'Could not save your VA profile.' });
+        }
+    });
+
+    // =====================================================================
+    // VA-FACING FEATURE REQUESTS  (flight events + embed — granted by staff)
+    // =====================================================================
+    // Request takeoff/landing notifications to the VA's OWN Discord webhook.
+    // This does NOT switch delivery on: a staff member must approve the VA
+    // (flightEventsApproved, set from the VA editor) before anything is sent. We
+    // store the webhook to use, stamp the request, file it in the submissions
+    // queue, and log it to Discord so staff are notified.
+    app.post('/api/va-portal/flight-events/request', requirePortalOwner, async (req, res) => {
+        try {
+            if (!req.portal.vaAdId) return res.status(404).json({ error: 'No VA is linked to this account.' });
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId).select('+flightEventsWebhookUrl');
+            if (!ad) return res.status(404).json({ error: 'Your VA listing could not be found.' });
+
+            const raw = String((req.body && req.body.flightEventsWebhookUrl) || '').trim();
+            if (!raw) return res.status(400).json({ error: 'Paste the Discord webhook URL you want your flights posted to.' });
+            if (typeof isDiscordWebhookUrl === 'function' && !isDiscordWebhookUrl(raw)) {
+                return res.status(400).json({ error: 'That doesn’t look like a Discord webhook URL. It should look like https://discord.com/api/webhooks/…' });
+            }
+
+            ad.flightEventsWebhookUrl = raw;
+            ad.flightEventsEnabled = true;
+            ad.flightEventsRequestedAt = new Date();
+            // Approval is staff-only; re-requesting never self-approves.
+            await ad.save();
+
+            await VaSubmission.create({
+                vaAdId: ad._id, vaName: ad.name, accountId: req.portal._id,
+                submittedByName: req.portal.displayName || req.portal.username,
+                submittedByRole: req.portal.role,
+                category: 'request',
+                title: 'Flight event notifications',
+                body: 'Requesting takeoff/landing notifications to the VA’s own Discord webhook. Approve from the VA editor (Flight events approved).',
+            });
+            logActivity({
+                vaAdId: ad._id, vaName: ad.name,
+                actorName: req.portal.displayName || req.portal.username, actorRole: 'owner',
+                action: 'flight-events.request',
+                detail: ad.flightEventsApproved ? 'Updated flight-event webhook (already approved)' : 'Requested flight-event notifications',
+            });
+            res.json({ va: portalVa(ad) });
+        } catch (err) {
+            console.error('VA portal flight-events request error:', err);
+            res.status(500).json({ error: 'Could not submit your request.' });
+        }
+    });
+
+    // Owner toggles their (already-approved) flight-event delivery on/off without
+    // losing the saved webhook. No-op effect until staff have approved the VA.
+    app.post('/api/va-portal/flight-events/toggle', requirePortalOwner, async (req, res) => {
+        try {
+            if (!req.portal.vaAdId) return res.status(404).json({ error: 'No VA is linked to this account.' });
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId).select('+flightEventsWebhookUrl');
+            if (!ad) return res.status(404).json({ error: 'Your VA listing could not be found.' });
+            const on = req.body && (req.body.enabled === true || req.body.enabled === 'true');
+            ad.flightEventsEnabled = on;
+            await ad.save();
+            logActivity({
+                vaAdId: ad._id, vaName: ad.name,
+                actorName: req.portal.displayName || req.portal.username, actorRole: 'owner',
+                action: 'flight-events.toggle', detail: on ? 'Resumed flight-event delivery' : 'Paused flight-event delivery',
+            });
+            res.json({ va: portalVa(ad) });
+        } catch (err) {
+            console.error('VA portal flight-events toggle error:', err);
+            res.status(500).json({ error: 'Could not update delivery.' });
+        }
+    });
+
+    // Request a live-map embed. Embeds are provisioned by staff (copy-only on the
+    // VA side), so this just files the request + logs it; no schema change.
+    app.post('/api/va-portal/embed/request', requirePortalOwner, async (req, res) => {
+        try {
+            if (!req.portal.vaAdId) return res.status(404).json({ error: 'No VA is linked to this account.' });
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId).select('name');
+            if (!ad) return res.status(404).json({ error: 'Your VA listing could not be found.' });
+            const note = String((req.body && req.body.note) || '').slice(0, 2000);
+            await VaSubmission.create({
+                vaAdId: ad._id, vaName: ad.name, accountId: req.portal._id,
+                submittedByName: req.portal.displayName || req.portal.username,
+                submittedByRole: req.portal.role,
+                category: 'request',
+                title: 'Live map embed',
+                body: note || 'Requesting a live-map embed for the VA.',
+            });
+            logActivity({
+                vaAdId: ad._id, vaName: ad.name,
+                actorName: req.portal.displayName || req.portal.username, actorRole: 'owner',
+                action: 'embed.request', detail: 'Requested a live-map embed',
+            });
+            res.json({ ok: true });
+        } catch (err) {
+            console.error('VA portal embed request error:', err);
+            res.status(500).json({ error: 'Could not submit your request.' });
         }
     });
 

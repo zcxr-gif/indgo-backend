@@ -195,6 +195,24 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // doubles as the guard that keeps the announcement from firing twice.
     partnershipAnnouncedAt: { type: Date, default: null },
 
+    // --- VA-managed flight event delivery (self-serve in the VA portal) ---
+    // When a webhook is set AND enabled, each takeoff/landing matched to this VA
+    // by callsign is ALSO posted to this Discord webhook (their own channel), in
+    // addition to the central VA-events feed. The URL is a secret (anyone holding
+    // it can post to that channel), so the portal never echoes it back in full —
+    // see portalVa()/the PATCH handler in vaPortal.js. Validated to a Discord
+    // webhook host on write to keep this from becoming an open POST relay.
+    // select:false so this secret is NEVER returned by default — notably the
+    // PUBLIC GET /api/va-ads list returns full ad docs. Read paths that need the
+    // actual URL must opt in with .select('+flightEventsWebhookUrl').
+    flightEventsWebhookUrl: { type: String, trim: true, default: null, select: false },
+    flightEventsEnabled: { type: Boolean, default: true },
+    // Staff gate: the feature is REQUESTED by the VA, not auto-granted. Delivery
+    // (sendVaEventToPartner) only fires once a staff member approves. The request
+    // timestamp lets the portal show a "pending approval" state.
+    flightEventsApproved: { type: Boolean, default: false },
+    flightEventsRequestedAt: { type: Date, default: null },
+
     // --- Analytics ---
     views: { type: Number, default: 0 },                            // detail-page impressions
     clicks: { type: Number, default: 0 },                           // click-throughs on join/apply link
@@ -405,6 +423,23 @@ const normalizeCallsignBase = (raw) => {
     if (!raw) return null;
     const clean = String(raw).trim().toUpperCase().replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim();
     return clean || null;
+};
+
+// True only for a well-formed Discord webhook URL. Partner VAs paste these into
+// the portal themselves, so we gate both the write (vaPortal.js) and the post
+// (VA flight events, below) on this — without it the per-VA delivery would be an
+// open POST relay to any host the caller named (SSRF). Covers the main +
+// canary/ptb subdomains and the optional /v<n>/ version segment Discord hands out.
+// Defined here (above registerVaPortalRoutes) so it can be passed into the portal.
+const isDiscordWebhookUrl = (url) => {
+    if (!url || typeof url !== 'string') return false;
+    let u;
+    try { u = new URL(url.trim()); } catch { return false; }
+    if (u.protocol !== 'https:') return false;
+    const host = u.hostname.toLowerCase();
+    const allowedHost = host === 'discord.com' || host === 'discordapp.com'
+        || host === 'canary.discord.com' || host === 'ptb.discord.com';
+    return allowedHost && /^\/api\/(v\d+\/)?webhooks\/\d+\/[\w-]+$/.test(u.pathname);
 };
 
 /* =========================
@@ -706,7 +741,7 @@ const hashIp = (ip) => {
 registerAuthRoutes(app);
 
 // VA Partnership Portal routes (partner login/submissions/team + staff oversight).
-registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage });
+registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl });
 
 // Health Check — public, unauthenticated (for uptime/platform monitors).
 // NOTE: the site is staff-only, so the homepage ("/") is gated below; point any
@@ -2100,6 +2135,10 @@ app.put('/api/va-ads/:id', requireAuth, uploadVaImages, async (req, res) => {
         if (b.contactEmail !== undefined) ad.contactEmail = b.contactEmail || null;
         if (b.status !== undefined && VA_AD_STATUSES.includes(b.status)) ad.status = b.status;
         if (b.featured !== undefined) ad.featured = b.featured === true || b.featured === 'true';
+        // Staff approval gate for VA-managed flight-event delivery (requested in
+        // the portal). Approving without a webhook on file is harmless — nothing
+        // sends until the VA has also saved one.
+        if (b.flightEventsApproved !== undefined) ad.flightEventsApproved = b.flightEventsApproved === true || b.flightEventsApproved === 'true';
 
         await ad.save();
         res.json({ message: 'VA advertisement updated.', data: ad });
@@ -2206,16 +2245,9 @@ app.delete('/api/va-ads/:id', requireAuth, async (req, res) => {
 // blank). Keep this in sync with VA_BOT_FORWARD_TOKEN on the ACARS backend.
 const VA_EVENT_TOKEN = process.env.VA_BOT_FORWARD_TOKEN || null;
 
-// Announce a takeoff/landing to Discord. Prefers a dedicated VA-events webhook
-// so flight chatter can live in its own channel, falling back to the shared
-// DISCORD_WEBHOOK_URL. No-op (logged) if neither is configured.
-const sendVaEventDiscord = async (e) => {
-    const webhookUrl = process.env.VA_EVENTS_DISCORD_WEBHOOK_URL || process.env.DISCORD_WEBHOOK_URL;
-    if (!webhookUrl) {
-        console.log('[va-events] no Discord webhook configured — event dropped:', e.event, e.flightId);
-        return;
-    }
-
+// Build the Discord embed payload for one takeoff/landing. Shared by the central
+// feed and per-VA partner delivery so both channels render an identical card.
+const buildVaEventPayload = (e) => {
     const isTakeoff = e.event === 'takeoff';
     const va = e.va || {};
     const pos = e.position || {};
@@ -2242,7 +2274,7 @@ const sendVaEventDiscord = async (e) => {
     if (Number.isFinite(pos.gs_kt)) fields.push({ name: 'Ground speed', value: `${Math.round(pos.gs_kt)} kt`, inline: true });
     if (coords) fields.push({ name: 'Position', value: coords, inline: true });
 
-    const payload = {
+    return {
         embeds: [{
             title: `${isTakeoff ? '🛫 Takeoff' : '🛬 Landing'} — ${va.name || va.code || 'VA'}`,
             description: `**${e.callsign || 'Unknown'}** (${e.username || 'unknown pilot'}) ${isTakeoff ? 'departed' : 'landed'} on ${e.server || 'unknown server'}.`,
@@ -2252,8 +2284,59 @@ const sendVaEventDiscord = async (e) => {
             footer: { text: 'VA Flight Events' }
         }]
     };
+};
 
-    await axios.post(webhookUrl, payload);
+// Post a takeoff/landing to the VA that flew it, if that VA has self-configured a
+// Discord webhook in the portal. Matched on the event's VA code / callsign base
+// against the VA's stored callsigns; a non-match (or a VA that hasn't opted in)
+// is a silent no-op. Isolated try/catch so a partner's broken webhook never
+// affects the central post or the ack.
+const sendVaEventToPartner = async (e) => {
+    const codes = [e.va?.code, e.callsign]
+        .map(normalizeCallsignBase)
+        .filter(Boolean);
+    if (!codes.length) return;
+
+    let ad;
+    try {
+        ad = await VirtualAirlineAd.findOne({
+            callsigns: { $in: codes },
+            flightEventsApproved: true,   // staff-granted; requests alone don't deliver
+            flightEventsEnabled: true,
+            flightEventsWebhookUrl: { $ne: null },
+        }).select('name +flightEventsWebhookUrl').lean();
+    } catch (err) {
+        console.error('[va-events] partner lookup failed:', err.message);
+        return;
+    }
+    if (!ad || !ad.flightEventsWebhookUrl) return;
+
+    // Re-validate at send time: a URL stored before validation tightened, or a
+    // VA host that should no longer be trusted, must not be posted to blindly.
+    if (!isDiscordWebhookUrl(ad.flightEventsWebhookUrl)) {
+        console.warn('[va-events] partner webhook not a valid Discord webhook, skipping:', ad.name);
+        return;
+    }
+
+    try {
+        await axios.post(ad.flightEventsWebhookUrl, buildVaEventPayload(e));
+        console.log(`🔔 partner VA ${e.event} → ${ad.name} (${e.callsign})`);
+    } catch (err) {
+        console.error(`[va-events] partner webhook post failed for ${ad.name}:`, err.message);
+    }
+};
+
+// Announce a takeoff/landing to Discord. Prefers a dedicated VA-events webhook
+// so flight chatter can live in its own channel, falling back to the shared
+// DISCORD_WEBHOOK_URL. No-op (logged) if neither is configured.
+const sendVaEventDiscord = async (e) => {
+    const webhookUrl = process.env.VA_EVENTS_DISCORD_WEBHOOK_URL || process.env.DISCORD_WEBHOOK_URL;
+    if (!webhookUrl) {
+        console.log('[va-events] no Discord webhook configured — event dropped:', e.event, e.flightId);
+        return;
+    }
+
+    await axios.post(webhookUrl, buildVaEventPayload(e));
     console.log(`🔔 VA ${e.event}: ${e.callsign} (${e.username}) on ${e.server}`);
 };
 
@@ -2285,7 +2368,11 @@ const handleVaEvent = async (e) => {
         }
     }
 
-    await sendVaEventDiscord(e);
+    // Fan out to the central feed and (if the flying VA opted in) its own
+    // channel. Independent so one broken webhook can't suppress the other.
+    await sendVaEventDiscord(e).catch(err =>
+        console.error('[va-events] central Discord post failed:', err.message));
+    await sendVaEventToPartner(e);
 };
 
 // POST /api/va-events — receive a single takeoff/landing event from the ACARS

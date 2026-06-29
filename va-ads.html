@@ -257,6 +257,10 @@
                         <input type="checkbox" id="f_featured" class="w-5 h-5 rounded accent-amber-500">
                         <span class="text-sm font-semibold">Featured</span>
                     </label>
+                    <label class="flex items-center gap-2 py-2.5 cursor-pointer" title="Approve this VA to receive takeoff/landing events on their own Discord webhook">
+                        <input type="checkbox" id="f_flightEventsApproved" class="w-5 h-5 rounded accent-emerald-500">
+                        <span class="text-sm font-semibold">Flight events approved</span>
+                    </label>
                 </div>
             </form>
 
@@ -414,6 +418,7 @@
                 document.getElementById('f_status').value = ad.status || 'approved';
                 document.getElementById('f_recruiting').checked = !!ad.recruiting;
                 document.getElementById('f_featured').checked = !!ad.featured;
+                document.getElementById('f_flightEventsApproved').checked = !!ad.flightEventsApproved;
                 if (ad.bannerUrl) showPreview('bannerPreview','bannerPlaceholder', ad.bannerUrl);
                 if (ad.logoUrl) showPreview('logoPreview','logoPlaceholder', ad.logoUrl);
             } else {
@@ -422,6 +427,7 @@
                 document.getElementById('f_pilotCount').value = 0;
                 document.getElementById('f_recruiting').checked = true;
                 document.getElementById('f_status').value = 'approved';
+                document.getElementById('f_flightEventsApproved').checked = false;
             }
             document.getElementById('modal').classList.remove('hidden');
             document.body.style.overflow = 'hidden';
@@ -459,6 +465,7 @@
             add('status', document.getElementById('f_status').value);
             fd.append('recruiting', document.getElementById('f_recruiting').checked);
             fd.append('featured', document.getElementById('f_featured').checked);
+            fd.append('flightEventsApproved', document.getElementById('f_flightEventsApproved').checked);
             const banner = document.getElementById('bannerInput').files[0];
             const logo = document.getElementById('logoInput').files[0];
             if (banner) fd.append('banner', banner);
