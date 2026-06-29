@@ -2618,7 +2618,12 @@ const buildVaEventPayload = (e, media = {}) => {
     if (aircraftLine) fields.push({ name: '✈️ Aircraft', value: aircraftLine, inline: true });
     if (Number.isFinite(pos.alt_ft)) fields.push({ name: '📈 Altitude', value: `${Math.round(pos.alt_ft).toLocaleString()} ft`, inline: true });
     if (Number.isFinite(pos.gs_kt)) fields.push({ name: '💨 Ground speed', value: `${Math.round(pos.gs_kt)} kt`, inline: true });
-    if (coords) fields.push({ name: '📍 Position', value: geoLink ? `[${coords}](${geoLink})` : coords, inline: true });
+    // Plain coordinates — NOT a masked link. Raw URLs don't auto-linkify inside
+    // embed fields and masked links can be stripped by clients/AutoMod, which
+    // would leave ugly `[..](..)` markdown. The map stays reachable two ways that
+    // never depend on field-link support: the clickable title `url` below and the
+    // map image itself.
+    if (coords) fields.push({ name: '📍 Position', value: coords, inline: true });
 
     const embed = {
         author: {
