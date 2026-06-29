@@ -229,6 +229,51 @@ const VaTermsAcceptance = mongoose.models.VaTermsAcceptance
     || mongoose.model('VaTermsAcceptance', VaTermsAcceptanceSchema);
 
 /* =========================
+ * VA FLIGHT EVENT SCHEMA
+ *
+ * One document per takeoff/landing received at POST /api/va-events from the
+ * ACARS backend. We persist them so the staff hub can show a live "is this
+ * actually working?" feed (GET /api/va-events/recent) instead of the events
+ * only flashing past in Discord.
+ *
+ * The sender guarantees each (flightId, event) is delivered at most once, so no
+ * dedupe is required — but a unique compound index makes a buggy double-post a
+ * harmless no-op rather than a duplicate row. A TTL index prunes old events so
+ * the collection stays bounded without any maintenance.
+ * ========================= */
+const VaFlightEventSchema = new mongoose.Schema({
+    event:    { type: String, enum: ['takeoff', 'landing'], required: true },
+    flightId: { type: String, required: true },
+    va: {
+        code: { type: String, default: '' },
+        name: { type: String, default: '' },
+    },
+    callsign: { type: String, default: '' },
+    username: { type: String, default: '' },
+    server:   { type: String, default: '' },
+    position: {
+        lat: Number, lon: Number, alt_ft: Number,
+        gs_kt: Number, heading_deg: Number, lastReportMs: Number,
+    },
+    aircraft: {
+        aircraftId: String, liveryId: String,
+        aircraftName: String, liveryName: String,
+    },
+    // When the flight event actually happened (sender clock) vs when we stored it.
+    eventTimestamp: { type: Date, default: null },
+    receivedAt: { type: Date, default: Date.now },
+}, { timestamps: true });
+
+VaFlightEventSchema.index({ receivedAt: -1 });
+// Self-prune after 30 days so the feed collection never grows unbounded.
+VaFlightEventSchema.index({ receivedAt: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 });
+// Belt-and-braces dedupe: at most one row per (flightId, event).
+VaFlightEventSchema.index({ flightId: 1, event: 1 }, { unique: true });
+
+const VaFlightEvent = mongoose.models.VaFlightEvent
+    || mongoose.model('VaFlightEvent', VaFlightEventSchema);
+
+/* =========================
  * EMBED CONFIG SCHEMA
  *
  * Backs the Inflight embed widget (hosted at inflight.info/embed.html).
@@ -2090,6 +2135,164 @@ app.delete('/api/va-ads/:id', requireAuth, async (req, res) => {
     } catch (error) {
         console.error('VA Ad Delete Error:', error);
         res.status(500).json({ message: 'Server error while deleting VA advertisement.' });
+    }
+});
+
+/* =========================
+ * VA TAKEOFF / LANDING EVENTS
+ *
+ * Webhook receiver for the ACARS backend (see VA-ADMIN-MANUAL.md). The sender
+ * matches every VA by callsign and POSTs one event per takeoff and per landing
+ * to VA_BOT_FORWARD_URL=https://<this-server>/api/va-events.
+ *
+ * Contract from the sender side:
+ *   - Each (flightId, event) is sent AT MOST ONCE (deduped on the ACARS side,
+ *     even across restarts), so this receiver needs no dedupe of its own.
+ *   - Fire-and-forget: the sender does NOT retry and drops slow responses, so we
+ *     must ack with a 2xx fast and do the slow work (Discord post) asynchronously.
+ *   - If VA_BOT_FORWARD_TOKEN is set on the sender, requests carry
+ *     Authorization: Bearer <token>; we check it against the same env var here.
+ * ========================= */
+
+// Shared secret expected on inbound VA event requests. Optional: if unset, the
+// endpoint accepts unauthenticated posts (matches the sender leaving the token
+// blank). Keep this in sync with VA_BOT_FORWARD_TOKEN on the ACARS backend.
+const VA_EVENT_TOKEN = process.env.VA_BOT_FORWARD_TOKEN || null;
+
+// Announce a takeoff/landing to Discord. Prefers a dedicated VA-events webhook
+// so flight chatter can live in its own channel, falling back to the shared
+// DISCORD_WEBHOOK_URL. No-op (logged) if neither is configured.
+const sendVaEventDiscord = async (e) => {
+    const webhookUrl = process.env.VA_EVENTS_DISCORD_WEBHOOK_URL || process.env.DISCORD_WEBHOOK_URL;
+    if (!webhookUrl) {
+        console.log('[va-events] no Discord webhook configured — event dropped:', e.event, e.flightId);
+        return;
+    }
+
+    const isTakeoff = e.event === 'takeoff';
+    const va = e.va || {};
+    const pos = e.position || {};
+    const ac = e.aircraft || {};
+
+    // Compact "lat, lon" with a few decimals; omitted entirely if absent.
+    const coords = (Number.isFinite(pos.lat) && Number.isFinite(pos.lon))
+        ? `${pos.lat.toFixed(3)}, ${pos.lon.toFixed(3)}`
+        : null;
+
+    const fields = [
+        { name: 'Pilot', value: String(e.username || '—'), inline: true },
+        { name: 'Callsign', value: String(e.callsign || '—'), inline: true },
+        { name: 'Server', value: String(e.server || '—'), inline: true }
+    ];
+    if (ac.aircraftName) {
+        fields.push({
+            name: 'Aircraft',
+            value: ac.liveryName ? `${ac.aircraftName} (${ac.liveryName})` : ac.aircraftName,
+            inline: true
+        });
+    }
+    if (Number.isFinite(pos.alt_ft)) fields.push({ name: 'Altitude', value: `${Math.round(pos.alt_ft)} ft`, inline: true });
+    if (Number.isFinite(pos.gs_kt)) fields.push({ name: 'Ground speed', value: `${Math.round(pos.gs_kt)} kt`, inline: true });
+    if (coords) fields.push({ name: 'Position', value: coords, inline: true });
+
+    const payload = {
+        embeds: [{
+            title: `${isTakeoff ? '🛫 Takeoff' : '🛬 Landing'} — ${va.name || va.code || 'VA'}`,
+            description: `**${e.callsign || 'Unknown'}** (${e.username || 'unknown pilot'}) ${isTakeoff ? 'departed' : 'landed'} on ${e.server || 'unknown server'}.`,
+            color: isTakeoff ? 3066993 : 15844367, // green for takeoff, gold for landing
+            fields,
+            timestamp: new Date(Number(e.timestamp) || Date.now()).toISOString(),
+            footer: { text: 'VA Flight Events' }
+        }]
+    };
+
+    await axios.post(webhookUrl, payload);
+    console.log(`🔔 VA ${e.event}: ${e.callsign} (${e.username}) on ${e.server}`);
+};
+
+// Slow-path handler, run after we've already acked the sender. Anything that
+// can throw lives here so the route handler stays synchronous and fast.
+const handleVaEvent = async (e) => {
+    // Persist first so the staff feed reflects the event even when Discord is
+    // unconfigured or its webhook call fails. A duplicate (flightId, event)
+    // hits the unique index and is treated as a harmless no-op.
+    try {
+        await VaFlightEvent.create({
+            event: e.event,
+            flightId: e.flightId,
+            va: { code: e.va?.code || '', name: e.va?.name || '' },
+            callsign: e.callsign || '',
+            username: e.username || '',
+            server: e.server || '',
+            position: e.position || {},
+            aircraft: e.aircraft || {},
+            eventTimestamp: Number(e.timestamp) ? new Date(Number(e.timestamp)) : null,
+            receivedAt: new Date(),
+        });
+    } catch (err) {
+        if (err && err.code === 11000) {
+            console.log('[va-events] duplicate ignored:', e.event, e.flightId);
+        } else {
+            // Don't let a storage hiccup swallow the Discord post — log and continue.
+            console.error('[va-events] persist failed:', err.message);
+        }
+    }
+
+    await sendVaEventDiscord(e);
+};
+
+// POST /api/va-events — receive a single takeoff/landing event from the ACARS
+// backend. Public route (no staff auth) guarded by the optional shared secret;
+// the sender is an external service, not a logged-in user.
+app.post('/api/va-events', (req, res) => {
+    // Optional shared-secret check (matches VA_BOT_FORWARD_TOKEN on the sender).
+    if (VA_EVENT_TOKEN && req.get('authorization') !== `Bearer ${VA_EVENT_TOKEN}`) {
+        return res.sendStatus(401);
+    }
+
+    const e = req.body || {};
+    if ((e.event !== 'takeoff' && e.event !== 'landing') || !e.flightId) {
+        return res.sendStatus(400);
+    }
+
+    // Ack first so we never hold the fire-and-forget sender open, then do the
+    // slow work (Discord post) asynchronously — its outcome can't affect the ack.
+    res.sendStatus(204);
+
+    handleVaEvent(e).catch(err =>
+        console.error('[va-events] handler failed:', err.message));
+});
+
+// GET /api/va-events/recent — staff-only. Powers the "VA Flight Activity" panel
+// in the staff hub: a feed of recently received takeoffs/landings plus summary
+// counters, so staff can confirm at a glance that the ACARS sender is actually
+// reaching this receiver. Declared before any '/api/va-ads/:id'-style routes is
+// irrelevant here (different prefix), but it must precede the SPA catch-all.
+app.get('/api/va-events/recent', requireAuth, async (req, res) => {
+    try {
+        const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 30, 100));
+        const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+        const [events, total, takeoffs, landings, last24h, latest] = await Promise.all([
+            VaFlightEvent.find().sort({ receivedAt: -1 }).limit(limit).lean(),
+            VaFlightEvent.countDocuments({}),
+            VaFlightEvent.countDocuments({ event: 'takeoff' }),
+            VaFlightEvent.countDocuments({ event: 'landing' }),
+            VaFlightEvent.countDocuments({ receivedAt: { $gte: since24h } }),
+            VaFlightEvent.findOne().sort({ receivedAt: -1 }).select('receivedAt').lean(),
+        ]);
+
+        res.json({
+            events,
+            stats: {
+                total, takeoffs, landings, last24h,
+                lastReceivedAt: latest ? latest.receivedAt : null,
+                tokenProtected: !!VA_EVENT_TOKEN,
+            },
+        });
+    } catch (err) {
+        console.error('VA events recent error:', err);
+        res.status(500).json({ error: 'Could not load flight events.' });
     }
 });
 
