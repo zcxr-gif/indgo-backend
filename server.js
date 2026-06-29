@@ -2327,6 +2327,34 @@ app.get('/api/va-ads/flight-events/diagnose', requireAuth, async (req, res) => {
     }
 });
 
+// GET: Resolve the VA ad a code/callsign belongs to and return its flight-event
+// webhook status. STAFF. Lets the embed manager light up the webhook panel from
+// the embed's stored va.code alone — server-side, so it doesn't depend on the
+// client-side directory list (which is paged) re-finding the VA on reopen.
+app.get('/api/va-ads/flight-events/by-code', requireAuth, async (req, res) => {
+    try {
+        const code = String(req.query.code || '').trim();
+        if (!code) return res.status(400).json({ message: 'Pass ?code=…' });
+        const bases = [...new Set([normalizeCallsignBase(code), callsignAirlineBase(code)].filter(Boolean))];
+
+        const sel = '+flightEventsWebhookUrl name callsign callsigns flightEventsEnabled flightEventsApproved flightEventsRequestedAt';
+        // Prefer a base-callsign match; fall back to an exact (case-insensitive)
+        // name match so embeds linked by name still resolve.
+        let ad = bases.length
+            ? await VirtualAirlineAd.findOne({ callsigns: { $in: bases } }).select(sel).lean()
+            : null;
+        if (!ad) {
+            const escaped = code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            ad = await VirtualAirlineAd.findOne({ name: new RegExp('^' + escaped + '$', 'i') }).select(sel).lean();
+        }
+        if (!ad) return res.status(404).json({ message: 'No VA ad found for that code.', code, basesTried: bases });
+        res.json({ data: flightEventsStatus(ad) });
+    } catch (err) {
+        console.error('VA Ad flight-events by-code error:', err);
+        res.status(500).json({ message: 'Lookup failed.' });
+    }
+});
+
 // GET: Flight-event webhook status for one VA. STAFF. Backs the approval controls
 // on the staff home page and in the embed manager (which mirror the same webhook,
 // keyed to the VA ad — one source of truth, see VA-ADMIN-MANUAL.md).
