@@ -2411,7 +2411,7 @@ app.patch('/api/va-ads/:id/flight-events', requireAuth, async (req, res) => {
 app.post('/api/va-ads/:id/flight-events/test', requireAuth, async (req, res) => {
     try {
         const ad = await VirtualAirlineAd.findById(req.params.id)
-            .select('+flightEventsWebhookUrl name callsign callsigns');
+            .select('+flightEventsWebhookUrl name callsign callsigns logoUrl');
         if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
         if (!ad.flightEventsWebhookUrl) {
             return res.status(400).json({ message: 'No webhook saved for this VA yet.' });
@@ -2431,7 +2431,9 @@ app.post('/api/va-ads/:id/flight-events/test', requireAuth, async (req, res) => 
             position: { lat: 43.6777, lon: -79.6248, alt_ft: 4200, gs_kt: 250 },
             timestamp: Date.now(),
         };
-        await axios.post(ad.flightEventsWebhookUrl, buildVaEventPayload(sample));
+        const media = await enrichEventMedia(sample);
+        if (ad.logoUrl) media.vaLogoUrl = ad.logoUrl;
+        await axios.post(ad.flightEventsWebhookUrl, buildVaEventPayload(sample, media));
         res.json({ message: 'Test event sent — check the VA’s Discord channel.' });
     } catch (error) {
         const status = error.response && error.response.status;
@@ -2503,45 +2505,143 @@ app.delete('/api/va-ads/:id', requireAuth, async (req, res) => {
 // blank). Keep this in sync with VA_BOT_FORWARD_TOKEN on the ACARS backend.
 const VA_EVENT_TOKEN = process.env.VA_BOT_FORWARD_TOKEN || null;
 
+// Public origin used to reference our own static assets (e.g. the brand logo in
+// the embed footer). Override with PUBLIC_BASE_URL if the site isn't on the
+// default host; trailing slashes are trimmed so we can append paths safely.
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://inflight.info').replace(/\/+$/, '');
+
+// Build a static map image URL with a plane marker at the flight's position, so
+// the card literally shows WHERE the aircraft is. Prefers Mapbox (set
+// MAPBOX_STATIC_TOKEN) for a clean dark map + plane pin; falls back to the
+// key-less OpenStreetMap static renderer when no token is configured. Returns
+// null when we don't have usable coordinates.
+const flightMapImageUrl = (lat, lon, isTakeoff) => {
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    const la = lat.toFixed(4), lo = lon.toFixed(4);
+    const zoom = 6;
+    const token = process.env.MAPBOX_STATIC_TOKEN || process.env.MAPBOX_TOKEN;
+    if (token) {
+        // Mapbox expects lon,lat ordering. The maki "airport" glyph is a plane
+        // silhouette, so the marker itself reads as an aircraft on the map.
+        const color = isTakeoff ? '2ecc71' : 'f1c40f';
+        const marker = `pin-l-airport+${color}(${lo},${la})`;
+        return `https://api.mapbox.com/styles/v1/mapbox/dark-v11/static/${marker}/${lo},${la},${zoom},0/640x320@2x?access_token=${encodeURIComponent(token)}`;
+    }
+    // Key-less fallback (OSM static map service uses lat,lon ordering).
+    return `https://staticmap.openstreetmap.de/staticmap.php?center=${la},${lo}&zoom=${zoom}&size=640x320&maptype=mapnik&markers=${la},${lo},lightblue1`;
+};
+
+// Find a real community photo of the flown aircraft (type + livery) to use as the
+// card thumbnail — an actual "plane image" rather than a generic icon. Tries an
+// exact type+livery match first, then falls back to any photo of the same type.
+// Never throws: a lookup miss or DB hiccup just yields null (no thumbnail).
+const lookupAircraftPhoto = async (aircraftName, liveryName) => {
+    if (!aircraftName) return null;
+    const exact = (s) => new RegExp('^' + String(s).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i');
+    try {
+        const typeRx = exact(aircraftName);
+        let doc = liveryName
+            ? await CommunityAircraft.findOne({ aircraftType: typeRx, liveryName: exact(liveryName), imageUrl: { $ne: null } })
+                .select('imageUrl imageUrls').lean()
+            : null;
+        if (!doc) {
+            doc = await CommunityAircraft.findOne({ aircraftType: typeRx, imageUrl: { $ne: null } })
+                .select('imageUrl imageUrls').lean();
+        }
+        return doc ? (doc.imageUrl || (Array.isArray(doc.imageUrls) ? doc.imageUrls[0] : null)) : null;
+    } catch (err) {
+        console.error('[va-events] aircraft photo lookup failed:', err.message);
+        return null;
+    }
+};
+
+// Resolve the flying VA's logo (for the embed author icon) from the VA directory,
+// matched on the event's VA code / callsign base or exact name. Best-effort only.
+const lookupVaLogo = async (e) => {
+    try {
+        const bases = [...new Set([
+            normalizeCallsignBase(e.va?.code),
+            callsignAirlineBase(e.va?.code),
+            normalizeCallsignBase(e.callsign),
+            callsignAirlineBase(e.callsign),
+        ].filter(Boolean))];
+        const name = String(e.va?.name || e.va?.code || '').trim();
+        const or = [];
+        if (bases.length) or.push({ callsigns: { $in: bases } });
+        if (name) or.push({ name: new RegExp('^' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
+        if (!or.length) return null;
+        const ad = await VirtualAirlineAd.findOne({ $or: or }).select('logoUrl').lean();
+        return ad?.logoUrl || null;
+    } catch (err) {
+        console.error('[va-events] VA logo lookup failed:', err.message);
+        return null;
+    }
+};
+
+// Gather the async media (aircraft photo + VA logo) a card wants to render. Kept
+// separate from buildVaEventPayload so that function stays pure/synchronous.
+const enrichEventMedia = async (e) => {
+    const ac = e.aircraft || {};
+    const [aircraftImageUrl, vaLogoUrl] = await Promise.all([
+        lookupAircraftPhoto(ac.aircraftName, ac.liveryName),
+        lookupVaLogo(e),
+    ]);
+    return { aircraftImageUrl, vaLogoUrl };
+};
+
 // Build the Discord embed payload for one takeoff/landing. Shared by the central
 // feed and per-VA partner delivery so both channels render an identical card.
-const buildVaEventPayload = (e) => {
+// `media` carries the (already-resolved) aircraft photo + VA logo URLs.
+const buildVaEventPayload = (e, media = {}) => {
     const isTakeoff = e.event === 'takeoff';
     const va = e.va || {};
     const pos = e.position || {};
     const ac = e.aircraft || {};
+    const accent = isTakeoff ? 0x2ecc71 : 0xf1c40f; // green takeoff / gold landing
 
-    // Compact "lat, lon" with a few decimals; omitted entirely if absent.
-    const coords = (Number.isFinite(pos.lat) && Number.isFinite(pos.lon))
-        ? `${pos.lat.toFixed(3)}, ${pos.lon.toFixed(3)}`
+    const hasCoords = Number.isFinite(pos.lat) && Number.isFinite(pos.lon);
+    const coords = hasCoords ? `${pos.lat.toFixed(3)}, ${pos.lon.toFixed(3)}` : null;
+    const geoLink = hasCoords
+        ? `https://www.google.com/maps?q=${pos.lat.toFixed(5)},${pos.lon.toFixed(5)}`
+        : null;
+    const mapUrl = hasCoords ? flightMapImageUrl(pos.lat, pos.lon, isTakeoff) : null;
+
+    const aircraftLine = ac.aircraftName
+        ? (ac.liveryName ? `${ac.aircraftName} · ${ac.liveryName}` : ac.aircraftName)
         : null;
 
     const fields = [
-        { name: 'Pilot', value: String(e.username || '—'), inline: true },
-        { name: 'Callsign', value: String(e.callsign || '—'), inline: true },
-        { name: 'Server', value: String(e.server || '—'), inline: true }
+        { name: '👤 Pilot', value: String(e.username || '—'), inline: true },
+        { name: '📡 Callsign', value: String(e.callsign || '—'), inline: true },
+        { name: '🌐 Server', value: String(e.server || '—'), inline: true },
     ];
-    if (ac.aircraftName) {
-        fields.push({
-            name: 'Aircraft',
-            value: ac.liveryName ? `${ac.aircraftName} (${ac.liveryName})` : ac.aircraftName,
-            inline: true
-        });
-    }
-    if (Number.isFinite(pos.alt_ft)) fields.push({ name: 'Altitude', value: `${Math.round(pos.alt_ft)} ft`, inline: true });
-    if (Number.isFinite(pos.gs_kt)) fields.push({ name: 'Ground speed', value: `${Math.round(pos.gs_kt)} kt`, inline: true });
-    if (coords) fields.push({ name: 'Position', value: coords, inline: true });
+    if (aircraftLine) fields.push({ name: '✈️ Aircraft', value: aircraftLine, inline: true });
+    if (Number.isFinite(pos.alt_ft)) fields.push({ name: '📈 Altitude', value: `${Math.round(pos.alt_ft).toLocaleString()} ft`, inline: true });
+    if (Number.isFinite(pos.gs_kt)) fields.push({ name: '💨 Ground speed', value: `${Math.round(pos.gs_kt)} kt`, inline: true });
+    if (coords) fields.push({ name: '📍 Position', value: geoLink ? `[${coords}](${geoLink})` : coords, inline: true });
 
-    return {
-        embeds: [{
-            title: `${isTakeoff ? '🛫 Takeoff' : '🛬 Landing'} — ${va.name || va.code || 'VA'}`,
-            description: `**${e.callsign || 'Unknown'}** (${e.username || 'unknown pilot'}) ${isTakeoff ? 'departed' : 'landed'} on ${e.server || 'unknown server'}.`,
-            color: isTakeoff ? 3066993 : 15844367, // green for takeoff, gold for landing
-            fields,
-            timestamp: new Date(Number(e.timestamp) || Date.now()).toISOString(),
-            footer: { text: 'VA Flight Events' }
-        }]
+    const embed = {
+        author: {
+            name: `${va.name || va.code || 'Virtual Airline'} · ${isTakeoff ? 'Departure' : 'Arrival'}`,
+            ...(media.vaLogoUrl ? { icon_url: media.vaLogoUrl } : {}),
+        },
+        title: `${isTakeoff ? '🛫' : '🛬'}  ${e.callsign || 'Unknown flight'}`,
+        ...(geoLink ? { url: geoLink } : {}),
+        description: `**${e.username || 'A pilot'}** ${isTakeoff ? 'just departed' : 'just landed'} on **${e.server || 'unknown'}**`
+            + (aircraftLine ? ` flying the **${ac.aircraftName}**.` : '.'),
+        color: accent,
+        fields,
+        timestamp: new Date(Number(e.timestamp) || Date.now()).toISOString(),
+        footer: { text: 'Inflight · VA Flight Events', icon_url: `${PUBLIC_BASE_URL}/assets/brand/inflight-logo.png` },
     };
+
+    // Big image: the map with a plane marker showing exactly where the flight is.
+    if (mapUrl) embed.image = { url: mapUrl };
+    // Thumbnail: a real photo of the aircraft when we have one, else the VA logo.
+    const thumb = media.aircraftImageUrl || media.vaLogoUrl || null;
+    if (thumb) embed.thumbnail = { url: thumb };
+
+    return { embeds: [embed] };
 };
 
 // Post a takeoff/landing to the VA that flew it, if that VA has self-configured a
@@ -2578,7 +2678,7 @@ const sendVaEventToPartner = async (e) => {
                 { flightEventsEnabled: true },
                 { flightEventsWebhookUrl: { $ne: null } },
             ],
-        }).select('name +flightEventsWebhookUrl').lean();
+        }).select('name logoUrl +flightEventsWebhookUrl').lean();
     } catch (err) {
         console.error('[va-events] partner lookup failed:', err.message);
         return;
@@ -2599,7 +2699,10 @@ const sendVaEventToPartner = async (e) => {
     }
 
     try {
-        await axios.post(ad.flightEventsWebhookUrl, buildVaEventPayload(e));
+        const media = await enrichEventMedia(e);
+        // The matched VA owns this card — prefer its own logo for the author icon.
+        if (ad.logoUrl) media.vaLogoUrl = ad.logoUrl;
+        await axios.post(ad.flightEventsWebhookUrl, buildVaEventPayload(e, media));
         console.log(`🔔 partner VA ${e.event} → ${ad.name} (${e.callsign})`);
     } catch (err) {
         console.error(`[va-events] partner webhook post failed for ${ad.name}:`, err.message);
@@ -2616,7 +2719,8 @@ const sendVaEventDiscord = async (e) => {
         return;
     }
 
-    await axios.post(webhookUrl, buildVaEventPayload(e));
+    const media = await enrichEventMedia(e);
+    await axios.post(webhookUrl, buildVaEventPayload(e, media));
     console.log(`🔔 VA ${e.event}: ${e.callsign} (${e.username}) on ${e.server}`);
 };
 
