@@ -2426,7 +2426,9 @@ app.post('/api/va-ads/:id/flight-events/test', requireAuth, async (req, res) => 
             va: { code: base, name: ad.name || base },
             callsign: `${base} 01`,
             username: 'Test Pilot',
-            server: 'Expert',
+            server: 'Expert Server',
+            departureIcao: 'CYYZ',
+            arrivalIcao: 'EGLL',
             aircraft: { aircraftName: 'Boeing 737-800', liveryName: 'Test Livery' },
             position: { lat: 43.6777, lon: -79.6248, alt_ft: 4200, gs_kt: 250 },
             timestamp: Date.now(),
@@ -2509,6 +2511,30 @@ const VA_EVENT_TOKEN = process.env.VA_BOT_FORWARD_TOKEN || null;
 // can be unit-tested in isolation and shared verbatim by every delivery path. The
 // DB-backed media lookups that feed it (aircraft photo, VA logo) stay here.
 const { buildVaEventPayload } = require('./vaEventCard');
+const airportData = require('airport-data-js'); // offline ICAO → coordinates/name
+
+// Resolve an ICAO to { icao, lat, lon, name } for the route map, or null when the
+// code is missing/unknown. Results are memoised for the process lifetime — the
+// airport dataset is static, so there's no reason to re-parse it per event.
+const _airportCache = new Map();
+const lookupAirport = async (icao) => {
+    const code = String(icao || '').toUpperCase().trim();
+    if (!/^[A-Z0-9]{3,4}$/.test(code)) return null; // not a plausible ICAO
+    if (_airportCache.has(code)) return _airportCache.get(code);
+    let result = null;
+    try {
+        const rows = await airportData.getAirportByIcao(code);
+        const a = Array.isArray(rows) ? rows[0] : rows;
+        const lat = Number(a && a.latitude), lon = Number(a && a.longitude);
+        if (Number.isFinite(lat) && Number.isFinite(lon)) {
+            result = { icao: code, lat, lon, name: (a.airport || '').trim() || null };
+        }
+    } catch (err) {
+        console.error('[va-events] airport lookup failed for', code, '-', err.message);
+    }
+    _airportCache.set(code, result);
+    return result;
+};
 
 // Find a real community photo of the flown aircraft (type + livery) to use as the
 // card thumbnail — an actual "plane image" rather than a generic icon. Tries an
@@ -2561,11 +2587,13 @@ const lookupVaLogo = async (e) => {
 // separate from buildVaEventPayload so that function stays pure/synchronous.
 const enrichEventMedia = async (e) => {
     const ac = e.aircraft || {};
-    const [aircraftImageUrl, vaLogoUrl] = await Promise.all([
+    const [aircraftImageUrl, vaLogoUrl, departure, arrival] = await Promise.all([
         lookupAircraftPhoto(ac.aircraftName, ac.liveryName),
         lookupVaLogo(e),
+        lookupAirport(e.departureIcao),
+        lookupAirport(e.arrivalIcao),
     ]);
-    return { aircraftImageUrl, vaLogoUrl };
+    return { aircraftImageUrl, vaLogoUrl, departure, arrival };
 };
 
 // Post a takeoff/landing to the VA that flew it, if that VA has self-configured a
