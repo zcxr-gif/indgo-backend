@@ -145,7 +145,13 @@ const VA_AD_TYPES = ['VA', 'VO']; // Virtual Airline vs Virtual Organization (IF
 const VirtualAirlineAdSchema = new mongoose.Schema({
     // --- Identity ---
     name: { type: String, required: true, unique: true, trim: true },
+    // Primary radio callsign base, kept for back-compat with everything that
+    // reads a single callsign (bot matching, embeds, indexes). Always mirrors
+    // callsigns[0] when any callsigns are set (see the pre-save hook below).
     callsign: { type: String, trim: true, uppercase: true, default: null }, // e.g. "IGO", "SPEEDBIRD"
+    // A VA may fly under several callsigns (e.g. a parent brand + sub-fleets).
+    // The first entry is treated as the primary and synced into `callsign`.
+    callsigns: { type: [String], default: [] },
     type: { type: String, enum: VA_AD_TYPES, default: 'VA' },
 
     // --- Copy ---
@@ -207,9 +213,27 @@ VirtualAirlineAdSchema.index({ callsign: 1 });
 VirtualAirlineAdSchema.index({ hubs: 1 });
 VirtualAirlineAdSchema.index({ name: 'text', tagline: 'text', description: 'text', tags: 'text' });
 
-// Keep updatedAt fresh on every save.
+// Keep updatedAt fresh, and keep the single `callsign` field and the
+// `callsigns` list reconciled so older code (which reads `callsign`) and newer
+// code (which reads the array) always agree. callsigns[0] is the primary.
 VirtualAirlineAdSchema.pre('save', function (next) {
     this.updatedAt = new Date();
+    if (Array.isArray(this.callsigns) && this.callsigns.length) {
+        // Normalise, de-dupe (case-insensitive), and drop blanks.
+        const seen = new Set();
+        const cleaned = [];
+        for (const c of this.callsigns) {
+            const norm = normalizeCallsignBase(c);
+            if (norm && !seen.has(norm)) { seen.add(norm); cleaned.push(norm); }
+        }
+        this.callsigns = cleaned;
+        this.callsign = cleaned[0] || null;
+    } else if (this.callsign) {
+        // Back-fill the array from a legacy single callsign.
+        this.callsigns = [this.callsign];
+    } else {
+        this.callsigns = [];
+    }
     next();
 });
 
@@ -682,7 +706,7 @@ const hashIp = (ip) => {
 registerAuthRoutes(app);
 
 // VA Partnership Portal routes (partner login/submissions/team + staff oversight).
-registerVaPortalRoutes(app, { VirtualAirlineAd, s3Client, upload });
+registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage });
 
 // Health Check — public, unauthenticated (for uptime/platform monitors).
 // NOTE: the site is staff-only, so the homepage ("/") is gated below; point any
@@ -1968,7 +1992,11 @@ app.post('/api/va-ads', requireAuth, uploadVaImages, async (req, res) => {
             return res.status(409).json({ message: 'A VA with that name has already been submitted.' });
         }
 
-        const callsign = normalizeCallsignBase(req.body.callsign);
+        // Accept either a single `callsign` or a `callsigns` list (the new
+        // multi-callsign field). The pre-save hook reconciles the two.
+        const callsigns = parseListField(req.body.callsigns).map(normalizeCallsignBase).filter(Boolean);
+        const callsign = normalizeCallsignBase(req.body.callsign) || callsigns[0] || null;
+        if (callsign && !callsigns.length) callsigns.push(callsign);
         const ref = callsign || name;
         const bannerUrl = bannerFile ? await uploadVaImage(s3Client, bannerFile, ref, 'banner') : null;
         const logoUrl = logoFile ? await uploadVaImage(s3Client, logoFile, ref, 'logo') : null;
@@ -1976,6 +2004,7 @@ app.post('/api/va-ads', requireAuth, uploadVaImages, async (req, res) => {
         const ad = new VirtualAirlineAd({
             name: name.trim(),
             callsign,
+            callsigns,
             type: VA_AD_TYPES.includes(req.body.type) ? req.body.type : 'VA',
             tagline: req.body.tagline,
             description: req.body.description,
@@ -2043,6 +2072,14 @@ app.put('/api/va-ads/:id', requireAuth, uploadVaImages, async (req, res) => {
         // Scalar/text fields: only overwrite when the key is present in the body.
         const b = req.body;
         if (b.name !== undefined) ad.name = b.name.trim();
+        // callsigns[] is authoritative; a lone legacy `callsign` maps into it so
+        // the pre-save reconciliation doesn't silently revert the edit.
+        if (b.callsigns !== undefined) {
+            ad.callsigns = parseListField(b.callsigns).map(normalizeCallsignBase).filter(Boolean);
+        } else if (b.callsign !== undefined) {
+            const cs = normalizeCallsignBase(b.callsign);
+            ad.callsigns = cs ? [cs] : [];
+        }
         if (b.callsign !== undefined) ad.callsign = normalizeCallsignBase(b.callsign);
         if (b.type !== undefined && VA_AD_TYPES.includes(b.type)) ad.type = b.type;
         if (b.tagline !== undefined) ad.tagline = b.tagline;
