@@ -443,7 +443,16 @@ async function uploadSubmissionFile(s3Client, file) {
  * @param {Function} [deps.uploadVaImage] (s3Client, file, ref, kind) => url
  * @param {Function} [deps.deleteVaImage] (s3Client, url) => Promise
  */
-function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage }) {
+function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl }) {
+    // Webhook URLs are secrets, so the profile API never echoes one back in full.
+    // Surface just enough for the owner to recognise what's saved: the trailing
+    // chars of the webhook id. Defensive against malformed stored values.
+    const maskWebhookUrl = (url) => {
+        if (!url) return '';
+        const m = String(url).match(/webhooks\/(\d+)/);
+        const id = m && m[1];
+        return id ? `…/webhooks/${id.slice(-4).padStart(id.length > 4 ? 8 : id.length, '•')}/…` : '…';
+    };
     // multipart parser for the VA-profile editor (optional new logo + banner).
     const uploadVaProfileImages = upload.fields([
         { name: 'logo', maxCount: 1 },
@@ -491,6 +500,11 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, 
             minGrade: ad.minGrade || null,
             requirements: ad.requirements || '',
             status: ad.status,
+            // Flight-event delivery (self-serve). Never return the raw webhook —
+            // only whether one is set, a masked hint, and the on/off toggle.
+            flightEventsConfigured: !!ad.flightEventsWebhookUrl,
+            flightEventsEnabled: !!ad.flightEventsEnabled,
+            flightEventsWebhookHint: ad.flightEventsWebhookUrl ? maskWebhookUrl(ad.flightEventsWebhookUrl) : '',
         };
     };
 
@@ -620,6 +634,26 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, 
             if (b.discordUrl !== undefined) ad.discordUrl = String(b.discordUrl).trim() || null;
             if (b.ifcThreadUrl !== undefined) ad.ifcThreadUrl = String(b.ifcThreadUrl).trim() || null;
             if (b.applicationUrl !== undefined) ad.applicationUrl = String(b.applicationUrl).trim() || null;
+            // Flight-event delivery: the VA's own Discord webhook for its
+            // takeoffs/landings, plus an on/off toggle that preserves the saved
+            // URL. Validate the host so this can't become an open POST relay.
+            if (b.flightEventsEnabled !== undefined) {
+                ad.flightEventsEnabled = b.flightEventsEnabled !== 'false' && b.flightEventsEnabled !== false;
+            }
+            if (b.flightEventsWebhookUrl !== undefined) {
+                const raw = String(b.flightEventsWebhookUrl).trim();
+                if (!raw) {
+                    ad.flightEventsWebhookUrl = null;
+                } else if (typeof isDiscordWebhookUrl === 'function' && !isDiscordWebhookUrl(raw)) {
+                    cleanup();
+                    return res.status(400).json({ error: 'That doesn’t look like a Discord webhook URL. It should look like https://discord.com/api/webhooks/…' });
+                } else {
+                    ad.flightEventsWebhookUrl = raw;
+                    // First time a webhook is added, default delivery to on unless
+                    // the same request explicitly turned it off.
+                    if (b.flightEventsEnabled === undefined) ad.flightEventsEnabled = true;
+                }
+            }
             // List fields.
             if (b.callsigns !== undefined) ad.callsigns = parseList(b.callsigns); // pre-save normalises + syncs callsign
             if (b.hubs !== undefined) ad.hubs = parseList(b.hubs).map(h => h.toUpperCase());
