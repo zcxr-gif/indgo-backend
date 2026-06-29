@@ -2278,6 +2278,55 @@ const flightEventsStatus = (ad) => ({
     requestedAt: ad.flightEventsRequestedAt || null,
 });
 
+// GET: Diagnose why a live callsign did/didn't deliver to a partner webhook.
+// STAFF. Paste the exact callsign you saw flying and this reports the bases we
+// reduce it to, the VA that owns one of those bases (ignoring the opt-in gates),
+// and the precise gate that's blocking delivery — so a silent miss becomes a
+// one-line answer. Declared before '/api/va-ads/:id/...' but the 'flight-events'
+// literal segment keeps the two from colliding.
+app.get('/api/va-ads/flight-events/diagnose', requireAuth, async (req, res) => {
+    try {
+        const callsign = String(req.query.callsign || '').trim();
+        if (!callsign) {
+            return res.status(400).json({ message: 'Pass ?callsign=… (the live callsign you saw flying).' });
+        }
+        const basesTried = [...new Set([
+            normalizeCallsignBase(callsign),
+            callsignAirlineBase(callsign),
+        ].filter(Boolean))];
+
+        const ad = await VirtualAirlineAd.findOne({ callsigns: { $in: basesTried } })
+            .select('+flightEventsWebhookUrl name callsigns flightEventsApproved flightEventsEnabled flightEventsRequestedAt')
+            .lean();
+
+        if (!ad) {
+            return res.json({
+                callsign, basesTried, matched: false, reason: 'no_va_owns_this_callsign',
+                hint: 'No VA in the directory has any of these base callsigns. Check the VA’s stored callsign(s) — they must be the base, e.g. "OCEAN".',
+            });
+        }
+
+        const configured = !!ad.flightEventsWebhookUrl;
+        let reason = 'would_deliver';
+        if (!configured) reason = 'no_webhook_saved';
+        else if (!ad.flightEventsApproved) reason = 'not_approved';
+        else if (!ad.flightEventsEnabled) reason = 'disabled';
+
+        res.json({
+            callsign, basesTried, matched: true,
+            va: { id: ad._id, name: ad.name, callsigns: ad.callsigns || [] },
+            approved: !!ad.flightEventsApproved,
+            enabled: !!ad.flightEventsEnabled,
+            configured,
+            webhookHint: maskWebhookUrl(ad.flightEventsWebhookUrl),
+            reason,
+        });
+    } catch (err) {
+        console.error('VA Ad flight-events diagnose error:', err);
+        res.status(500).json({ message: 'Diagnose failed.' });
+    }
+});
+
 // GET: Flight-event webhook status for one VA. STAFF. Backs the approval controls
 // on the staff home page and in the embed manager (which mirror the same webhook,
 // keyed to the VA ad — one source of truth, see VA-ADMIN-MANUAL.md).
