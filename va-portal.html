@@ -7,6 +7,8 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <script>tailwind.config = { darkMode: 'class' };</script>
+    <!-- Apply the saved theme before paint so there's no light/dark flash. -->
+    <script>(function(){try{var t=localStorage.getItem('va_portal_theme');document.documentElement.classList.toggle('dark', t!=='light');}catch(e){document.documentElement.classList.add('dark');}})();</script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
         :root { color-scheme: light dark; }
@@ -16,10 +18,17 @@
         svg.lucide { stroke-width: 1.75; }
         .surface { background: #fff; border: 1px solid rgba(0,0,0,.06); box-shadow: 0 1px 2px rgba(0,0,0,.03), 0 1px 1px rgba(0,0,0,.02); }
         .dark .surface { background: #18181b; border-color: rgba(255,255,255,.07); box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+        .lift { transition: transform .25s cubic-bezier(.2,.8,.2,1), box-shadow .25s, border-color .25s; }
+        .lift:hover { transform: translateY(-3px); box-shadow: 0 18px 40px -18px rgba(0,0,0,.25); border-color: rgba(0,0,0,.14); }
+        .dark .lift:hover { border-color: rgba(255,255,255,.18); box-shadow: 0 18px 50px -20px rgba(0,0,0,.7); }
         .loader { border: 2.5px solid rgba(120,120,128,.25); border-top-color: currentColor; border-radius: 50%; width: 30px; height: 30px; animation: spin .7s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
         .fade-in { animation: fade .4s cubic-bezier(.2,.8,.2,1) forwards; }
         @keyframes fade { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        /* Floating partner-logo halo behind the login card */
+        @keyframes floaty { 0%,100% { transform: translate(-50%, -50%); } 50% { transform: translate(-50%, calc(-50% - 10px)); } }
+        .halo-logo { animation: floaty 7s ease-in-out infinite; }
+        .partner-chip { animation: fade .5s cubic-bezier(.2,.8,.2,1) backwards; }
         .hub-bg { background-image: radial-gradient(rgba(0,0,0,.025) 1px, transparent 1px); background-size: 22px 22px; }
         .dark .hub-bg { background-image: radial-gradient(rgba(255,255,255,.03) 1px, transparent 1px); }
         input, select, textarea { font-family: inherit; }
@@ -31,6 +40,11 @@
         .btn { background: #18181b; color: #fff; padding: .625rem 1rem; border-radius: .75rem; font-size: .875rem; font-weight: 600; transition: .15s; }
         .dark .btn { background: #fafafa; color: #18181b; }
         .btn:hover { opacity: .9; } .btn:active { transform: scale(.98); }
+        .btn[disabled] { opacity: .5; cursor: not-allowed; }
+        /* Segmented tab nav */
+        .tab { padding: .5rem .9rem; border-radius: .75rem; font-size: .8125rem; font-weight: 600; color: #71717a; transition: .15s; white-space: nowrap; display: inline-flex; align-items: center; gap: .4rem; }
+        .tab:hover { color: #18181b; } .dark .tab:hover { color: #fafafa; }
+        .tab.active { background: #18181b; color: #fff; } .dark .tab.active { background: #fafafa; color: #18181b; }
     </style>
 </head>
 <body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 antialiased min-h-screen transition-colors duration-300">
@@ -42,8 +56,14 @@
     </div>
 
     <!-- ============ LOGIN ============ -->
-    <div id="loginView" class="hidden min-h-screen hub-bg flex items-center justify-center px-5">
-        <div class="w-full max-w-sm fade-in">
+    <div id="loginView" class="hidden min-h-screen hub-bg relative overflow-hidden flex items-center justify-center px-5">
+        <!-- Floating constellation of partnered-VA logos, filled by loadPartnerLogos() -->
+        <div id="partnerHalo" class="pointer-events-none absolute inset-0 z-0"></div>
+
+        <!-- Theme toggle (top-right) -->
+        <button onclick="toggleTheme()" title="Toggle theme" class="absolute top-5 right-5 z-20 w-10 h-10 grid place-items-center rounded-full surface text-zinc-600 dark:text-zinc-300 hover:scale-105 transition"><span id="loginThemeIcon"></span></button>
+
+        <div class="relative z-10 w-full max-w-sm fade-in">
             <div class="text-center mb-8">
                 <div class="w-16 h-16 rounded-2xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 flex items-center justify-center mx-auto mb-5 shadow-lg shadow-zinc-900/10">
                     <i data-lucide="handshake" class="w-8 h-8"></i>
@@ -60,38 +80,77 @@
             <p class="text-center text-xs text-zinc-400 dark:text-zinc-600 mt-6">
                 Are you Inflight staff? <a href="/staff" class="underline hover:text-zinc-600 dark:hover:text-zinc-300">Staff hub</a>
             </p>
+
+            <!-- Partnered VA logos (crisp strip under the card) -->
+            <div id="partnerStrip" class="hidden mt-9">
+                <div class="flex items-center gap-3 mb-4">
+                    <div class="h-px flex-1 bg-zinc-200 dark:bg-zinc-800"></div>
+                    <p class="text-[11px] font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-600">Our partnered VAs</p>
+                    <div class="h-px flex-1 bg-zinc-200 dark:bg-zinc-800"></div>
+                </div>
+                <div id="partnerLogos" class="flex flex-wrap items-center justify-center gap-2.5"></div>
+            </div>
         </div>
     </div>
 
     <!-- ============ DASHBOARD ============ -->
-    <div id="dashView" class="hidden max-w-4xl mx-auto px-5 py-8">
-        <!-- Header -->
-        <header class="flex items-center justify-between mb-8 fade-in">
-            <div class="flex items-center gap-3">
-                <div class="w-11 h-11 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 grid place-items-center"><i data-lucide="handshake" class="w-5 h-5"></i></div>
-                <div>
-                    <h1 id="vaName" class="text-lg font-bold tracking-tight leading-tight">—</h1>
-                    <p class="text-xs text-zinc-500 dark:text-zinc-400"><span id="acctName">—</span> · <span id="acctRole" class="capitalize">—</span></p>
+    <div id="dashView" class="hidden max-w-4xl mx-auto px-5 py-6">
+
+        <!-- Banner hero with logo avatar overlay -->
+        <section class="fade-in mb-5">
+            <div class="surface rounded-3xl overflow-hidden">
+                <div id="heroBanner" class="relative h-36 sm:h-48 bg-gradient-to-br from-zinc-200 to-zinc-300 dark:from-zinc-800 dark:to-zinc-900 bg-cover bg-center">
+                    <div class="absolute inset-0 bg-gradient-to-t from-black/55 via-black/10 to-transparent"></div>
+                    <!-- Top-right controls -->
+                    <div class="absolute top-3 right-3 flex items-center gap-2">
+                        <button onclick="toggleTheme()" title="Toggle theme" class="w-9 h-9 grid place-items-center rounded-full bg-white/85 dark:bg-zinc-900/80 backdrop-blur text-zinc-700 dark:text-zinc-200 hover:scale-105 transition shadow"><span id="dashThemeIcon"></span></button>
+                        <button onclick="logout()" title="Sign out" class="w-9 h-9 grid place-items-center rounded-full bg-white/85 dark:bg-zinc-900/80 backdrop-blur text-zinc-700 dark:text-zinc-200 hover:scale-105 transition shadow"><i data-lucide="log-out" class="w-4 h-4"></i></button>
+                    </div>
+                </div>
+                <div class="px-5 sm:px-7 pb-5">
+                    <div class="flex items-end gap-4 -mt-10 sm:-mt-12">
+                        <div id="heroLogo" class="w-20 h-20 sm:w-24 sm:h-24 rounded-2xl bg-white dark:bg-zinc-900 border border-black/5 dark:border-white/10 shadow-lg grid place-items-center overflow-hidden shrink-0">
+                            <i data-lucide="handshake" class="w-9 h-9 text-zinc-400"></i>
+                        </div>
+                        <div class="pb-1 min-w-0">
+                            <h1 id="vaName" class="text-xl sm:text-2xl font-extrabold tracking-tight leading-tight truncate">—</h1>
+                            <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
+                                Signed in as <span id="acctName" class="font-medium text-zinc-700 dark:text-zinc-200">—</span> · <span id="acctRole" class="capitalize">—</span>
+                            </p>
+                        </div>
+                    </div>
+                    <div id="callsignChips" class="flex flex-wrap gap-1.5 mt-3"></div>
                 </div>
             </div>
-            <button onclick="logout()" class="flex items-center gap-2 text-sm font-medium text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition"><i data-lucide="log-out" class="w-4 h-4"></i> Sign out</button>
-        </header>
+        </section>
 
         <!-- Must-change-password banner -->
-        <div id="pwBanner" class="hidden mb-6 surface rounded-2xl p-4 border-amber-300/60 bg-amber-50/60 dark:bg-amber-500/5 fade-in">
-            <p class="text-sm text-amber-700 dark:text-amber-300 flex items-center gap-2"><i data-lucide="alert-triangle" class="w-4 h-4"></i> You're using a temporary password. Please set your own in <button onclick="scrollToAccount()" class="underline font-semibold">Account</button>.</p>
+        <div id="pwBanner" class="hidden mb-5 surface rounded-2xl p-4 border-amber-300/60 bg-amber-50/60 dark:bg-amber-500/5 fade-in">
+            <p class="text-sm text-amber-700 dark:text-amber-300 flex items-center gap-2"><i data-lucide="alert-triangle" class="w-4 h-4"></i> You're using a temporary password. Please set your own in <button onclick="switchTab('account')" class="underline font-semibold">Account</button>.</p>
         </div>
 
-        <!-- Submit anything -->
-        <section class="mb-8 fade-in">
-            <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-3">Submit to Inflight</h2>
-            <form id="subForm" class="surface rounded-2xl p-6 space-y-3">
+        <!-- Tab nav -->
+        <nav class="surface rounded-2xl p-1.5 mb-6 flex items-center gap-1 overflow-x-auto fade-in">
+            <button class="tab active" data-tab="submit" onclick="switchTab('submit')"><i data-lucide="send" class="w-4 h-4"></i> Submit</button>
+            <button class="tab" data-tab="events" onclick="switchTab('events')"><i data-lucide="calendar" class="w-4 h-4"></i> Events</button>
+            <button class="tab" data-tab="profile" onclick="switchTab('profile')"><i data-lucide="building-2" class="w-4 h-4"></i> VA Profile</button>
+            <button class="tab" data-tab="embed" onclick="switchTab('embed')"><i data-lucide="code-2" class="w-4 h-4"></i> Embed</button>
+            <button id="tabTeamBtn" class="tab hidden" data-tab="team" onclick="switchTab('team')"><i data-lucide="users" class="w-4 h-4"></i> Team</button>
+            <button class="tab" data-tab="account" onclick="switchTab('account')"><i data-lucide="user-cog" class="w-4 h-4"></i> Account</button>
+        </nav>
+
+        <!-- ===== TAB: SUBMIT ===== -->
+        <section id="panel-submit" class="tab-panel">
+            <div class="mb-3">
+                <h2 class="text-base font-bold tracking-tight">Submit to Inflight</h2>
+                <p class="text-sm text-zinc-500 dark:text-zinc-400">Send us anything — documents, requests, reports, feedback or files. We'll triage it and follow up.</p>
+            </div>
+            <form id="subForm" class="surface rounded-2xl p-6 space-y-3 mb-6">
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
                     <select id="subCategory" class="field sm:col-span-1">
                         <option value="document">Document</option>
                         <option value="request">Request</option>
                         <option value="report">Report</option>
-                        <option value="event">Event</option>
                         <option value="feedback">Feedback</option>
                         <option value="other" selected>Other</option>
                     </select>
@@ -108,21 +167,21 @@
                     <p id="subMsg" class="hidden text-sm font-medium"></p>
                 </div>
             </form>
-        </section>
 
-        <!-- Submissions list -->
-        <section class="mb-8 fade-in">
             <div class="flex items-center justify-between mb-3">
-                <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Your submissions</h2>
+                <h2 class="text-base font-bold tracking-tight">Your submissions</h2>
                 <button onclick="loadSubmissions()" title="Refresh" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500 transition"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
             </div>
             <div id="subList" class="space-y-3"><div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400">Loading…</div></div>
         </section>
 
-        <!-- Events -->
-        <section class="mb-8 fade-in">
-            <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-3">Events</h2>
-            <form id="evForm" class="surface rounded-2xl p-6 space-y-3 mb-3">
+        <!-- ===== TAB: EVENTS ===== -->
+        <section id="panel-events" class="tab-panel hidden">
+            <div class="mb-3">
+                <h2 class="text-base font-bold tracking-tight">Schedule an event</h2>
+                <p class="text-sm text-zinc-500 dark:text-zinc-400">Group flights, fly-ins and briefings for your VA. Events auto-clear two weeks after they run.</p>
+            </div>
+            <form id="evForm" class="surface rounded-2xl p-6 space-y-3 mb-6">
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <input id="evTitle" type="text" placeholder="Event title" required maxlength="120" class="field">
                     <input id="evWhen" type="datetime-local" required class="field">
@@ -134,15 +193,147 @@
                     <p id="evMsg" class="hidden text-sm font-medium"></p>
                 </div>
             </form>
+            <div class="flex items-center justify-between mb-3">
+                <h2 class="text-base font-bold tracking-tight">Upcoming events</h2>
+                <button onclick="loadEvents()" title="Refresh" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500 transition"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+            </div>
             <div id="evList" class="space-y-2"><div class="surface rounded-2xl p-5 text-center text-sm text-zinc-400">Loading…</div></div>
         </section>
 
-        <!-- Team (owner only) -->
-        <section id="teamSection" class="hidden mb-8 fade-in">
-            <div class="flex items-center justify-between mb-3">
-                <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Your team <span class="text-zinc-300 dark:text-zinc-600 normal-case tracking-normal">· owner</span></h2>
+        <!-- ===== TAB: VA PROFILE ===== -->
+        <section id="panel-profile" class="tab-panel hidden">
+            <div class="mb-3">
+                <h2 class="text-base font-bold tracking-tight">Your VA profile</h2>
+                <p id="profileHint" class="text-sm text-zinc-500 dark:text-zinc-400">Keep your listing fresh — update your logo, banner, callsigns and details any time.</p>
             </div>
-            <div class="surface rounded-2xl p-6 mb-3">
+            <form id="profileForm" class="surface rounded-2xl p-6 space-y-5">
+                <!-- Images -->
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Logo</label>
+                        <div class="flex items-center gap-3">
+                            <div id="pfLogoPreview" class="w-16 h-16 rounded-xl bg-zinc-100 dark:bg-zinc-800 grid place-items-center overflow-hidden shrink-0"><i data-lucide="image" class="w-5 h-5 text-zinc-400"></i></div>
+                            <input id="pfLogo" type="file" accept="image/*" class="block w-full text-xs text-zinc-500 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-zinc-900 file:text-white dark:file:bg-white dark:file:text-zinc-900 pf-edit">
+                        </div>
+                    </div>
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Banner</label>
+                        <div class="flex items-center gap-3">
+                            <div id="pfBannerPreview" class="w-24 h-14 rounded-xl bg-zinc-100 dark:bg-zinc-800 grid place-items-center overflow-hidden shrink-0 bg-cover bg-center"><i data-lucide="image" class="w-5 h-5 text-zinc-400"></i></div>
+                            <input id="pfBanner" type="file" accept="image/*" class="block w-full text-xs text-zinc-500 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-zinc-900 file:text-white dark:file:bg-white dark:file:text-zinc-900 pf-edit">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">VA name</label>
+                        <input id="pfName" type="text" disabled class="field opacity-70 cursor-not-allowed">
+                        <p class="text-[11px] text-zinc-400 mt-1">Contact Inflight staff to rename your VA.</p>
+                    </div>
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Callsigns <span class="font-normal text-zinc-400">· comma separated</span></label>
+                        <input id="pfCallsigns" type="text" placeholder="e.g. OCEANIC, OCEAN HEAVY" class="field pf-edit">
+                        <p class="text-[11px] text-zinc-400 mt-1">Add every callsign your pilots fly under — the first is your primary.</p>
+                    </div>
+                </div>
+
+                <div>
+                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Tagline</label>
+                    <input id="pfTagline" type="text" maxlength="140" placeholder="A short hook for your VA" class="field pf-edit">
+                </div>
+                <div>
+                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Description</label>
+                    <textarea id="pfDescription" rows="4" maxlength="4000" placeholder="Tell pilots about your VA…" class="field pf-edit"></textarea>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Region</label>
+                        <input id="pfRegion" type="text" placeholder="e.g. Europe, Global" class="field pf-edit">
+                    </div>
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Pilot count</label>
+                        <input id="pfPilotCount" type="number" min="0" class="field pf-edit">
+                    </div>
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Hubs <span class="font-normal text-zinc-400">· ICAO, comma separated</span></label>
+                        <input id="pfHubs" type="text" placeholder="EGLL, KJFK" class="field pf-edit">
+                    </div>
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Fleet <span class="font-normal text-zinc-400">· comma separated</span></label>
+                        <input id="pfFleet" type="text" placeholder="A320, B738" class="field pf-edit">
+                    </div>
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Minimum IF grade</label>
+                        <select id="pfMinGrade" class="field pf-edit">
+                            <option value="">No requirement</option>
+                            <option value="1">Grade 1+</option>
+                            <option value="2">Grade 2+</option>
+                            <option value="3">Grade 3+</option>
+                            <option value="4">Grade 4+</option>
+                            <option value="5">Grade 5</option>
+                        </select>
+                    </div>
+                    <div class="flex items-end">
+                        <label class="flex items-center gap-2 text-sm font-medium select-none">
+                            <input id="pfRecruiting" type="checkbox" class="w-4 h-4 rounded pf-edit"> Currently recruiting
+                        </label>
+                    </div>
+                </div>
+
+                <div>
+                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Joining requirements</label>
+                    <textarea id="pfRequirements" rows="2" placeholder="Anything pilots should know before applying" class="field pf-edit"></textarea>
+                </div>
+                <div>
+                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Tags <span class="font-normal text-zinc-400">· comma separated</span></label>
+                    <input id="pfTags" type="text" placeholder="long-haul, realism, friendly" class="field pf-edit">
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Website</label>
+                        <input id="pfWebsite" type="url" placeholder="https://…" class="field pf-edit">
+                    </div>
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Discord invite</label>
+                        <input id="pfDiscord" type="url" placeholder="https://discord.gg/…" class="field pf-edit">
+                    </div>
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">IFC thread</label>
+                        <input id="pfIfc" type="url" placeholder="https://community.infiniteflight.com/…" class="field pf-edit">
+                    </div>
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Application link</label>
+                        <input id="pfApplication" type="url" placeholder="Where pilots apply" class="field pf-edit">
+                    </div>
+                </div>
+
+                <div id="profileActions" class="flex items-center gap-3 pt-1">
+                    <button type="submit" id="pfBtn" class="btn">Save changes</button>
+                    <p id="pfMsg" class="hidden text-sm font-medium"></p>
+                </div>
+            </form>
+            <p id="profileReadonly" class="hidden text-xs text-zinc-400 mt-3 flex items-center gap-1.5"><i data-lucide="lock" class="w-3.5 h-3.5"></i> Only the VA owner can edit this profile.</p>
+        </section>
+
+        <!-- ===== TAB: EMBED ===== -->
+        <section id="panel-embed" class="tab-panel hidden">
+            <div class="mb-3">
+                <h2 class="text-base font-bold tracking-tight">Your live map embed</h2>
+                <p class="text-sm text-zinc-500 dark:text-zinc-400">Copy your embed link or iframe to drop your live pilot map onto your own site. These are managed by Inflight — copy only, no editing.</p>
+            </div>
+            <div id="embedList" class="space-y-3"><div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400">Loading…</div></div>
+        </section>
+
+        <!-- ===== TAB: TEAM (owner only) ===== -->
+        <section id="panel-team" class="tab-panel hidden">
+            <div class="mb-3">
+                <h2 class="text-base font-bold tracking-tight">Your team</h2>
+                <p class="text-sm text-zinc-500 dark:text-zinc-400">Give your own staff portal access. They can submit and view your VA's inbox, but can't manage accounts.</p>
+            </div>
+            <div class="surface rounded-2xl p-6 mb-4">
                 <p class="text-sm font-semibold mb-3 flex items-center gap-2"><i data-lucide="user-plus" class="w-4 h-4"></i> Add a staff member</p>
                 <form id="teamForm" class="grid grid-cols-1 sm:grid-cols-4 gap-3">
                     <input id="tmName" type="text" placeholder="Display name" class="field sm:col-span-1">
@@ -155,9 +346,12 @@
             <div id="teamList" class="space-y-2"></div>
         </section>
 
-        <!-- Account -->
-        <section id="accountSection" class="mb-12 fade-in">
-            <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-3">Account</h2>
+        <!-- ===== TAB: ACCOUNT ===== -->
+        <section id="panel-account" class="tab-panel hidden">
+            <div class="mb-3">
+                <h2 class="text-base font-bold tracking-tight">Account</h2>
+                <p class="text-sm text-zinc-500 dark:text-zinc-400">Manage your sign-in.</p>
+            </div>
             <div class="surface rounded-2xl p-6 max-w-md">
                 <p class="text-sm font-semibold mb-3 flex items-center gap-2"><i data-lucide="key-round" class="w-4 h-4"></i> Change password</p>
                 <form id="pwForm" class="space-y-3">
@@ -173,6 +367,7 @@
     <script>
         const API = '/api/va-portal';
         let me = null;
+        let vaProfile = null;
 
         const $ = (id) => document.getElementById(id);
         const show = (id) => $(id).classList.remove('hidden');
@@ -180,6 +375,21 @@
         const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
         const fmtDate = (d) => new Date(d).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
         const flash = (id, text, ok) => { const el = $(id); el.textContent = text; el.classList.remove('hidden','text-rose-500','text-emerald-500'); el.classList.add(ok ? 'text-emerald-500' : 'text-rose-500'); };
+        const drawIcons = () => { if (window.lucide) lucide.createIcons(); };
+
+        // ---------- Theme ----------
+        function setThemeIcons() {
+            const dark = document.documentElement.classList.contains('dark');
+            const html = `<i data-lucide="${dark ? 'sun' : 'moon'}" class="w-[18px] h-[18px]"></i>`;
+            ['loginThemeIcon','dashThemeIcon'].forEach(id => { const el = $(id); if (el) el.innerHTML = html; });
+            drawIcons();
+        }
+        function toggleTheme() {
+            const dark = !document.documentElement.classList.contains('dark');
+            document.documentElement.classList.toggle('dark', dark);
+            try { localStorage.setItem('va_portal_theme', dark ? 'dark' : 'light'); } catch (e) {}
+            setThemeIcons();
+        }
 
         async function api(path, opts = {}) {
             const res = await fetch(API + path, { credentials: 'include', ...opts });
@@ -187,6 +397,32 @@
             try { data = await res.json(); } catch {}
             if (!res.ok) throw new Error(data.error || 'Request failed.');
             return data;
+        }
+
+        // Copy helper with a graceful fallback for older browsers.
+        async function copyText(text, label) {
+            try { await navigator.clipboard.writeText(text); }
+            catch {
+                const ta = document.createElement('textarea');
+                ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+                document.body.appendChild(ta); ta.select();
+                try { document.execCommand('copy'); } catch {}
+                ta.remove();
+            }
+            toast((label || 'Copied') + ' copied to clipboard');
+        }
+        let toastTimer = null;
+        function toast(msg) {
+            let t = $('toast');
+            if (!t) {
+                t = document.createElement('div');
+                t.id = 'toast';
+                t.className = 'fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-2.5 rounded-xl bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-sm font-medium shadow-xl transition-opacity';
+                document.body.appendChild(t);
+            }
+            t.textContent = msg; t.style.opacity = '1';
+            clearTimeout(toastTimer);
+            toastTimer = setTimeout(() => { t.style.opacity = '0'; }, 2200);
         }
 
         const STATUS_STYLE = {
@@ -199,14 +435,65 @@
 
         // ---------- Auth ----------
         async function boot() {
+            setThemeIcons();
             try {
                 const { account } = await api('/auth/me');
                 me = account;
                 enterDashboard();
             } catch {
                 hide('bootLoader'); show('loginView');
-                lucide.createIcons();
+                loadPartnerLogos();
+                drawIcons();
             }
+        }
+
+        // Decorate the login screen with our partnered VAs' logos (public endpoint).
+        async function loadPartnerLogos() {
+            try {
+                const res = await fetch('/api/va-ads?limit=60&sort=newest', { credentials: 'include' });
+                if (!res.ok) return;
+                const data = await res.json();
+                if (!data || !Array.isArray(data.data)) return;
+                const partners = data.data.filter(v => v && v.logoUrl);
+                if (!partners.length) return;
+
+                const logos = $('partnerLogos');
+                logos.innerHTML = '';
+                partners.slice(0, 18).forEach((v, i) => {
+                    const chip = document.createElement('div');
+                    chip.className = 'partner-chip group relative';
+                    chip.style.animationDelay = (i * 45) + 'ms';
+                    chip.innerHTML =
+                        '<div class="w-10 h-10 rounded-full surface lift overflow-hidden grid place-items-center bg-white dark:bg-zinc-900">' +
+                            '<img src="' + esc(v.logoUrl) + '" alt="' + esc(v.name || 'VA') + '" loading="lazy" class="w-full h-full object-cover" onerror="this.closest(\'.partner-chip\').remove()">' +
+                        '</div>' +
+                        '<span class="pointer-events-none absolute -top-8 left-1/2 -translate-x-1/2 whitespace-nowrap px-2 py-1 rounded-md bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-[11px] font-medium opacity-0 group-hover:opacity-100 transition shadow-lg z-20">' + esc(v.name || 'VA') + '</span>';
+                    logos.appendChild(chip);
+                });
+                show('partnerStrip');
+
+                const halo = $('partnerHalo');
+                if (halo) {
+                    const spots = [
+                        { t: '12%', l: '12%', s: 68 }, { t: '20%', l: '84%', s: 54 },
+                        { t: '74%', l: '10%', s: 60 }, { t: '82%', l: '82%', s: 66 },
+                        { t: '46%', l: '5%',  s: 46 }, { t: '52%', l: '93%', s: 50 },
+                        { t: '8%',  l: '50%', s: 42 }, { t: '90%', l: '46%', s: 46 },
+                        { t: '32%', l: '70%', s: 40 }, { t: '66%', l: '26%', s: 44 },
+                    ];
+                    halo.innerHTML = '';
+                    const pool = partners.slice().sort(() => Math.random() - 0.5);
+                    spots.forEach((sp, i) => {
+                        const v = pool[i % pool.length];
+                        if (!v) return;
+                        const el = document.createElement('div');
+                        el.className = 'halo-logo absolute hidden lg:block rounded-2xl overflow-hidden opacity-[.16] dark:opacity-[.12] blur-[1px] saturate-150';
+                        el.style.cssText += 'top:' + sp.t + ';left:' + sp.l + ';width:' + sp.s + 'px;height:' + sp.s + 'px;animation-delay:' + (i * 600) + 'ms;';
+                        el.innerHTML = '<img src="' + esc(v.logoUrl) + '" alt="" class="w-full h-full object-cover" onerror="this.closest(\'.halo-logo\').remove()">';
+                        halo.appendChild(el);
+                    });
+                }
+            } catch (_) { /* decorative only */ }
         }
 
         $('loginForm').addEventListener('submit', async (e) => {
@@ -234,13 +521,166 @@
             $('acctName').textContent = me.displayName || me.username;
             $('acctRole').textContent = me.role;
             if (me.mustChangePassword) show('pwBanner');
-            if (me.role === 'owner') { show('teamSection'); loadTeam(); }
+            if (me.role === 'owner') show('tabTeamBtn');
+            loadProfile();        // also paints the hero banner/logo/callsigns
             loadSubmissions();
             loadEvents();
-            lucide.createIcons();
+            loadEmbeds();
+            if (me.role === 'owner') loadTeam();
+            setThemeIcons();
+            drawIcons();
         }
 
-        function scrollToAccount() { $('accountSection').scrollIntoView({ behavior: 'smooth' }); }
+        // ---------- Tabs ----------
+        function switchTab(name) {
+            document.querySelectorAll('.tab-panel').forEach(p => p.classList.add('hidden'));
+            const panel = $('panel-' + name);
+            if (panel) { panel.classList.remove('hidden'); panel.classList.add('fade-in'); }
+            document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+            drawIcons();
+        }
+
+        // ---------- VA profile + hero ----------
+        function paintHero() {
+            const va = vaProfile;
+            if (!va) return;
+            $('vaName').textContent = va.name || me.vaName || 'Your VA';
+            // Banner
+            const hero = $('heroBanner');
+            if (va.bannerUrl) hero.style.backgroundImage = `url('${va.bannerUrl}')`;
+            // Logo avatar
+            const logo = $('heroLogo');
+            if (va.logoUrl) logo.innerHTML = `<img src="${esc(va.logoUrl)}" alt="${esc(va.name)}" class="w-full h-full object-cover">`;
+            // Callsign chips
+            const chips = $('callsignChips');
+            const list = (va.callsigns && va.callsigns.length) ? va.callsigns : (va.callsign ? [va.callsign] : []);
+            chips.innerHTML = list.map(c => `<span class="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 inline-flex items-center gap-1"><i data-lucide="radio" class="w-3 h-3"></i>${esc(c)} ##VA</span>`).join('')
+                + (va.region ? `<span class="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 inline-flex items-center gap-1"><i data-lucide="globe" class="w-3 h-3"></i>${esc(va.region)}</span>` : '')
+                + (va.recruiting ? `<span class="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300 inline-flex items-center gap-1"><i data-lucide="user-plus" class="w-3 h-3"></i>Recruiting</span>` : '');
+            drawIcons();
+        }
+
+        function fillProfileForm(va, editable) {
+            $('pfName').value = va.name || '';
+            $('pfCallsigns').value = (va.callsigns || []).join(', ');
+            $('pfTagline').value = va.tagline || '';
+            $('pfDescription').value = va.description || '';
+            $('pfRegion').value = va.region || '';
+            $('pfPilotCount').value = va.pilotCount || 0;
+            $('pfHubs').value = (va.hubs || []).join(', ');
+            $('pfFleet').value = (va.fleet || []).join(', ');
+            $('pfMinGrade').value = va.minGrade || '';
+            $('pfRecruiting').checked = !!va.recruiting;
+            $('pfRequirements').value = va.requirements || '';
+            $('pfTags').value = (va.tags || []).join(', ');
+            $('pfWebsite').value = va.websiteUrl || '';
+            $('pfDiscord').value = va.discordUrl || '';
+            $('pfIfc').value = va.ifcThreadUrl || '';
+            $('pfApplication').value = va.applicationUrl || '';
+            // Image previews
+            if (va.logoUrl) $('pfLogoPreview').innerHTML = `<img src="${esc(va.logoUrl)}" class="w-full h-full object-cover">`;
+            if (va.bannerUrl) { $('pfBannerPreview').style.backgroundImage = `url('${va.bannerUrl}')`; $('pfBannerPreview').innerHTML = ''; }
+
+            // Lock down for non-owners (read-only view).
+            document.querySelectorAll('.pf-edit').forEach(el => { el.disabled = !editable; if (!editable) el.classList.add('opacity-70','cursor-not-allowed'); });
+            $('profileActions').classList.toggle('hidden', !editable);
+            $('profileReadonly').classList.toggle('hidden', editable);
+            $('profileHint').textContent = editable
+                ? 'Keep your listing fresh — update your logo, banner, callsigns and details any time.'
+                : 'This is your VA listing as pilots see it. Ask your VA owner to make changes.';
+        }
+
+        async function loadProfile() {
+            try {
+                const { va, editable } = await api('/va');
+                if (!va) return;
+                vaProfile = va;
+                paintHero();
+                fillProfileForm(va, editable);
+                drawIcons();
+            } catch (err) { /* non-fatal */ }
+        }
+
+        $('pfLogo').addEventListener('change', (e) => {
+            const f = e.target.files[0]; if (!f) return;
+            $('pfLogoPreview').innerHTML = `<img src="${URL.createObjectURL(f)}" class="w-full h-full object-cover">`;
+        });
+        $('pfBanner').addEventListener('change', (e) => {
+            const f = e.target.files[0]; if (!f) return;
+            $('pfBannerPreview').style.backgroundImage = `url('${URL.createObjectURL(f)}')`;
+            $('pfBannerPreview').innerHTML = '';
+        });
+
+        $('profileForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            hide('pfMsg'); $('pfBtn').disabled = true;
+            try {
+                const fd = new FormData();
+                fd.append('callsigns', $('pfCallsigns').value);
+                fd.append('tagline', $('pfTagline').value);
+                fd.append('description', $('pfDescription').value);
+                fd.append('region', $('pfRegion').value);
+                fd.append('pilotCount', $('pfPilotCount').value || '0');
+                fd.append('hubs', $('pfHubs').value);
+                fd.append('fleet', $('pfFleet').value);
+                fd.append('minGrade', $('pfMinGrade').value);
+                fd.append('recruiting', $('pfRecruiting').checked ? 'true' : 'false');
+                fd.append('requirements', $('pfRequirements').value);
+                fd.append('tags', $('pfTags').value);
+                fd.append('websiteUrl', $('pfWebsite').value);
+                fd.append('discordUrl', $('pfDiscord').value);
+                fd.append('ifcThreadUrl', $('pfIfc').value);
+                fd.append('applicationUrl', $('pfApplication').value);
+                if ($('pfLogo').files[0]) fd.append('logo', $('pfLogo').files[0]);
+                if ($('pfBanner').files[0]) fd.append('banner', $('pfBanner').files[0]);
+                const { va } = await api('/va', { method: 'PATCH', body: fd });
+                vaProfile = va;
+                paintHero();
+                $('pfLogo').value = ''; $('pfBanner').value = '';
+                flash('pfMsg', 'Saved — your listing is updated.', true);
+                loadEmbeds(); // callsign changes may surface different embeds
+            } catch (err) { flash('pfMsg', err.message, false); }
+            finally { $('pfBtn').disabled = false; }
+        });
+
+        // ---------- Embeds (read-only) ----------
+        let embedsCache = [];
+        function copyEmbedUrl(i) { const em = embedsCache[i]; if (em) copyText(em.url, 'Embed link'); }
+        function copyEmbedIframe(i) { const em = embedsCache[i]; if (em) copyText(em.iframe, 'iframe snippet'); }
+        async function loadEmbeds() {
+            try {
+                const { embeds } = await api('/va');
+                embedsCache = embeds || [];
+                const box = $('embedList');
+                if (!embeds || !embeds.length) {
+                    box.innerHTML = `<div class="surface rounded-2xl p-8 text-center text-sm text-zinc-400">
+                        <i data-lucide="code-2" class="w-6 h-6 mx-auto mb-2 text-zinc-300 dark:text-zinc-600"></i>
+                        No embed link yet. Ask your Inflight VA rep to set one up for you.
+                    </div>`;
+                    drawIcons();
+                    return;
+                }
+                box.innerHTML = embeds.map((em, i) => `
+                    <div class="surface rounded-2xl p-5">
+                        <div class="flex items-center justify-between gap-3 mb-3">
+                            <p class="font-semibold text-sm truncate flex items-center gap-2"><i data-lucide="map" class="w-4 h-4"></i>${esc(em.label || 'Live map')}<span class="text-[10px] uppercase tracking-wide text-zinc-400">${esc(em.mode || '')}</span></p>
+                            ${em.revoked ? '<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-rose-100 text-rose-600 dark:bg-rose-500/15 dark:text-rose-300">Inactive</span>' : '<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">Active</span>'}
+                        </div>
+                        <label class="text-[11px] font-semibold uppercase tracking-wide text-zinc-400">Embed link</label>
+                        <div class="flex items-center gap-2 mt-1 mb-3">
+                            <code class="flex-1 min-w-0 truncate text-xs px-3 py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-500">${esc(em.url)}</code>
+                            <button onclick="copyEmbedUrl(${i})" class="btn shrink-0 py-2 px-3 text-xs"><i data-lucide="copy" class="w-3.5 h-3.5"></i></button>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <button onclick="copyEmbedIframe(${i})" class="text-xs font-medium px-3 py-2 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition inline-flex items-center gap-1.5"><i data-lucide="code" class="w-3.5 h-3.5"></i> Copy iframe</button>
+                            <a href="${esc(em.url)}" target="_blank" rel="noopener" class="text-xs font-medium px-3 py-2 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition inline-flex items-center gap-1.5"><i data-lucide="external-link" class="w-3.5 h-3.5"></i> Preview</a>
+                        </div>
+                    </div>`).join('');
+                drawIcons();
+            } catch (err) {
+                $('embedList').innerHTML = `<div class="surface rounded-2xl p-6 text-center text-sm text-rose-500">${esc(err.message)}</div>`;
+            }
+        }
 
         // ---------- Submissions ----------
         async function loadSubmissions() {
@@ -267,7 +707,7 @@
                         ${(s.attachments && s.attachments.length) ? `<div class="mt-3 flex flex-wrap gap-2">${s.attachments.map(a => `<a href="${esc(a.url)}" target="_blank" rel="noopener" class="text-xs px-2.5 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 inline-flex items-center gap-1.5"><i data-lucide="paperclip" class="w-3 h-3"></i>${esc((a.name||'file').slice(0,28))}</a>`).join('')}</div>` : ''}
                         <p class="text-[11px] text-zinc-400 mt-3">by ${esc(s.submittedByName)}</p>
                     </div>`).join('');
-                lucide.createIcons();
+                drawIcons();
             } catch (err) {
                 $('subList').innerHTML = `<div class="surface rounded-2xl p-6 text-center text-sm text-rose-500">${esc(err.message)}</div>`;
             }
@@ -311,7 +751,7 @@
                         </div>
                         <button onclick="deleteEvent('${e.id}')" title="Remove" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-rose-50 dark:hover:bg-rose-500/10 text-rose-500 shrink-0"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
                     </div>`).join('');
-                lucide.createIcons();
+                drawIcons();
             } catch (err) {
                 $('evList').innerHTML = `<div class="surface rounded-2xl p-5 text-center text-sm text-rose-500">${esc(err.message)}</div>`;
             }
@@ -348,7 +788,7 @@
                 if (!members.length) html += '<div class="surface rounded-2xl p-5 text-center text-sm text-zinc-400">No staff yet. Add a teammate above to give them portal access.</div>';
                 else html += members.map(m => teamRow(m, false)).join('');
                 $('teamList').innerHTML = html;
-                lucide.createIcons();
+                drawIcons();
             } catch (err) {
                 $('teamList').innerHTML = `<div class="surface rounded-2xl p-5 text-center text-sm text-rose-500">${esc(err.message)}</div>`;
             }

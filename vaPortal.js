@@ -30,6 +30,10 @@ const { PutObjectCommand } = require('@aws-sdk/client-s3');
 // Reuse the staff portal's auth so our oversight routes accept a staff session.
 const { requireAuth: requireStaffSession } = require('./staffAuth');
 
+// Where the embed widget is hosted. The portal surfaces a VA's embed link as a
+// read-only, copyable URL; it never lets the VA change the underlying config.
+const EMBED_BASE_URL = process.env.EMBED_BASE_URL || 'https://inflight.info/embed.html';
+
 const COOKIE_NAME = 'va_portal_token';
 const TOKEN_TYPE = 'va_portal';            // distinguishes these tokens from staff tokens
 const TOKEN_TTL = '30d';
@@ -433,10 +437,86 @@ async function uploadSubmissionFile(s3Client, file) {
  * @param {Express} app
  * @param {Object} deps
  * @param {Object} deps.VirtualAirlineAd  the VA ad mongoose model
+ * @param {Object} [deps.EmbedConfig]     the embed-config model (for embed links)
  * @param {Object} deps.s3Client          AWS S3 client (for attachments)
  * @param {Object} deps.upload            configured multer instance
+ * @param {Function} [deps.uploadVaImage] (s3Client, file, ref, kind) => url
+ * @param {Function} [deps.deleteVaImage] (s3Client, url) => Promise
  */
-function registerVaPortalRoutes(app, { VirtualAirlineAd, s3Client, upload }) {
+function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage }) {
+    // multipart parser for the VA-profile editor (optional new logo + banner).
+    const uploadVaProfileImages = upload.fields([
+        { name: 'logo', maxCount: 1 },
+        { name: 'banner', maxCount: 1 },
+    ]);
+
+    // Parse a field that may arrive as a JSON array, a CSV string, or an array.
+    const parseList = (value) => {
+        if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean);
+        if (typeof value !== 'string' || !value.trim()) return [];
+        const raw = value.trim();
+        if (raw.startsWith('[')) {
+            try { const arr = JSON.parse(raw); if (Array.isArray(arr)) return arr.map(v => String(v).trim()).filter(Boolean); }
+            catch { /* fall through */ }
+        }
+        return raw.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+    };
+
+    // Shape a VA ad for the portal's "profile" view — everything a partner may
+    // see/edit about themselves, plus the read-only media URLs.
+    const portalVa = (ad) => {
+        if (!ad) return null;
+        const callsigns = (Array.isArray(ad.callsigns) && ad.callsigns.length)
+            ? ad.callsigns : (ad.callsign ? [ad.callsign] : []);
+        return {
+            id: ad._id,
+            name: ad.name,
+            type: ad.type,
+            callsign: ad.callsign || (callsigns[0] || ''),
+            callsigns,
+            tagline: ad.tagline || '',
+            description: ad.description || '',
+            logoUrl: ad.logoUrl || null,
+            bannerUrl: ad.bannerUrl || null,
+            websiteUrl: ad.websiteUrl || '',
+            discordUrl: ad.discordUrl || '',
+            ifcThreadUrl: ad.ifcThreadUrl || '',
+            applicationUrl: ad.applicationUrl || '',
+            region: ad.region || 'Global',
+            hubs: ad.hubs || [],
+            fleet: ad.fleet || [],
+            tags: ad.tags || [],
+            pilotCount: ad.pilotCount || 0,
+            recruiting: !!ad.recruiting,
+            minGrade: ad.minGrade || null,
+            requirements: ad.requirements || '',
+            status: ad.status,
+        };
+    };
+
+    // Find this VA's embed links (read-only). Matched on the embed config's
+    // va.code against any of the VA's callsigns. Returns copyable URLs only;
+    // tokens/config are never editable from the portal.
+    async function embedLinksForVa(ad) {
+        if (!EmbedConfig || !ad) return [];
+        const codes = ((Array.isArray(ad.callsigns) && ad.callsigns.length ? ad.callsigns : [ad.callsign])
+            .filter(Boolean)).map(c => String(c).toUpperCase());
+        if (!codes.length) return [];
+        try {
+            const configs = await EmbedConfig.find({ 'va.code': { $in: codes } }).sort({ createdAt: -1 }).limit(20);
+            return configs.map(c => ({
+                label: c.label || c.va?.name || ad.name,
+                mode: c.mode,
+                revoked: !!c.revoked,
+                url: `${EMBED_BASE_URL}?token=${encodeURIComponent(c.token)}`,
+                iframe: `<iframe src="${EMBED_BASE_URL}?token=${encodeURIComponent(c.token)}" style="width:100%;height:560px;border:0;border-radius:16px;overflow:hidden" loading="lazy" title="${(c.va?.name || ad.name || 'VA')} live map"></iframe>`,
+            }));
+        } catch (err) {
+            console.error('VA portal embed lookup error:', err.message);
+            return [];
+        }
+    }
+
     // =====================================================================
     // VA-FACING AUTH
     // =====================================================================
@@ -494,6 +574,89 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, s3Client, upload }) {
         } catch (err) {
             console.error('VA portal change-password error:', err);
             res.status(500).json({ error: 'Could not change password.' });
+        }
+    });
+
+    // =====================================================================
+    // VA-FACING PROFILE  (the partner's own VA listing)
+    // =====================================================================
+    // The VA's profile (logo, banner, callsigns, copy, links) plus its
+    // read-only embed link(s). Any signed-in account on the VA may view it.
+    app.get('/api/va-portal/va', requirePortal, async (req, res) => {
+        try {
+            if (!req.portal.vaAdId) {
+                return res.json({ va: null, embeds: [], editable: false });
+            }
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId);
+            if (!ad) return res.json({ va: null, embeds: [], editable: false });
+            const embeds = await embedLinksForVa(ad);
+            res.json({ va: portalVa(ad), embeds, editable: req.portal.role === 'owner' });
+        } catch (err) {
+            console.error('VA portal get profile error:', err);
+            res.status(500).json({ error: 'Could not load your VA profile.' });
+        }
+    });
+
+    // Update the VA's own listing. Owner only. Accepts JSON or multipart (so a
+    // fresh logo/banner can ride along). Moderation fields (status, featured),
+    // the unique name, and ownership are intentionally NOT editable here.
+    app.patch('/api/va-portal/va', requirePortalOwner, uploadVaProfileImages, async (req, res) => {
+        const logoFile = req.files && req.files.logo && req.files.logo[0];
+        const bannerFile = req.files && req.files.banner && req.files.banner[0];
+        const fs = require('fs');
+        const cleanup = () => [logoFile, bannerFile].forEach(f => { if (f && f.path) fs.unlink(f.path, () => {}); });
+        try {
+            if (!req.portal.vaAdId) { cleanup(); return res.status(404).json({ error: 'No VA is linked to this account.' }); }
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId);
+            if (!ad) { cleanup(); return res.status(404).json({ error: 'Your VA listing could not be found.' }); }
+
+            const b = req.body || {};
+            // Free-text + link fields.
+            if (b.tagline !== undefined) ad.tagline = String(b.tagline).slice(0, 140);
+            if (b.description !== undefined) ad.description = String(b.description).slice(0, 4000);
+            if (b.region !== undefined) ad.region = String(b.region).trim() || 'Global';
+            if (b.requirements !== undefined) ad.requirements = String(b.requirements);
+            if (b.websiteUrl !== undefined) ad.websiteUrl = String(b.websiteUrl).trim() || null;
+            if (b.discordUrl !== undefined) ad.discordUrl = String(b.discordUrl).trim() || null;
+            if (b.ifcThreadUrl !== undefined) ad.ifcThreadUrl = String(b.ifcThreadUrl).trim() || null;
+            if (b.applicationUrl !== undefined) ad.applicationUrl = String(b.applicationUrl).trim() || null;
+            // List fields.
+            if (b.callsigns !== undefined) ad.callsigns = parseList(b.callsigns); // pre-save normalises + syncs callsign
+            if (b.hubs !== undefined) ad.hubs = parseList(b.hubs).map(h => h.toUpperCase());
+            if (b.fleet !== undefined) ad.fleet = parseList(b.fleet);
+            if (b.tags !== undefined) ad.tags = parseList(b.tags);
+            // Numbers / flags.
+            if (b.pilotCount !== undefined) ad.pilotCount = Math.max(0, parseInt(b.pilotCount, 10) || 0);
+            if (b.minGrade !== undefined) ad.minGrade = b.minGrade ? Math.min(5, Math.max(1, parseInt(b.minGrade, 10))) : null;
+            if (b.recruiting !== undefined) ad.recruiting = b.recruiting !== 'false' && b.recruiting !== false;
+
+            // Optional new images (only if the helper was wired in).
+            const ref = ad.callsign || ad.name;
+            if (logoFile && uploadVaImage) {
+                const url = await uploadVaImage(s3Client, logoFile, ref, 'logo');
+                if (ad.logoUrl && deleteVaImage) await deleteVaImage(s3Client, ad.logoUrl);
+                ad.logoUrl = url;
+            }
+            if (bannerFile && uploadVaImage) {
+                const url = await uploadVaImage(s3Client, bannerFile, ref, 'banner');
+                if (ad.bannerUrl && deleteVaImage) await deleteVaImage(s3Client, ad.bannerUrl);
+                ad.bannerUrl = url;
+            }
+
+            // Keep the portal account's denormalized VA name in step (name is
+            // not editable here, but this is cheap insurance).
+            await ad.save();
+            logActivity({
+                vaAdId: ad._id, vaName: ad.name,
+                actorName: req.portal.displayName || req.portal.username, actorRole: 'owner',
+                action: 'va.update', detail: 'Updated VA profile',
+            });
+            const embeds = await embedLinksForVa(ad);
+            res.json({ va: portalVa(ad), embeds, editable: true });
+        } catch (err) {
+            cleanup();
+            console.error('VA portal update profile error:', err);
+            res.status(500).json({ error: 'Could not save your VA profile.' });
         }
     });
 
