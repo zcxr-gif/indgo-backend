@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VA Partnership Portal — Inflight</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script>tailwind.config = { darkMode: 'class' };</script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+        :root { color-scheme: light dark; }
+        * { -webkit-tap-highlight-color: transparent; }
+        body { font-family: 'Inter', sans-serif; -webkit-font-smoothing: antialiased; }
+        [data-lucide] { width: 1.15em; height: 1.15em; }
+        svg.lucide { stroke-width: 1.75; }
+        .surface { background: #fff; border: 1px solid rgba(0,0,0,.06); box-shadow: 0 1px 2px rgba(0,0,0,.03), 0 1px 1px rgba(0,0,0,.02); }
+        .dark .surface { background: #18181b; border-color: rgba(255,255,255,.07); box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+        .loader { border: 2.5px solid rgba(120,120,128,.25); border-top-color: currentColor; border-radius: 50%; width: 30px; height: 30px; animation: spin .7s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .fade-in { animation: fade .4s cubic-bezier(.2,.8,.2,1) forwards; }
+        @keyframes fade { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .hub-bg { background-image: radial-gradient(rgba(0,0,0,.025) 1px, transparent 1px); background-size: 22px 22px; }
+        .dark .hub-bg { background-image: radial-gradient(rgba(255,255,255,.03) 1px, transparent 1px); }
+        input, select, textarea { font-family: inherit; }
+        ::placeholder { color: #a1a1aa; }
+        .field { width: 100%; padding: .625rem .875rem; border-radius: .75rem; background: rgba(244,244,245,.7); border: 1px solid transparent; outline: none; font-size: .875rem; transition: .15s; }
+        .dark .field { background: rgba(39,39,42,.7); }
+        .field:focus { background: #fff; border-color: #d4d4d8; box-shadow: 0 0 0 4px rgba(24,24,27,.05); }
+        .dark .field:focus { background: #27272a; border-color: #52525b; box-shadow: 0 0 0 4px rgba(255,255,255,.05); }
+        .btn { background: #18181b; color: #fff; padding: .625rem 1rem; border-radius: .75rem; font-size: .875rem; font-weight: 600; transition: .15s; }
+        .dark .btn { background: #fafafa; color: #18181b; }
+        .btn:hover { opacity: .9; } .btn:active { transform: scale(.98); }
+    </style>
+</head>
+<body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 antialiased min-h-screen transition-colors duration-300">
+
+    <!-- ============ BOOT ============ -->
+    <div id="bootLoader" class="min-h-screen flex flex-col items-center justify-center gap-4 text-zinc-400">
+        <div class="loader"></div>
+        <p class="text-sm font-medium">Loading portal…</p>
+    </div>
+
+    <!-- ============ LOGIN ============ -->
+    <div id="loginView" class="hidden min-h-screen hub-bg flex items-center justify-center px-5">
+        <div class="w-full max-w-sm fade-in">
+            <div class="text-center mb-8">
+                <div class="w-16 h-16 rounded-2xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 flex items-center justify-center mx-auto mb-5 shadow-lg shadow-zinc-900/10">
+                    <i data-lucide="handshake" class="w-8 h-8"></i>
+                </div>
+                <h1 class="text-2xl font-extrabold tracking-tight">VA Partnership Portal</h1>
+                <p class="text-sm text-zinc-500 dark:text-zinc-400 mt-1.5">Sign in to your partnered Virtual Airline.</p>
+            </div>
+            <form id="loginForm" class="surface rounded-2xl p-6 space-y-3">
+                <input id="loginUser" type="text" placeholder="Username" autocomplete="username" required class="field">
+                <input id="loginPass" type="password" placeholder="Password" autocomplete="current-password" required class="field">
+                <p id="loginMsg" class="hidden text-sm font-medium text-rose-500"></p>
+                <button type="submit" class="btn w-full">Sign in</button>
+            </form>
+            <p class="text-center text-xs text-zinc-400 dark:text-zinc-600 mt-6">
+                Are you Inflight staff? <a href="/staff" class="underline hover:text-zinc-600 dark:hover:text-zinc-300">Staff hub</a>
+            </p>
+        </div>
+    </div>
+
+    <!-- ============ DASHBOARD ============ -->
+    <div id="dashView" class="hidden max-w-4xl mx-auto px-5 py-8">
+        <!-- Header -->
+        <header class="flex items-center justify-between mb-8 fade-in">
+            <div class="flex items-center gap-3">
+                <div class="w-11 h-11 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 grid place-items-center"><i data-lucide="handshake" class="w-5 h-5"></i></div>
+                <div>
+                    <h1 id="vaName" class="text-lg font-bold tracking-tight leading-tight">—</h1>
+                    <p class="text-xs text-zinc-500 dark:text-zinc-400"><span id="acctName">—</span> · <span id="acctRole" class="capitalize">—</span></p>
+                </div>
+            </div>
+            <button onclick="logout()" class="flex items-center gap-2 text-sm font-medium text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition"><i data-lucide="log-out" class="w-4 h-4"></i> Sign out</button>
+        </header>
+
+        <!-- Must-change-password banner -->
+        <div id="pwBanner" class="hidden mb-6 surface rounded-2xl p-4 border-amber-300/60 bg-amber-50/60 dark:bg-amber-500/5 fade-in">
+            <p class="text-sm text-amber-700 dark:text-amber-300 flex items-center gap-2"><i data-lucide="alert-triangle" class="w-4 h-4"></i> You're using a temporary password. Please set your own in <button onclick="scrollToAccount()" class="underline font-semibold">Account</button>.</p>
+        </div>
+
+        <!-- Submit anything -->
+        <section class="mb-8 fade-in">
+            <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-3">Submit to Inflight</h2>
+            <form id="subForm" class="surface rounded-2xl p-6 space-y-3">
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <select id="subCategory" class="field sm:col-span-1">
+                        <option value="document">Document</option>
+                        <option value="request">Request</option>
+                        <option value="report">Report</option>
+                        <option value="event">Event</option>
+                        <option value="feedback">Feedback</option>
+                        <option value="other" selected>Other</option>
+                    </select>
+                    <input id="subTitle" type="text" placeholder="Title / subject" required maxlength="200" class="field sm:col-span-2">
+                </div>
+                <textarea id="subBody" rows="4" placeholder="Tell us everything — details, context, anything you need…" maxlength="8000" class="field"></textarea>
+                <input id="subLinks" type="text" placeholder="Links (comma or newline separated, optional)" class="field">
+                <div>
+                    <label class="text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-1.5 flex items-center gap-1.5"><i data-lucide="paperclip" class="w-3.5 h-3.5"></i> Attachments (up to 8 files)</label>
+                    <input id="subFiles" type="file" multiple class="block w-full text-sm text-zinc-500 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-zinc-900 file:text-white dark:file:bg-white dark:file:text-zinc-900">
+                </div>
+                <div class="flex items-center gap-3">
+                    <button type="submit" id="subBtn" class="btn">Submit</button>
+                    <p id="subMsg" class="hidden text-sm font-medium"></p>
+                </div>
+            </form>
+        </section>
+
+        <!-- Submissions list -->
+        <section class="mb-8 fade-in">
+            <div class="flex items-center justify-between mb-3">
+                <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Your submissions</h2>
+                <button onclick="loadSubmissions()" title="Refresh" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500 transition"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+            </div>
+            <div id="subList" class="space-y-3"><div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400">Loading…</div></div>
+        </section>
+
+        <!-- Team (owner only) -->
+        <section id="teamSection" class="hidden mb-8 fade-in">
+            <div class="flex items-center justify-between mb-3">
+                <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Your team <span class="text-zinc-300 dark:text-zinc-600 normal-case tracking-normal">· owner</span></h2>
+            </div>
+            <div class="surface rounded-2xl p-6 mb-3">
+                <p class="text-sm font-semibold mb-3 flex items-center gap-2"><i data-lucide="user-plus" class="w-4 h-4"></i> Add a staff member</p>
+                <form id="teamForm" class="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                    <input id="tmName" type="text" placeholder="Display name" class="field sm:col-span-1">
+                    <input id="tmUser" type="text" placeholder="Username" required class="field sm:col-span-1">
+                    <input id="tmPass" type="text" placeholder="Password (min 8)" required class="field sm:col-span-1">
+                    <button type="submit" class="btn sm:col-span-1">Add member</button>
+                </form>
+                <p id="teamMsg" class="hidden text-sm font-medium mt-3"></p>
+            </div>
+            <div id="teamList" class="space-y-2"></div>
+        </section>
+
+        <!-- Account -->
+        <section id="accountSection" class="mb-12 fade-in">
+            <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-3">Account</h2>
+            <div class="surface rounded-2xl p-6 max-w-md">
+                <p class="text-sm font-semibold mb-3 flex items-center gap-2"><i data-lucide="key-round" class="w-4 h-4"></i> Change password</p>
+                <form id="pwForm" class="space-y-3">
+                    <input id="pwCurrent" type="password" placeholder="Current password" autocomplete="current-password" required class="field">
+                    <input id="pwNew" type="password" placeholder="New password (min 8 chars)" autocomplete="new-password" required class="field">
+                    <p id="pwMsg" class="hidden text-sm font-medium"></p>
+                    <button type="submit" class="btn">Update password</button>
+                </form>
+            </div>
+        </section>
+    </div>
+
+    <script>
+        const API = '/api/va-portal';
+        let me = null;
+
+        const $ = (id) => document.getElementById(id);
+        const show = (id) => $(id).classList.remove('hidden');
+        const hide = (id) => $(id).classList.add('hidden');
+        const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+        const fmtDate = (d) => new Date(d).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+        const flash = (id, text, ok) => { const el = $(id); el.textContent = text; el.classList.remove('hidden','text-rose-500','text-emerald-500'); el.classList.add(ok ? 'text-emerald-500' : 'text-rose-500'); };
+
+        async function api(path, opts = {}) {
+            const res = await fetch(API + path, { credentials: 'include', ...opts });
+            let data = {};
+            try { data = await res.json(); } catch {}
+            if (!res.ok) throw new Error(data.error || 'Request failed.');
+            return data;
+        }
+
+        const STATUS_STYLE = {
+            open: 'bg-blue-100 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300',
+            in_review: 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300',
+            resolved: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300',
+            archived: 'bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400',
+        };
+        const STATUS_LABEL = { open: 'Open', in_review: 'In review', resolved: 'Resolved', archived: 'Archived' };
+
+        // ---------- Auth ----------
+        async function boot() {
+            try {
+                const { account } = await api('/auth/me');
+                me = account;
+                enterDashboard();
+            } catch {
+                hide('bootLoader'); show('loginView');
+                lucide.createIcons();
+            }
+        }
+
+        $('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            hide('loginMsg');
+            try {
+                const { account } = await api('/auth/login', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username: $('loginUser').value, password: $('loginPass').value }),
+                });
+                me = account;
+                hide('loginView');
+                enterDashboard();
+            } catch (err) { flash('loginMsg', err.message, false); }
+        });
+
+        async function logout() {
+            try { await api('/auth/logout', { method: 'POST' }); } catch {}
+            location.reload();
+        }
+
+        function enterDashboard() {
+            hide('bootLoader'); hide('loginView'); show('dashView');
+            $('vaName').textContent = me.vaName || 'Your VA';
+            $('acctName').textContent = me.displayName || me.username;
+            $('acctRole').textContent = me.role;
+            if (me.mustChangePassword) show('pwBanner');
+            if (me.role === 'owner') { show('teamSection'); loadTeam(); }
+            loadSubmissions();
+            lucide.createIcons();
+        }
+
+        function scrollToAccount() { $('accountSection').scrollIntoView({ behavior: 'smooth' }); }
+
+        // ---------- Submissions ----------
+        async function loadSubmissions() {
+            try {
+                const { submissions } = await api('/submissions');
+                if (!submissions.length) {
+                    $('subList').innerHTML = '<div class="surface rounded-2xl p-8 text-center text-sm text-zinc-400">No submissions yet. Use the form above to send us anything.</div>';
+                    return;
+                }
+                $('subList').innerHTML = submissions.map(s => `
+                    <div class="surface rounded-2xl p-5">
+                        <div class="flex items-start justify-between gap-3">
+                            <div class="min-w-0">
+                                <div class="flex items-center gap-2 flex-wrap mb-1">
+                                    <span class="text-[11px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400">${esc(s.category)}</span>
+                                    <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full ${STATUS_STYLE[s.status] || ''}">${STATUS_LABEL[s.status] || esc(s.status)}</span>
+                                </div>
+                                <h3 class="font-semibold tracking-tight truncate">${esc(s.title)}</h3>
+                            </div>
+                            <span class="text-[11px] text-zinc-400 whitespace-nowrap">${fmtDate(s.createdAt)}</span>
+                        </div>
+                        ${s.body ? `<p class="text-sm text-zinc-600 dark:text-zinc-300 mt-2 whitespace-pre-wrap">${esc(s.body)}</p>` : ''}
+                        ${(s.links && s.links.length) ? `<div class="mt-3 flex flex-wrap gap-2">${s.links.map(l => `<a href="${esc(l)}" target="_blank" rel="noopener" class="text-xs text-blue-600 dark:text-blue-400 hover:underline inline-flex items-center gap-1"><i data-lucide="link" class="w-3 h-3"></i>${esc(l.replace(/^https?:\/\//,'').slice(0,40))}</a>`).join('')}</div>` : ''}
+                        ${(s.attachments && s.attachments.length) ? `<div class="mt-3 flex flex-wrap gap-2">${s.attachments.map(a => `<a href="${esc(a.url)}" target="_blank" rel="noopener" class="text-xs px-2.5 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 inline-flex items-center gap-1.5"><i data-lucide="paperclip" class="w-3 h-3"></i>${esc((a.name||'file').slice(0,28))}</a>`).join('')}</div>` : ''}
+                        <p class="text-[11px] text-zinc-400 mt-3">by ${esc(s.submittedByName)}</p>
+                    </div>`).join('');
+                lucide.createIcons();
+            } catch (err) {
+                $('subList').innerHTML = `<div class="surface rounded-2xl p-6 text-center text-sm text-rose-500">${esc(err.message)}</div>`;
+            }
+        }
+
+        $('subForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            hide('subMsg'); $('subBtn').disabled = true;
+            try {
+                const fd = new FormData();
+                fd.append('category', $('subCategory').value);
+                fd.append('title', $('subTitle').value);
+                fd.append('body', $('subBody').value);
+                fd.append('links', $('subLinks').value);
+                for (const f of $('subFiles').files) fd.append('attachments', f);
+                await api('/submissions', { method: 'POST', body: fd });
+                $('subForm').reset();
+                flash('subMsg', 'Submitted — thank you!', true);
+                loadSubmissions();
+            } catch (err) { flash('subMsg', err.message, false); }
+            finally { $('subBtn').disabled = false; }
+        });
+
+        // ---------- Team (owner) ----------
+        async function loadTeam() {
+            try {
+                const { team } = await api('/team');
+                const members = team.filter(t => t.role !== 'owner');
+                const ownerRow = team.find(t => t.role === 'owner');
+                let html = '';
+                if (ownerRow) html += teamRow(ownerRow, true);
+                if (!members.length) html += '<div class="surface rounded-2xl p-5 text-center text-sm text-zinc-400">No staff yet. Add a teammate above to give them portal access.</div>';
+                else html += members.map(m => teamRow(m, false)).join('');
+                $('teamList').innerHTML = html;
+                lucide.createIcons();
+            } catch (err) {
+                $('teamList').innerHTML = `<div class="surface rounded-2xl p-5 text-center text-sm text-rose-500">${esc(err.message)}</div>`;
+            }
+        }
+
+        function teamRow(m, isOwner) {
+            return `<div class="surface rounded-2xl p-4 flex items-center justify-between gap-3">
+                <div class="min-w-0">
+                    <p class="font-semibold text-sm truncate">${esc(m.displayName)} ${isOwner ? '<span class="text-[10px] uppercase tracking-wide text-zinc-400 ml-1">owner</span>' : ''}</p>
+                    <p class="text-xs text-zinc-400">@${esc(m.username)} ${m.active ? '' : '· <span class="text-rose-500">disabled</span>'}</p>
+                </div>
+                ${isOwner ? '' : `<div class="flex items-center gap-1.5">
+                    <button onclick="resetMember('${m.id}')" title="Reset password" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"><i data-lucide="key-round" class="w-4 h-4"></i></button>
+                    <button onclick="toggleMember('${m.id}', ${!m.active})" title="${m.active ? 'Disable' : 'Enable'}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"><i data-lucide="${m.active ? 'user-x' : 'user-check'}" class="w-4 h-4"></i></button>
+                    <button onclick="deleteMember('${m.id}')" title="Remove" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-rose-50 dark:hover:bg-rose-500/10 text-rose-500"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                </div>`}
+            </div>`;
+        }
+
+        $('teamForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            hide('teamMsg');
+            try {
+                await api('/team', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ displayName: $('tmName').value, username: $('tmUser').value, password: $('tmPass').value }),
+                });
+                $('teamForm').reset();
+                flash('teamMsg', 'Team member added.', true);
+                loadTeam();
+            } catch (err) { flash('teamMsg', err.message, false); }
+        });
+
+        async function toggleMember(id, active) {
+            try { await api('/team/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ active }) }); loadTeam(); }
+            catch (err) { alert(err.message); }
+        }
+        async function resetMember(id) {
+            const password = prompt('New password for this team member (min 8 characters):');
+            if (!password) return;
+            try { await api('/team/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) }); alert('Password updated.'); }
+            catch (err) { alert(err.message); }
+        }
+        async function deleteMember(id) {
+            if (!confirm('Remove this team member? They will lose portal access.')) return;
+            try { await api('/team/' + id, { method: 'DELETE' }); loadTeam(); }
+            catch (err) { alert(err.message); }
+        }
+
+        // ---------- Password ----------
+        $('pwForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            hide('pwMsg');
+            try {
+                await api('/auth/change-password', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ currentPassword: $('pwCurrent').value, newPassword: $('pwNew').value }),
+                });
+                $('pwForm').reset();
+                hide('pwBanner');
+                flash('pwMsg', 'Password updated.', true);
+            } catch (err) { flash('pwMsg', err.message, false); }
+        });
+
+        boot();
+    </script>
+</body>
+</html>

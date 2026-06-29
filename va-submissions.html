@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VA Partnership Portal — Staff Oversight</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script>tailwind.config = { darkMode: 'class' };</script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+        :root { color-scheme: light dark; }
+        * { -webkit-tap-highlight-color: transparent; }
+        body { font-family: 'Inter', sans-serif; -webkit-font-smoothing: antialiased; }
+        [data-lucide] { width: 1.15em; height: 1.15em; }
+        svg.lucide { stroke-width: 1.75; }
+        .surface { background: #fff; border: 1px solid rgba(0,0,0,.06); box-shadow: 0 1px 2px rgba(0,0,0,.03), 0 1px 1px rgba(0,0,0,.02); }
+        .dark .surface { background: #18181b; border-color: rgba(255,255,255,.07); box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+        .loader { border: 2.5px solid rgba(120,120,128,.25); border-top-color: currentColor; border-radius: 50%; width: 30px; height: 30px; animation: spin .7s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .fade-in { animation: fade .4s cubic-bezier(.2,.8,.2,1) forwards; }
+        @keyframes fade { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        input, select, textarea { font-family: inherit; }
+        ::placeholder { color: #a1a1aa; }
+        .field { width: 100%; padding: .55rem .8rem; border-radius: .7rem; background: rgba(244,244,245,.7); border: 1px solid transparent; outline: none; font-size: .875rem; transition: .15s; }
+        .dark .field { background: rgba(39,39,42,.7); }
+        .field:focus { background: #fff; border-color: #d4d4d8; box-shadow: 0 0 0 4px rgba(24,24,27,.05); }
+        .dark .field:focus { background: #27272a; border-color: #52525b; box-shadow: 0 0 0 4px rgba(255,255,255,.05); }
+        .btn { background: #18181b; color: #fff; padding: .55rem .9rem; border-radius: .7rem; font-size: .875rem; font-weight: 600; transition: .15s; }
+        .dark .btn { background: #fafafa; color: #18181b; }
+        .btn:hover { opacity: .9; } .btn:active { transform: scale(.98); }
+        .tab { padding: .5rem .9rem; border-radius: .7rem; font-size: .875rem; font-weight: 600; color: #71717a; transition: .15s; }
+        .tab.active { background: #18181b; color: #fff; }
+        .dark .tab.active { background: #fafafa; color: #18181b; }
+    </style>
+</head>
+<body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 antialiased min-h-screen transition-colors duration-300">
+
+    <div id="bootLoader" class="min-h-screen flex flex-col items-center justify-center gap-4 text-zinc-400">
+        <div class="loader"></div>
+        <p class="text-sm font-medium">Loading…</p>
+    </div>
+
+    <div id="app" class="hidden max-w-5xl mx-auto px-5 py-8">
+        <!-- Header -->
+        <header class="flex items-center justify-between mb-6 fade-in">
+            <div class="flex items-center gap-3">
+                <a href="/staff" class="w-10 h-10 rounded-xl surface grid place-items-center text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 transition" title="Back to hub"><i data-lucide="arrow-left" class="w-5 h-5"></i></a>
+                <div>
+                    <h1 class="text-lg font-bold tracking-tight leading-tight">VA Partnership Portal</h1>
+                    <p class="text-xs text-zinc-500 dark:text-zinc-400">Submissions, accounts &amp; activity across every partner VA</p>
+                </div>
+            </div>
+            <a href="/va-portal" target="_blank" class="hidden sm:flex items-center gap-2 text-sm font-medium text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition" title="Open the partner-facing portal"><i data-lucide="external-link" class="w-4 h-4"></i> Partner view</a>
+        </header>
+
+        <!-- Tabs -->
+        <div class="flex items-center gap-2 mb-6">
+            <button class="tab active" data-tab="submissions" onclick="switchTab('submissions')">Submissions</button>
+            <button class="tab" data-tab="accounts" onclick="switchTab('accounts')">Accounts</button>
+            <button class="tab" data-tab="activity" onclick="switchTab('activity')">Activity</button>
+        </div>
+
+        <!-- ===== SUBMISSIONS ===== -->
+        <div id="tab-submissions">
+            <div class="flex flex-wrap items-center gap-2 mb-4">
+                <select id="fVa" class="field max-w-[14rem]" onchange="loadSubmissions()"><option value="">All VAs</option></select>
+                <select id="fStatus" class="field max-w-[10rem]" onchange="loadSubmissions()">
+                    <option value="">Any status</option>
+                    <option value="open">Open</option>
+                    <option value="in_review">In review</option>
+                    <option value="resolved">Resolved</option>
+                    <option value="archived">Archived</option>
+                </select>
+                <select id="fCat" class="field max-w-[10rem]" onchange="loadSubmissions()">
+                    <option value="">Any type</option>
+                    <option value="document">Document</option>
+                    <option value="request">Request</option>
+                    <option value="report">Report</option>
+                    <option value="event">Event</option>
+                    <option value="feedback">Feedback</option>
+                    <option value="other">Other</option>
+                </select>
+                <button onclick="loadSubmissions()" class="w-9 h-9 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500" title="Refresh"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+            </div>
+            <div id="subList" class="space-y-3"></div>
+        </div>
+
+        <!-- ===== ACCOUNTS ===== -->
+        <div id="tab-accounts" class="hidden">
+            <div class="surface rounded-2xl p-6 mb-5">
+                <p class="text-sm font-semibold mb-3 flex items-center gap-2"><i data-lucide="user-plus" class="w-4 h-4"></i> Create a portal account</p>
+                <form id="acctForm" class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <select id="naVa" class="field" required><option value="">Select VA…</option></select>
+                    <select id="naRole" class="field">
+                        <option value="owner">Owner</option>
+                        <option value="staff">Staff</option>
+                    </select>
+                    <input id="naName" type="text" placeholder="Display name (optional)" class="field">
+                    <input id="naUser" type="text" placeholder="Username (optional — auto from VA name)" class="field">
+                    <input id="naPass" type="text" placeholder="Password (optional — auto-generated)" class="field sm:col-span-2">
+                    <div class="sm:col-span-2 flex items-center gap-3">
+                        <button type="submit" class="btn">Create account</button>
+                        <p id="acctMsg" class="hidden text-sm font-medium"></p>
+                    </div>
+                </form>
+            </div>
+            <div class="flex items-center justify-between mb-3">
+                <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Portal accounts</h2>
+                <button onclick="loadAccounts()" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500" title="Refresh"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+            </div>
+            <div id="acctList" class="space-y-2"></div>
+        </div>
+
+        <!-- ===== ACTIVITY ===== -->
+        <div id="tab-activity" class="hidden">
+            <div class="flex items-center justify-between mb-3">
+                <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Recent portal activity</h2>
+                <button onclick="loadActivity()" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500" title="Refresh"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+            </div>
+            <div class="surface rounded-2xl overflow-hidden">
+                <div id="actList" class="divide-y divide-zinc-100 dark:divide-zinc-800/80 max-h-[36rem] overflow-y-auto"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API = '/api/va-portal/admin';
+        let vas = [];
+
+        const $ = (id) => document.getElementById(id);
+        const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+        const fmtDate = (d) => new Date(d).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+        const flash = (id, text, ok) => { const el = $(id); el.textContent = text; el.classList.remove('hidden','text-rose-500','text-emerald-500'); el.classList.add(ok ? 'text-emerald-500' : 'text-rose-500'); };
+
+        async function api(path, opts = {}) {
+            const res = await fetch(API + path, { credentials: 'include', ...opts });
+            if (res.status === 401) { location.href = '/staff?next=' + encodeURIComponent('/va-submissions'); throw new Error('auth'); }
+            let data = {};
+            try { data = await res.json(); } catch {}
+            if (!res.ok) throw new Error(data.error || 'Request failed.');
+            return data;
+        }
+
+        const STATUS_STYLE = {
+            open: 'bg-blue-100 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300',
+            in_review: 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300',
+            resolved: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300',
+            archived: 'bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400',
+        };
+        const STATUS_LABEL = { open: 'Open', in_review: 'In review', resolved: 'Resolved', archived: 'Archived' };
+
+        function switchTab(name) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+            ['submissions','accounts','activity'].forEach(n => $('tab-' + n).classList.toggle('hidden', n !== name));
+            if (name === 'accounts') loadAccounts();
+            if (name === 'activity') loadActivity();
+        }
+
+        async function boot() {
+            try {
+                const { vas: list } = await api('/vas');
+                vas = list;
+                // Fill VA dropdowns.
+                const opts = list.map(v => `<option value="${v.id}">${esc(v.name)}${v.callsign ? ' (' + esc(v.callsign) + ')' : ''}</option>`).join('');
+                $('fVa').innerHTML = '<option value="">All VAs</option>' + opts;
+                $('naVa').innerHTML = '<option value="">Select VA…</option>' + opts;
+                $('bootLoader').classList.add('hidden');
+                $('app').classList.remove('hidden');
+                lucide.createIcons();
+                loadSubmissions();
+            } catch (err) {
+                if (err.message !== 'auth') {
+                    $('bootLoader').innerHTML = `<p class="text-sm text-rose-500">${esc(err.message)}</p>`;
+                }
+            }
+        }
+
+        // ---------- Submissions ----------
+        async function loadSubmissions() {
+            const params = new URLSearchParams();
+            if ($('fVa').value) params.set('vaAdId', $('fVa').value);
+            if ($('fStatus').value) params.set('status', $('fStatus').value);
+            if ($('fCat').value) params.set('category', $('fCat').value);
+            $('subList').innerHTML = '<div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400">Loading…</div>';
+            try {
+                const { submissions } = await api('/submissions?' + params.toString());
+                if (!submissions.length) {
+                    $('subList').innerHTML = '<div class="surface rounded-2xl p-8 text-center text-sm text-zinc-400">No submissions match.</div>';
+                    return;
+                }
+                $('subList').innerHTML = submissions.map(renderSub).join('');
+                lucide.createIcons();
+            } catch (err) {
+                if (err.message !== 'auth') $('subList').innerHTML = `<div class="surface rounded-2xl p-6 text-center text-sm text-rose-500">${esc(err.message)}</div>`;
+            }
+        }
+
+        function renderSub(s) {
+            const statusSel = ['open','in_review','resolved','archived'].map(v => `<option value="${v}" ${s.status===v?'selected':''}>${STATUS_LABEL[v]}</option>`).join('');
+            return `<div class="surface rounded-2xl p-5">
+                <div class="flex items-start justify-between gap-3">
+                    <div class="min-w-0">
+                        <div class="flex items-center gap-2 flex-wrap mb-1">
+                            <span class="text-[11px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400">${esc(s.category)}</span>
+                            <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full ${STATUS_STYLE[s.status]||''}">${STATUS_LABEL[s.status]||esc(s.status)}</span>
+                            <span class="text-[11px] font-semibold text-zinc-400">${esc(s.vaName||'—')}</span>
+                        </div>
+                        <h3 class="font-semibold tracking-tight">${esc(s.title)}</h3>
+                    </div>
+                    <span class="text-[11px] text-zinc-400 whitespace-nowrap">${fmtDate(s.createdAt)}</span>
+                </div>
+                ${s.body ? `<p class="text-sm text-zinc-600 dark:text-zinc-300 mt-2 whitespace-pre-wrap">${esc(s.body)}</p>` : ''}
+                ${(s.links&&s.links.length) ? `<div class="mt-3 flex flex-wrap gap-2">${s.links.map(l=>`<a href="${esc(l)}" target="_blank" rel="noopener" class="text-xs text-blue-600 dark:text-blue-400 hover:underline inline-flex items-center gap-1"><i data-lucide="link" class="w-3 h-3"></i>${esc(l.replace(/^https?:\/\//,'').slice(0,40))}</a>`).join('')}</div>` : ''}
+                ${(s.attachments&&s.attachments.length) ? `<div class="mt-3 flex flex-wrap gap-2">${s.attachments.map(a=>`<a href="${esc(a.url)}" target="_blank" rel="noopener" class="text-xs px-2.5 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 inline-flex items-center gap-1.5"><i data-lucide="paperclip" class="w-3 h-3"></i>${esc((a.name||'file').slice(0,28))}</a>`).join('')}</div>` : ''}
+                <p class="text-[11px] text-zinc-400 mt-3">by ${esc(s.submittedByName)} · ${esc(s.submittedByRole)}</p>
+                <div class="mt-4 pt-4 border-t border-zinc-100 dark:border-zinc-800 space-y-2">
+                    <div class="flex items-center gap-2">
+                        <span class="text-xs font-medium text-zinc-500">Status</span>
+                        <select class="field max-w-[10rem]" data-sub-status="${s.id}">${statusSel}</select>
+                    </div>
+                    <textarea class="field" rows="2" placeholder="Internal staff notes (not shown to the VA)" data-sub-notes="${s.id}">${esc(s.staffNotes||'')}</textarea>
+                    <div class="flex items-center gap-3">
+                        <button onclick="saveSub('${s.id}')" class="btn">Save</button>
+                        <p class="hidden text-sm font-medium" data-sub-msg="${s.id}"></p>
+                    </div>
+                </div>
+            </div>`;
+        }
+
+        async function saveSub(id) {
+            const status = document.querySelector(`[data-sub-status="${id}"]`).value;
+            const staffNotes = document.querySelector(`[data-sub-notes="${id}"]`).value;
+            const msg = document.querySelector(`[data-sub-msg="${id}"]`);
+            try {
+                await api('/submissions/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status, staffNotes }) });
+                msg.textContent = 'Saved.'; msg.classList.remove('hidden','text-rose-500'); msg.classList.add('text-emerald-500');
+            } catch (err) {
+                if (err.message !== 'auth') { msg.textContent = err.message; msg.classList.remove('hidden','text-emerald-500'); msg.classList.add('text-rose-500'); }
+            }
+        }
+
+        // ---------- Accounts ----------
+        async function loadAccounts() {
+            $('acctList').innerHTML = '<div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400">Loading…</div>';
+            try {
+                const { accounts } = await api('/accounts');
+                if (!accounts.length) { $('acctList').innerHTML = '<div class="surface rounded-2xl p-8 text-center text-sm text-zinc-400">No portal accounts yet.</div>'; return; }
+                $('acctList').innerHTML = accounts.map(renderAcct).join('');
+                lucide.createIcons();
+            } catch (err) {
+                if (err.message !== 'auth') $('acctList').innerHTML = `<div class="surface rounded-2xl p-6 text-center text-sm text-rose-500">${esc(err.message)}</div>`;
+            }
+        }
+
+        function renderAcct(a) {
+            return `<div class="surface rounded-2xl p-4 flex items-center justify-between gap-3">
+                <div class="min-w-0">
+                    <p class="font-semibold text-sm truncate">${esc(a.displayName)} <span class="text-[10px] uppercase tracking-wide text-zinc-400 ml-1">${esc(a.role)}</span> ${a.active ? '' : '<span class="text-[10px] text-rose-500 ml-1">disabled</span>'}</p>
+                    <p class="text-xs text-zinc-400">@${esc(a.username)} · ${esc(a.vaName||'—')} · ${a.lastLoginAt ? 'last in ' + fmtDate(a.lastLoginAt) : 'never signed in'} · via ${esc(a.createdVia)}</p>
+                </div>
+                <div class="flex items-center gap-1.5">
+                    <button onclick="resetAcct('${a.id}')" title="Reset password" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"><i data-lucide="key-round" class="w-4 h-4"></i></button>
+                    <button onclick="toggleAcct('${a.id}', ${!a.active})" title="${a.active ? 'Disable' : 'Enable'}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"><i data-lucide="${a.active ? 'user-x' : 'user-check'}" class="w-4 h-4"></i></button>
+                    <button onclick="deleteAcct('${a.id}')" title="Delete" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-rose-50 dark:hover:bg-rose-500/10 text-rose-500"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                </div>
+            </div>`;
+        }
+
+        $('acctForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            $('acctMsg').classList.add('hidden');
+            try {
+                const { account, password } = await api('/accounts', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        vaAdId: $('naVa').value, role: $('naRole').value,
+                        displayName: $('naName').value, username: $('naUser').value,
+                        password: $('naPass').value || undefined,
+                    }),
+                });
+                $('acctForm').reset();
+                if (password) flash('acctMsg', `Created @${account.username} — password: ${password} (copy it now)`, true);
+                else flash('acctMsg', `Created @${account.username}.`, true);
+                loadAccounts();
+            } catch (err) { if (err.message !== 'auth') flash('acctMsg', err.message, false); }
+        });
+
+        async function toggleAcct(id, active) {
+            try { await api('/accounts/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ active }) }); loadAccounts(); }
+            catch (err) { if (err.message !== 'auth') alert(err.message); }
+        }
+        async function resetAcct(id) {
+            const password = prompt('New password (min 8 characters):');
+            if (!password) return;
+            try { await api('/accounts/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) }); alert('Password updated.'); }
+            catch (err) { if (err.message !== 'auth') alert(err.message); }
+        }
+        async function deleteAcct(id) {
+            if (!confirm('Delete this portal account permanently?')) return;
+            try { await api('/accounts/' + id, { method: 'DELETE' }); loadAccounts(); }
+            catch (err) { if (err.message !== 'auth') alert(err.message); }
+        }
+
+        // ---------- Activity ----------
+        async function loadActivity() {
+            $('actList').innerHTML = '<div class="px-5 py-10 text-center text-sm text-zinc-400">Loading…</div>';
+            try {
+                const { activity } = await api('/activity');
+                if (!activity.length) { $('actList').innerHTML = '<div class="px-5 py-10 text-center text-sm text-zinc-400">No activity yet.</div>'; return; }
+                $('actList').innerHTML = activity.map(a => `
+                    <div class="px-5 py-3 flex items-center justify-between gap-3">
+                        <div class="min-w-0">
+                            <p class="text-sm"><span class="font-semibold">${esc(a.actorName||'—')}</span> <span class="text-zinc-400">${esc(a.actorRole||'')}</span> · <span class="text-zinc-600 dark:text-zinc-300">${esc(a.action)}</span></p>
+                            <p class="text-xs text-zinc-400 truncate">${esc(a.vaName||'')}${a.detail ? ' · ' + esc(a.detail) : ''}</p>
+                        </div>
+                        <span class="text-[11px] text-zinc-400 whitespace-nowrap">${fmtDate(a.createdAt)}</span>
+                    </div>`).join('');
+            } catch (err) {
+                if (err.message !== 'auth') $('actList').innerHTML = `<div class="px-5 py-10 text-center text-sm text-rose-500">${esc(err.message)}</div>`;
+            }
+        }
+
+        boot();
+    </script>
+</body>
+</html>
