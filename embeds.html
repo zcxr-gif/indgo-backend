@@ -141,7 +141,7 @@
                      to the linked VA ad, so there's one webhook per VA, not per token. -->
                 <div id="webhookNoVa" class="rounded-2xl border-2 border-dashed border-zinc-200 dark:border-zinc-800 p-4 text-xs text-zinc-400 flex items-center gap-2">
                     <i class="fa-solid fa-bolt text-zinc-300 dark:text-zinc-600"></i>
-                    Connect this embed to a VA above to manage its takeoff/landing webhook.
+                    <span id="webhookNoVaMsg">Connect this embed to a VA above to manage its takeoff/landing webhook.</span>
                 </div>
                 <div id="webhookPanel" class="hidden rounded-2xl border-2 border-zinc-200 dark:border-zinc-800 p-4 space-y-3">
                     <div class="flex items-center justify-between gap-2">
@@ -154,6 +154,7 @@
                     <div class="flex items-center gap-2 flex-wrap">
                         <button type="button" onclick="saveWebhookUrl()" class="bg-zinc-900 hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 text-white text-xs font-semibold px-3 py-2 rounded-lg active:scale-95 transition">Save webhook</button>
                         <button type="button" id="wh_approveBtn" onclick="toggleWebhookApproved()" class="text-xs font-semibold px-3 py-2 rounded-lg active:scale-95 transition"></button>
+                        <button type="button" id="wh_testBtn" onclick="sendWebhookTest()" class="text-xs font-semibold px-3 py-2 rounded-lg active:scale-95 transition border-2 border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800">Send test</button>
                         <label class="flex items-center gap-2 text-xs font-semibold text-zinc-600 dark:text-zinc-300 ml-auto cursor-pointer">
                             <input type="checkbox" id="wh_enabled" onchange="toggleWebhookEnabled()" class="w-4 h-4 rounded accent-emerald-500"> Enabled
                         </label>
@@ -545,40 +546,51 @@
         // the VA ad, not the embed token, so there's one webhook per VA. ----
         let webhookAd = null; // { id, ...status } for the VA this embed links to
 
-        // Find the VA-ad directory record whose callsign matches the embed VA code.
-        function findVaAdByCode(code) {
-            const c = (code || '').trim().toUpperCase();
-            if (!c) return null;
-            return (VA_DIRECTORY || []).find(v => {
-                if ((v.callsign || '').trim().toUpperCase() === c) return true;
-                return Array.isArray(v.callsigns) && v.callsigns.some(x => (x || '').trim().toUpperCase() === c);
-            }) || null;
-        }
-
         // Light up (or hide) the webhook panel for the embed's currently-linked VA.
-        // `picked` is an optional directory record (from pickVa) to skip the search.
+        // Resolution goes through the server (by VA-ad id when we just picked one,
+        // otherwise by the embed's stored va.code) so reopening the editor reliably
+        // re-finds the VA — no dependence on the paged client-side directory.
+        // `picked` is an optional directory record (from pickVa) carrying its _id.
+        let whSyncToken = 0;
         async function syncWebhookPanel(picked) {
             const panel = document.getElementById('webhookPanel');
             const noVa = document.getElementById('webhookNoVa');
             if (!panel || !noVa) return;
+            const token = ++whSyncToken;
             webhookAd = null;
             document.getElementById('wh_url').value = '';
-            await loadVaDirectory();
-            const ad = (picked && picked._id) ? picked : findVaAdByCode(document.getElementById('f_va_code').value);
-            if (!ad || !ad._id) {
+            const code = document.getElementById('f_va_code').value.trim();
+            const showNoVa = (msg) => {
                 panel.classList.add('hidden');
                 noVa.classList.remove('hidden');
+                document.getElementById('webhookNoVaMsg').textContent = msg;
+            };
+
+            if (!(picked && picked._id) && !code) {
+                showNoVa('Connect this embed to a VA above to manage its takeoff/landing webhook.');
                 return;
             }
+
+            let res;
+            try {
+                res = (picked && picked._id)
+                    ? await fetch(`/api/va-ads/${picked._id}/flight-events`)
+                    : await fetch(`/api/va-ads/flight-events/by-code?code=${encodeURIComponent(code)}`);
+            } catch {
+                if (token === whSyncToken) showNoVa('Could not reach the server to load the webhook. Try again.');
+                return;
+            }
+            if (token !== whSyncToken) return; // a newer sync superseded this one
+            if (res.status === 404) {
+                showNoVa(`No VA listing matches “${code}”. The webhook is stored on the VA’s directory listing — create/connect that VA in the VA Ads Manager first.`);
+                return;
+            }
+            if (!res.ok) { showNoVa('Could not load the webhook for this VA.'); return; }
+            const json = await res.json().catch(() => ({}));
+            webhookAd = Object.assign({}, json.data || {});
+            if (!webhookAd.id) { showNoVa('Could not load the webhook for this VA.'); return; }
             noVa.classList.add('hidden');
             panel.classList.remove('hidden');
-            try {
-                const res = await fetch(`/api/va-ads/${ad._id}/flight-events`);
-                const json = await res.json();
-                webhookAd = Object.assign({ id: ad._id }, json.data || {});
-            } catch {
-                webhookAd = { id: ad._id, configured: !!ad.flightEventsWebhookUrl, approved: !!ad.flightEventsApproved, enabled: ad.flightEventsEnabled !== false, requestedAt: ad.flightEventsRequestedAt };
-            }
             renderWebhookPanel();
         }
 
@@ -588,6 +600,10 @@
             const pill = document.getElementById('wh_status');
             const approveBtn = document.getElementById('wh_approveBtn');
             document.getElementById('wh_enabled').checked = !!s.enabled;
+            const testBtn = document.getElementById('wh_testBtn');
+            testBtn.disabled = !s.configured;
+            testBtn.classList.toggle('opacity-40', !s.configured);
+            testBtn.classList.toggle('cursor-not-allowed', !s.configured);
             const hint = document.getElementById('wh_hint');
             if (s.configured && s.hint) { hint.textContent = 'On file: ' + s.hint; hint.classList.remove('hidden'); }
             else { hint.classList.add('hidden'); }
@@ -636,6 +652,21 @@
             const url = el.value.trim();
             patchWebhook({ webhookUrl: url }, url ? 'Webhook saved' : 'Webhook cleared');
             el.value = '';
+        }
+        async function sendWebhookTest() {
+            if (!webhookAd || !webhookAd.id) return;
+            const btn = document.getElementById('wh_testBtn');
+            const orig = btn.textContent;
+            btn.disabled = true; btn.textContent = 'Sending…';
+            try {
+                const res = await fetch(`/api/va-ads/${webhookAd.id}/flight-events/test`, { method: 'POST' });
+                const json = await res.json().catch(() => ({}));
+                toast(res.ok ? (json.message || 'Test sent') : (json.message || 'Test failed'));
+            } catch {
+                toast('Test failed');
+            } finally {
+                btn.disabled = false; btn.textContent = orig;
+            }
         }
 
         // ---- modal ----

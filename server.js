@@ -426,6 +426,17 @@ const normalizeCallsignBase = (raw) => {
     return clean || null;
 };
 
+// Reduce a LIVE in-game callsign to its airline-name base by dropping the trailing
+// flight number + optional tag: "Air Canada 001VA" -> "AIR CANADA",
+// "OCEAN 12VA" -> "OCEAN", "OCEAN 7" -> "OCEAN". A bare base ("OCEAN") is left as
+// is. Complements normalizeCallsignBase (which only strips the "##VA" suffix form)
+// so partner matching can line a real callsign up against a stored base callsign.
+const callsignAirlineBase = (raw) => {
+    if (!raw) return null;
+    const clean = String(raw).trim().toUpperCase().replace(/\s+\d+\s*[A-Z]*$/, '').trim();
+    return clean || null;
+};
+
 // True only for a well-formed Discord webhook URL. Partner VAs paste these into
 // the portal themselves, so we gate both the write (vaPortal.js) and the post
 // (VA flight events, below) on this — without it the per-VA delivery would be an
@@ -2267,6 +2278,83 @@ const flightEventsStatus = (ad) => ({
     requestedAt: ad.flightEventsRequestedAt || null,
 });
 
+// GET: Diagnose why a live callsign did/didn't deliver to a partner webhook.
+// STAFF. Paste the exact callsign you saw flying and this reports the bases we
+// reduce it to, the VA that owns one of those bases (ignoring the opt-in gates),
+// and the precise gate that's blocking delivery — so a silent miss becomes a
+// one-line answer. Declared before '/api/va-ads/:id/...' but the 'flight-events'
+// literal segment keeps the two from colliding.
+app.get('/api/va-ads/flight-events/diagnose', requireAuth, async (req, res) => {
+    try {
+        const callsign = String(req.query.callsign || '').trim();
+        if (!callsign) {
+            return res.status(400).json({ message: 'Pass ?callsign=… (the live callsign you saw flying).' });
+        }
+        const basesTried = [...new Set([
+            normalizeCallsignBase(callsign),
+            callsignAirlineBase(callsign),
+        ].filter(Boolean))];
+
+        const ad = await VirtualAirlineAd.findOne({ callsigns: { $in: basesTried } })
+            .select('+flightEventsWebhookUrl name callsigns flightEventsApproved flightEventsEnabled flightEventsRequestedAt')
+            .lean();
+
+        if (!ad) {
+            return res.json({
+                callsign, basesTried, matched: false, reason: 'no_va_owns_this_callsign',
+                hint: 'No VA in the directory has any of these base callsigns. Check the VA’s stored callsign(s) — they must be the base, e.g. "OCEAN".',
+            });
+        }
+
+        const configured = !!ad.flightEventsWebhookUrl;
+        let reason = 'would_deliver';
+        if (!configured) reason = 'no_webhook_saved';
+        else if (!ad.flightEventsApproved) reason = 'not_approved';
+        else if (!ad.flightEventsEnabled) reason = 'disabled';
+
+        res.json({
+            callsign, basesTried, matched: true,
+            va: { id: ad._id, name: ad.name, callsigns: ad.callsigns || [] },
+            approved: !!ad.flightEventsApproved,
+            enabled: !!ad.flightEventsEnabled,
+            configured,
+            webhookHint: maskWebhookUrl(ad.flightEventsWebhookUrl),
+            reason,
+        });
+    } catch (err) {
+        console.error('VA Ad flight-events diagnose error:', err);
+        res.status(500).json({ message: 'Diagnose failed.' });
+    }
+});
+
+// GET: Resolve the VA ad a code/callsign belongs to and return its flight-event
+// webhook status. STAFF. Lets the embed manager light up the webhook panel from
+// the embed's stored va.code alone — server-side, so it doesn't depend on the
+// client-side directory list (which is paged) re-finding the VA on reopen.
+app.get('/api/va-ads/flight-events/by-code', requireAuth, async (req, res) => {
+    try {
+        const code = String(req.query.code || '').trim();
+        if (!code) return res.status(400).json({ message: 'Pass ?code=…' });
+        const bases = [...new Set([normalizeCallsignBase(code), callsignAirlineBase(code)].filter(Boolean))];
+
+        const sel = '+flightEventsWebhookUrl name callsign callsigns flightEventsEnabled flightEventsApproved flightEventsRequestedAt';
+        // Prefer a base-callsign match; fall back to an exact (case-insensitive)
+        // name match so embeds linked by name still resolve.
+        let ad = bases.length
+            ? await VirtualAirlineAd.findOne({ callsigns: { $in: bases } }).select(sel).lean()
+            : null;
+        if (!ad) {
+            const escaped = code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            ad = await VirtualAirlineAd.findOne({ name: new RegExp('^' + escaped + '$', 'i') }).select(sel).lean();
+        }
+        if (!ad) return res.status(404).json({ message: 'No VA ad found for that code.', code, basesTried: bases });
+        res.json({ data: flightEventsStatus(ad) });
+    } catch (err) {
+        console.error('VA Ad flight-events by-code error:', err);
+        res.status(500).json({ message: 'Lookup failed.' });
+    }
+});
+
 // GET: Flight-event webhook status for one VA. STAFF. Backs the approval controls
 // on the staff home page and in the embed manager (which mirror the same webhook,
 // keyed to the VA ad — one source of truth, see VA-ADMIN-MANUAL.md).
@@ -2313,6 +2401,46 @@ app.patch('/api/va-ads/:id/flight-events', requireAuth, async (req, res) => {
     } catch (error) {
         console.error('VA Ad flight-events update error:', error);
         res.status(500).json({ message: 'Server error while updating flight-event webhook.' });
+    }
+});
+
+// POST: Fire a sample takeoff card to the VA's saved webhook. STAFF. Lets staff
+// confirm the webhook URL itself works without waiting for a real flight — it
+// deliberately bypasses approval / enabled / callsign matching, so a success here
+// means "the URL is good" and the only remaining variable is the live match.
+app.post('/api/va-ads/:id/flight-events/test', requireAuth, async (req, res) => {
+    try {
+        const ad = await VirtualAirlineAd.findById(req.params.id)
+            .select('+flightEventsWebhookUrl name callsign callsigns');
+        if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+        if (!ad.flightEventsWebhookUrl) {
+            return res.status(400).json({ message: 'No webhook saved for this VA yet.' });
+        }
+        if (!isDiscordWebhookUrl(ad.flightEventsWebhookUrl)) {
+            return res.status(400).json({ message: 'The saved webhook is not a valid Discord webhook URL.' });
+        }
+        const base = ad.callsign || (ad.callsigns && ad.callsigns[0]) || ad.name || 'VA';
+        const sample = {
+            event: 'takeoff',
+            flightId: 'test-' + Date.now(),
+            va: { code: base, name: ad.name || base },
+            callsign: `${base} 01`,
+            username: 'Test Pilot',
+            server: 'Expert',
+            aircraft: { aircraftName: 'Boeing 737-800', liveryName: 'Test Livery' },
+            position: { lat: 43.6777, lon: -79.6248, alt_ft: 4200, gs_kt: 250 },
+            timestamp: Date.now(),
+        };
+        await axios.post(ad.flightEventsWebhookUrl, buildVaEventPayload(sample));
+        res.json({ message: 'Test event sent — check the VA’s Discord channel.' });
+    } catch (error) {
+        const status = error.response && error.response.status;
+        console.error('VA Ad flight-events test error:', status || '', error.message);
+        res.status(502).json({
+            message: status
+                ? `Discord rejected the webhook (HTTP ${status}). The URL may be wrong, revoked or deleted.`
+                : 'Could not reach the webhook URL.',
+        });
     }
 });
 
@@ -2422,24 +2550,46 @@ const buildVaEventPayload = (e) => {
 // is a silent no-op. Isolated try/catch so a partner's broken webhook never
 // affects the central post or the ack.
 const sendVaEventToPartner = async (e) => {
-    const codes = [e.va?.code, e.callsign]
-        .map(normalizeCallsignBase)
-        .filter(Boolean);
-    if (!codes.length) return;
+    // The event ALREADY arrives attributed to a VA — the ACARS sender resolved it
+    // and set e.va.code / e.va.name. We're not re-identifying the flight here; we
+    // just need the ONE VA listing that owns the webhook to post to (the webhook
+    // lives on the listing, not in the event). So match the listing off that
+    // attribution — its code/name — and only fall back to the raw callsign.
+    const codeBases = [...new Set([
+        normalizeCallsignBase(e.va?.code),
+        callsignAirlineBase(e.va?.code),
+        normalizeCallsignBase(e.callsign),
+        callsignAirlineBase(e.callsign),
+    ].filter(Boolean))];
+    const names = [...new Set([e.va?.name, e.va?.code]
+        .map(s => String(s || '').trim()).filter(Boolean))];
+
+    const or = [];
+    if (codeBases.length) or.push({ callsigns: { $in: codeBases } });
+    for (const n of names) or.push({ name: new RegExp('^' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
+    if (!or.length) return;
 
     let ad;
     try {
         ad = await VirtualAirlineAd.findOne({
-            callsigns: { $in: codes },
-            flightEventsApproved: true,   // staff-granted; requests alone don't deliver
-            flightEventsEnabled: true,
-            flightEventsWebhookUrl: { $ne: null },
+            $and: [
+                { $or: or },
+                { flightEventsApproved: true },   // staff-granted; requests alone don't deliver
+                { flightEventsEnabled: true },
+                { flightEventsWebhookUrl: { $ne: null } },
+            ],
         }).select('name +flightEventsWebhookUrl').lean();
     } catch (err) {
         console.error('[va-events] partner lookup failed:', err.message);
         return;
     }
-    if (!ad || !ad.flightEventsWebhookUrl) return;
+    // Silent no-op when no VA opted in — but log what we tried so a miss is
+    // diagnosable (almost always a gate that's off: not approved / disabled / no
+    // webhook saved — not a failure to identify the VA, which already happened).
+    if (!ad || !ad.flightEventsWebhookUrl) {
+        console.log(`[va-events] no opted-in partner for VA "${e.va?.name || e.va?.code || e.callsign}" — codes [${codeBases.join(', ')}] names [${names.join(', ')}]`);
+        return;
+    }
 
     // Re-validate at send time: a URL stored before validation tightened, or a
     // VA host that should no longer be trusted, must not be posted to blindly.
