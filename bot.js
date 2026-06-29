@@ -392,6 +392,31 @@ const normalizeData = async (rawType, rawLivery) => {
     return { type: finalType, livery: finalLivery };
 };
 
+// Module-level handle to the logged-in Discord client, set inside
+// startDiscordBot. Lets server-side code (e.g. the VA portal's activity logging)
+// post to a channel by ID without holding its own bot connection.
+let botClient = null;
+
+// Post a message/embed to a Discord channel by ID using the running bot client.
+// Fire-and-forget: a no-op (logged) if the client isn't ready or the channel
+// can't be reached, so callers never have to guard against startup races.
+async function postToChannel(channelId, payload) {
+    try {
+        if (!botClient || typeof botClient.isReady === 'function' && !botClient.isReady()) {
+            console.warn('[discord] bot not ready — dropping channel post to', channelId);
+            return;
+        }
+        const channel = await botClient.channels.fetch(channelId).catch(() => null);
+        if (!channel || typeof channel.send !== 'function') {
+            console.warn('[discord] channel not found or not sendable:', channelId);
+            return;
+        }
+        await channel.send(typeof payload === 'string' ? { content: payload } : payload);
+    } catch (err) {
+        console.error('[discord] postToChannel failed:', err.message);
+    }
+}
+
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, models = {}) => {
     const { DailyPilotStats, VirtualAirlineAd, Giveaway, VaTermsAcceptance,
             provisionVaPortalAccount } = models;
@@ -3732,6 +3757,9 @@ client.on('interactionCreate', async (interaction) => {
       }
     });
 
+    // Expose the client module-wide so postToChannel() can reach it.
+    botClient = client;
+
     if (process.env.DISCORD_BOT_TOKEN) {
         client.login(process.env.DISCORD_BOT_TOKEN).catch((err) => {
             console.error('🤖 Discord login failed (continuing without bot):', err && err.message ? err.message : err);
@@ -3741,4 +3769,4 @@ client.on('interactionCreate', async (interaction) => {
     }
 };
 
-module.exports = { startDiscordBot };
+module.exports = { startDiscordBot, postToChannel };

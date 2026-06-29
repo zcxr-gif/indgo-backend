@@ -202,8 +202,16 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // it can post to that channel), so the portal never echoes it back in full —
     // see portalVa()/the PATCH handler in vaPortal.js. Validated to a Discord
     // webhook host on write to keep this from becoming an open POST relay.
-    flightEventsWebhookUrl: { type: String, trim: true, default: null },
+    // select:false so this secret is NEVER returned by default — notably the
+    // PUBLIC GET /api/va-ads list returns full ad docs. Read paths that need the
+    // actual URL must opt in with .select('+flightEventsWebhookUrl').
+    flightEventsWebhookUrl: { type: String, trim: true, default: null, select: false },
     flightEventsEnabled: { type: Boolean, default: true },
+    // Staff gate: the feature is REQUESTED by the VA, not auto-granted. Delivery
+    // (sendVaEventToPartner) only fires once a staff member approves. The request
+    // timestamp lets the portal show a "pending approval" state.
+    flightEventsApproved: { type: Boolean, default: false },
+    flightEventsRequestedAt: { type: Date, default: null },
 
     // --- Analytics ---
     views: { type: Number, default: 0 },                            // detail-page impressions
@@ -2127,6 +2135,10 @@ app.put('/api/va-ads/:id', requireAuth, uploadVaImages, async (req, res) => {
         if (b.contactEmail !== undefined) ad.contactEmail = b.contactEmail || null;
         if (b.status !== undefined && VA_AD_STATUSES.includes(b.status)) ad.status = b.status;
         if (b.featured !== undefined) ad.featured = b.featured === true || b.featured === 'true';
+        // Staff approval gate for VA-managed flight-event delivery (requested in
+        // the portal). Approving without a webhook on file is harmless — nothing
+        // sends until the VA has also saved one.
+        if (b.flightEventsApproved !== undefined) ad.flightEventsApproved = b.flightEventsApproved === true || b.flightEventsApproved === 'true';
 
         await ad.save();
         res.json({ message: 'VA advertisement updated.', data: ad });
@@ -2289,9 +2301,10 @@ const sendVaEventToPartner = async (e) => {
     try {
         ad = await VirtualAirlineAd.findOne({
             callsigns: { $in: codes },
+            flightEventsApproved: true,   // staff-granted; requests alone don't deliver
             flightEventsEnabled: true,
             flightEventsWebhookUrl: { $ne: null },
-        }).select('name flightEventsWebhookUrl').lean();
+        }).select('name +flightEventsWebhookUrl').lean();
     } catch (err) {
         console.error('[va-events] partner lookup failed:', err.message);
         return;
