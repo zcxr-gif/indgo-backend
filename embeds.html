@@ -123,7 +123,7 @@
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
                     <div>
                         <label class="block text-sm font-semibold mb-1.5">VA code <span class="text-red-500">*</span></label>
-                        <input id="f_va_code" required placeholder="OCEAN" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
+                        <input id="f_va_code" required placeholder="OCEAN" onchange="syncWebhookPanel()" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
                     </div>
                     <div class="sm:col-span-2">
                         <label class="block text-sm font-semibold mb-1.5">Display name</label>
@@ -134,6 +134,30 @@
                 <div>
                     <label class="block text-sm font-semibold mb-1.5">Logo URL</label>
                     <input id="f_va_logo" placeholder="https://…/logo.png (optional — auto-resolved from VA-Ads if blank)" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                </div>
+
+                <!-- Flight-event webhook — mirrors the VA's takeoff/landing Discord
+                     webhook (the SAME one staff approve in the VA Ads manager). Keyed
+                     to the linked VA ad, so there's one webhook per VA, not per token. -->
+                <div id="webhookNoVa" class="rounded-2xl border-2 border-dashed border-zinc-200 dark:border-zinc-800 p-4 text-xs text-zinc-400 flex items-center gap-2">
+                    <i class="fa-solid fa-bolt text-zinc-300 dark:text-zinc-600"></i>
+                    Connect this embed to a VA above to manage its takeoff/landing webhook.
+                </div>
+                <div id="webhookPanel" class="hidden rounded-2xl border-2 border-zinc-200 dark:border-zinc-800 p-4 space-y-3">
+                    <div class="flex items-center justify-between gap-2">
+                        <label class="text-sm font-semibold flex items-center gap-2"><i class="fa-solid fa-bolt text-amber-500"></i> Flight-event webhook</label>
+                        <span id="wh_status" class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-500">—</span>
+                    </div>
+                    <p class="text-xs text-zinc-400">Takeoffs &amp; landings matched to this VA are posted to its own Discord channel. This is the same webhook staff approve in the VA Ads manager — one per VA.</p>
+                    <input id="wh_url" placeholder="https://discord.com/api/webhooks/… (paste to set on the VA's behalf)" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none mono text-sm">
+                    <p id="wh_hint" class="hidden text-xs text-zinc-400 mono"></p>
+                    <div class="flex items-center gap-2 flex-wrap">
+                        <button type="button" onclick="saveWebhookUrl()" class="bg-zinc-900 hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 text-white text-xs font-semibold px-3 py-2 rounded-lg active:scale-95 transition">Save webhook</button>
+                        <button type="button" id="wh_approveBtn" onclick="toggleWebhookApproved()" class="text-xs font-semibold px-3 py-2 rounded-lg active:scale-95 transition"></button>
+                        <label class="flex items-center gap-2 text-xs font-semibold text-zinc-600 dark:text-zinc-300 ml-auto cursor-pointer">
+                            <input type="checkbox" id="wh_enabled" onchange="toggleWebhookEnabled()" class="w-4 h-4 rounded accent-emerald-500"> Enabled
+                        </label>
+                    </div>
                 </div>
 
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -496,6 +520,9 @@
             note.classList.remove('hidden');
             document.getElementById('vaResults').classList.add('hidden');
             document.getElementById('f_va_connect').value = '';
+            // The picked record carries its VA-ad _id + flight-event flags, so we
+            // can light up the webhook panel without another lookup.
+            syncWebhookPanel(v);
         }
 
         // Hide the results dropdown when clicking away from the connector.
@@ -513,6 +540,104 @@
             document.getElementById('vaConnected').classList.add('hidden');
         }
 
+        // ---- Flight-event webhook (mirrors the linked VA ad's takeoff/landing
+        // webhook — the SAME record staff approve in the VA Ads manager). Keyed to
+        // the VA ad, not the embed token, so there's one webhook per VA. ----
+        let webhookAd = null; // { id, ...status } for the VA this embed links to
+
+        // Find the VA-ad directory record whose callsign matches the embed VA code.
+        function findVaAdByCode(code) {
+            const c = (code || '').trim().toUpperCase();
+            if (!c) return null;
+            return (VA_DIRECTORY || []).find(v => {
+                if ((v.callsign || '').trim().toUpperCase() === c) return true;
+                return Array.isArray(v.callsigns) && v.callsigns.some(x => (x || '').trim().toUpperCase() === c);
+            }) || null;
+        }
+
+        // Light up (or hide) the webhook panel for the embed's currently-linked VA.
+        // `picked` is an optional directory record (from pickVa) to skip the search.
+        async function syncWebhookPanel(picked) {
+            const panel = document.getElementById('webhookPanel');
+            const noVa = document.getElementById('webhookNoVa');
+            if (!panel || !noVa) return;
+            webhookAd = null;
+            document.getElementById('wh_url').value = '';
+            await loadVaDirectory();
+            const ad = (picked && picked._id) ? picked : findVaAdByCode(document.getElementById('f_va_code').value);
+            if (!ad || !ad._id) {
+                panel.classList.add('hidden');
+                noVa.classList.remove('hidden');
+                return;
+            }
+            noVa.classList.add('hidden');
+            panel.classList.remove('hidden');
+            try {
+                const res = await fetch(`/api/va-ads/${ad._id}/flight-events`);
+                const json = await res.json();
+                webhookAd = Object.assign({ id: ad._id }, json.data || {});
+            } catch {
+                webhookAd = { id: ad._id, configured: !!ad.flightEventsWebhookUrl, approved: !!ad.flightEventsApproved, enabled: ad.flightEventsEnabled !== false, requestedAt: ad.flightEventsRequestedAt };
+            }
+            renderWebhookPanel();
+        }
+
+        function renderWebhookPanel() {
+            if (!webhookAd) return;
+            const s = webhookAd;
+            const pill = document.getElementById('wh_status');
+            const approveBtn = document.getElementById('wh_approveBtn');
+            document.getElementById('wh_enabled').checked = !!s.enabled;
+            const hint = document.getElementById('wh_hint');
+            if (s.configured && s.hint) { hint.textContent = 'On file: ' + s.hint; hint.classList.remove('hidden'); }
+            else { hint.classList.add('hidden'); }
+
+            let label, cls;
+            if (!s.configured) { label = 'No webhook'; cls = 'bg-zinc-100 dark:bg-zinc-800 text-zinc-500'; }
+            else if (s.approved) { label = 'Approved'; cls = 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300'; }
+            else { label = 'Pending approval'; cls = 'bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300'; }
+            pill.textContent = label;
+            pill.className = 'text-[11px] font-semibold px-2 py-0.5 rounded-full ' + cls;
+
+            if (s.approved) {
+                approveBtn.textContent = 'Unapprove';
+                approveBtn.className = 'text-xs font-semibold px-3 py-2 rounded-lg active:scale-95 transition border-2 border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800';
+            } else {
+                approveBtn.textContent = 'Approve';
+                approveBtn.className = 'text-xs font-semibold px-3 py-2 rounded-lg active:scale-95 transition bg-emerald-600 hover:bg-emerald-500 text-white';
+            }
+        }
+
+        async function patchWebhook(body, okMsg) {
+            if (!webhookAd || !webhookAd.id) return;
+            try {
+                const res = await fetch(`/api/va-ads/${webhookAd.id}/flight-events`, {
+                    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                const json = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(json.message || 'Update failed');
+                webhookAd = Object.assign({ id: webhookAd.id }, json.data || {});
+                renderWebhookPanel();
+                if (okMsg) toast(okMsg);
+            } catch (err) {
+                toast(err.message || 'Update failed');
+            }
+        }
+
+        function toggleWebhookApproved() {
+            if (webhookAd) patchWebhook({ approved: !webhookAd.approved }, webhookAd.approved ? 'Approval revoked' : 'Webhook approved');
+        }
+        function toggleWebhookEnabled() {
+            patchWebhook({ enabled: document.getElementById('wh_enabled').checked });
+        }
+        function saveWebhookUrl() {
+            const el = document.getElementById('wh_url');
+            const url = el.value.trim();
+            patchWebhook({ webhookUrl: url }, url ? 'Webhook saved' : 'Webhook cleared');
+            el.value = '';
+        }
+
         // ---- modal ----
         function openModal() {
             document.getElementById('form').reset();
@@ -522,6 +647,7 @@
             resetVaConnector();
             document.getElementById('modalTitle').textContent = 'New embed';
             document.getElementById('saveLabel').textContent = 'Create token';
+            syncWebhookPanel();
             document.getElementById('modal').classList.remove('hidden');
         }
         function closeModal() { document.getElementById('modal').classList.add('hidden'); }
@@ -552,6 +678,7 @@
             document.getElementById('formError').classList.add('hidden');
             document.getElementById('modalTitle').textContent = 'Edit embed';
             document.getElementById('saveLabel').textContent = 'Save changes';
+            syncWebhookPanel();
             document.getElementById('modal').classList.remove('hidden');
         }
 

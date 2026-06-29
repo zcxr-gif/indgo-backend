@@ -23,6 +23,7 @@ const {
 const {
     registerVaPortalRoutes,
     provisionOwnerAccount,
+    VaSubmission,
 } = require('./vaPortal');
 
 const express = require('express');
@@ -442,6 +443,16 @@ const isDiscordWebhookUrl = (url) => {
     return allowedHost && /^\/api\/(v\d+\/)?webhooks\/\d+\/[\w-]+$/.test(u.pathname);
 };
 
+// A safe, non-secret hint for a stored Discord webhook — mirrors the masking in
+// vaPortal.js so staff surfaces (inbox, embed manager) can show "a webhook is on
+// file" without ever echoing the token back. Returns '' when nothing is set.
+const maskWebhookUrl = (url) => {
+    if (!url) return '';
+    const m = String(url).match(/webhooks\/(\d+)/);
+    const id = m && m[1];
+    return id ? `…/webhooks/${id.slice(-4).padStart(id.length > 4 ? 8 : id.length, '•')}/…` : '…';
+};
+
 /* =========================
  * LEADERBOARD SCHEMAS
  *
@@ -774,6 +785,63 @@ app.get('/api/staff/overview', requireAuth, async (req, res) => {
     } catch (err) {
         console.error('Staff overview error:', err);
         res.status(500).json({ error: 'Could not load overview.' });
+    }
+});
+
+// GET /api/staff/inbox — STAFF. The "needs attention" feed for the staff home:
+// VAs that have requested flight-event webhook delivery but aren't approved yet,
+// plus the most recent open partner submissions (tickets). Surfaced at a glance
+// so staff don't have to dig through the VA editor / submissions inbox to act.
+app.get('/api/staff/inbox', requireAuth, async (req, res) => {
+    try {
+        const [pendingAds, openSubs, ticketsOpen] = await Promise.all([
+            // Requested + not yet approved. The webhook URL is a secret, so we only
+            // expose a masked hint and a boolean for whether one is on file.
+            VirtualAirlineAd
+                .find({ flightEventsRequestedAt: { $ne: null }, flightEventsApproved: { $ne: true } })
+                .select('+flightEventsWebhookUrl name callsign callsigns flightEventsEnabled flightEventsRequestedAt')
+                .sort({ flightEventsRequestedAt: 1 })
+                .limit(50)
+                .lean(),
+            VaSubmission
+                .find({ status: { $in: ['open', 'in_review'] } })
+                .sort({ createdAt: -1 })
+                .limit(12)
+                .lean(),
+            VaSubmission.countDocuments({ status: { $in: ['open', 'in_review'] } }),
+        ]);
+
+        const webhookApprovals = pendingAds.map(ad => ({
+            id: ad._id,
+            name: ad.name || ad.callsign || (ad.callsigns && ad.callsigns[0]) || 'Unnamed VA',
+            code: ad.callsign || (ad.callsigns && ad.callsigns[0]) || '',
+            requestedAt: ad.flightEventsRequestedAt,
+            enabled: !!ad.flightEventsEnabled,
+            configured: !!ad.flightEventsWebhookUrl,
+            hint: maskWebhookUrl(ad.flightEventsWebhookUrl),
+        }));
+
+        const tickets = openSubs.map(s => ({
+            id: s._id,
+            title: s.title || '(untitled)',
+            category: s.category || 'other',
+            status: s.status || 'open',
+            vaName: s.vaName || '',
+            submittedByName: s.submittedByName || '',
+            createdAt: s.createdAt,
+        }));
+
+        res.json({
+            webhookApprovals,
+            tickets,
+            counts: {
+                webhookPending: webhookApprovals.length,
+                ticketsOpen,
+            },
+        });
+    } catch (err) {
+        console.error('Staff inbox error:', err);
+        res.status(500).json({ error: 'Could not load the staff inbox.' });
     }
 });
 
@@ -2183,6 +2251,68 @@ app.patch('/api/va-ads/:id/feature', requireAuth, async (req, res) => {
     } catch (error) {
         console.error('VA Ad Feature Error:', error);
         res.status(500).json({ message: 'Server error while toggling featured.' });
+    }
+});
+
+// Shape the (secret-free) flight-event webhook status for a VA ad. The raw URL
+// is never returned — only whether one is configured plus a masked hint.
+const flightEventsStatus = (ad) => ({
+    id: ad._id,
+    name: ad.name || ad.callsign || '',
+    code: ad.callsign || (ad.callsigns && ad.callsigns[0]) || '',
+    configured: !!ad.flightEventsWebhookUrl,
+    hint: maskWebhookUrl(ad.flightEventsWebhookUrl),
+    enabled: !!ad.flightEventsEnabled,
+    approved: !!ad.flightEventsApproved,
+    requestedAt: ad.flightEventsRequestedAt || null,
+});
+
+// GET: Flight-event webhook status for one VA. STAFF. Backs the approval controls
+// on the staff home page and in the embed manager (which mirror the same webhook,
+// keyed to the VA ad — one source of truth, see VA-ADMIN-MANUAL.md).
+app.get('/api/va-ads/:id/flight-events', requireAuth, async (req, res) => {
+    try {
+        const ad = await VirtualAirlineAd.findById(req.params.id)
+            .select('+flightEventsWebhookUrl name callsign callsigns flightEventsEnabled flightEventsApproved flightEventsRequestedAt')
+            .lean();
+        if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+        res.json({ data: flightEventsStatus(ad) });
+    } catch (error) {
+        console.error('VA Ad flight-events status error:', error);
+        res.status(500).json({ message: 'Server error while loading flight-event status.' });
+    }
+});
+
+// PATCH: Update a VA's flight-event webhook. STAFF. Accepts any of:
+//   approved   — the staff gate that lets delivery actually fire
+//   enabled    — the on/off switch (independent of approval)
+//   webhookUrl — set/replace the Discord webhook on the VA's behalf ('' clears it)
+// This is the single place staff approve the webhook, shared by the staff home
+// page and the embed manager.
+app.patch('/api/va-ads/:id/flight-events', requireAuth, async (req, res) => {
+    try {
+        const ad = await VirtualAirlineAd.findById(req.params.id).select('+flightEventsWebhookUrl');
+        if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+
+        const b = req.body || {};
+        if (b.webhookUrl !== undefined) {
+            const raw = String(b.webhookUrl || '').trim();
+            if (raw && !isDiscordWebhookUrl(raw)) {
+                return res.status(400).json({ message: 'That doesn’t look like a Discord webhook URL.' });
+            }
+            ad.flightEventsWebhookUrl = raw || null;
+            // Setting a webhook for the first time counts as a request, so it shows
+            // up in the approval queue even when staff paste it on the VA's behalf.
+            if (raw && !ad.flightEventsRequestedAt) ad.flightEventsRequestedAt = new Date();
+        }
+        if (b.approved !== undefined) ad.flightEventsApproved = b.approved === true || b.approved === 'true';
+        if (b.enabled !== undefined) ad.flightEventsEnabled = b.enabled === true || b.enabled === 'true';
+
+        await ad.save();
+        res.json({ message: 'Flight-event webhook updated.', data: flightEventsStatus(ad) });
+    } catch (error) {
+        console.error('VA Ad flight-events update error:', error);
+        res.status(500).json({ message: 'Server error while updating flight-event webhook.' });
     }
 });
 

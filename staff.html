@@ -164,6 +164,43 @@
                 </div>
             </section>
 
+            <!-- Needs attention — webhook approvals awaiting staff + open tickets -->
+            <section data-roles="admin,staff,va_rep" class="pt-10 fade-in">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Needs attention</h2>
+                    <button onclick="loadStaffInbox()" title="Refresh" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500 dark:text-zinc-400 transition"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+                </div>
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                    <!-- Pending flight-event webhook approvals -->
+                    <div class="surface rounded-2xl overflow-hidden flex flex-col">
+                        <div class="px-5 py-3.5 border-b border-zinc-100 dark:border-zinc-800/80 flex items-center justify-between">
+                            <div class="flex items-center gap-2 text-zinc-600 dark:text-zinc-300">
+                                <i data-lucide="webhook" class="w-4 h-4"></i>
+                                <span class="text-sm font-semibold">Webhook approvals</span>
+                            </div>
+                            <span id="inboxWebhookCount" class="hidden text-[11px] font-semibold px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300">0</span>
+                        </div>
+                        <div id="inboxWebhooks" class="divide-y divide-zinc-100 dark:divide-zinc-800/80 max-h-80 overflow-y-auto">
+                            <div class="px-5 py-8 text-center text-sm text-zinc-400">Loading…</div>
+                        </div>
+                    </div>
+                    <!-- Open partner submissions (tickets) -->
+                    <div class="surface rounded-2xl overflow-hidden flex flex-col">
+                        <div class="px-5 py-3.5 border-b border-zinc-100 dark:border-zinc-800/80 flex items-center justify-between">
+                            <div class="flex items-center gap-2 text-zinc-600 dark:text-zinc-300">
+                                <i data-lucide="inbox" class="w-4 h-4"></i>
+                                <span class="text-sm font-semibold">Open tickets</span>
+                                <span id="inboxTicketCount" class="hidden text-[11px] font-semibold px-1.5 py-0.5 rounded-full bg-zinc-200/70 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">0</span>
+                            </div>
+                            <a href="/va-submissions" class="text-[11px] font-semibold text-zinc-500 hover:text-zinc-900 dark:hover:text-white transition inline-flex items-center gap-1">View all <i data-lucide="arrow-right" class="w-3 h-3"></i></a>
+                        </div>
+                        <div id="inboxTickets" class="divide-y divide-zinc-100 dark:divide-zinc-800/80 max-h-80 overflow-y-auto">
+                            <div class="px-5 py-8 text-center text-sm text-zinc-400">Loading…</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
             <!-- VA flight activity — live proof the ACARS event receiver works -->
             <section data-roles="admin,staff,va_rep" class="pt-10 fade-in">
                 <div class="flex items-center justify-between mb-4">
@@ -506,6 +543,7 @@
             show('userChip');
             applyRoleVisibility();
             loadOverview();
+            if (['admin', 'staff', 'va_rep'].includes(currentUser.role)) loadStaffInbox();
             startVaEventsFeed();
             if (currentUser.role === 'admin') { show('adminSection'); loadUsers(); }
             setThemeIcon();
@@ -523,6 +561,110 @@
             set('statPartnerships', data.partnerships);
             set('statAircraft', data.aircraft);
             set('statAirports', data.airports);
+        }
+
+        // ---- Needs attention: webhook approvals + open tickets ----
+        const CAT_ICON = { document: 'file-text', request: 'inbox', report: 'flag', event: 'calendar', feedback: 'message-square', other: 'circle-dot' };
+
+        async function loadStaffInbox() {
+            const whBox = document.getElementById('inboxWebhooks');
+            const tkBox = document.getElementById('inboxTickets');
+            if (!whBox || !tkBox) return;
+            const { ok, data } = await api('/api/staff/inbox');
+            if (!ok || !data) {
+                whBox.innerHTML = '<div class="px-5 py-8 text-center text-sm text-zinc-400">Could not load.</div>';
+                tkBox.innerHTML = '<div class="px-5 py-8 text-center text-sm text-zinc-400">Could not load.</div>';
+                return;
+            }
+            renderInboxWebhooks(Array.isArray(data.webhookApprovals) ? data.webhookApprovals : []);
+            renderInboxTickets(Array.isArray(data.tickets) ? data.tickets : [], (data.counts && data.counts.ticketsOpen) || 0);
+            drawIcons();
+        }
+
+        function renderInboxWebhooks(items) {
+            const box = document.getElementById('inboxWebhooks');
+            const badge = document.getElementById('inboxWebhookCount');
+            badge.textContent = items.length;
+            badge.classList.toggle('hidden', items.length === 0);
+            if (!items.length) {
+                box.innerHTML =
+                    '<div class="px-5 py-10 text-center">' +
+                        '<div class="w-11 h-11 rounded-2xl bg-emerald-50 dark:bg-emerald-950/40 text-emerald-500 grid place-items-center mx-auto mb-3"><i data-lucide="check" class="w-5 h-5"></i></div>' +
+                        '<p class="text-sm font-medium text-zinc-500 dark:text-zinc-400">All caught up</p>' +
+                        '<p class="text-xs text-zinc-400 dark:text-zinc-600 mt-1">No flight-event webhooks awaiting approval.</p>' +
+                    '</div>';
+                return;
+            }
+            box.innerHTML = items.map(w =>
+                '<div class="flex items-center gap-3.5 px-5 py-3.5" id="wh-' + w.id + '">' +
+                    '<span class="w-9 h-9 rounded-xl grid place-items-center shrink-0 bg-amber-50 text-amber-500 dark:bg-amber-950/40"><i data-lucide="webhook" class="w-[18px] h-[18px]"></i></span>' +
+                    '<div class="min-w-0 flex-1">' +
+                        '<div class="flex items-center gap-2 flex-wrap">' +
+                            '<span class="font-semibold text-sm truncate">' + esc(w.name) + '</span>' +
+                            (w.code ? '<span class="text-[11px] font-mono px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500">' + esc(w.code) + '</span>' : '') +
+                        '</div>' +
+                        '<div class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5 truncate">' +
+                            (w.configured ? '<span class="font-mono">' + esc(w.hint || 'webhook on file') + '</span>' : '<span class="text-amber-500">no webhook saved yet</span>') +
+                            ' · requested ' + relTime(w.requestedAt) +
+                        '</div>' +
+                    '</div>' +
+                    '<button onclick="approveWebhook(\'' + w.id + '\', this)" class="shrink-0 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-3 py-1.5 rounded-lg active:scale-95 transition inline-flex items-center gap-1.5">' +
+                        '<i data-lucide="check" class="w-3.5 h-3.5"></i>Approve</button>' +
+                '</div>'
+            ).join('');
+        }
+
+        function renderInboxTickets(items, totalOpen) {
+            const box = document.getElementById('inboxTickets');
+            const badge = document.getElementById('inboxTicketCount');
+            badge.textContent = totalOpen;
+            badge.classList.toggle('hidden', totalOpen === 0);
+            if (!items.length) {
+                box.innerHTML =
+                    '<div class="px-5 py-10 text-center">' +
+                        '<div class="w-11 h-11 rounded-2xl bg-zinc-100 dark:bg-zinc-800 text-zinc-400 grid place-items-center mx-auto mb-3"><i data-lucide="inbox" class="w-5 h-5"></i></div>' +
+                        '<p class="text-sm font-medium text-zinc-500 dark:text-zinc-400">No open tickets</p>' +
+                        '<p class="text-xs text-zinc-400 dark:text-zinc-600 mt-1">Partner submissions will show up here.</p>' +
+                    '</div>';
+                return;
+            }
+            box.innerHTML = items.map(t => {
+                const icon = CAT_ICON[t.category] || 'circle-dot';
+                const who = [t.vaName, t.submittedByName].filter(Boolean).join(' · ');
+                const newBadge = t.status === 'open'
+                    ? '<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300">new</span>'
+                    : '<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-blue-100 text-blue-700 dark:bg-blue-950/60 dark:text-blue-300">in review</span>';
+                return '<a href="/va-submissions" class="flex items-center gap-3.5 px-5 py-3.5 hover:bg-zinc-50/60 dark:hover:bg-zinc-800/30 transition">' +
+                    '<span class="w-9 h-9 rounded-xl grid place-items-center shrink-0 bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-300"><i data-lucide="' + icon + '" class="w-[18px] h-[18px]"></i></span>' +
+                    '<div class="min-w-0 flex-1">' +
+                        '<div class="flex items-center gap-2 flex-wrap">' +
+                            '<span class="font-semibold text-sm truncate">' + esc(t.title) + '</span>' + newBadge +
+                        '</div>' +
+                        '<div class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5 truncate">' +
+                            esc(t.category) + (who ? ' · ' + esc(who) : '') +
+                        '</div>' +
+                    '</div>' +
+                    '<span class="text-[11px] text-zinc-400 dark:text-zinc-600 shrink-0 whitespace-nowrap">' + relTime(t.createdAt) + '</span>' +
+                '</a>';
+            }).join('');
+        }
+
+        async function approveWebhook(id, btn) {
+            if (btn) { btn.disabled = true; btn.innerHTML = '<span class="loader" style="width:14px;height:14px;border-width:2px;"></span>'; }
+            const { ok, data } = await api('/api/va-ads/' + id + '/flight-events', {
+                method: 'PATCH',
+                body: JSON.stringify({ approved: true }),
+            });
+            if (ok) {
+                const row = document.getElementById('wh-' + id);
+                if (row) row.remove();
+                loadStaffInbox();
+            } else if (btn) {
+                btn.disabled = false;
+                btn.innerHTML = '<i data-lucide="check" class="w-3.5 h-3.5"></i>Approve';
+                drawIcons();
+                alert((data && data.message) || 'Could not approve.');
+            }
         }
 
         // ---- VA flight activity feed ----
@@ -612,7 +754,7 @@
             loadVaEvents();
             if (vaEvTimer) clearInterval(vaEvTimer);
             vaEvTimer = setInterval(() => {
-                if (document.visibilityState === 'visible') loadVaEvents();
+                if (document.visibilityState === 'visible') { loadVaEvents(); loadStaffInbox(); }
             }, 20000);
         }
 
