@@ -2550,35 +2550,44 @@ const buildVaEventPayload = (e) => {
 // is a silent no-op. Isolated try/catch so a partner's broken webhook never
 // affects the central post or the ack.
 const sendVaEventToPartner = async (e) => {
-    // Build every plausible base for the flying VA: the sender's va.code and the
-    // raw callsign, each reduced both by the "##VA" suffix rule and by stripping a
-    // trailing flight number. This covers real callsigns like "Air Canada 001VA"
-    // that the suffix rule alone leaves intact (and so would never match a stored
-    // base like "AIR CANADA").
-    const codes = [...new Set([
+    // The event ALREADY arrives attributed to a VA — the ACARS sender resolved it
+    // and set e.va.code / e.va.name. We're not re-identifying the flight here; we
+    // just need the ONE VA listing that owns the webhook to post to (the webhook
+    // lives on the listing, not in the event). So match the listing off that
+    // attribution — its code/name — and only fall back to the raw callsign.
+    const codeBases = [...new Set([
         normalizeCallsignBase(e.va?.code),
-        normalizeCallsignBase(e.callsign),
         callsignAirlineBase(e.va?.code),
+        normalizeCallsignBase(e.callsign),
         callsignAirlineBase(e.callsign),
     ].filter(Boolean))];
-    if (!codes.length) return;
+    const names = [...new Set([e.va?.name, e.va?.code]
+        .map(s => String(s || '').trim()).filter(Boolean))];
+
+    const or = [];
+    if (codeBases.length) or.push({ callsigns: { $in: codeBases } });
+    for (const n of names) or.push({ name: new RegExp('^' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
+    if (!or.length) return;
 
     let ad;
     try {
         ad = await VirtualAirlineAd.findOne({
-            callsigns: { $in: codes },
-            flightEventsApproved: true,   // staff-granted; requests alone don't deliver
-            flightEventsEnabled: true,
-            flightEventsWebhookUrl: { $ne: null },
+            $and: [
+                { $or: or },
+                { flightEventsApproved: true },   // staff-granted; requests alone don't deliver
+                { flightEventsEnabled: true },
+                { flightEventsWebhookUrl: { $ne: null } },
+            ],
         }).select('name +flightEventsWebhookUrl').lean();
     } catch (err) {
         console.error('[va-events] partner lookup failed:', err.message);
         return;
     }
-    // Silent no-op when no VA opted in — but log the bases we tried so a missed
-    // delivery is diagnosable (usually a stored callsign / approval mismatch).
+    // Silent no-op when no VA opted in — but log what we tried so a miss is
+    // diagnosable (almost always a gate that's off: not approved / disabled / no
+    // webhook saved — not a failure to identify the VA, which already happened).
     if (!ad || !ad.flightEventsWebhookUrl) {
-        console.log(`[va-events] no opted-in partner for "${e.callsign}" — tried bases: ${codes.join(', ')}`);
+        console.log(`[va-events] no opted-in partner for VA "${e.va?.name || e.va?.code || e.callsign}" — codes [${codeBases.join(', ')}] names [${names.join(', ')}]`);
         return;
     }
 
