@@ -19,6 +19,12 @@ const {
     requireAuthPage,
 } = require('./staffAuth');
 
+// VA Partnership Portal (partner-facing logins, submissions, oversight).
+const {
+    registerVaPortalRoutes,
+    provisionOwnerAccount,
+} = require('./vaPortal');
+
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
@@ -501,7 +507,8 @@ startDiscordBot(
     s3Client,
     process.env.AWS_S3_BUCKET_NAME,
     process.env.AWS_REGION,
-    { DailyPilotStats, DailyPilotView, VirtualAirlineAd, Giveaway, VaTermsAcceptance }
+    { DailyPilotStats, DailyPilotView, VirtualAirlineAd, Giveaway, VaTermsAcceptance,
+      provisionVaPortalAccount: provisionOwnerAccount }
 );
 // ---------------------
 
@@ -673,6 +680,9 @@ const hashIp = (ip) => {
 
 // Staff portal auth routes (login / logout / me / user management).
 registerAuthRoutes(app);
+
+// VA Partnership Portal routes (partner login/submissions/team + staff oversight).
+registerVaPortalRoutes(app, { VirtualAirlineAd, s3Client, upload });
 
 // Health Check — public, unauthenticated (for uptime/platform monitors).
 // NOTE: the site is staff-only, so the homepage ("/") is gated below; point any
@@ -2523,6 +2533,7 @@ const STAFF_ONLY_PATHS = new Set([
     '/embeds', '/embeds.html',
     '/EMBEDBACKEND.md',
     '/graphic-designer', '/graphic-designer.html',
+    '/va-submissions', '/va-submissions.html',
 ]);
 app.use((req, res, next) => {
     if (req.method === 'GET' && STAFF_ONLY_PATHS.has(req.path)) {
@@ -2535,6 +2546,13 @@ app.use((req, res, next) => {
 // can reach the login form; the page calls /api/auth/me to decide what to show.
 app.get('/staff', (req, res) => {
     res.sendFile(path.join(__dirname, 'staff.html'));
+});
+
+// The VA Partnership Portal login + dashboard. Public so partner VAs can reach
+// the login form; the page calls /api/va-portal/auth/me to decide what to show.
+// This is a SEPARATE login from the staff hub (partners are not staff).
+app.get('/va-portal', (req, res) => {
+    res.sendFile(path.join(__dirname, 'va-portal.html'));
 });
 
 // 1. Serve static files from the root directory
@@ -2570,6 +2588,13 @@ app.get('/va-admin-manual', (req, res) => {
 // (staff-only — see guard above; scoped to admin/staff/graphic_designer).
 app.get('/graphic-designer', (req, res) => {
     res.sendFile(path.join(__dirname, 'graphic-designer.html'));
+});
+
+// Specific route for the VA Submissions oversight page (admin/staff/va_rep):
+// every partner VA's submissions, the portal activity feed, and portal account
+// management. Accessible via yoursite.com/va-submissions (staff-only — see guard above).
+app.get('/va-submissions', (req, res) => {
+    res.sendFile(path.join(__dirname, 'va-submissions.html'));
 });
 
 // 3. The Aircraft Database app (homepage) — staff-only.

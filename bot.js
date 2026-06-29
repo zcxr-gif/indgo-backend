@@ -96,6 +96,9 @@ const INFLIGHT_VA_REP_ROLE_ID = '1518665927254605925';
 const METADATA_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api/metadata';
 const BASE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api';
 
+// Public URL of the VA Partnership Portal login (DM'd to a VA owner on approval).
+const VA_PORTAL_URL = process.env.VA_PORTAL_URL || 'https://inflight.info/va-portal';
+
 // --- CACHE SYSTEMS ---
 let cachedAircraftData = []; 
 let lastAircraftCacheUpdate = 0;
@@ -390,7 +393,8 @@ const normalizeData = async (rawType, rawLivery) => {
 };
 
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, models = {}) => {
-    const { DailyPilotStats, VirtualAirlineAd, Giveaway, VaTermsAcceptance } = models;
+    const { DailyPilotStats, VirtualAirlineAd, Giveaway, VaTermsAcceptance,
+            provisionVaPortalAccount } = models;
 
     // NOTE: `Options.cacheEverything()` is the *opposite* of what we want — it
     // caches everything with no caps and silently ignores the limits passed to
@@ -2483,9 +2487,35 @@ client.on('interactionCreate', async (interaction) => {
 
                     await interaction.message.reply(`✅ **${ad.name}** approved by <@${interaction.user.id}>.\n• Role: ${role ? `<@&${role.id}>` : '—'}\n• Channel: ${channel ? `<#${channel.id}>` : '—'}`).catch(() => {});
 
+                    // Provision the VA's self-service Partnership Portal account
+                    // (idempotent). The plaintext password is only returned the very
+                    // first time, so we only DM credentials on initial creation.
+                    let portalLine = '';
+                    if (typeof provisionVaPortalAccount === 'function') {
+                        try {
+                            const { created, username, password } = await provisionVaPortalAccount(ad, {
+                                createdVia: 'bot',
+                                createdByName: `Bot (approved by ${interaction.user.username})`,
+                            });
+                            if (created && password) {
+                                portalLine = `\n\n🔐 **Your VA Partnership Portal is ready.**\n` +
+                                    `Log in at ${VA_PORTAL_URL} to submit documents, requests, reports — anything — ` +
+                                    `and to give your own staff access.\n` +
+                                    `• Username: \`${username}\`\n` +
+                                    `• Temporary password: \`${password}\`\n` +
+                                    `Please change your password after your first login.`;
+                            } else {
+                                portalLine = `\n\n🔐 Your VA Partnership Portal is at ${VA_PORTAL_URL} ` +
+                                    `(sign in with your existing portal credentials).`;
+                            }
+                        } catch (e) {
+                            console.error('❌ VA portal provision error:', e.message);
+                        }
+                    }
+
                     if (ad.ownerId) {
                         const owner = await client.users.fetch(ad.ownerId).catch(() => null);
-                        if (owner) await owner.send(`🎉 Your VA **${ad.name}** has been approved! Your private channel is ${channel ? `<#${channel.id}>` : 'ready'}.`).catch(() => {});
+                        if (owner) await owner.send(`🎉 Your VA **${ad.name}** has been approved! Your private channel is ${channel ? `<#${channel.id}>` : 'ready'}.${portalLine}`).catch(() => {});
                     }
 
                     // If the VA already shipped a banner + logo (e.g. submitted via
