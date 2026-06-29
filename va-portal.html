@@ -94,7 +94,7 @@
     </div>
 
     <!-- ============ DASHBOARD ============ -->
-    <div id="dashView" class="hidden max-w-4xl mx-auto px-5 py-6">
+    <div id="dashView" class="hidden max-w-4xl mx-auto px-5 py-6 overflow-x-hidden">
 
         <!-- Banner hero with logo avatar overlay -->
         <section class="fade-in mb-5">
@@ -133,6 +133,7 @@
         <nav class="surface rounded-2xl p-1.5 mb-6 flex items-center gap-1 overflow-x-auto fade-in">
             <button class="tab active" data-tab="submit" onclick="switchTab('submit')"><i data-lucide="send" class="w-4 h-4"></i> Submit</button>
             <button class="tab" data-tab="events" onclick="switchTab('events')"><i data-lucide="calendar" class="w-4 h-4"></i> Events</button>
+            <button class="tab" data-tab="flightevents" onclick="switchTab('flightevents')"><i data-lucide="plane-takeoff" class="w-4 h-4"></i> Flight events</button>
             <button class="tab" data-tab="profile" onclick="switchTab('profile')"><i data-lucide="building-2" class="w-4 h-4"></i> VA Profile</button>
             <button class="tab" data-tab="embed" onclick="switchTab('embed')"><i data-lucide="code-2" class="w-4 h-4"></i> Embed</button>
             <button id="tabTeamBtn" class="tab hidden" data-tab="team" onclick="switchTab('team')"><i data-lucide="users" class="w-4 h-4"></i> Team</button>
@@ -198,6 +199,36 @@
                 <button onclick="loadEvents()" title="Refresh" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500 transition"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
             </div>
             <div id="evList" class="space-y-2"><div class="surface rounded-2xl p-5 text-center text-sm text-zinc-400">Loading…</div></div>
+        </section>
+
+        <!-- ===== TAB: FLIGHT EVENTS ===== -->
+        <section id="panel-flightevents" class="tab-panel hidden">
+            <div class="mb-3">
+                <h2 class="text-base font-bold tracking-tight">Takeoff &amp; landing notifications</h2>
+                <p class="text-sm text-zinc-500 dark:text-zinc-400">Get a Discord post in your own server every time one of your pilots takes off or lands.</p>
+            </div>
+            <div class="surface rounded-2xl p-6 space-y-4">
+                <div class="flex items-start gap-3">
+                    <div class="w-9 h-9 rounded-xl bg-zinc-100 dark:bg-zinc-800 grid place-items-center shrink-0"><i data-lucide="plane-takeoff" class="w-4 h-4 text-zinc-500 dark:text-zinc-400"></i></div>
+                    <div class="min-w-0">
+                        <p class="text-sm font-semibold">How it works</p>
+                        <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">Create a <span class="font-medium">webhook</span> in the Discord channel you want flights posted to (Channel settings → Integrations → Webhooks), paste its URL below and request access. Our team reviews it and switches delivery on for you.</p>
+                    </div>
+                </div>
+                <p id="pfFlightState" class="hidden text-xs font-medium break-words"></p>
+                <div>
+                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Discord webhook URL</label>
+                    <input id="pfFlightWebhook" type="url" placeholder="https://discord.com/api/webhooks/…" class="field pf-edit">
+                </div>
+                <div class="flex items-center gap-3 flex-wrap">
+                    <button type="button" id="pfFlightRequestBtn" class="btn pf-edit">Request access</button>
+                    <label id="pfFlightToggleWrap" class="hidden items-center gap-2 text-sm font-medium select-none">
+                        <input id="pfFlightEnabled" type="checkbox" class="w-4 h-4 rounded pf-edit"> Delivery on
+                    </label>
+                    <p id="pfFlightMsg" class="hidden text-sm font-medium break-words"></p>
+                </div>
+            </div>
+            <p id="flightReadonly" class="hidden text-xs text-zinc-400 mt-3 flex items-center gap-1.5"><i data-lucide="lock" class="w-3.5 h-3.5"></i> Only the VA owner can manage flight notifications.</p>
         </section>
 
         <!-- ===== TAB: VA PROFILE ===== -->
@@ -307,28 +338,6 @@
                     <div>
                         <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Application link</label>
                         <input id="pfApplication" type="url" placeholder="Where pilots apply" class="field pf-edit">
-                    </div>
-                </div>
-
-                <div class="rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 space-y-3">
-                    <div class="flex items-start gap-2">
-                        <i data-lucide="plane-takeoff" class="w-4 h-4 mt-0.5 text-zinc-500 dark:text-zinc-400"></i>
-                        <div class="flex-1">
-                            <p class="text-sm font-semibold">Flight event notifications</p>
-                            <p class="text-xs text-zinc-500 dark:text-zinc-400">Get a Discord post in your own server every time one of your pilots takes off or lands. Create a <span class="font-medium">webhook</span> in your channel (Channel settings → Integrations → Webhooks), paste it below and request access — our team enables it for you.</p>
-                        </div>
-                    </div>
-                    <p id="pfFlightState" class="hidden text-xs font-medium"></p>
-                    <div>
-                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Discord webhook URL</label>
-                        <input id="pfFlightWebhook" type="url" placeholder="https://discord.com/api/webhooks/…" class="field pf-edit">
-                    </div>
-                    <div class="flex items-center gap-3 flex-wrap">
-                        <button type="button" id="pfFlightRequestBtn" class="btn pf-edit">Request access</button>
-                        <label id="pfFlightToggleWrap" class="hidden items-center gap-2 text-sm font-medium select-none">
-                            <input id="pfFlightEnabled" type="checkbox" class="w-4 h-4 rounded pf-edit"> Delivery on
-                        </label>
-                        <p id="pfFlightMsg" class="hidden text-sm font-medium"></p>
                     </div>
                 </div>
 
@@ -642,6 +651,7 @@
             $('profileActions').classList.toggle('hidden', !editable);
             $('profileReadonly').classList.toggle('hidden', editable);
             $('embedRequestBtn').classList.toggle('hidden', !editable);
+            $('flightReadonly').classList.toggle('hidden', editable);
             $('profileHint').textContent = editable
                 ? 'Keep your listing fresh — update your logo, banner, callsigns and details any time.'
                 : 'This is your VA listing as pilots see it. Ask your VA owner to make changes.';
