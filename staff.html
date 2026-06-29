@@ -164,6 +164,50 @@
                 </div>
             </section>
 
+            <!-- VA flight activity — live proof the ACARS event receiver works -->
+            <section data-roles="admin,staff,va_rep" class="pt-10 fade-in">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500 flex items-center gap-2">
+                        VA Flight Activity
+                        <span id="vaEvLive" class="hidden items-center gap-1.5 normal-case tracking-normal text-emerald-500">
+                            <span class="relative flex h-2 w-2"><span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span><span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span></span>
+                            <span class="text-[11px] font-semibold">Live</span>
+                        </span>
+                    </h2>
+                    <div class="flex items-center gap-3">
+                        <span id="vaEvUpdated" class="text-[11px] text-zinc-400 dark:text-zinc-600"></span>
+                        <button onclick="loadVaEvents()" title="Refresh" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500 dark:text-zinc-400 transition"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+                    </div>
+                </div>
+
+                <!-- Summary tiles -->
+                <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+                    <div class="surface rounded-2xl p-4">
+                        <div class="flex items-center gap-2 text-zinc-400 dark:text-zinc-500 mb-1.5"><i data-lucide="activity" class="w-4 h-4"></i><span class="text-[11px] font-semibold uppercase tracking-wide">Total events</span></div>
+                        <p class="text-2xl font-bold tracking-tight" id="vaEvTotal">—</p>
+                    </div>
+                    <div class="surface rounded-2xl p-4">
+                        <div class="flex items-center gap-2 text-zinc-400 dark:text-zinc-500 mb-1.5"><i data-lucide="plane-takeoff" class="w-4 h-4"></i><span class="text-[11px] font-semibold uppercase tracking-wide">Takeoffs</span></div>
+                        <p class="text-2xl font-bold tracking-tight text-emerald-500" id="vaEvTakeoffs">—</p>
+                    </div>
+                    <div class="surface rounded-2xl p-4">
+                        <div class="flex items-center gap-2 text-zinc-400 dark:text-zinc-500 mb-1.5"><i data-lucide="plane-landing" class="w-4 h-4"></i><span class="text-[11px] font-semibold uppercase tracking-wide">Landings</span></div>
+                        <p class="text-2xl font-bold tracking-tight text-amber-500" id="vaEvLandings">—</p>
+                    </div>
+                    <div class="surface rounded-2xl p-4">
+                        <div class="flex items-center gap-2 text-zinc-400 dark:text-zinc-500 mb-1.5"><i data-lucide="clock" class="w-4 h-4"></i><span class="text-[11px] font-semibold uppercase tracking-wide">Last event</span></div>
+                        <p class="text-2xl font-bold tracking-tight" id="vaEvLast">—</p>
+                    </div>
+                </div>
+
+                <!-- Feed -->
+                <div class="surface rounded-2xl overflow-hidden">
+                    <div id="vaEvFeed" class="divide-y divide-zinc-100 dark:divide-zinc-800/80 max-h-[28rem] overflow-y-auto">
+                        <div class="px-5 py-10 text-center text-sm text-zinc-400">Loading flight events…</div>
+                    </div>
+                </div>
+            </section>
+
             <!-- Tools -->
             <section class="pt-10 fade-in">
                 <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-4">Tools</h2>
@@ -456,6 +500,7 @@
             show('userChip');
             applyRoleVisibility();
             loadOverview();
+            startVaEventsFeed();
             if (currentUser.role === 'admin') { show('adminSection'); loadUsers(); }
             setThemeIcon();
             drawIcons();
@@ -472,6 +517,97 @@
             set('statPartnerships', data.partnerships);
             set('statAircraft', data.aircraft);
             set('statAirports', data.airports);
+        }
+
+        // ---- VA flight activity feed ----
+        let vaEvTimer = null;
+
+        // Compact "x ago" relative time for the feed + last-event tile.
+        function relTime(d) {
+            const t = d ? new Date(d).getTime() : 0;
+            if (!t) return '—';
+            const s = Math.floor((Date.now() - t) / 1000);
+            if (s < 5) return 'just now';
+            if (s < 60) return s + 's ago';
+            const m = Math.floor(s / 60);
+            if (m < 60) return m + 'm ago';
+            const h = Math.floor(m / 60);
+            if (h < 24) return h + 'h ago';
+            return Math.floor(h / 24) + 'd ago';
+        }
+        function clockTime(d) {
+            return d ? new Date(d).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : '';
+        }
+
+        async function loadVaEvents() {
+            const feed = document.getElementById('vaEvFeed');
+            if (!feed) return;
+            const { ok, data } = await api('/api/va-events/recent?limit=40');
+            if (!ok || !data) {
+                feed.innerHTML = '<div class="px-5 py-10 text-center text-sm text-zinc-400">Could not load flight events.</div>';
+                return;
+            }
+            const s = data.stats || {};
+            const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+            set('vaEvTotal', (s.total ?? 0).toLocaleString());
+            set('vaEvTakeoffs', (s.takeoffs ?? 0).toLocaleString());
+            set('vaEvLandings', (s.landings ?? 0).toLocaleString());
+            set('vaEvLast', relTime(s.lastReceivedAt));
+            document.getElementById('vaEvLive').classList.toggle('flex', s.total > 0);
+            document.getElementById('vaEvLive').classList.toggle('hidden', !(s.total > 0));
+            document.getElementById('vaEvUpdated').textContent = 'Updated ' + clockTime(new Date());
+
+            const events = Array.isArray(data.events) ? data.events : [];
+            if (!events.length) {
+                feed.innerHTML =
+                    '<div class="px-5 py-12 text-center">' +
+                        '<div class="w-12 h-12 rounded-2xl bg-zinc-100 dark:bg-zinc-800 text-zinc-400 grid place-items-center mx-auto mb-3"><i data-lucide="radio" class="w-5 h-5"></i></div>' +
+                        '<p class="text-sm font-medium text-zinc-500 dark:text-zinc-400">No flight events yet</p>' +
+                        '<p class="text-xs text-zinc-400 dark:text-zinc-600 mt-1 max-w-sm mx-auto">Once the ACARS sender is pointed at <code class="px-1 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800">/api/va-events</code>, takeoffs and landings will appear here live.</p>' +
+                    '</div>';
+                drawIcons();
+                return;
+            }
+
+            feed.innerHTML = events.map(ev => {
+                const isT = ev.event === 'takeoff';
+                const va = ev.va || {};
+                const ac = ev.aircraft || {};
+                const acName = ac.aircraftName ? esc(ac.aircraftName) + (ac.liveryName ? ' · ' + esc(ac.liveryName) : '') : '';
+                const icon = isT ? 'plane-takeoff' : 'plane-landing';
+                const tone = isT ? 'text-emerald-500 bg-emerald-50 dark:bg-emerald-950/40' : 'text-amber-500 bg-amber-50 dark:bg-amber-950/40';
+                const badge = isT
+                    ? 'bg-emerald-100 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300'
+                    : 'bg-amber-100 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300';
+                const meta = [esc(ev.username || ''), esc(ev.server || ''), acName].filter(Boolean).join(' · ');
+                return '<div class="flex items-center gap-3.5 px-5 py-3.5 hover:bg-zinc-50/60 dark:hover:bg-zinc-800/30 transition">' +
+                    '<span class="w-9 h-9 rounded-xl grid place-items-center shrink-0 ' + tone + '"><i data-lucide="' + icon + '" class="w-[18px] h-[18px]"></i></span>' +
+                    '<div class="min-w-0 flex-1">' +
+                        '<div class="flex items-center gap-2 flex-wrap">' +
+                            '<span class="font-semibold text-sm truncate">' + esc(va.name || va.code || 'VA') + '</span>' +
+                            '<span class="text-[11px] font-semibold px-1.5 py-0.5 rounded ' + badge + '">' + (isT ? 'departed' : 'landed') + '</span>' +
+                        '</div>' +
+                        '<div class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5 truncate">' +
+                            '<span class="font-medium text-zinc-600 dark:text-zinc-300">' + esc(ev.callsign || '—') + '</span>' +
+                            (meta ? ' · ' + meta : '') +
+                        '</div>' +
+                    '</div>' +
+                    '<span class="text-[11px] text-zinc-400 dark:text-zinc-600 shrink-0 whitespace-nowrap">' + relTime(ev.receivedAt) + '</span>' +
+                '</div>';
+            }).join('');
+            drawIcons();
+        }
+
+        // Poll the feed while the portal is open. The data only changes when a
+        // flight actually takes off or lands, so a relaxed 20s cadence is plenty
+        // (and we skip refreshes while the tab is hidden).
+        function startVaEventsFeed() {
+            if (!['admin', 'staff', 'va_rep'].includes(currentUser.role)) return;
+            loadVaEvents();
+            if (vaEvTimer) clearInterval(vaEvTimer);
+            vaEvTimer = setInterval(() => {
+                if (document.visibilityState === 'visible') loadVaEvents();
+            }, 20000);
         }
 
         // ---- Change own password ----
