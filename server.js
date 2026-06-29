@@ -2505,31 +2505,10 @@ app.delete('/api/va-ads/:id', requireAuth, async (req, res) => {
 // blank). Keep this in sync with VA_BOT_FORWARD_TOKEN on the ACARS backend.
 const VA_EVENT_TOKEN = process.env.VA_BOT_FORWARD_TOKEN || null;
 
-// Public origin used to reference our own static assets (e.g. the brand logo in
-// the embed footer). Override with PUBLIC_BASE_URL if the site isn't on the
-// default host; trailing slashes are trimmed so we can append paths safely.
-const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://inflight.info').replace(/\/+$/, '');
-
-// Build a static map image URL with a plane marker at the flight's position, so
-// the card literally shows WHERE the aircraft is. Prefers Mapbox (set
-// MAPBOX_STATIC_TOKEN) for a clean dark map + plane pin; falls back to the
-// key-less OpenStreetMap static renderer when no token is configured. Returns
-// null when we don't have usable coordinates.
-const flightMapImageUrl = (lat, lon, isTakeoff) => {
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-    const la = lat.toFixed(4), lo = lon.toFixed(4);
-    const zoom = 6;
-    const token = process.env.MAPBOX_STATIC_TOKEN || process.env.MAPBOX_TOKEN;
-    if (token) {
-        // Mapbox expects lon,lat ordering. The maki "airport" glyph is a plane
-        // silhouette, so the marker itself reads as an aircraft on the map.
-        const color = isTakeoff ? '2ecc71' : 'f1c40f';
-        const marker = `pin-l-airport+${color}(${lo},${la})`;
-        return `https://api.mapbox.com/styles/v1/mapbox/dark-v11/static/${marker}/${lo},${la},${zoom},0/640x320@2x?access_token=${encodeURIComponent(token)}`;
-    }
-    // Key-less fallback (OSM static map service uses lat,lon ordering).
-    return `https://staticmap.openstreetmap.de/staticmap.php?center=${la},${lo}&zoom=${zoom}&size=640x320&maptype=mapnik&markers=${la},${lo},lightblue1`;
-};
+// The Discord embed card for a takeoff/landing lives in its own pure module so it
+// can be unit-tested in isolation and shared verbatim by every delivery path. The
+// DB-backed media lookups that feed it (aircraft photo, VA logo) stay here.
+const { buildVaEventPayload } = require('./vaEventCard');
 
 // Find a real community photo of the flown aircraft (type + livery) to use as the
 // card thumbnail — an actual "plane image" rather than a generic icon. Tries an
@@ -2587,66 +2566,6 @@ const enrichEventMedia = async (e) => {
         lookupVaLogo(e),
     ]);
     return { aircraftImageUrl, vaLogoUrl };
-};
-
-// Build the Discord embed payload for one takeoff/landing. Shared by the central
-// feed and per-VA partner delivery so both channels render an identical card.
-// `media` carries the (already-resolved) aircraft photo + VA logo URLs.
-const buildVaEventPayload = (e, media = {}) => {
-    const isTakeoff = e.event === 'takeoff';
-    const va = e.va || {};
-    const pos = e.position || {};
-    const ac = e.aircraft || {};
-    const accent = isTakeoff ? 0x2ecc71 : 0xf1c40f; // green takeoff / gold landing
-
-    const hasCoords = Number.isFinite(pos.lat) && Number.isFinite(pos.lon);
-    const coords = hasCoords ? `${pos.lat.toFixed(3)}, ${pos.lon.toFixed(3)}` : null;
-    const geoLink = hasCoords
-        ? `https://www.google.com/maps?q=${pos.lat.toFixed(5)},${pos.lon.toFixed(5)}`
-        : null;
-    const mapUrl = hasCoords ? flightMapImageUrl(pos.lat, pos.lon, isTakeoff) : null;
-
-    const aircraftLine = ac.aircraftName
-        ? (ac.liveryName ? `${ac.aircraftName} · ${ac.liveryName}` : ac.aircraftName)
-        : null;
-
-    const fields = [
-        { name: '👤 Pilot', value: String(e.username || '—'), inline: true },
-        { name: '📡 Callsign', value: String(e.callsign || '—'), inline: true },
-        { name: '🌐 Server', value: String(e.server || '—'), inline: true },
-    ];
-    if (aircraftLine) fields.push({ name: '✈️ Aircraft', value: aircraftLine, inline: true });
-    if (Number.isFinite(pos.alt_ft)) fields.push({ name: '📈 Altitude', value: `${Math.round(pos.alt_ft).toLocaleString()} ft`, inline: true });
-    if (Number.isFinite(pos.gs_kt)) fields.push({ name: '💨 Ground speed', value: `${Math.round(pos.gs_kt)} kt`, inline: true });
-    // Plain coordinates — NOT a masked link. Raw URLs don't auto-linkify inside
-    // embed fields and masked links can be stripped by clients/AutoMod, which
-    // would leave ugly `[..](..)` markdown. The map stays reachable two ways that
-    // never depend on field-link support: the clickable title `url` below and the
-    // map image itself.
-    if (coords) fields.push({ name: '📍 Position', value: coords, inline: true });
-
-    const embed = {
-        author: {
-            name: `${va.name || va.code || 'Virtual Airline'} · ${isTakeoff ? 'Departure' : 'Arrival'}`,
-            ...(media.vaLogoUrl ? { icon_url: media.vaLogoUrl } : {}),
-        },
-        title: `${isTakeoff ? '🛫' : '🛬'}  ${e.callsign || 'Unknown flight'}`,
-        ...(geoLink ? { url: geoLink } : {}),
-        description: `**${e.username || 'A pilot'}** ${isTakeoff ? 'just departed' : 'just landed'} on **${e.server || 'unknown'}**`
-            + (aircraftLine ? ` flying the **${ac.aircraftName}**.` : '.'),
-        color: accent,
-        fields,
-        timestamp: new Date(Number(e.timestamp) || Date.now()).toISOString(),
-        footer: { text: 'Inflight · VA Flight Events', icon_url: `${PUBLIC_BASE_URL}/assets/brand/inflight-logo.png` },
-    };
-
-    // Big image: the map with a plane marker showing exactly where the flight is.
-    if (mapUrl) embed.image = { url: mapUrl };
-    // Thumbnail: a real photo of the aircraft when we have one, else the VA logo.
-    const thumb = media.aircraftImageUrl || media.vaLogoUrl || null;
-    if (thumb) embed.thumbnail = { url: thumb };
-
-    return { embeds: [embed] };
 };
 
 // Post a takeoff/landing to the VA that flew it, if that VA has self-configured a
