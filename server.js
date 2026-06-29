@@ -2094,6 +2094,106 @@ app.delete('/api/va-ads/:id', requireAuth, async (req, res) => {
 });
 
 /* =========================
+ * VA TAKEOFF / LANDING EVENTS
+ *
+ * Webhook receiver for the ACARS backend (see VA-ADMIN-MANUAL.md). The sender
+ * matches every VA by callsign and POSTs one event per takeoff and per landing
+ * to VA_BOT_FORWARD_URL=https://<this-server>/api/va-events.
+ *
+ * Contract from the sender side:
+ *   - Each (flightId, event) is sent AT MOST ONCE (deduped on the ACARS side,
+ *     even across restarts), so this receiver needs no dedupe of its own.
+ *   - Fire-and-forget: the sender does NOT retry and drops slow responses, so we
+ *     must ack with a 2xx fast and do the slow work (Discord post) asynchronously.
+ *   - If VA_BOT_FORWARD_TOKEN is set on the sender, requests carry
+ *     Authorization: Bearer <token>; we check it against the same env var here.
+ * ========================= */
+
+// Shared secret expected on inbound VA event requests. Optional: if unset, the
+// endpoint accepts unauthenticated posts (matches the sender leaving the token
+// blank). Keep this in sync with VA_BOT_FORWARD_TOKEN on the ACARS backend.
+const VA_EVENT_TOKEN = process.env.VA_BOT_FORWARD_TOKEN || null;
+
+// Announce a takeoff/landing to Discord. Prefers a dedicated VA-events webhook
+// so flight chatter can live in its own channel, falling back to the shared
+// DISCORD_WEBHOOK_URL. No-op (logged) if neither is configured.
+const sendVaEventDiscord = async (e) => {
+    const webhookUrl = process.env.VA_EVENTS_DISCORD_WEBHOOK_URL || process.env.DISCORD_WEBHOOK_URL;
+    if (!webhookUrl) {
+        console.log('[va-events] no Discord webhook configured — event dropped:', e.event, e.flightId);
+        return;
+    }
+
+    const isTakeoff = e.event === 'takeoff';
+    const va = e.va || {};
+    const pos = e.position || {};
+    const ac = e.aircraft || {};
+
+    // Compact "lat, lon" with a few decimals; omitted entirely if absent.
+    const coords = (Number.isFinite(pos.lat) && Number.isFinite(pos.lon))
+        ? `${pos.lat.toFixed(3)}, ${pos.lon.toFixed(3)}`
+        : null;
+
+    const fields = [
+        { name: 'Pilot', value: String(e.username || '—'), inline: true },
+        { name: 'Callsign', value: String(e.callsign || '—'), inline: true },
+        { name: 'Server', value: String(e.server || '—'), inline: true }
+    ];
+    if (ac.aircraftName) {
+        fields.push({
+            name: 'Aircraft',
+            value: ac.liveryName ? `${ac.aircraftName} (${ac.liveryName})` : ac.aircraftName,
+            inline: true
+        });
+    }
+    if (Number.isFinite(pos.alt_ft)) fields.push({ name: 'Altitude', value: `${Math.round(pos.alt_ft)} ft`, inline: true });
+    if (Number.isFinite(pos.gs_kt)) fields.push({ name: 'Ground speed', value: `${Math.round(pos.gs_kt)} kt`, inline: true });
+    if (coords) fields.push({ name: 'Position', value: coords, inline: true });
+
+    const payload = {
+        embeds: [{
+            title: `${isTakeoff ? '🛫 Takeoff' : '🛬 Landing'} — ${va.name || va.code || 'VA'}`,
+            description: `**${e.callsign || 'Unknown'}** (${e.username || 'unknown pilot'}) ${isTakeoff ? 'departed' : 'landed'} on ${e.server || 'unknown server'}.`,
+            color: isTakeoff ? 3066993 : 15844367, // green for takeoff, gold for landing
+            fields,
+            timestamp: new Date(Number(e.timestamp) || Date.now()).toISOString(),
+            footer: { text: 'VA Flight Events' }
+        }]
+    };
+
+    await axios.post(webhookUrl, payload);
+    console.log(`🔔 VA ${e.event}: ${e.callsign} (${e.username}) on ${e.server}`);
+};
+
+// Slow-path handler, run after we've already acked the sender. Anything that
+// can throw lives here so the route handler stays synchronous and fast.
+const handleVaEvent = async (e) => {
+    await sendVaEventDiscord(e);
+};
+
+// POST /api/va-events — receive a single takeoff/landing event from the ACARS
+// backend. Public route (no staff auth) guarded by the optional shared secret;
+// the sender is an external service, not a logged-in user.
+app.post('/api/va-events', (req, res) => {
+    // Optional shared-secret check (matches VA_BOT_FORWARD_TOKEN on the sender).
+    if (VA_EVENT_TOKEN && req.get('authorization') !== `Bearer ${VA_EVENT_TOKEN}`) {
+        return res.sendStatus(401);
+    }
+
+    const e = req.body || {};
+    if ((e.event !== 'takeoff' && e.event !== 'landing') || !e.flightId) {
+        return res.sendStatus(400);
+    }
+
+    // Ack first so we never hold the fire-and-forget sender open, then do the
+    // slow work (Discord post) asynchronously — its outcome can't affect the ack.
+    res.sendStatus(204);
+
+    handleVaEvent(e).catch(err =>
+        console.error('[va-events] handler failed:', err.message));
+});
+
+/* =========================
  * EMBED WIDGET ENDPOINTS
  *
  * Public resolver (called cross-origin by the embed widget on the VA's site)
