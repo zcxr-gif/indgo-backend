@@ -119,6 +119,24 @@
             <div id="subList" class="space-y-3"><div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400">Loading…</div></div>
         </section>
 
+        <!-- Events -->
+        <section class="mb-8 fade-in">
+            <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-3">Events</h2>
+            <form id="evForm" class="surface rounded-2xl p-6 space-y-3 mb-3">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <input id="evTitle" type="text" placeholder="Event title" required maxlength="120" class="field">
+                    <input id="evWhen" type="datetime-local" required class="field">
+                </div>
+                <input id="evLink" type="text" placeholder="Link (sign-up, briefing… optional)" maxlength="300" class="field">
+                <textarea id="evDesc" rows="2" placeholder="Details (optional)" maxlength="1000" class="field"></textarea>
+                <div class="flex items-center gap-3">
+                    <button type="submit" class="btn">Add event</button>
+                    <p id="evMsg" class="hidden text-sm font-medium"></p>
+                </div>
+            </form>
+            <div id="evList" class="space-y-2"><div class="surface rounded-2xl p-5 text-center text-sm text-zinc-400">Loading…</div></div>
+        </section>
+
         <!-- Team (owner only) -->
         <section id="teamSection" class="hidden mb-8 fade-in">
             <div class="flex items-center justify-between mb-3">
@@ -218,6 +236,7 @@
             if (me.mustChangePassword) show('pwBanner');
             if (me.role === 'owner') { show('teamSection'); loadTeam(); }
             loadSubmissions();
+            loadEvents();
             lucide.createIcons();
         }
 
@@ -271,6 +290,52 @@
             } catch (err) { flash('subMsg', err.message, false); }
             finally { $('subBtn').disabled = false; }
         });
+
+        // ---------- Events ----------
+        const fmtEvent = (d) => new Date(d).toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+
+        async function loadEvents() {
+            try {
+                const { events } = await api('/events');
+                if (!events.length) {
+                    $('evList').innerHTML = '<div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400">No upcoming events.</div>';
+                    return;
+                }
+                $('evList').innerHTML = events.map(e => `
+                    <div class="surface rounded-2xl p-4 flex items-start justify-between gap-3">
+                        <div class="min-w-0">
+                            <p class="font-semibold text-sm truncate">${esc(e.title)}</p>
+                            <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5 flex items-center gap-1.5"><i data-lucide="calendar-clock" class="w-3.5 h-3.5"></i>${fmtEvent(e.startsAt)}</p>
+                            ${e.description ? `<p class="text-sm text-zinc-600 dark:text-zinc-300 mt-1.5 whitespace-pre-wrap">${esc(e.description)}</p>` : ''}
+                            ${e.link ? `<a href="${esc(e.link)}" target="_blank" rel="noopener" class="text-xs text-blue-600 dark:text-blue-400 hover:underline inline-flex items-center gap-1 mt-1.5"><i data-lucide="link" class="w-3 h-3"></i>${esc(e.link.replace(/^https?:\/\//,'').slice(0,40))}</a>` : ''}
+                        </div>
+                        <button onclick="deleteEvent('${e.id}')" title="Remove" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-rose-50 dark:hover:bg-rose-500/10 text-rose-500 shrink-0"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                    </div>`).join('');
+                lucide.createIcons();
+            } catch (err) {
+                $('evList').innerHTML = `<div class="surface rounded-2xl p-5 text-center text-sm text-rose-500">${esc(err.message)}</div>`;
+            }
+        }
+
+        $('evForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            hide('evMsg');
+            try {
+                await api('/events', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ title: $('evTitle').value, startsAt: $('evWhen').value, link: $('evLink').value, description: $('evDesc').value }),
+                });
+                $('evForm').reset();
+                flash('evMsg', 'Event added.', true);
+                loadEvents();
+            } catch (err) { flash('evMsg', err.message, false); }
+        });
+
+        async function deleteEvent(id) {
+            if (!confirm('Remove this event?')) return;
+            try { await api('/events/' + id, { method: 'DELETE' }); loadEvents(); }
+            catch (err) { alert(err.message); }
+        }
 
         // ---------- Team (owner) ----------
         async function loadTeam() {

@@ -116,6 +116,44 @@ VaSubmissionSchema.index({ status: 1, createdAt: -1 });
 const VaSubmission = mongoose.models.VaSubmission
     || mongoose.model('VaSubmission', VaSubmissionSchema);
 
+/* =========================
+ * VA PORTAL EVENTS
+ *
+ * Events a partner VA schedules through the portal (group flights, fly-ins,
+ * etc.). Kept DELIBERATELY tiny on storage: a handful of short fields, no
+ * attachments, and a TTL index that auto-deletes each event 14 days after it
+ * starts, so past events never accumulate and the collection stays bounded.
+ * (minimize:true also drops any empty objects.)
+ * ========================= */
+const MAX_EVENTS_PER_VA = 50;       // soft cap on a VA's upcoming events
+const EVENT_RETAIN_MS = 14 * 24 * 60 * 60 * 1000; // prune 14d after start
+
+const VaEventSchema = new mongoose.Schema({
+    vaAdId: { type: mongoose.Schema.Types.ObjectId, ref: 'VirtualAirlineAd', default: null, index: true },
+    vaName: { type: String, default: '' },
+    createdByName: { type: String, default: '' },
+    title: { type: String, required: true, trim: true, maxlength: 120 },
+    description: { type: String, default: '', maxlength: 1000 },
+    link: { type: String, default: '', maxlength: 300 },
+    startsAt: { type: Date, required: true },
+    createdAt: { type: Date, default: Date.now },
+}, { minimize: true });
+
+// TTL prune: Mongo deletes the doc once startsAt + EVENT_RETAIN_MS is in the past.
+VaEventSchema.index({ startsAt: 1 }, { expireAfterSeconds: EVENT_RETAIN_MS / 1000 });
+VaEventSchema.index({ vaAdId: 1, startsAt: 1 });
+
+const VaEvent = mongoose.models.VaEvent || mongoose.model('VaEvent', VaEventSchema);
+
+function publicEvent(e) {
+    if (!e) return null;
+    return {
+        id: e._id, vaAdId: e.vaAdId, vaName: e.vaName,
+        title: e.title, description: e.description || '', link: e.link || '',
+        startsAt: e.startsAt, createdByName: e.createdByName, createdAt: e.createdAt,
+    };
+}
+
 // Lightweight audit trail so the Inflight side can "see whatever they do".
 const VaPortalActivitySchema = new mongoose.Schema({
     vaAdId: { type: mongoose.Schema.Types.ObjectId, ref: 'VirtualAirlineAd', default: null, index: true },
@@ -535,6 +573,77 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, s3Client, upload }) {
     });
 
     // =====================================================================
+    // VA-FACING EVENTS
+    // =====================================================================
+    // Upcoming events for this VA (anything not older than 12h ago).
+    app.get('/api/va-portal/events', requirePortal, async (req, res) => {
+        try {
+            const since = new Date(Date.now() - 12 * 60 * 60 * 1000);
+            const events = await VaEvent.find({ vaAdId: req.portal.vaAdId, startsAt: { $gte: since } })
+                .sort({ startsAt: 1 }).limit(MAX_EVENTS_PER_VA);
+            res.json({ events: events.map(publicEvent) });
+        } catch (err) {
+            console.error('VA portal list events error:', err);
+            res.status(500).json({ error: 'Could not load events.' });
+        }
+    });
+
+    app.post('/api/va-portal/events', requirePortal, async (req, res) => {
+        try {
+            const { title, description, link, startsAt } = req.body || {};
+            if (!title || !String(title).trim()) return res.status(400).json({ error: 'A title is required.' });
+            const when = new Date(startsAt);
+            if (isNaN(when.getTime())) return res.status(400).json({ error: 'A valid date & time is required.' });
+
+            // Soft cap so a VA can't balloon the (tiny) collection.
+            const upcoming = await VaEvent.countDocuments({
+                vaAdId: req.portal.vaAdId, startsAt: { $gte: new Date() },
+            });
+            if (upcoming >= MAX_EVENTS_PER_VA) {
+                return res.status(400).json({ error: `You can have at most ${MAX_EVENTS_PER_VA} upcoming events.` });
+            }
+
+            const event = await VaEvent.create({
+                vaAdId: req.portal.vaAdId,
+                vaName: req.portal.vaName,
+                createdByName: req.portal.displayName || req.portal.username,
+                title: String(title).trim().slice(0, 120),
+                description: String(description || '').slice(0, 1000),
+                link: String(link || '').trim().slice(0, 300),
+                startsAt: when,
+            });
+            logActivity({
+                vaAdId: req.portal.vaAdId, vaName: req.portal.vaName,
+                actorName: req.portal.displayName || req.portal.username, actorRole: req.portal.role,
+                action: 'event.create', detail: `${event.title} @ ${when.toISOString()}`,
+            });
+            res.status(201).json({ event: publicEvent(event) });
+        } catch (err) {
+            console.error('VA portal create event error:', err);
+            res.status(500).json({ error: 'Could not save the event.' });
+        }
+    });
+
+    app.delete('/api/va-portal/events/:id', requirePortal, async (req, res) => {
+        try {
+            const event = await VaEvent.findById(req.params.id);
+            if (!event || String(event.vaAdId) !== String(req.portal.vaAdId)) {
+                return res.status(404).json({ error: 'Event not found.' });
+            }
+            await event.deleteOne();
+            logActivity({
+                vaAdId: req.portal.vaAdId, vaName: req.portal.vaName,
+                actorName: req.portal.displayName || req.portal.username, actorRole: req.portal.role,
+                action: 'event.delete', detail: event.title,
+            });
+            res.json({ ok: true });
+        } catch (err) {
+            console.error('VA portal delete event error:', err);
+            res.status(500).json({ error: 'Could not delete the event.' });
+        }
+    });
+
+    // =====================================================================
     // VA-FACING TEAM MANAGEMENT (owner only)
     // =====================================================================
     app.get('/api/va-portal/team', requirePortal, async (req, res) => {
@@ -799,6 +908,20 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, s3Client, upload }) {
         }
     });
 
+    // Upcoming events across every VA (optionally filtered by VA).
+    app.get('/api/va-portal/admin/events', requireOversight, async (req, res) => {
+        try {
+            const since = new Date(Date.now() - 12 * 60 * 60 * 1000);
+            const filter = { startsAt: { $gte: since } };
+            if (req.query.vaAdId) filter.vaAdId = req.query.vaAdId;
+            const events = await VaEvent.find(filter).sort({ startsAt: 1 }).limit(500);
+            res.json({ events: events.map(publicEvent) });
+        } catch (err) {
+            console.error('VA portal admin events error:', err);
+            res.status(500).json({ error: 'Could not load events.' });
+        }
+    });
+
     // Recent portal activity feed ("see whatever they do").
     app.get('/api/va-portal/admin/activity', requireOversight, async (req, res) => {
         const filter = {};
@@ -816,6 +939,7 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, s3Client, upload }) {
 module.exports = {
     VaPortalAccount,
     VaSubmission,
+    VaEvent,
     VaPortalActivity,
     registerVaPortalRoutes,
     provisionOwnerAccount,

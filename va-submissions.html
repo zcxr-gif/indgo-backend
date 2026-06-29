@@ -57,6 +57,7 @@
         <!-- Tabs -->
         <div class="flex items-center gap-2 mb-6">
             <button class="tab active" data-tab="submissions" onclick="switchTab('submissions')">Submissions</button>
+            <button class="tab" data-tab="events" onclick="switchTab('events')">Events</button>
             <button class="tab" data-tab="accounts" onclick="switchTab('accounts')">Accounts</button>
             <button class="tab" data-tab="activity" onclick="switchTab('activity')">Activity</button>
         </div>
@@ -84,6 +85,15 @@
                 <button onclick="loadSubmissions()" class="w-9 h-9 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500" title="Refresh"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
             </div>
             <div id="subList" class="space-y-3"></div>
+        </div>
+
+        <!-- ===== EVENTS ===== -->
+        <div id="tab-events" class="hidden">
+            <div class="flex flex-wrap items-center gap-2 mb-4">
+                <select id="evVa" class="field max-w-[14rem]" onchange="loadEvents()"><option value="">All VAs</option></select>
+                <button onclick="loadEvents()" class="w-9 h-9 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500" title="Refresh"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+            </div>
+            <div id="evList" class="space-y-2"></div>
         </div>
 
         <!-- ===== ACCOUNTS ===== -->
@@ -152,7 +162,8 @@
 
         function switchTab(name) {
             document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
-            ['submissions','accounts','activity'].forEach(n => $('tab-' + n).classList.toggle('hidden', n !== name));
+            ['submissions','events','accounts','activity'].forEach(n => $('tab-' + n).classList.toggle('hidden', n !== name));
+            if (name === 'events') loadEvents();
             if (name === 'accounts') loadAccounts();
             if (name === 'activity') loadActivity();
         }
@@ -164,6 +175,7 @@
                 // Fill VA dropdowns.
                 const opts = list.map(v => `<option value="${v.id}">${esc(v.name)}${v.callsign ? ' (' + esc(v.callsign) + ')' : ''}</option>`).join('');
                 $('fVa').innerHTML = '<option value="">All VAs</option>' + opts;
+                $('evVa').innerHTML = '<option value="">All VAs</option>' + opts;
                 $('naVa').innerHTML = '<option value="">Select VA…</option>' + opts;
                 $('bootLoader').classList.add('hidden');
                 $('app').classList.remove('hidden');
@@ -237,6 +249,34 @@
                 msg.textContent = 'Saved.'; msg.classList.remove('hidden','text-rose-500'); msg.classList.add('text-emerald-500');
             } catch (err) {
                 if (err.message !== 'auth') { msg.textContent = err.message; msg.classList.remove('hidden','text-emerald-500'); msg.classList.add('text-rose-500'); }
+            }
+        }
+
+        // ---------- Events ----------
+        const fmtEvent = (d) => new Date(d).toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+
+        async function loadEvents() {
+            const params = new URLSearchParams();
+            if ($('evVa').value) params.set('vaAdId', $('evVa').value);
+            $('evList').innerHTML = '<div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400">Loading…</div>';
+            try {
+                const { events } = await api('/events?' + params.toString());
+                if (!events.length) { $('evList').innerHTML = '<div class="surface rounded-2xl p-8 text-center text-sm text-zinc-400">No upcoming events.</div>'; return; }
+                $('evList').innerHTML = events.map(e => `
+                    <div class="surface rounded-2xl p-4">
+                        <div class="flex items-start justify-between gap-3">
+                            <div class="min-w-0">
+                                <p class="font-semibold text-sm">${esc(e.title)} <span class="text-[11px] font-semibold text-zinc-400 ml-1">${esc(e.vaName||'—')}</span></p>
+                                <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5 flex items-center gap-1.5"><i data-lucide="calendar-clock" class="w-3.5 h-3.5"></i>${fmtEvent(e.startsAt)}</p>
+                            </div>
+                        </div>
+                        ${e.description ? `<p class="text-sm text-zinc-600 dark:text-zinc-300 mt-2 whitespace-pre-wrap">${esc(e.description)}</p>` : ''}
+                        ${e.link ? `<a href="${esc(e.link)}" target="_blank" rel="noopener" class="text-xs text-blue-600 dark:text-blue-400 hover:underline inline-flex items-center gap-1 mt-2"><i data-lucide="link" class="w-3 h-3"></i>${esc(e.link.replace(/^https?:\/\//,'').slice(0,40))}</a>` : ''}
+                        <p class="text-[11px] text-zinc-400 mt-2">by ${esc(e.createdByName||'—')}</p>
+                    </div>`).join('');
+                lucide.createIcons();
+            } catch (err) {
+                if (err.message !== 'auth') $('evList').innerHTML = `<div class="surface rounded-2xl p-6 text-center text-sm text-rose-500">${esc(err.message)}</div>`;
             }
         }
 
