@@ -458,7 +458,7 @@ async function uploadSubmissionFile(s3Client, file) {
  * @param {Function} [deps.uploadVaImage] (s3Client, file, ref, kind) => url
  * @param {Function} [deps.deleteVaImage] (s3Client, url) => Promise
  */
-function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl }) {
+function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent }) {
     // Webhook URLs are secrets, so the profile API never echoes one back in full.
     // Surface just enough for the owner to recognise what's saved: the trailing
     // chars of the webhook id. Defensive against malformed stored values.
@@ -761,6 +761,36 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, 
         } catch (err) {
             console.error('VA portal flight-events toggle error:', err);
             res.status(500).json({ error: 'Could not update delivery.' });
+        }
+    });
+
+    // Owner sends a sample takeoff card to their own saved webhook, so they can
+    // confirm delivery works (and see the card) without waiting for a real flight.
+    // Posts via the same renderer/path as live events, so a failure here surfaces
+    // the exact problem a real flight would hit.
+    app.post('/api/va-portal/flight-events/test', requirePortalOwner, async (req, res) => {
+        try {
+            if (!req.portal.vaAdId) return res.status(404).json({ error: 'No VA is linked to this account.' });
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId)
+                .select('+flightEventsWebhookUrl name callsign callsigns logoUrl');
+            if (!ad) return res.status(404).json({ error: 'Your VA listing could not be found.' });
+            if (!ad.flightEventsWebhookUrl) return res.status(400).json({ error: 'Save a webhook first, then send a test.' });
+            if (typeof isDiscordWebhookUrl === 'function' && !isDiscordWebhookUrl(ad.flightEventsWebhookUrl)) {
+                return res.status(400).json({ error: 'The saved webhook is not a valid Discord webhook URL.' });
+            }
+            if (typeof sendVaTestEvent !== 'function') {
+                return res.status(500).json({ error: 'Test delivery is unavailable right now.' });
+            }
+            await sendVaTestEvent(ad);
+            res.json({ message: 'Test event sent — check your Discord channel.' });
+        } catch (err) {
+            const status = err.response && err.response.status;
+            console.error('VA portal flight-events test error:', status || '', err.message);
+            res.status(502).json({
+                error: status
+                    ? `Discord rejected the webhook (HTTP ${status}). The URL may be wrong, revoked or deleted.`
+                    : 'Could not reach the webhook URL.',
+            });
         }
     });
 
