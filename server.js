@@ -2606,13 +2606,22 @@ const postVaEventCard = async (webhookUrl, e, media) => {
         footer: { text: 'Powered by Inflight' },
         timestamp: new Date(Number(e.timestamp) || Date.now()).toISOString(),
     };
-    const form = new FormData();
-    form.append('payload_json', JSON.stringify({
-        embeds: [embed],
-        attachments: [{ id: 0, filename: 'card.png' }],
-    }));
-    form.append('files[0]', new Blob([png], { type: 'image/png' }), 'card.png');
-    return axios.post(webhookUrl, form);
+    // The card rendered, but the multipart upload can still fail (a transient
+    // Discord error, an oversize/edge-case attachment). Don't let a render success
+    // become worse than a render failure: on ANY upload error fall back to the
+    // plain JSON embed so the notification still goes out.
+    try {
+        const form = new FormData();
+        form.append('payload_json', JSON.stringify({
+            embeds: [embed],
+            attachments: [{ id: 0, filename: 'card.png' }],
+        }));
+        form.append('files[0]', new Blob([png], { type: 'image/png' }), 'card.png');
+        return await axios.post(webhookUrl, form);
+    } catch (err) {
+        console.warn('[va-events] card upload failed, falling back to embed:', err.message);
+        return axios.post(webhookUrl, buildVaEventPayload(e, media));
+    }
 };
 
 // A representative sample takeoff for the "send test" buttons (staff editor + VA
