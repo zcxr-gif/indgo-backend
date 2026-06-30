@@ -242,7 +242,7 @@ VirtualAirlineAdSchema.pre('save', function (next) {
         const seen = new Set();
         const cleaned = [];
         for (const c of this.callsigns) {
-            const norm = normalizeCallsignBase(c);
+            const norm = cleanCallsignInput(c);
             if (norm && !seen.has(norm)) { seen.add(norm); cleaned.push(norm); }
         }
         this.callsigns = cleaned;
@@ -424,6 +424,71 @@ const normalizeCallsignBase = (raw) => {
     if (!raw) return null;
     const clean = String(raw).trim().toUpperCase().replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim();
     return clean || null;
+};
+
+// Callsign as the operator typed it (trim + uppercase only — no suffix
+// stripping). Used by the staff/portal SAVE paths so a value entered as
+// "AIR CANADA ##VA" is stored verbatim and shown back unchanged when the editor
+// is reopened. Display helpers collapse any "##VA" the stored value already
+// carries (formatCallsignDisplay here; fmtCallsign / formatVaCallsign in the
+// UIs) so the suffix is never doubled at render time.
+const cleanCallsignInput = (raw) => {
+    if (!raw) return null;
+    const clean = String(raw).trim().toUpperCase();
+    return clean || null;
+};
+
+// Render a stored callsign as "<BASE> ##VA" for read-only display, tolerating a
+// stored value that already ends in the suffix so it isn't doubled.
+const formatCallsignDisplay = (raw) => {
+    if (!raw) return null;
+    const base = String(raw).trim().toUpperCase()
+        .replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim();
+    return base ? `${base} ##VA` : null;
+};
+
+// Expand reduced callsign bases with their "##VA" / " VA" suffixed forms for the
+// flight-event lookups. Stored callsigns are now kept verbatim (see
+// cleanCallsignInput), so a VA that saved its callsign WITH the suffix (e.g.
+// "AIR CANADA ##VA") must still match a live callsign we reduced to the bare base
+// ("AIR CANADA"). Querying both forms keeps delivery working either way.
+const callsignQueryVariants = (bases) => {
+    const out = new Set();
+    for (const b of bases) {
+        if (!b) continue;
+        out.add(b);
+        out.add(`${b} ##VA`);
+        out.add(`${b} VA`);
+    }
+    return [...out];
+};
+
+// --- Our own VA callsign filter ---------------------------------------------
+// A pilot flying for a VA uses a callsign shaped "<BASE> <pilot#>VA": it must
+// START with the VA's base radio callsign and END with "VA", with the pilot
+// number in between — e.g. base "STARLUX" → "STARLUX 123VA" (the "###" in
+// "Starlux ###VA" stands in for the number). This is the rule we apply to decide
+// whether a live in-game callsign really belongs to one of the VA's stored
+// callsigns. Tolerances: case-insensitive; a stored base that itself carries a
+// "##VA"/" VA" suffix is reduced first; the number may use digits and/or "#"
+// placeholders; the space before "VA" is optional.
+const callsignMatchesVaBase = (callsign, base) => {
+    const cs = String(callsign || '').trim().toUpperCase();
+    const b = String(base || '').trim().toUpperCase()
+        .replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim();
+    if (!cs || !b) return false;
+    const escaped = b.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // <base><space><pilot number (digits / # placeholders)><optional space>VA
+    return new RegExp('^' + escaped + '\\s+[0-9#]+\\s*VA$').test(cs);
+};
+
+// List-aware form of callsignMatchesVaBase: returns the first stored base the
+// live callsign fits (so it doubles as "which callsign matched"), or null.
+const matchVaCallsign = (callsign, bases = []) => {
+    for (const b of (Array.isArray(bases) ? bases : [bases])) {
+        if (callsignMatchesVaBase(callsign, b)) return b;
+    }
+    return null;
 };
 
 // Reduce a LIVE in-game callsign to its airline-name base by dropping the trailing
@@ -1934,7 +1999,7 @@ const sendVaAdWebhook = async (ad) => {
                 fields: [
                     { name: 'Name', value: ad.name, inline: true },
                     { name: 'Type', value: ad.type, inline: true },
-                    { name: 'Callsign', value: ad.callsign ? `${ad.callsign} ##VA` : '—', inline: true },
+                    { name: 'Callsign', value: formatCallsignDisplay(ad.callsign) || '—', inline: true },
                     { name: 'Region', value: ad.region || '—', inline: true },
                     { name: 'Recruiting', value: ad.recruiting ? 'Yes' : 'No', inline: true },
                     { name: 'Status', value: ad.status, inline: true }
@@ -2108,8 +2173,8 @@ app.post('/api/va-ads', requireAuth, uploadVaImages, async (req, res) => {
 
         // Accept either a single `callsign` or a `callsigns` list (the new
         // multi-callsign field). The pre-save hook reconciles the two.
-        const callsigns = parseListField(req.body.callsigns).map(normalizeCallsignBase).filter(Boolean);
-        const callsign = normalizeCallsignBase(req.body.callsign) || callsigns[0] || null;
+        const callsigns = parseListField(req.body.callsigns).map(cleanCallsignInput).filter(Boolean);
+        const callsign = cleanCallsignInput(req.body.callsign) || callsigns[0] || null;
         if (callsign && !callsigns.length) callsigns.push(callsign);
         const ref = callsign || name;
         const bannerUrl = bannerFile ? await uploadVaImage(s3Client, bannerFile, ref, 'banner') : null;
@@ -2189,12 +2254,12 @@ app.put('/api/va-ads/:id', requireAuth, uploadVaImages, async (req, res) => {
         // callsigns[] is authoritative; a lone legacy `callsign` maps into it so
         // the pre-save reconciliation doesn't silently revert the edit.
         if (b.callsigns !== undefined) {
-            ad.callsigns = parseListField(b.callsigns).map(normalizeCallsignBase).filter(Boolean);
+            ad.callsigns = parseListField(b.callsigns).map(cleanCallsignInput).filter(Boolean);
         } else if (b.callsign !== undefined) {
-            const cs = normalizeCallsignBase(b.callsign);
+            const cs = cleanCallsignInput(b.callsign);
             ad.callsigns = cs ? [cs] : [];
         }
-        if (b.callsign !== undefined) ad.callsign = normalizeCallsignBase(b.callsign);
+        if (b.callsign !== undefined) ad.callsign = cleanCallsignInput(b.callsign);
         if (b.type !== undefined && VA_AD_TYPES.includes(b.type)) ad.type = b.type;
         if (b.tagline !== undefined) ad.tagline = b.tagline;
         if (b.description !== undefined) ad.description = b.description;
@@ -2295,7 +2360,7 @@ app.get('/api/va-ads/flight-events/diagnose', requireAuth, async (req, res) => {
             callsignAirlineBase(callsign),
         ].filter(Boolean))];
 
-        const ad = await VirtualAirlineAd.findOne({ callsigns: { $in: basesTried } })
+        const ad = await VirtualAirlineAd.findOne({ callsigns: { $in: callsignQueryVariants(basesTried) } })
             .select('+flightEventsWebhookUrl name callsigns flightEventsApproved flightEventsEnabled flightEventsRequestedAt')
             .lean();
 
@@ -2307,8 +2372,12 @@ app.get('/api/va-ads/flight-events/diagnose', requireAuth, async (req, res) => {
         }
 
         const configured = !!ad.flightEventsWebhookUrl;
+        // Our callsign filter gates delivery too: even fully opted-in, a callsign
+        // that doesn't fit "<base> ###VA" won't post. Report it as the top reason.
+        const callsignFitsFormat = !!matchVaCallsign(callsign, ad.callsigns);
         let reason = 'would_deliver';
-        if (!configured) reason = 'no_webhook_saved';
+        if (!callsignFitsFormat) reason = 'callsign_format_mismatch';
+        else if (!configured) reason = 'no_webhook_saved';
         else if (!ad.flightEventsApproved) reason = 'not_approved';
         else if (!ad.flightEventsEnabled) reason = 'disabled';
 
@@ -2318,8 +2387,12 @@ app.get('/api/va-ads/flight-events/diagnose', requireAuth, async (req, res) => {
             approved: !!ad.flightEventsApproved,
             enabled: !!ad.flightEventsEnabled,
             configured,
+            callsignFitsFormat,
             webhookHint: maskWebhookUrl(ad.flightEventsWebhookUrl),
             reason,
+            ...(callsignFitsFormat ? {} : {
+                hint: `Callsign must start with the VA's base and end in "VA" with the pilot number between — e.g. "${formatCallsignDisplay((ad.callsigns || [])[0]) || 'STARLUX ##VA'}" (pilot flies "${((ad.callsigns || [])[0] || 'STARLUX').replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim()} 123VA").`,
+            }),
         });
     } catch (err) {
         console.error('VA Ad flight-events diagnose error:', err);
@@ -2341,7 +2414,7 @@ app.get('/api/va-ads/flight-events/by-code', requireAuth, async (req, res) => {
         // Prefer a base-callsign match; fall back to an exact (case-insensitive)
         // name match so embeds linked by name still resolve.
         let ad = bases.length
-            ? await VirtualAirlineAd.findOne({ callsigns: { $in: bases } }).select(sel).lean()
+            ? await VirtualAirlineAd.findOne({ callsigns: { $in: callsignQueryVariants(bases) } }).select(sel).lean()
             : null;
         if (!ad) {
             const escaped = code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -2546,7 +2619,7 @@ const lookupVaLogo = async (e) => {
         ].filter(Boolean))];
         const name = String(e.va?.name || e.va?.code || '').trim();
         const or = [];
-        if (bases.length) or.push({ callsigns: { $in: bases } });
+        if (bases.length) or.push({ callsigns: { $in: callsignQueryVariants(bases) } });
         if (name) or.push({ name: new RegExp('^' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
         if (!or.length) return null;
         const ad = await VirtualAirlineAd.findOne({ $or: or }).select('logoUrl').lean();
@@ -2589,7 +2662,7 @@ const sendVaEventToPartner = async (e) => {
         .map(s => String(s || '').trim()).filter(Boolean))];
 
     const or = [];
-    if (codeBases.length) or.push({ callsigns: { $in: codeBases } });
+    if (codeBases.length) or.push({ callsigns: { $in: callsignQueryVariants(codeBases) } });
     for (const n of names) or.push({ name: new RegExp('^' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
     if (!or.length) return;
 
@@ -2602,7 +2675,7 @@ const sendVaEventToPartner = async (e) => {
                 { flightEventsEnabled: true },
                 { flightEventsWebhookUrl: { $ne: null } },
             ],
-        }).select('name logoUrl +flightEventsWebhookUrl').lean();
+        }).select('name callsigns logoUrl +flightEventsWebhookUrl').lean();
     } catch (err) {
         console.error('[va-events] partner lookup failed:', err.message);
         return;
@@ -2612,6 +2685,16 @@ const sendVaEventToPartner = async (e) => {
     // webhook saved — not a failure to identify the VA, which already happened).
     if (!ad || !ad.flightEventsWebhookUrl) {
         console.log(`[va-events] no opted-in partner for VA "${e.va?.name || e.va?.code || e.callsign}" — codes [${codeBases.join(', ')}] names [${names.join(', ')}]`);
+        return;
+    }
+
+    // Our own callsign filter, strictly enforced: the live in-game callsign MUST
+    // fit one of THIS VA's stored callsigns — start with the base, end in "VA",
+    // pilot number between (e.g. "STARLUX 123VA"). Anything that doesn't match is
+    // thrown away: a missing or mis-formatted callsign never posts, even though
+    // code/name attribution found the listing.
+    if (!matchVaCallsign(e.callsign, ad.callsigns)) {
+        console.log(`[va-events] callsign "${e.callsign || ''}" doesn't fit ${ad.name} callsigns [${(ad.callsigns || []).join(', ')}] (needs "<base> ###VA") — discarding`);
         return;
     }
 

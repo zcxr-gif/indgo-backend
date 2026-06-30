@@ -591,7 +591,11 @@
             // Callsign chips
             const chips = $('callsignChips');
             const list = (va.callsigns && va.callsigns.length) ? va.callsigns : (va.callsign ? [va.callsign] : []);
-            chips.innerHTML = list.map(c => `<span class="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 inline-flex items-center gap-1"><i data-lucide="radio" class="w-3 h-3"></i>${esc(c)} ##VA</span>`).join('')
+            chips.innerHTML = list.map(c => {
+                // Stored value may already carry "##VA" — collapse it so the chip never doubles the suffix.
+                const base = String(c || '').trim().toUpperCase().replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim();
+                return `<span class="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 inline-flex items-center gap-1"><i data-lucide="radio" class="w-3 h-3"></i>${esc(base)} ##VA</span>`;
+            }).join('')
                 + (va.region ? `<span class="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 inline-flex items-center gap-1"><i data-lucide="globe" class="w-3 h-3"></i>${esc(va.region)}</span>` : '')
                 + (va.recruiting ? `<span class="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300 inline-flex items-center gap-1"><i data-lucide="user-plus" class="w-3 h-3"></i>Recruiting</span>` : '');
             drawIcons();
