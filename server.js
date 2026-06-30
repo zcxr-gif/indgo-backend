@@ -2688,13 +2688,13 @@ const sendVaEventToPartner = async (e) => {
         return;
     }
 
-    // Our own callsign filter: when the flight carries a live in-game callsign,
-    // it must fit one of THIS VA's stored callsigns — start with the base, end in
-    // "VA", pilot number between (e.g. "STARLUX 123VA"). Code/name attribution got
-    // us the listing; this is the final "is it really one of theirs" check. Events
-    // with no live callsign fall through on that attribution as before.
-    if (e.callsign && !matchVaCallsign(e.callsign, ad.callsigns)) {
-        console.log(`[va-events] callsign "${e.callsign}" doesn't fit ${ad.name} callsigns [${(ad.callsigns || []).join(', ')}] (needs "<base> ###VA") — skipping`);
+    // Our own callsign filter, strictly enforced: the live in-game callsign MUST
+    // fit one of THIS VA's stored callsigns — start with the base, end in "VA",
+    // pilot number between (e.g. "STARLUX 123VA"). Anything that doesn't match is
+    // thrown away: a missing or mis-formatted callsign never posts, even though
+    // code/name attribution found the listing.
+    if (!matchVaCallsign(e.callsign, ad.callsigns)) {
+        console.log(`[va-events] callsign "${e.callsign || ''}" doesn't fit ${ad.name} callsigns [${(ad.callsigns || []).join(', ')}] (needs "<base> ###VA") — discarding`);
         return;
     }
 
