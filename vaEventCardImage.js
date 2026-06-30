@@ -84,10 +84,11 @@ const contain = async (buf, w, h) => {
 };
 
 // --- Card geometry ----------------------------------------------------------
-// Left column = brand + route + details; right column = one big aircraft photo
-// (now occupies the full height the map used to share, so it reads clearly).
+// Left column = brand + route + details; right column = the aircraft photo,
+// kept at its original 688x300 size (the bigger version read as too large) and
+// vertically centred in the right column so removing the map leaves no gap.
 const LOGO = { x: 28, y: 28, w: 300, h: 56 };       // OUR brand logo (top-left)
-const PHOTO = { x: 488, y: 116, w: 688, h: 440 };   // BIG aircraft photo
+const PHOTO = { x: 488, y: 184, w: 688, h: 300 };   // aircraft photo (original size, centred)
 
 // Build the background/text SVG. `has` flags which bitmaps will be composited so
 // we draw placeholders only where an image is missing.
