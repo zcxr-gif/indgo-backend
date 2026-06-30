@@ -828,7 +828,10 @@ const hashIp = (ip) => {
 registerAuthRoutes(app);
 
 // VA Partnership Portal routes (partner login/submissions/team + staff oversight).
-registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl });
+// sendVaTestEvent is defined further down (with the card renderer); wrap it in a
+// lambda so this call site doesn't touch it before it's initialised — the wrapper
+// only resolves it at request time, when the "send test" button is clicked.
+registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent: (ad) => sendVaTestEvent(ad) });
 
 // Health Check — public, unauthenticated (for uptime/platform monitors).
 // NOTE: the site is staff-only, so the homepage ("/") is gated below; point any
@@ -2492,23 +2495,7 @@ app.post('/api/va-ads/:id/flight-events/test', requireAuth, async (req, res) => 
         if (!isDiscordWebhookUrl(ad.flightEventsWebhookUrl)) {
             return res.status(400).json({ message: 'The saved webhook is not a valid Discord webhook URL.' });
         }
-        const base = ad.callsign || (ad.callsigns && ad.callsigns[0]) || ad.name || 'VA';
-        const sample = {
-            event: 'takeoff',
-            flightId: 'test-' + Date.now(),
-            va: { code: base, name: ad.name || base },
-            callsign: `${base} 01`,
-            username: 'Test Pilot',
-            server: 'Expert',
-            aircraft: { aircraftName: 'Boeing 737-800', liveryName: 'Test Livery' },
-            position: { lat: 43.6777, lon: -79.6248, alt_ft: 4200, gs_kt: 250 },
-            departure: 'CYYZ',
-            arrival: 'KJFK',
-            timestamp: Date.now(),
-        };
-        const media = await enrichEventMedia(sample);
-        if (ad.logoUrl) media.vaLogoUrl = ad.logoUrl;
-        await postVaEventCard(ad.flightEventsWebhookUrl, sample, media);
+        await sendVaTestEvent(ad);
         res.json({ message: 'Test event sent — check the VA’s Discord channel.' });
     } catch (error) {
         const status = error.response && error.response.status;
@@ -2583,7 +2570,7 @@ const VA_EVENT_TOKEN = process.env.VA_BOT_FORWARD_TOKEN || null;
 // The Discord embed card for a takeoff/landing lives in its own pure module so it
 // can be unit-tested in isolation and shared verbatim by every delivery path. The
 // DB-backed media lookups that feed it (aircraft photo, VA logo) stay here.
-const { buildVaEventPayload, extractRoute } = require('./vaEventCard');
+const { buildVaEventPayload, extractRoute, isHttpUrl: isHttpImageUrl, clip: clipEmbed, trackUrl } = require('./vaEventCard');
 const { renderVaEventCard } = require('./vaEventCardImage');
 
 // Deliver one event to a Discord webhook as our composite image card: render the
@@ -2598,10 +2585,23 @@ const postVaEventCard = async (webhookUrl, e, media) => {
     const isTakeoff = e.event === 'takeoff';
     const { dep, arr } = extractRoute(e);
     const routeLine = (dep || arr) ? `\`${dep || '????'} → ${arr || '????'}\`  ·  ` : '';
+    const track = trackUrl();
+    const vaName = e.va?.name || e.va?.code || 'Virtual Airline';
     const embed = {
         color: isTakeoff ? 0x2ecc71 : 0xf1c40f,
-        title: `${isTakeoff ? '🛫' : '🛬'} ${e.callsign || 'Flight'} — ${e.va?.name || e.va?.code || 'Virtual Airline'}`,
-        description: `${routeLine}**${e.username || 'A pilot'}** ${isTakeoff ? 'departed' : 'landed'} on **${e.server || 'unknown'}**.`,
+        // The VA's own logo lives here, in the message (the card image carries our
+        // brand). Author icon = small round logo next to the VA name.
+        author: {
+            name: clipEmbed(`${vaName} · ${isTakeoff ? 'Departure' : 'Arrival'}`, 256),
+            ...(isHttpImageUrl(media && media.vaLogoUrl) ? { icon_url: media.vaLogoUrl } : {}),
+        },
+        // Clip title/description: an over-long callsign/VA name must not 400 the POST.
+        title: clipEmbed(`${isTakeoff ? '🛫' : '🛬'} ${e.callsign || 'Flight'}`, 256),
+        ...(isHttpImageUrl(track) ? { url: track } : {}),
+        description: clipEmbed(
+            `${routeLine}**${e.username || 'A pilot'}** ${isTakeoff ? 'departed' : 'landed'} on **${e.server || 'unknown'}**.`
+            + (isHttpImageUrl(track) ? `\n[🔭 Track on Inflight](${track})` : ''),
+            2048),
         image: { url: 'attachment://card.png' },
         footer: { text: 'Powered by Inflight' },
         timestamp: new Date(Number(e.timestamp) || Date.now()).toISOString(),
@@ -2613,6 +2613,37 @@ const postVaEventCard = async (webhookUrl, e, media) => {
     }));
     form.append('files[0]', new Blob([png], { type: 'image/png' }), 'card.png');
     return axios.post(webhookUrl, form);
+};
+
+// A representative sample takeoff for the "send test" buttons (staff editor + VA
+// portal): a real-looking CYYZ->KJFK departure so the route, map and aircraft
+// photo all render. Built from the VA's own callsign/name/logo so the card looks
+// like one of theirs. Shared so every test path posts an identical card.
+const buildVaSampleEvent = (ad = {}) => {
+    const base = ad.callsign || (ad.callsigns && ad.callsigns[0]) || ad.name || 'VA';
+    return {
+        event: 'takeoff',
+        flightId: 'test-' + Date.now(),
+        va: { code: base, name: ad.name || base },
+        callsign: `${base} 01`,
+        username: 'Test Pilot',
+        server: 'Expert',
+        aircraft: { aircraftName: 'Boeing 737-800', liveryName: 'Test Livery' },
+        position: { lat: 43.6777, lon: -79.6248, alt_ft: 4200, gs_kt: 250 },
+        departure: 'CYYZ',
+        arrival: 'KJFK',
+        timestamp: Date.now(),
+    };
+};
+
+// Render + post a sample card to a VA's saved webhook. Used by both the staff and
+// VA-portal "send test" buttons. Throws on a delivery failure so the caller can
+// report Discord's status back to whoever clicked the button.
+const sendVaTestEvent = async (ad) => {
+    const sample = buildVaSampleEvent(ad);
+    const media = await enrichEventMedia(sample);
+    if (ad.logoUrl) media.vaLogoUrl = ad.logoUrl;
+    await postVaEventCard(ad.flightEventsWebhookUrl, sample, media);
 };
 
 // Find a real community photo of the flown aircraft (type + livery) to use as the

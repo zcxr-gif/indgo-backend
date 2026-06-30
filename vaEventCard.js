@@ -33,6 +33,11 @@ const clip = (s, max, fallback = '—') => {
     return str.length > max ? str.slice(0, max - 1) + '…' : str;
 };
 
+// The "Track on Inflight" link shown on every card. No per-flight deep link
+// exists yet, so this points at the tracker home; override the base with
+// PUBLIC_BASE_URL if the site moves.
+const trackUrl = () => PUBLIC_BASE_URL;
+
 // Build a static map image URL with a plane marker at the flight's position, so
 // the card literally shows WHERE the aircraft is. Prefers Mapbox (set
 // MAPBOX_STATIC_TOKEN) for a clean dark map + plane pin; falls back to the
@@ -102,10 +107,7 @@ const buildVaEventPayload = (e = {}, media = {}) => {
 
     const hasCoords = Number.isFinite(pos.lat) && Number.isFinite(pos.lon);
     const coords = hasCoords ? `${pos.lat.toFixed(3)}, ${pos.lon.toFixed(3)}` : null;
-    const geoLink = hasCoords
-        ? `https://www.google.com/maps?q=${pos.lat.toFixed(5)},${pos.lon.toFixed(5)}`
-        : null;
-    const mapUrl = hasCoords ? flightMapImageUrl(pos.lat, pos.lon, isTakeoff) : null;
+    const track = trackUrl();
 
     const aircraftLine = ac.aircraftName
         ? (ac.liveryName ? `${ac.aircraftName} · ${ac.liveryName}` : ac.aircraftName)
@@ -141,10 +143,11 @@ const buildVaEventPayload = (e = {}, media = {}) => {
             ...(isHttpUrl(media.vaLogoUrl) ? { icon_url: media.vaLogoUrl } : {}),
         },
         title: clip(`${isTakeoff ? '🛫' : '🛬'}  ${e.callsign || 'Unknown flight'}`, 256),
-        ...(isHttpUrl(geoLink) ? { url: geoLink } : {}),
+        ...(isHttpUrl(track) ? { url: track } : {}),
         description: clip(
             `**${e.username || 'A pilot'}** ${isTakeoff ? 'just departed' : 'just landed'} on **${e.server || 'unknown'}**`
-            + (aircraftLine ? ` flying the **${ac.aircraftName}**.` : '.'),
+            + (aircraftLine ? ` flying the **${ac.aircraftName}**.` : '.')
+            + (isHttpUrl(track) ? `\n[🔭 Track on Inflight](${track})` : ''),
             2048),
         color: accent,
         fields,
@@ -155,13 +158,11 @@ const buildVaEventPayload = (e = {}, media = {}) => {
         },
     };
 
-    // Big image: the map with a plane marker showing exactly where the flight is.
-    if (isHttpUrl(mapUrl)) embed.image = { url: mapUrl };
-    // Thumbnail: a real photo of the aircraft when we have one, else the VA logo.
-    const thumb = [media.aircraftImageUrl, media.vaLogoUrl].find(isHttpUrl) || null;
-    if (thumb) embed.thumbnail = { url: thumb };
+    // Big image: a real photo of the flown aircraft (the map has been removed).
+    // The VA's logo rides in the author icon above, not as a thumbnail here.
+    if (isHttpUrl(media.aircraftImageUrl)) embed.image = { url: media.aircraftImageUrl };
 
     return { embeds: [embed] };
 };
 
-module.exports = { buildVaEventPayload, extractRoute, flightMapImageUrl, isHttpUrl, PUBLIC_BASE_URL };
+module.exports = { buildVaEventPayload, extractRoute, flightMapImageUrl, isHttpUrl, clip, trackUrl, PUBLIC_BASE_URL };

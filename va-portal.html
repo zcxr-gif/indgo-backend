@@ -222,6 +222,7 @@
                 </div>
                 <div class="flex items-center gap-3 flex-wrap">
                     <button type="button" id="pfFlightRequestBtn" class="btn pf-edit">Request access</button>
+                    <button type="button" id="pfFlightTestBtn" class="hidden btn pf-edit">Send test</button>
                     <label id="pfFlightToggleWrap" class="hidden items-center gap-2 text-sm font-medium select-none">
                         <input id="pfFlightEnabled" type="checkbox" class="w-4 h-4 rounded pf-edit"> Delivery on
                     </label>
@@ -624,7 +625,10 @@
             const fState = $('pfFlightState');
             const fToggle = $('pfFlightToggleWrap');
             const fReqBtn = $('pfFlightRequestBtn');
+            const fTestBtn = $('pfFlightTestBtn');
             hide('pfFlightMsg');
+            // The test button only makes sense once an approved webhook is on file.
+            fTestBtn.classList.toggle('hidden', !(va.flightEventsApproved && va.flightEventsConfigured));
             if (va.flightEventsApproved) {
                 fState.textContent = '✅ Approved' + (va.flightEventsConfigured ? ' · webhook ' + (va.flightEventsWebhookHint || '') : '');
                 fState.className = 'text-xs font-medium text-emerald-500';
@@ -740,6 +744,16 @@
                 vaProfile = va;
                 flash('pfFlightMsg', e.target.checked ? 'Delivery resumed.' : 'Delivery paused.', true);
             } catch (err) { e.target.checked = !e.target.checked; flash('pfFlightMsg', err.message, false); }
+        });
+        // Fire a sample takeoff card at the saved webhook so the owner can confirm
+        // delivery (and what the card looks like) without waiting for a real flight.
+        $('pfFlightTestBtn').addEventListener('click', async () => {
+            $('pfFlightTestBtn').disabled = true;
+            try {
+                const { message } = await api('/flight-events/test', { method: 'POST' });
+                flash('pfFlightMsg', message || 'Test event sent — check your Discord channel.', true);
+            } catch (err) { flash('pfFlightMsg', err.message, false); }
+            finally { $('pfFlightTestBtn').disabled = false; }
         });
 
         // ---------- Embed requests (owner only; embeds are staff-provisioned) ----------
