@@ -463,6 +463,34 @@ const callsignQueryVariants = (bases) => {
     return [...out];
 };
 
+// --- Our own VA callsign filter ---------------------------------------------
+// A pilot flying for a VA uses a callsign shaped "<BASE> <pilot#>VA": it must
+// START with the VA's base radio callsign and END with "VA", with the pilot
+// number in between — e.g. base "STARLUX" → "STARLUX 123VA" (the "###" in
+// "Starlux ###VA" stands in for the number). This is the rule we apply to decide
+// whether a live in-game callsign really belongs to one of the VA's stored
+// callsigns. Tolerances: case-insensitive; a stored base that itself carries a
+// "##VA"/" VA" suffix is reduced first; the number may use digits and/or "#"
+// placeholders; the space before "VA" is optional.
+const callsignMatchesVaBase = (callsign, base) => {
+    const cs = String(callsign || '').trim().toUpperCase();
+    const b = String(base || '').trim().toUpperCase()
+        .replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim();
+    if (!cs || !b) return false;
+    const escaped = b.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // <base><space><pilot number (digits / # placeholders)><optional space>VA
+    return new RegExp('^' + escaped + '\\s+[0-9#]+\\s*VA$').test(cs);
+};
+
+// List-aware form of callsignMatchesVaBase: returns the first stored base the
+// live callsign fits (so it doubles as "which callsign matched"), or null.
+const matchVaCallsign = (callsign, bases = []) => {
+    for (const b of (Array.isArray(bases) ? bases : [bases])) {
+        if (callsignMatchesVaBase(callsign, b)) return b;
+    }
+    return null;
+};
+
 // Reduce a LIVE in-game callsign to its airline-name base by dropping the trailing
 // flight number + optional tag: "Air Canada 001VA" -> "AIR CANADA",
 // "OCEAN 12VA" -> "OCEAN", "OCEAN 7" -> "OCEAN". A bare base ("OCEAN") is left as
@@ -2344,8 +2372,12 @@ app.get('/api/va-ads/flight-events/diagnose', requireAuth, async (req, res) => {
         }
 
         const configured = !!ad.flightEventsWebhookUrl;
+        // Our callsign filter gates delivery too: even fully opted-in, a callsign
+        // that doesn't fit "<base> ###VA" won't post. Report it as the top reason.
+        const callsignFitsFormat = !!matchVaCallsign(callsign, ad.callsigns);
         let reason = 'would_deliver';
-        if (!configured) reason = 'no_webhook_saved';
+        if (!callsignFitsFormat) reason = 'callsign_format_mismatch';
+        else if (!configured) reason = 'no_webhook_saved';
         else if (!ad.flightEventsApproved) reason = 'not_approved';
         else if (!ad.flightEventsEnabled) reason = 'disabled';
 
@@ -2355,8 +2387,12 @@ app.get('/api/va-ads/flight-events/diagnose', requireAuth, async (req, res) => {
             approved: !!ad.flightEventsApproved,
             enabled: !!ad.flightEventsEnabled,
             configured,
+            callsignFitsFormat,
             webhookHint: maskWebhookUrl(ad.flightEventsWebhookUrl),
             reason,
+            ...(callsignFitsFormat ? {} : {
+                hint: `Callsign must start with the VA's base and end in "VA" with the pilot number between — e.g. "${formatCallsignDisplay((ad.callsigns || [])[0]) || 'STARLUX ##VA'}" (pilot flies "${((ad.callsigns || [])[0] || 'STARLUX').replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim()} 123VA").`,
+            }),
         });
     } catch (err) {
         console.error('VA Ad flight-events diagnose error:', err);
@@ -2639,7 +2675,7 @@ const sendVaEventToPartner = async (e) => {
                 { flightEventsEnabled: true },
                 { flightEventsWebhookUrl: { $ne: null } },
             ],
-        }).select('name logoUrl +flightEventsWebhookUrl').lean();
+        }).select('name callsigns logoUrl +flightEventsWebhookUrl').lean();
     } catch (err) {
         console.error('[va-events] partner lookup failed:', err.message);
         return;
@@ -2649,6 +2685,16 @@ const sendVaEventToPartner = async (e) => {
     // webhook saved — not a failure to identify the VA, which already happened).
     if (!ad || !ad.flightEventsWebhookUrl) {
         console.log(`[va-events] no opted-in partner for VA "${e.va?.name || e.va?.code || e.callsign}" — codes [${codeBases.join(', ')}] names [${names.join(', ')}]`);
+        return;
+    }
+
+    // Our own callsign filter: when the flight carries a live in-game callsign,
+    // it must fit one of THIS VA's stored callsigns — start with the base, end in
+    // "VA", pilot number between (e.g. "STARLUX 123VA"). Code/name attribution got
+    // us the listing; this is the final "is it really one of theirs" check. Events
+    // with no live callsign fall through on that attribution as before.
+    if (e.callsign && !matchVaCallsign(e.callsign, ad.callsigns)) {
+        console.log(`[va-events] callsign "${e.callsign}" doesn't fit ${ad.name} callsigns [${(ad.callsigns || []).join(', ')}] (needs "<base> ###VA") — skipping`);
         return;
     }
 
