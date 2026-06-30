@@ -54,8 +54,45 @@ const flightMapImageUrl = (lat, lon, isTakeoff) => {
     return `https://staticmap.openstreetmap.de/staticmap.php?center=${la},${lo}&zoom=${zoom}&size=640x320&maptype=mapnik&markers=${la},${lo},lightblue1`;
 };
 
+// Pull a single ICAO out of whatever shape a value arrives in — a bare string,
+// or an object keyed by icao/code/ident. Upper-cased; '' when nothing usable.
+const icaoOf = (v) => {
+    if (!v) return '';
+    if (typeof v === 'string') return v.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (typeof v === 'object') {
+        return String(v.icao || v.code || v.ident || v.ICAO || v.airport || '')
+            .trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    }
+    return '';
+};
+const firstIcao = (...vals) => {
+    for (const v of vals) { const s = icaoOf(v); if (s) return s; }
+    return '';
+};
+
+// Extract departure/arrival ICAO from an event, tolerant of the field names an
+// ACARS sender might use (flat strings, nested {icao}/{code}/{ident}, or a
+// route/flightPlan object). Returns { dep, arr } as ICAO strings ('' if absent).
+// Exported so both the image card and the JSON-embed fallback read the route the
+// same way.
+const extractRoute = (e = {}) => {
+    const r = e.route || e.flightPlan || e.fpl || e.fp || {};
+    const dep = firstIcao(
+        e.departure, e.depIcao, e.dep, e.origin, e.from, e.originIcao, e.fromIcao,
+        e.departureAirport, e.departureIcao, e.depAirport,
+        r.departure, r.dep, r.origin, r.from,
+    );
+    const arr = firstIcao(
+        e.arrival, e.arrIcao, e.arr, e.destination, e.dest, e.to, e.destinationIcao, e.toIcao,
+        e.arrivalAirport, e.arrivalIcao, e.arrAirport,
+        r.arrival, r.arr, r.destination, r.dest, r.to,
+    );
+    return { dep, arr };
+};
+
 // Build the Discord embed payload for one takeoff/landing. `media` carries the
-// (already-resolved) aircraft photo + VA logo URLs. Pure & synchronous.
+// (already-resolved) aircraft photo + VA logo URLs. Pure & synchronous. Used as
+// the fallback when the composite image card can't be rendered.
 const buildVaEventPayload = (e = {}, media = {}) => {
     const isTakeoff = e.event === 'takeoff';
     const va = e.va || {};
@@ -74,11 +111,19 @@ const buildVaEventPayload = (e = {}, media = {}) => {
         ? (ac.liveryName ? `${ac.aircraftName} · ${ac.liveryName}` : ac.aircraftName)
         : null;
 
-    const fields = [
+    const { dep, arr } = extractRoute(e);
+    const fields = [];
+    // Route first, laid out horizontally (two inline fields sitting side by side)
+    // so departure → arrival reads across, not stacked.
+    if (dep || arr) {
+        fields.push({ name: '🛫 Departure', value: clip(dep || '—', 256), inline: true });
+        fields.push({ name: '🛬 Arrival', value: clip(arr || '—', 256), inline: true });
+    }
+    fields.push(
         { name: '👤 Pilot', value: clip(e.username, 256), inline: true },
         { name: '📡 Callsign', value: clip(e.callsign, 256), inline: true },
         { name: '🌐 Server', value: clip(e.server, 256), inline: true },
-    ];
+    );
     if (aircraftLine) fields.push({ name: '✈️ Aircraft', value: clip(aircraftLine, 256), inline: true });
     if (Number.isFinite(pos.alt_ft)) fields.push({ name: '📈 Altitude', value: `${Math.round(pos.alt_ft).toLocaleString()} ft`, inline: true });
     if (Number.isFinite(pos.gs_kt)) fields.push({ name: '💨 Ground speed', value: `${Math.round(pos.gs_kt)} kt`, inline: true });
@@ -105,7 +150,7 @@ const buildVaEventPayload = (e = {}, media = {}) => {
         fields,
         timestamp: new Date(Number(e.timestamp) || Date.now()).toISOString(),
         footer: {
-            text: 'Inflight · VA Flight Events',
+            text: 'Powered by Inflight',
             ...(isHttpUrl(brandIcon) ? { icon_url: brandIcon } : {}),
         },
     };
@@ -119,4 +164,4 @@ const buildVaEventPayload = (e = {}, media = {}) => {
     return { embeds: [embed] };
 };
 
-module.exports = { buildVaEventPayload, flightMapImageUrl, isHttpUrl, PUBLIC_BASE_URL };
+module.exports = { buildVaEventPayload, extractRoute, flightMapImageUrl, isHttpUrl, PUBLIC_BASE_URL };
