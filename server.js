@@ -2502,11 +2502,13 @@ app.post('/api/va-ads/:id/flight-events/test', requireAuth, async (req, res) => 
             server: 'Expert',
             aircraft: { aircraftName: 'Boeing 737-800', liveryName: 'Test Livery' },
             position: { lat: 43.6777, lon: -79.6248, alt_ft: 4200, gs_kt: 250 },
+            departure: 'CYYZ',
+            arrival: 'KJFK',
             timestamp: Date.now(),
         };
         const media = await enrichEventMedia(sample);
         if (ad.logoUrl) media.vaLogoUrl = ad.logoUrl;
-        await axios.post(ad.flightEventsWebhookUrl, buildVaEventPayload(sample, media));
+        await postVaEventCard(ad.flightEventsWebhookUrl, sample, media);
         res.json({ message: 'Test event sent — check the VA’s Discord channel.' });
     } catch (error) {
         const status = error.response && error.response.status;
@@ -2581,7 +2583,37 @@ const VA_EVENT_TOKEN = process.env.VA_BOT_FORWARD_TOKEN || null;
 // The Discord embed card for a takeoff/landing lives in its own pure module so it
 // can be unit-tested in isolation and shared verbatim by every delivery path. The
 // DB-backed media lookups that feed it (aircraft photo, VA logo) stay here.
-const { buildVaEventPayload } = require('./vaEventCard');
+const { buildVaEventPayload, extractRoute } = require('./vaEventCard');
+const { renderVaEventCard } = require('./vaEventCardImage');
+
+// Deliver one event to a Discord webhook as our composite image card: render the
+// PNG and attach it (the embed points at attachment://card.png). If rendering
+// fails for any reason, fall back to the plain JSON embed so the notification
+// still goes out. Used by every delivery path (central feed, partner webhook,
+// staff test) so they all render identically.
+const postVaEventCard = async (webhookUrl, e, media) => {
+    const png = await renderVaEventCard(e, media);
+    if (!png) return axios.post(webhookUrl, buildVaEventPayload(e, media));
+
+    const isTakeoff = e.event === 'takeoff';
+    const { dep, arr } = extractRoute(e);
+    const routeLine = (dep || arr) ? `\`${dep || '????'} → ${arr || '????'}\`  ·  ` : '';
+    const embed = {
+        color: isTakeoff ? 0x2ecc71 : 0xf1c40f,
+        title: `${isTakeoff ? '🛫' : '🛬'} ${e.callsign || 'Flight'} — ${e.va?.name || e.va?.code || 'Virtual Airline'}`,
+        description: `${routeLine}**${e.username || 'A pilot'}** ${isTakeoff ? 'departed' : 'landed'} on **${e.server || 'unknown'}**.`,
+        image: { url: 'attachment://card.png' },
+        footer: { text: 'Powered by Inflight' },
+        timestamp: new Date(Number(e.timestamp) || Date.now()).toISOString(),
+    };
+    const form = new FormData();
+    form.append('payload_json', JSON.stringify({
+        embeds: [embed],
+        attachments: [{ id: 0, filename: 'card.png' }],
+    }));
+    form.append('files[0]', new Blob([png], { type: 'image/png' }), 'card.png');
+    return axios.post(webhookUrl, form);
+};
 
 // Find a real community photo of the flown aircraft (type + livery) to use as the
 // card thumbnail — an actual "plane image" rather than a generic icon. Tries an
@@ -2709,7 +2741,7 @@ const sendVaEventToPartner = async (e) => {
         const media = await enrichEventMedia(e);
         // The matched VA owns this card — prefer its own logo for the author icon.
         if (ad.logoUrl) media.vaLogoUrl = ad.logoUrl;
-        await axios.post(ad.flightEventsWebhookUrl, buildVaEventPayload(e, media));
+        await postVaEventCard(ad.flightEventsWebhookUrl, e, media);
         console.log(`🔔 partner VA ${e.event} → ${ad.name} (${e.callsign})`);
     } catch (err) {
         console.error(`[va-events] partner webhook post failed for ${ad.name}:`, err.message);
@@ -2727,7 +2759,7 @@ const sendVaEventDiscord = async (e) => {
     }
 
     const media = await enrichEventMedia(e);
-    await axios.post(webhookUrl, buildVaEventPayload(e, media));
+    await postVaEventCard(webhookUrl, e, media);
     console.log(`🔔 VA ${e.event}: ${e.callsign} (${e.username}) on ${e.server}`);
 };
 
