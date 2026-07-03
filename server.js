@@ -209,7 +209,7 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     flightEventsWebhookUrl: { type: String, trim: true, default: null, select: false },
     flightEventsEnabled: { type: Boolean, default: true },
     // Staff gate: the feature is REQUESTED by the VA, not auto-granted. Delivery
-    // (sendVaEventToPartner) only fires once a staff member approves. The request
+    // (resolveVaEventPartner) only fires once a staff member approves. The request
     // timestamp lets the portal show a "pending approval" state.
     flightEventsApproved: { type: Boolean, default: false },
     flightEventsRequestedAt: { type: Date, default: null },
@@ -276,51 +276,6 @@ const VaTermsAcceptanceSchema = new mongoose.Schema({
 
 const VaTermsAcceptance = mongoose.models.VaTermsAcceptance
     || mongoose.model('VaTermsAcceptance', VaTermsAcceptanceSchema);
-
-/* =========================
- * VA FLIGHT EVENT SCHEMA
- *
- * One document per takeoff/landing received at POST /api/va-events from the
- * ACARS backend. We persist them so the staff hub can show a live "is this
- * actually working?" feed (GET /api/va-events/recent) instead of the events
- * only flashing past in Discord.
- *
- * The sender guarantees each (flightId, event) is delivered at most once, so no
- * dedupe is required — but a unique compound index makes a buggy double-post a
- * harmless no-op rather than a duplicate row. A TTL index prunes old events so
- * the collection stays bounded without any maintenance.
- * ========================= */
-const VaFlightEventSchema = new mongoose.Schema({
-    event:    { type: String, enum: ['takeoff', 'landing'], required: true },
-    flightId: { type: String, required: true },
-    va: {
-        code: { type: String, default: '' },
-        name: { type: String, default: '' },
-    },
-    callsign: { type: String, default: '' },
-    username: { type: String, default: '' },
-    server:   { type: String, default: '' },
-    position: {
-        lat: Number, lon: Number, alt_ft: Number,
-        gs_kt: Number, heading_deg: Number, lastReportMs: Number,
-    },
-    aircraft: {
-        aircraftId: String, liveryId: String,
-        aircraftName: String, liveryName: String,
-    },
-    // When the flight event actually happened (sender clock) vs when we stored it.
-    eventTimestamp: { type: Date, default: null },
-    receivedAt: { type: Date, default: Date.now },
-}, { timestamps: true });
-
-VaFlightEventSchema.index({ receivedAt: -1 });
-// Self-prune after 30 days so the feed collection never grows unbounded.
-VaFlightEventSchema.index({ receivedAt: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 });
-// Belt-and-braces dedupe: at most one row per (flightId, event).
-VaFlightEventSchema.index({ flightId: 1, event: 1 }, { unique: true });
-
-const VaFlightEvent = mongoose.models.VaFlightEvent
-    || mongoose.model('VaFlightEvent', VaFlightEventSchema);
 
 /* =========================
  * EMBED CONFIG SCHEMA
@@ -2560,12 +2515,78 @@ app.delete('/api/va-ads/:id', requireAuth, async (req, res) => {
  *     must ack with a 2xx fast and do the slow work (Discord post) asynchronously.
  *   - If VA_BOT_FORWARD_TOKEN is set on the sender, requests carry
  *     Authorization: Bearer <token>; we check it against the same env var here.
+ *
+ * Events are EPHEMERAL. The sender broadcasts every VA's flights at us; we only
+ * care about the ones something is actually hooked to (the central Discord
+ * webhook and/or an opted-in partner VA's webhook). An event with no delivery
+ * target is discarded on arrival — never stored, never enriched. A delivered
+ * event survives only as a trimmed copy in a small in-memory ring buffer that
+ * powers the staff hub's "is this actually working?" feed; the full payload is
+ * dropped as soon as the webhook posts finish. Nothing is written to MongoDB
+ * (the old VaFlightEvent collection is gone — its TTL index drains leftovers).
  * ========================= */
 
 // Shared secret expected on inbound VA event requests. Optional: if unset, the
 // endpoint accepts unauthenticated posts (matches the sender leaving the token
 // blank). Keep this in sync with VA_BOT_FORWARD_TOKEN on the ACARS backend.
 const VA_EVENT_TOKEN = process.env.VA_BOT_FORWARD_TOKEN || null;
+
+// --- In-memory staff feed (replaces the old VaFlightEvent collection) --------
+// Only events that were actually DELIVERED to a webhook land here, as trimmed
+// copies (no position, no raw payload), newest first, hard-capped. Counters are
+// since process start; the 24h counter prunes itself on every touch. Total
+// worst-case footprint is a few tens of KB — nothing accumulates.
+const VA_EVENT_FEED_MAX = 100;
+const vaEventFeed = [];
+const vaEventStats = { total: 0, takeoffs: 0, landings: 0, lastReceivedAt: null };
+const vaEventTimes = []; // delivery timestamps (ms), pruned to the last 24h
+
+const pruneVaEventTimes = () => {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    while (vaEventTimes.length && vaEventTimes[0] < cutoff) vaEventTimes.shift();
+};
+
+const recordVaEventForFeed = (e) => {
+    const now = new Date();
+    const ac = e.aircraft || {};
+    vaEventFeed.unshift({
+        event: e.event,
+        flightId: e.flightId,
+        va: { code: e.va?.code || '', name: e.va?.name || '' },
+        callsign: e.callsign || '',
+        username: e.username || '',
+        server: e.server || '',
+        aircraft: { aircraftName: ac.aircraftName || '', liveryName: ac.liveryName || '' },
+        receivedAt: now,
+    });
+    if (vaEventFeed.length > VA_EVENT_FEED_MAX) vaEventFeed.length = VA_EVENT_FEED_MAX;
+    vaEventStats.total += 1;
+    if (e.event === 'takeoff') vaEventStats.takeoffs += 1; else vaEventStats.landings += 1;
+    vaEventStats.lastReceivedAt = now;
+    vaEventTimes.push(now.getTime());
+    pruneVaEventTimes();
+};
+
+// Belt-and-braces dedupe of (flightId, event). The sender promises at-most-once
+// delivery, but the DB unique index used to make a buggy double-post harmless —
+// this bounded Map keeps that guarantee without storing anything. Insertion
+// order == age, so pruning stops at the first fresh entry.
+const VA_EVENT_SEEN_TTL = 6 * 60 * 60 * 1000;
+const VA_EVENT_SEEN_MAX = 2000;
+const vaEventSeen = new Map();
+const isDuplicateVaEvent = (e) => {
+    const key = `${e.flightId}:${e.event}`;
+    const now = Date.now();
+    for (const [k, ts] of vaEventSeen) {
+        if (now - ts > VA_EVENT_SEEN_TTL) vaEventSeen.delete(k); else break;
+    }
+    if (vaEventSeen.has(key)) return true;
+    vaEventSeen.set(key, now);
+    if (vaEventSeen.size > VA_EVENT_SEEN_MAX) {
+        vaEventSeen.delete(vaEventSeen.keys().next().value);
+    }
+    return false;
+};
 
 // The Discord embed card for a takeoff/landing lives in its own pure module so it
 // can be unit-tested in isolation and shared verbatim by every delivery path. The
@@ -2577,9 +2598,11 @@ const { renderVaEventCard } = require('./vaEventCardImage');
 // PNG and attach it (the embed points at attachment://card.png). If rendering
 // fails for any reason, fall back to the plain JSON embed so the notification
 // still goes out. Used by every delivery path (central feed, partner webhook,
-// staff test) so they all render identically.
-const postVaEventCard = async (webhookUrl, e, media) => {
-    const png = await renderVaEventCard(e, media);
+// staff test) so they all render identically. The card PNG doesn't depend on
+// the VA logo (that lives in the embed), so a caller posting the same event to
+// several webhooks can render once and pass the buffer in as `prerenderedPng`.
+const postVaEventCard = async (webhookUrl, e, media, prerenderedPng) => {
+    const png = prerenderedPng !== undefined ? prerenderedPng : await renderVaEventCard(e, media);
     if (!png) return axios.post(webhookUrl, buildVaEventPayload(e, media));
 
     const isTakeoff = e.event === 'takeoff';
@@ -2713,12 +2736,12 @@ const enrichEventMedia = async (e) => {
     return { aircraftImageUrl, vaLogoUrl };
 };
 
-// Post a takeoff/landing to the VA that flew it, if that VA has self-configured a
-// Discord webhook in the portal. Matched on the event's VA code / callsign base
-// against the VA's stored callsigns; a non-match (or a VA that hasn't opted in)
-// is a silent no-op. Isolated try/catch so a partner's broken webhook never
-// affects the central post or the ack.
-const sendVaEventToPartner = async (e) => {
+// Resolve which opted-in partner VA (if any) this event should be delivered to.
+// Matched on the event's VA code / callsign base against the VA's stored
+// callsigns. Returns the ad (with webhook URL) or null; every gate that used to
+// abort the send now simply resolves to "no target" so the caller can decide
+// whether the event is worth keeping at all. Never throws.
+const resolveVaEventPartner = async (e) => {
     // The event ALREADY arrives attributed to a VA — the ACARS sender resolved it
     // and set e.va.code / e.va.name. We're not re-identifying the flight here; we
     // just need the ONE VA listing that owns the webhook to post to (the webhook
@@ -2736,7 +2759,7 @@ const sendVaEventToPartner = async (e) => {
     const or = [];
     if (codeBases.length) or.push({ callsigns: { $in: callsignQueryVariants(codeBases) } });
     for (const n of names) or.push({ name: new RegExp('^' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
-    if (!or.length) return;
+    if (!or.length) return null;
 
     let ad;
     try {
@@ -2750,14 +2773,14 @@ const sendVaEventToPartner = async (e) => {
         }).select('name callsigns logoUrl +flightEventsWebhookUrl').lean();
     } catch (err) {
         console.error('[va-events] partner lookup failed:', err.message);
-        return;
+        return null;
     }
-    // Silent no-op when no VA opted in — but log what we tried so a miss is
-    // diagnosable (almost always a gate that's off: not approved / disabled / no
-    // webhook saved — not a failure to identify the VA, which already happened).
+    // No opted-in VA — but log what we tried so a miss is diagnosable (almost
+    // always a gate that's off: not approved / disabled / no webhook saved —
+    // not a failure to identify the VA, which already happened on the sender).
     if (!ad || !ad.flightEventsWebhookUrl) {
         console.log(`[va-events] no opted-in partner for VA "${e.va?.name || e.va?.code || e.callsign}" — codes [${codeBases.join(', ')}] names [${names.join(', ')}]`);
-        return;
+        return null;
     }
 
     // Our own callsign filter, strictly enforced: the live in-game callsign MUST
@@ -2767,75 +2790,71 @@ const sendVaEventToPartner = async (e) => {
     // code/name attribution found the listing.
     if (!matchVaCallsign(e.callsign, ad.callsigns)) {
         console.log(`[va-events] callsign "${e.callsign || ''}" doesn't fit ${ad.name} callsigns [${(ad.callsigns || []).join(', ')}] (needs "<base> ###VA") — discarding`);
-        return;
+        return null;
     }
 
     // Re-validate at send time: a URL stored before validation tightened, or a
     // VA host that should no longer be trusted, must not be posted to blindly.
     if (!isDiscordWebhookUrl(ad.flightEventsWebhookUrl)) {
         console.warn('[va-events] partner webhook not a valid Discord webhook, skipping:', ad.name);
-        return;
+        return null;
     }
 
-    try {
-        const media = await enrichEventMedia(e);
-        // The matched VA owns this card — prefer its own logo for the author icon.
-        if (ad.logoUrl) media.vaLogoUrl = ad.logoUrl;
-        await postVaEventCard(ad.flightEventsWebhookUrl, e, media);
-        console.log(`🔔 partner VA ${e.event} → ${ad.name} (${e.callsign})`);
-    } catch (err) {
-        console.error(`[va-events] partner webhook post failed for ${ad.name}:`, err.message);
-    }
-};
-
-// Announce a takeoff/landing to Discord. Prefers a dedicated VA-events webhook
-// so flight chatter can live in its own channel, falling back to the shared
-// DISCORD_WEBHOOK_URL. No-op (logged) if neither is configured.
-const sendVaEventDiscord = async (e) => {
-    const webhookUrl = process.env.VA_EVENTS_DISCORD_WEBHOOK_URL || process.env.DISCORD_WEBHOOK_URL;
-    if (!webhookUrl) {
-        console.log('[va-events] no Discord webhook configured — event dropped:', e.event, e.flightId);
-        return;
-    }
-
-    const media = await enrichEventMedia(e);
-    await postVaEventCard(webhookUrl, e, media);
-    console.log(`🔔 VA ${e.event}: ${e.callsign} (${e.username}) on ${e.server}`);
+    return ad;
 };
 
 // Slow-path handler, run after we've already acked the sender. Anything that
 // can throw lives here so the route handler stays synchronous and fast.
+//
+// Filter-first pipeline: figure out WHO wants this event before doing any work
+// on it. An event nothing is hooked to is discarded immediately — no media
+// lookups, no card render, no storage. A wanted event is rendered ONCE, posted
+// to every target, remembered as a trimmed feed entry, and then everything
+// (payload, media, PNG buffer) goes out of scope and is garbage-collected.
 const handleVaEvent = async (e) => {
-    // Persist first so the staff feed reflects the event even when Discord is
-    // unconfigured or its webhook call fails. A duplicate (flightId, event)
-    // hits the unique index and is treated as a harmless no-op.
-    try {
-        await VaFlightEvent.create({
-            event: e.event,
-            flightId: e.flightId,
-            va: { code: e.va?.code || '', name: e.va?.name || '' },
-            callsign: e.callsign || '',
-            username: e.username || '',
-            server: e.server || '',
-            position: e.position || {},
-            aircraft: e.aircraft || {},
-            eventTimestamp: Number(e.timestamp) ? new Date(Number(e.timestamp)) : null,
-            receivedAt: new Date(),
-        });
-    } catch (err) {
-        if (err && err.code === 11000) {
-            console.log('[va-events] duplicate ignored:', e.event, e.flightId);
-        } else {
-            // Don't let a storage hiccup swallow the Discord post — log and continue.
-            console.error('[va-events] persist failed:', err.message);
-        }
+    if (isDuplicateVaEvent(e)) {
+        console.log('[va-events] duplicate ignored:', e.event, e.flightId);
+        return;
     }
 
-    // Fan out to the central feed and (if the flying VA opted in) its own
-    // channel. Independent so one broken webhook can't suppress the other.
-    await sendVaEventDiscord(e).catch(err =>
-        console.error('[va-events] central Discord post failed:', err.message));
-    await sendVaEventToPartner(e);
+    // Central feed: prefers a dedicated VA-events webhook so flight chatter can
+    // live in its own channel, falling back to the shared DISCORD_WEBHOOK_URL.
+    const centralWebhook = process.env.VA_EVENTS_DISCORD_WEBHOOK_URL
+        || process.env.DISCORD_WEBHOOK_URL || null;
+    const partnerAd = await resolveVaEventPartner(e);
+
+    // Nothing is hooked to this event — throw it away right here.
+    if (!centralWebhook && !partnerAd) {
+        console.log('[va-events] no delivery target — event dropped:', e.event, e.flightId);
+        return;
+    }
+
+    recordVaEventForFeed(e);
+
+    // One media lookup and one Sharp render shared by every target (the card
+    // PNG doesn't vary per webhook; only the embed's VA logo does).
+    const media = await enrichEventMedia(e);
+    const png = await renderVaEventCard(e, media);
+
+    // Independent try/catches so one broken webhook can't suppress the other.
+    if (centralWebhook) {
+        try {
+            await postVaEventCard(centralWebhook, e, media, png);
+            console.log(`🔔 VA ${e.event}: ${e.callsign} (${e.username}) on ${e.server}`);
+        } catch (err) {
+            console.error('[va-events] central Discord post failed:', err.message);
+        }
+    }
+    if (partnerAd) {
+        try {
+            // The matched VA owns this card — prefer its own logo for the author icon.
+            const partnerMedia = partnerAd.logoUrl ? { ...media, vaLogoUrl: partnerAd.logoUrl } : media;
+            await postVaEventCard(partnerAd.flightEventsWebhookUrl, e, partnerMedia, png);
+            console.log(`🔔 partner VA ${e.event} → ${partnerAd.name} (${e.callsign})`);
+        } catch (err) {
+            console.error(`[va-events] partner webhook post failed for ${partnerAd.name}:`, err.message);
+        }
+    }
 };
 
 // POST /api/va-events — receive a single takeoff/landing event from the ACARS
@@ -2861,29 +2880,23 @@ app.post('/api/va-events', (req, res) => {
 });
 
 // GET /api/va-events/recent — staff-only. Powers the "VA Flight Activity" panel
-// in the staff hub: a feed of recently received takeoffs/landings plus summary
+// in the staff hub: a feed of recently DELIVERED takeoffs/landings plus summary
 // counters, so staff can confirm at a glance that the ACARS sender is actually
-// reaching this receiver. Declared before any '/api/va-ads/:id'-style routes is
-// irrelevant here (different prefix), but it must precede the SPA catch-all.
-app.get('/api/va-events/recent', requireAuth, async (req, res) => {
+// reaching this receiver. Served entirely from the in-memory ring buffer —
+// dropped (unhooked) events don't appear, and counters reset on restart.
+app.get('/api/va-events/recent', requireAuth, (req, res) => {
     try {
         const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 30, 100));
-        const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
-
-        const [events, total, takeoffs, landings, last24h, latest] = await Promise.all([
-            VaFlightEvent.find().sort({ receivedAt: -1 }).limit(limit).lean(),
-            VaFlightEvent.countDocuments({}),
-            VaFlightEvent.countDocuments({ event: 'takeoff' }),
-            VaFlightEvent.countDocuments({ event: 'landing' }),
-            VaFlightEvent.countDocuments({ receivedAt: { $gte: since24h } }),
-            VaFlightEvent.findOne().sort({ receivedAt: -1 }).select('receivedAt').lean(),
-        ]);
+        pruneVaEventTimes();
 
         res.json({
-            events,
+            events: vaEventFeed.slice(0, limit),
             stats: {
-                total, takeoffs, landings, last24h,
-                lastReceivedAt: latest ? latest.receivedAt : null,
+                total: vaEventStats.total,
+                takeoffs: vaEventStats.takeoffs,
+                landings: vaEventStats.landings,
+                last24h: vaEventTimes.length,
+                lastReceivedAt: vaEventStats.lastReceivedAt,
                 tokenProtected: !!VA_EVENT_TOKEN,
             },
         });
