@@ -728,12 +728,21 @@
                     ? 'bg-emerald-100 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300'
                     : 'bg-amber-100 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300';
                 const meta = [esc(ev.username || ''), esc(ev.server || ''), acName].filter(Boolean).join(' · ');
+                // Un-hooked events now show in the feed too (they're kept 10 min so
+                // staff can spot a VA flying with no webhook wired up yet). Flag it.
+                const targets = Array.isArray(ev.targets) ? ev.targets.filter(t => t && t !== 'central') : [];
+                const hookTag = ev.delivered
+                    ? (targets.length
+                        ? '<span class="text-[11px] font-semibold px-1.5 py-0.5 rounded bg-sky-100 dark:bg-sky-950/60 text-sky-700 dark:text-sky-300">→ ' + esc(targets[0]) + '</span>'
+                        : '<span class="text-[11px] font-semibold px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400">central</span>')
+                    : '<span class="text-[11px] font-semibold px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-400 dark:text-zinc-500">no webhook</span>';
                 return '<div class="flex items-center gap-3.5 px-5 py-3.5 hover:bg-zinc-50/60 dark:hover:bg-zinc-800/30 transition">' +
                     '<span class="w-9 h-9 rounded-xl grid place-items-center shrink-0 ' + tone + '"><i data-lucide="' + icon + '" class="w-[18px] h-[18px]"></i></span>' +
                     '<div class="min-w-0 flex-1">' +
                         '<div class="flex items-center gap-2 flex-wrap">' +
                             '<span class="font-semibold text-sm truncate">' + esc(va.name || va.code || 'VA') + '</span>' +
                             '<span class="text-[11px] font-semibold px-1.5 py-0.5 rounded ' + badge + '">' + (isT ? 'departed' : 'landed') + '</span>' +
+                            hookTag +
                         '</div>' +
                         '<div class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5 truncate">' +
                             '<span class="font-medium text-zinc-600 dark:text-zinc-300">' + esc(ev.callsign || '—') + '</span>' +
