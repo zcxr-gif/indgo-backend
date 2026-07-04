@@ -197,9 +197,9 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     partnershipAnnouncedAt: { type: Date, default: null },
 
     // --- VA-managed flight event delivery (self-serve in the VA portal) ---
-    // When a webhook is set AND enabled, each takeoff/landing matched to this VA
-    // by callsign is ALSO posted to this Discord webhook (their own channel), in
-    // addition to the central VA-events feed. The URL is a secret (anyone holding
+    // When a webhook is set AND enabled, each takeoff/landing the ACARS sender
+    // attributes to this VA is ALSO posted to this Discord webhook (their own
+    // channel), in addition to the central VA-events feed. The URL is a secret (anyone holding
     // it can post to that channel), so the portal never echoes it back in full —
     // see portalVa()/the PATCH handler in vaPortal.js. Validated to a Discord
     // webhook host on write to keep this from becoming an open POST relay.
@@ -2516,14 +2516,15 @@ app.delete('/api/va-ads/:id', requireAuth, async (req, res) => {
  *   - If VA_BOT_FORWARD_TOKEN is set on the sender, requests carry
  *     Authorization: Bearer <token>; we check it against the same env var here.
  *
- * Events are EPHEMERAL. The sender broadcasts every VA's flights at us; we only
- * care about the ones something is actually hooked to (the central Discord
- * webhook and/or an opted-in partner VA's webhook). An event with no delivery
- * target is discarded on arrival — never stored, never enriched. A delivered
- * event survives only as a trimmed copy in a small in-memory ring buffer that
- * powers the staff hub's "is this actually working?" feed; the full payload is
- * dropped as soon as the webhook posts finish. Nothing is written to MongoDB
- * (the old VaFlightEvent collection is gone — its TTL index drains leftovers).
+ * Events are EPHEMERAL. The sender broadcasts every VA's flights at us. Every
+ * incoming event is kept for just 10 minutes in a small in-memory feed that
+ * powers the staff hub's "is this actually working?" panel — long enough to see
+ * what's flying (including VAs not yet wired to a webhook) without ever building
+ * up history. Delivery is a separate concern: only events something is hooked to
+ * (the central Discord webhook and/or an opted-in partner VA's webhook) get
+ * enriched, rendered and posted; an un-hooked event just rides the 10-minute
+ * feed and does no other work. Nothing is written to MongoDB (the old
+ * VaFlightEvent collection is gone — its TTL index drains leftovers).
  * ========================= */
 
 // Shared secret expected on inbound VA event requests. Optional: if unset, the
@@ -2532,24 +2533,44 @@ app.delete('/api/va-ads/:id', requireAuth, async (req, res) => {
 const VA_EVENT_TOKEN = process.env.VA_BOT_FORWARD_TOKEN || null;
 
 // --- In-memory staff feed (replaces the old VaFlightEvent collection) --------
-// Only events that were actually DELIVERED to a webhook land here, as trimmed
-// copies (no position, no raw payload), newest first, hard-capped. Counters are
-// since process start; the 24h counter prunes itself on every touch. Total
-// worst-case footprint is a few tens of KB — nothing accumulates.
-const VA_EVENT_FEED_MAX = 100;
+// EVERY incoming takeoff/landing lands here as a trimmed copy (no position, no
+// raw payload), newest first — including events that AREN'T hooked to any
+// webhook. Seeing an un-hooked VA fly is exactly what you want when wiring its
+// webhook up, and it's proof the ACARS sender is reaching us at all. Each entry
+// ERASES 10 minutes after it arrives: this is a live "what's flying right now"
+// view, not a history log, so nothing accumulates (a hard count cap is a
+// belt-and-braces bound on top of the time window). Counters are cumulative
+// since process start; the 24h counter prunes itself on every touch.
+const VA_EVENT_FEED_TTL = 10 * 60 * 1000;   // erase each entry 10 min after arrival
+const VA_EVENT_FEED_MAX = 200;
 const vaEventFeed = [];
 const vaEventStats = { total: 0, takeoffs: 0, landings: 0, lastReceivedAt: null };
-const vaEventTimes = []; // delivery timestamps (ms), pruned to the last 24h
+const vaEventTimes = []; // arrival timestamps (ms), pruned to the last 24h
 
 const pruneVaEventTimes = () => {
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
     while (vaEventTimes.length && vaEventTimes[0] < cutoff) vaEventTimes.shift();
 };
 
-const recordVaEventForFeed = (e) => {
+// Drop feed entries older than the 10-minute window. Entries are newest-first,
+// so the stale ones cluster at the tail — pop until we hit a fresh one. Cheap
+// enough to call on every read and write.
+const pruneVaEventFeed = () => {
+    const cutoff = Date.now() - VA_EVENT_FEED_TTL;
+    while (vaEventFeed.length && vaEventFeed[vaEventFeed.length - 1].ts < cutoff) {
+        vaEventFeed.pop();
+    }
+};
+
+// Record one incoming event for the staff feed. `targets` lists where it was (or
+// will be) delivered — e.g. ['central', 'Air Canada Virtual'] — or is empty when
+// nothing is hooked to it, which the staff UI surfaces so a missing hook is
+// obvious at a glance.
+const recordVaEventForFeed = (e, targets = []) => {
     const now = new Date();
     const ac = e.aircraft || {};
     vaEventFeed.unshift({
+        ts: now.getTime(),
         event: e.event,
         flightId: e.flightId,
         va: { code: e.va?.code || '', name: e.va?.name || '' },
@@ -2557,8 +2578,11 @@ const recordVaEventForFeed = (e) => {
         username: e.username || '',
         server: e.server || '',
         aircraft: { aircraftName: ac.aircraftName || '', liveryName: ac.liveryName || '' },
+        delivered: targets.length > 0,
+        targets,
         receivedAt: now,
     });
+    pruneVaEventFeed();
     if (vaEventFeed.length > VA_EVENT_FEED_MAX) vaEventFeed.length = VA_EVENT_FEED_MAX;
     vaEventStats.total += 1;
     if (e.event === 'takeoff') vaEventStats.takeoffs += 1; else vaEventStats.landings += 1;
@@ -2737,10 +2761,14 @@ const enrichEventMedia = async (e) => {
 };
 
 // Resolve which opted-in partner VA (if any) this event should be delivered to.
-// Matched on the event's VA code / callsign base against the VA's stored
-// callsigns. Returns the ad (with webhook URL) or null; every gate that used to
-// abort the send now simply resolves to "no target" so the caller can decide
-// whether the event is worth keeping at all. Never throws.
+// The ACARS backend has ALREADY attributed the flight to a VA (it did the
+// prefix/suffix callsign matching on its side and set e.va.code / e.va.name), so
+// here we just look the ONE listing that owns the webhook up off that
+// attribution — we do NOT re-impose a second, stricter callsign filter of our
+// own. That extra gate used to silently discard any flight whose live callsign
+// didn't fit "<base> ###VA" exactly, which is the "matching the VA to the
+// callsign every time" pain this removes. Returns the ad (with webhook URL) or
+// null; every gate that can't produce a target just resolves to null. Never throws.
 const resolveVaEventPartner = async (e) => {
     // The event ALREADY arrives attributed to a VA — the ACARS sender resolved it
     // and set e.va.code / e.va.name. We're not re-identifying the flight here; we
@@ -2783,15 +2811,11 @@ const resolveVaEventPartner = async (e) => {
         return null;
     }
 
-    // Our own callsign filter, strictly enforced: the live in-game callsign MUST
-    // fit one of THIS VA's stored callsigns — start with the base, end in "VA",
-    // pilot number between (e.g. "STARLUX 123VA"). Anything that doesn't match is
-    // thrown away: a missing or mis-formatted callsign never posts, even though
-    // code/name attribution found the listing.
-    if (!matchVaCallsign(e.callsign, ad.callsigns)) {
-        console.log(`[va-events] callsign "${e.callsign || ''}" doesn't fit ${ad.name} callsigns [${(ad.callsigns || []).join(', ')}] (needs "<base> ###VA") — discarding`);
-        return null;
-    }
+    // NOTE: we deliberately DON'T re-check the live callsign against the VA's
+    // stored callsigns here. The sender already identified the VA by callsign;
+    // requiring the in-game callsign to also fit our strict "<base> ###VA" shape
+    // was a redundant second gate that dropped legitimate flights and made hooking
+    // a VA up feel unreliable. Trusting the sender's attribution is the fix.
 
     // Re-validate at send time: a URL stored before validation tightened, or a
     // VA host that should no longer be trusted, must not be posted to blindly.
@@ -2806,11 +2830,13 @@ const resolveVaEventPartner = async (e) => {
 // Slow-path handler, run after we've already acked the sender. Anything that
 // can throw lives here so the route handler stays synchronous and fast.
 //
-// Filter-first pipeline: figure out WHO wants this event before doing any work
-// on it. An event nothing is hooked to is discarded immediately — no media
-// lookups, no card render, no storage. A wanted event is rendered ONCE, posted
-// to every target, remembered as a trimmed feed entry, and then everything
-// (payload, media, PNG buffer) goes out of scope and is garbage-collected.
+// Filter-first pipeline: figure out WHO wants this event before doing any heavy
+// work on it. EVERY non-duplicate event is recorded in the 10-minute staff feed
+// (even one nothing is hooked to — that's what you watch when wiring a VA up),
+// but the expensive delivery work (media lookup, card render, webhook posts) only
+// runs when there's an actual target. A wanted event is rendered ONCE, posted to
+// every target, and then everything (payload, media, PNG buffer) goes out of
+// scope and is garbage-collected; the trimmed feed entry erases 10 minutes later.
 const handleVaEvent = async (e) => {
     if (isDuplicateVaEvent(e)) {
         console.log('[va-events] duplicate ignored:', e.event, e.flightId);
@@ -2823,13 +2849,19 @@ const handleVaEvent = async (e) => {
         || process.env.DISCORD_WEBHOOK_URL || null;
     const partnerAd = await resolveVaEventPartner(e);
 
-    // Nothing is hooked to this event — throw it away right here.
+    // Record every incoming event for the staff feed, tagged with where it's
+    // headed (or nothing, when it's un-hooked). The entry self-erases after 10m.
+    const targets = [];
+    if (centralWebhook) targets.push('central');
+    if (partnerAd) targets.push(partnerAd.name);
+    recordVaEventForFeed(e, targets);
+
+    // Nothing is hooked to this event — it still lives in the feed for 10 minutes,
+    // but there's no delivery to do, so skip all the expensive work.
     if (!centralWebhook && !partnerAd) {
-        console.log('[va-events] no delivery target — event dropped:', e.event, e.flightId);
+        console.log('[va-events] no delivery target — kept 10m in feed, not posted:', e.event, e.flightId);
         return;
     }
-
-    recordVaEventForFeed(e);
 
     // One media lookup and one Sharp render shared by every target (the card
     // PNG doesn't vary per webhook; only the embed's VA logo does).
@@ -2880,13 +2912,15 @@ app.post('/api/va-events', (req, res) => {
 });
 
 // GET /api/va-events/recent — staff-only. Powers the "VA Flight Activity" panel
-// in the staff hub: a feed of recently DELIVERED takeoffs/landings plus summary
-// counters, so staff can confirm at a glance that the ACARS sender is actually
-// reaching this receiver. Served entirely from the in-memory ring buffer —
-// dropped (unhooked) events don't appear, and counters reset on restart.
+// in the staff hub: the last 10 minutes of takeoffs/landings (hooked or not)
+// plus summary counters, so staff can confirm at a glance that the ACARS sender
+// is actually reaching this receiver — and spot a VA that's flying but not yet
+// wired to a webhook. Served entirely from the in-memory feed, which self-erases
+// each entry after 10 minutes; the cumulative counters reset on restart.
 app.get('/api/va-events/recent', requireAuth, (req, res) => {
     try {
         const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 30, 100));
+        pruneVaEventFeed();
         pruneVaEventTimes();
 
         res.json({
