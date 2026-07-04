@@ -2330,14 +2330,24 @@ app.get('/api/va-ads/flight-events/diagnose', requireAuth, async (req, res) => {
         }
 
         const configured = !!ad.flightEventsWebhookUrl;
-        // Our callsign filter gates delivery too: even fully opted-in, a callsign
-        // that doesn't fit "<base> ###VA" won't post. Report it as the top reason.
+        // Delivery no longer re-checks the live callsign format — the ACARS sender
+        // already attributed the flight to this VA, so the only gates left are the
+        // opt-in ones. We still report whether the callsign fits "<base> ###VA" as
+        // informational (it can explain why the SENDER didn't attribute a flight),
+        // but it never blocks delivery here.
         const callsignFitsFormat = !!matchVaCallsign(callsign, ad.callsigns);
         let reason = 'would_deliver';
-        if (!callsignFitsFormat) reason = 'callsign_format_mismatch';
-        else if (!configured) reason = 'no_webhook_saved';
+        if (!configured) reason = 'no_webhook_saved';
         else if (!ad.flightEventsApproved) reason = 'not_approved';
         else if (!ad.flightEventsEnabled) reason = 'disabled';
+
+        // Point at whatever is actually blocking delivery. The opt-in gates are
+        // the only blockers now; the callsign format is informational only.
+        const hints = {
+            no_webhook_saved: `${ad.name} has no Discord webhook saved. Paste one in the VA portal (Flight events).`,
+            not_approved: `${ad.name}'s flight events aren't approved yet. Approve them in the VA Ads manager.`,
+            disabled: `${ad.name} has flight events turned off. Re-enable them in the VA portal.`,
+        };
 
         res.json({
             callsign, basesTried, matched: true,
@@ -2348,9 +2358,7 @@ app.get('/api/va-ads/flight-events/diagnose', requireAuth, async (req, res) => {
             callsignFitsFormat,
             webhookHint: maskWebhookUrl(ad.flightEventsWebhookUrl),
             reason,
-            ...(callsignFitsFormat ? {} : {
-                hint: `Callsign must start with the VA's base and end in "VA" with the pilot number between — e.g. "${formatCallsignDisplay((ad.callsigns || [])[0]) || 'STARLUX ##VA'}" (pilot flies "${((ad.callsigns || [])[0] || 'STARLUX').replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim()} 123VA").`,
-            }),
+            ...(hints[reason] ? { hint: hints[reason] } : {}),
         });
     } catch (err) {
         console.error('VA Ad flight-events diagnose error:', err);
