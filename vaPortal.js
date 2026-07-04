@@ -426,23 +426,27 @@ async function provisionOwnerAccount(ad, opts = {}) {
 /**
  * Completely erase a VA's portal-side footprint: every portal account (owner +
  * staff), submission (and its S3 attachments), scheduled event, activity-log row
- * and live-map embed, plus the VA's own logo/banner images in S3.
+ * and live-map embed, the VA's own logo/banner images in S3, and its flight-events
+ * Discord webhook (deleted at Discord, not just dropped from our database).
  *
- * It deliberately does NOT touch Discord (channel/role) or delete the
+ * It deliberately does NOT touch the Discord channel/role or delete the
  * VirtualAirlineAd document itself — the caller owns those (the bot deletes the
- * Discord space; deleting the ad doc also drops the stored flight-events webhook
- * URL, which lives on the ad). Every delete is best-effort so one failure never
+ * Discord space and the ad doc). Every delete is best-effort so one failure never
  * blocks the rest. Returns counts so the caller can report what was cleared.
+ *
+ * NOTE: the webhook URL is stored select:false, so for the webhook delete to fire
+ * the caller must load `ad` with `.select('+flightEventsWebhookUrl')`.
  *
  * @param {Object} ad  the VirtualAirlineAd document being removed
  * @param {Object} [deps]
- * @param {Object} [deps.EmbedConfig]      embed-config model (embeds are matched by callsign)
- * @param {Function} [deps.deleteVaImage]  (s3Client, url) => Promise — deletes one S3 object
- * @param {Object} [deps.s3Client]         S3 client for image/attachment deletes
- * @returns {Promise<{accounts:number, submissions:number, events:number, activity:number, embeds:number, images:number}>}
+ * @param {Object} [deps.EmbedConfig]         embed-config model (embeds are matched by callsign)
+ * @param {Function} [deps.deleteVaImage]     (s3Client, url) => Promise — deletes one S3 object
+ * @param {Object} [deps.s3Client]            S3 client for image/attachment deletes
+ * @param {Function} [deps.isDiscordWebhookUrl] (url) => boolean — validates before we DELETE it
+ * @returns {Promise<{accounts:number, submissions:number, events:number, activity:number, embeds:number, images:number, webhook:boolean}>}
  */
-async function purgeVaData(ad, { EmbedConfig, deleteVaImage, s3Client } = {}) {
-    const counts = { accounts: 0, submissions: 0, events: 0, activity: 0, embeds: 0, images: 0 };
+async function purgeVaData(ad, { EmbedConfig, deleteVaImage, s3Client, isDiscordWebhookUrl } = {}) {
+    const counts = { accounts: 0, submissions: 0, events: 0, activity: 0, embeds: 0, images: 0, webhook: false };
     if (!ad || !ad._id) return counts;
     const vaAdId = ad._id;
 
@@ -477,12 +481,26 @@ async function purgeVaData(ad, { EmbedConfig, deleteVaImage, s3Client } = {}) {
         } catch (e) { console.error('purgeVaData embeds:', e.message); }
     }
 
-    // Finally the VA's own banner/logo images.
+    // The VA's own banner/logo images.
     if (deleteVaImage && s3Client) {
         try {
             if (ad.logoUrl)   { await deleteVaImage(s3Client, ad.logoUrl);   counts.images += 1; }
             if (ad.bannerUrl) { await deleteVaImage(s3Client, ad.bannerUrl); counts.images += 1; }
         } catch (e) { console.error('purgeVaData images:', e.message); }
+    }
+
+    // Finally the flight-events webhook — deleted at Discord, so the VA's own
+    // channel stops receiving posts and the webhook itself is gone (not just our
+    // stored copy). Only fires if the caller loaded the select:false URL. Validate
+    // the host first so this can never be turned into an arbitrary-URL DELETE.
+    const hookUrl = ad.flightEventsWebhookUrl;
+    if (hookUrl && (typeof isDiscordWebhookUrl !== 'function' || isDiscordWebhookUrl(hookUrl))) {
+        try {
+            const resp = await fetch(hookUrl.trim(), { method: 'DELETE' });
+            // 204 = deleted; 404 = already gone. Either way it is no longer live.
+            if (resp.ok || resp.status === 404) counts.webhook = true;
+            else console.error('purgeVaData webhook delete: unexpected status', resp.status);
+        } catch (e) { console.error('purgeVaData webhook delete:', e.message); }
     }
 
     return counts;

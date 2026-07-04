@@ -611,9 +611,10 @@ startDiscordBot(
     process.env.AWS_REGION,
     { DailyPilotStats, DailyPilotView, VirtualAirlineAd, Giveaway, VaTermsAcceptance,
       provisionVaPortalAccount: provisionOwnerAccount,
-      // Full VA teardown: wipes portal accounts, submissions, events, embeds and
-      // S3 images for a VA. The bot handles the Discord side + the ad doc itself.
-      purgeVaData: (ad) => purgeVaData(ad, { EmbedConfig, deleteVaImage, s3Client }) }
+      // Full VA teardown: wipes portal accounts, submissions, events, embeds,
+      // S3 images and the flight-events webhook for a VA. The bot handles the
+      // Discord channel/role + the ad doc itself.
+      purgeVaData: (ad) => purgeVaData(ad, { EmbedConfig, deleteVaImage, s3Client, isDiscordWebhookUrl }) }
 );
 // ---------------------
 

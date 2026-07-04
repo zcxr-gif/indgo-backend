@@ -2481,7 +2481,8 @@ client.on('interactionCreate', async (interaction) => {
 
                 const adId = customId.replace('va_purge_confirm_', '');
                 await interaction.update({ content: '🗑️ Removing everything…', components: [] }).catch(() => {});
-                const ad = await VirtualAirlineAd.findById(adId).catch(() => null);
+                // Load the select:false webhook URL too so purgeVaData can delete it at Discord.
+                const ad = await VirtualAirlineAd.findById(adId).select('+flightEventsWebhookUrl').catch(() => null);
                 if (!ad) return interaction.editReply({ content: '❌ That VA no longer exists.' }).catch(() => {});
                 const vaName = ad.name;
 
@@ -2511,7 +2512,7 @@ client.on('interactionCreate', async (interaction) => {
                         `• Discord: ${discordBits.length ? discordBits.join(' + ') + ' deleted' : 'nothing left to delete'}\n` +
                         `• Portal accounts: ${counts.accounts || 0} · Submissions: ${counts.submissions || 0} · Events: ${counts.events || 0}\n` +
                         `• Embeds: ${counts.embeds || 0} · Activity rows: ${counts.activity || 0} · S3 images: ${counts.images || 0}\n` +
-                        `• Public listing + saved flight-events webhook removed.`;
+                        `• Flight-events webhook: ${counts.webhook ? 'deleted from Discord' : 'none on file'} · Public listing removed.`;
                     return interaction.editReply({ content: summary }).catch(() => {});
                 } catch (e) {
                     console.error('❌ va_purge error:', e);
