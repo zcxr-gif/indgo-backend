@@ -423,6 +423,71 @@ async function provisionOwnerAccount(ad, opts = {}) {
     return { account, created: true, username, password };
 }
 
+/**
+ * Completely erase a VA's portal-side footprint: every portal account (owner +
+ * staff), submission (and its S3 attachments), scheduled event, activity-log row
+ * and live-map embed, plus the VA's own logo/banner images in S3.
+ *
+ * It deliberately does NOT touch Discord (channel/role) or delete the
+ * VirtualAirlineAd document itself — the caller owns those (the bot deletes the
+ * Discord space; deleting the ad doc also drops the stored flight-events webhook
+ * URL, which lives on the ad). Every delete is best-effort so one failure never
+ * blocks the rest. Returns counts so the caller can report what was cleared.
+ *
+ * @param {Object} ad  the VirtualAirlineAd document being removed
+ * @param {Object} [deps]
+ * @param {Object} [deps.EmbedConfig]      embed-config model (embeds are matched by callsign)
+ * @param {Function} [deps.deleteVaImage]  (s3Client, url) => Promise — deletes one S3 object
+ * @param {Object} [deps.s3Client]         S3 client for image/attachment deletes
+ * @returns {Promise<{accounts:number, submissions:number, events:number, activity:number, embeds:number, images:number}>}
+ */
+async function purgeVaData(ad, { EmbedConfig, deleteVaImage, s3Client } = {}) {
+    const counts = { accounts: 0, submissions: 0, events: 0, activity: 0, embeds: 0, images: 0 };
+    if (!ad || !ad._id) return counts;
+    const vaAdId = ad._id;
+
+    // Delete any S3 attachments carried by this VA's submissions before we drop
+    // the rows that point at them (otherwise the objects would be orphaned).
+    if (deleteVaImage && s3Client) {
+        try {
+            const subs = await VaSubmission.find({ vaAdId }, 'attachments');
+            for (const s of subs) {
+                for (const att of (s.attachments || [])) {
+                    if (att && att.url) { await deleteVaImage(s3Client, att.url); counts.images += 1; }
+                }
+            }
+        } catch (e) { console.error('purgeVaData submission attachments:', e.message); }
+    }
+
+    // Drop every portal-side collection keyed to this VA.
+    try { counts.accounts    = (await VaPortalAccount.deleteMany({ vaAdId })).deletedCount || 0; } catch (e) { console.error('purgeVaData accounts:', e.message); }
+    try { counts.submissions = (await VaSubmission.deleteMany({ vaAdId })).deletedCount || 0; } catch (e) { console.error('purgeVaData submissions:', e.message); }
+    try { counts.events      = (await VaEvent.deleteMany({ vaAdId })).deletedCount || 0; } catch (e) { console.error('purgeVaData events:', e.message); }
+    try { counts.activity    = (await VaPortalActivity.deleteMany({ vaAdId })).deletedCount || 0; } catch (e) { console.error('purgeVaData activity:', e.message); }
+
+    // Embeds are linked to a VA by callsign (the same match the portal uses to
+    // list "your embeds"), not by vaAdId.
+    if (EmbedConfig) {
+        try {
+            const codes = ((Array.isArray(ad.callsigns) && ad.callsigns.length ? ad.callsigns : [ad.callsign])
+                .filter(Boolean)).map(c => String(c).toUpperCase());
+            if (codes.length) {
+                counts.embeds = (await EmbedConfig.deleteMany({ 'va.code': { $in: codes } })).deletedCount || 0;
+            }
+        } catch (e) { console.error('purgeVaData embeds:', e.message); }
+    }
+
+    // Finally the VA's own banner/logo images.
+    if (deleteVaImage && s3Client) {
+        try {
+            if (ad.logoUrl)   { await deleteVaImage(s3Client, ad.logoUrl);   counts.images += 1; }
+            if (ad.bannerUrl) { await deleteVaImage(s3Client, ad.bannerUrl); counts.images += 1; }
+        } catch (e) { console.error('purgeVaData images:', e.message); }
+    }
+
+    return counts;
+}
+
 // Upload an arbitrary submission attachment to S3 and return its descriptor.
 async function uploadSubmissionFile(s3Client, file) {
     const bucketName = process.env.AWS_S3_BUCKET_NAME;
@@ -1268,6 +1333,7 @@ module.exports = {
     VaPortalActivity,
     registerVaPortalRoutes,
     provisionOwnerAccount,
+    purgeVaData,
     requirePortalPage,
     SUBMISSION_CATEGORIES,
     SUBMISSION_STATUSES,

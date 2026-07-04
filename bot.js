@@ -419,7 +419,7 @@ async function postToChannel(channelId, payload) {
 
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, models = {}) => {
     const { DailyPilotStats, VirtualAirlineAd, Giveaway, VaTermsAcceptance,
-            provisionVaPortalAccount } = models;
+            provisionVaPortalAccount, purgeVaData } = models;
 
     // NOTE: `Options.cacheEverything()` is the *opposite* of what we want — it
     // caches everything with no caps and silently ignores the limits passed to
@@ -1834,7 +1834,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 .addUserOption(o => o.setName('user').setDescription('User to remove').setRequired(true))
                 .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageRoles),
 
-            new SlashCommandBuilder().setName('va_remove').setDescription("[STAFF] Delete a VA's role and channel")
+            new SlashCommandBuilder().setName('va_remove').setDescription('[STAFF] Permanently remove a VA and everything it owns')
                 .addStringOption(o => o.setName('va').setDescription('VA name').setRequired(true).setAutocomplete(true))
                 .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageRoles),
 
@@ -2464,6 +2464,59 @@ client.on('interactionCreate', async (interaction) => {
                 } catch (e) { /* non-fatal — entry still counts */ }
 
                 return interaction.reply({ content: '✅ You have entered the giveaway! Good luck! 🎉', ephemeral: true });
+            }
+
+            // --- VA FULL-REMOVAL CONFIRMATION (from /va_remove) ---
+            if (customId.startsWith('va_purge_confirm_') || customId.startsWith('va_purge_cancel_')) {
+                // Staff only (mirrors the /va_remove guard).
+                if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID) && !interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+                    return interaction.reply({ content: '❌ Staff only.', ephemeral: true });
+                }
+                if (customId.startsWith('va_purge_cancel_')) {
+                    return interaction.update({ content: '✋ Cancelled — nothing was removed.', components: [] }).catch(() => {});
+                }
+                if (!VirtualAirlineAd) {
+                    return interaction.update({ content: '❌ VA system unavailable.', components: [] }).catch(() => {});
+                }
+
+                const adId = customId.replace('va_purge_confirm_', '');
+                await interaction.update({ content: '🗑️ Removing everything…', components: [] }).catch(() => {});
+                const ad = await VirtualAirlineAd.findById(adId).catch(() => null);
+                if (!ad) return interaction.editReply({ content: '❌ That VA no longer exists.' }).catch(() => {});
+                const vaName = ad.name;
+
+                try {
+                    // 1) Discord space — channel + role (best-effort; either may already be gone).
+                    const discordBits = [];
+                    if (ad.discordChannelId) {
+                        const ch = await interaction.guild.channels.fetch(ad.discordChannelId).catch(() => null);
+                        if (ch) { await ch.delete('VA fully removed by staff').catch(() => {}); discordBits.push('channel'); }
+                    }
+                    if (ad.discordRoleId) {
+                        const role = interaction.guild.roles.cache.get(ad.discordRoleId) || await interaction.guild.roles.fetch(ad.discordRoleId).catch(() => null);
+                        if (role) { await role.delete('VA fully removed by staff').catch(() => {}); discordBits.push('role'); }
+                    }
+
+                    // 2) Portal data + embeds + S3 images (centralized helper).
+                    let counts = {};
+                    if (typeof purgeVaData === 'function') {
+                        counts = await purgeVaData(ad).catch((e) => { console.error('❌ purgeVaData error:', e.message); return {}; });
+                    }
+
+                    // 3) The ad document itself — this also drops the stored flight-events webhook URL.
+                    await VirtualAirlineAd.deleteOne({ _id: ad._id }).catch(() => {});
+
+                    const summary =
+                        `🗑️ **${vaName}** fully removed.\n` +
+                        `• Discord: ${discordBits.length ? discordBits.join(' + ') + ' deleted' : 'nothing left to delete'}\n` +
+                        `• Portal accounts: ${counts.accounts || 0} · Submissions: ${counts.submissions || 0} · Events: ${counts.events || 0}\n` +
+                        `• Embeds: ${counts.embeds || 0} · Activity rows: ${counts.activity || 0} · S3 images: ${counts.images || 0}\n` +
+                        `• Public listing + saved flight-events webhook removed.`;
+                    return interaction.editReply({ content: summary }).catch(() => {});
+                } catch (e) {
+                    console.error('❌ va_purge error:', e);
+                    return interaction.editReply({ content: `❌ Something failed while removing **${vaName}**. Some parts may already be gone — check the logs.` }).catch(() => {});
+                }
             }
 
             // --- VA APPLICATION REVIEW BUTTONS ---
@@ -3275,26 +3328,33 @@ client.on('interactionCreate', async (interaction) => {
                 const vaName = interaction.options.getString('va');
                 const ad = await VirtualAirlineAd.findOne({ name: vaName }).catch(() => null);
                 if (!ad) return interaction.editReply(`❌ No VA named **${vaName}** found.`);
+
+                // --- FULL REMOVAL ---
+                // Wipes EVERYTHING tied to the VA, not just its Discord space, so it
+                // must work even when the role/channel is already gone (hence it runs
+                // before the role guards below). Because it is irreversible — portal
+                // accounts, submissions, embeds and S3 images all go too — we confirm
+                // with a button before touching anything.
+                if (commandName === 'va_remove') {
+                    const row = new ActionRowBuilder().addComponents(
+                        new ButtonBuilder().setCustomId(`va_purge_confirm_${ad._id}`).setLabel('Delete everything').setStyle(ButtonStyle.Danger).setEmoji('🗑️'),
+                        new ButtonBuilder().setCustomId(`va_purge_cancel_${ad._id}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+                    );
+                    return interaction.editReply({
+                        content: `⚠️ **Permanently remove ${ad.name}?**\n` +
+                            `This deletes its Discord channel & role, every portal account (owner + staff), ` +
+                            `all submissions, scheduled events and activity history, its live-map embeds, ` +
+                            `the saved flight-events webhook, and the VA's logo & banner — and removes the ` +
+                            `public listing.\n**This cannot be undone.**`,
+                        components: [row],
+                    });
+                }
+
+                // --- REP MANAGEMENT (add/remove) needs the provisioned role. ---
                 if (!ad.discordRoleId) return interaction.editReply(`❌ **${vaName}** hasn't been provisioned yet (approve its application first).`);
 
                 const vaRole = interaction.guild.roles.cache.get(ad.discordRoleId) || await interaction.guild.roles.fetch(ad.discordRoleId).catch(() => null);
                 if (!vaRole) return interaction.editReply(`❌ The role for **${vaName}** no longer exists.`);
-
-                if (commandName === 'va_remove') {
-                    try {
-                        if (ad.discordChannelId) {
-                            const ch = await interaction.guild.channels.fetch(ad.discordChannelId).catch(() => null);
-                            if (ch) await ch.delete('VA removed by staff').catch(() => {});
-                        }
-                        await vaRole.delete('VA removed by staff').catch(() => {});
-                        ad.discordRoleId = null; ad.discordChannelId = null;
-                        await ad.save().catch(() => {});
-                        return interaction.editReply(`🗑️ Removed the role and channel for **${vaName}**.`);
-                    } catch (e) {
-                        console.error('❌ va_remove error:', e);
-                        return interaction.editReply('❌ Failed to remove the VA space.');
-                    }
-                }
 
                 // add/remove rep
                 const user = interaction.options.getUser('user');
