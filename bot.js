@@ -97,7 +97,9 @@ const METADATA_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api
 const BASE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run/api';
 
 // Public URL of the VA Partnership Portal login (DM'd to a VA owner on approval).
-const VA_PORTAL_URL = process.env.VA_PORTAL_URL || 'https://inflight.info/va-portal';
+// The portal is served by THIS backend, not the inflight.info tracker site —
+// the old default sent owners to a page that doesn't exist there.
+const VA_PORTAL_URL = process.env.VA_PORTAL_URL || 'https://site--indgo-backend--6dmjph8ltlhv.code.run/va-portal.html';
 
 // --- CACHE SYSTEMS ---
 let cachedAircraftData = []; 
