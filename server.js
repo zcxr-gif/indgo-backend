@@ -293,6 +293,7 @@ const VaTermsAcceptance = mongoose.models.VaTermsAcceptance
 const EMBED_MODES = ['roster', 'map'];
 const EMBED_PROVIDERS = ['mapbox', 'free'];
 const EMBED_THEMES = ['dark', 'light'];
+const EMBED_HEADER_POSITIONS = ['top', 'bottom', 'left', 'right'];
 
 const EmbedConfigSchema = new mongoose.Schema({
     // Opaque token the VA embeds in their iframe URL. Generated on create.
@@ -327,8 +328,22 @@ const EmbedConfigSchema = new mongoose.Schema({
     theme: { type: String, enum: EMBED_THEMES, default: 'dark' },
     // Header/accent colour, stored as a hex string like "#1d4ed8". Empty lets the
     // widget fall back to sampling the VA logo for its header colour.
+    // LEGACY: superseded by `accent` below, but still served (mirroring accent's
+    // first stop) so older cached widget builds keep their header colour.
     brandColor: { type: String, trim: true, default: '' },
     servers: { type: [String], default: [] },                         // IF session names to scan
+
+    // --- Header & appearance customization (mirrors embed.html query params) ---
+    header: { type: String, enum: ['on', 'off'], default: 'on' },     // 'off' hides the bar; Powered-by floats as a pill
+    headerPos: { type: String, enum: EMBED_HEADER_POSITIONS, default: 'top' }, // left/right = vertical brand rail
+    // Accent colour stops, up to 3 "#rrggbb" strings. One stop auto-expands into
+    // a gradient with a derived companion shade; 2–3 stops = multi-stop gradient.
+    // Empty => the widget samples the VA logo's most vivid colours.
+    accent: { type: [String], default: [] },
+    gradient: { type: String, enum: ['auto', 'off'], default: 'auto' }, // 'off' keeps a single colour flat
+    gradientAngle: { type: Number, default: 120 },                    // degrees
+    compact: { type: Boolean, default: false },                       // slimmer header
+    radius: { type: Number, default: null },                          // widget corner radius px 0–32; null = widget default
 
     // --- Access control ---
     allowedOrigins: { type: [String], default: [] }, // empty => any site may embed
@@ -2628,27 +2643,31 @@ const isDuplicateVaEvent = (e) => {
 // The Discord embed card for a takeoff/landing lives in its own pure module so it
 // can be unit-tested in isolation and shared verbatim by every delivery path. The
 // DB-backed media lookups that feed it (aircraft photo, VA logo) stay here.
-const { buildVaEventPayload, extractRoute, isHttpUrl: isHttpImageUrl, clip: clipEmbed, trackUrl } = require('./vaEventCard');
-const { renderVaEventCard } = require('./vaEventCardImage');
+const { buildVaEventPayload, extractRoute, isHttpUrl: isHttpImageUrl, clip: clipEmbed, trackUrl, accentFor } = require('./vaEventCard');
+const { renderVaEventCard, renderVaRouteMapImage } = require('./vaEventCardImage');
 
-// Deliver one event to a Discord webhook as our composite image card: render the
-// PNG and attach it (the embed points at attachment://card.png). If rendering
-// fails for any reason, fall back to the plain JSON embed so the notification
-// still goes out. Used by every delivery path (central feed, partner webhook,
-// staff test) so they all render identically. The card PNG doesn't depend on
-// the VA logo (that lives in the embed), so a caller posting the same event to
-// several webhooks can render once and pass the buffer in as `prerenderedPng`.
-const postVaEventCard = async (webhookUrl, e, media, prerenderedPng) => {
-    const png = prerenderedPng !== undefined ? prerenderedPng : await renderVaEventCard(e, media);
+// Deliver one event to a Discord webhook as our composite image card plus (when
+// the route can be mapped) a separate route-map image in the same message: two
+// embeds, so the map sits full-width BELOW the card instead of being squeezed
+// into it. If card rendering fails, fall back to the plain JSON embed so the
+// notification still goes out. Used by every delivery path (central feed,
+// partner webhook, staff test) so they all render identically. Neither PNG
+// depends on the VA logo (that lives in the embed), so a caller posting the
+// same event to several webhooks can render once and pass the buffers in as
+// `prerendered` ({ card, map }).
+const postVaEventCard = async (webhookUrl, e, media, prerendered) => {
+    const pre = prerendered || {};
+    const png = pre.card !== undefined ? pre.card : await renderVaEventCard(e, media);
     if (!png) return axios.post(webhookUrl, buildVaEventPayload(e, media));
+    const mapPng = pre.map !== undefined ? pre.map : await renderVaRouteMapImage(e);
 
     const isTakeoff = e.event === 'takeoff';
     const { dep, arr } = extractRoute(e);
-    const routeLine = (dep || arr) ? `\`${dep || '????'} → ${arr || '????'}\`  ·  ` : '';
+    const routeTag = (dep || arr) ? `  ·  ${dep || '????'} → ${arr || '????'}` : '';
     const track = trackUrl();
     const vaName = e.va?.name || e.va?.code || 'Virtual Airline';
     const embed = {
-        color: isTakeoff ? 0x2ecc71 : 0xf1c40f,
+        color: accentFor(e).int,
         // The VA's own logo lives here, in the message (the card image carries our
         // brand). Author icon = small round logo next to the VA name.
         author: {
@@ -2656,27 +2675,40 @@ const postVaEventCard = async (webhookUrl, e, media, prerenderedPng) => {
             ...(isHttpImageUrl(media && media.vaLogoUrl) ? { icon_url: media.vaLogoUrl } : {}),
         },
         // Clip title/description: an over-long callsign/VA name must not 400 the POST.
-        title: clipEmbed(`${isTakeoff ? '🛫' : '🛬'} ${e.callsign || 'Flight'}`, 256),
+        // The route rides in the title so it reads at a glance; the card image
+        // below repeats it big anyway.
+        title: clipEmbed(`${isTakeoff ? '🛫' : '🛬'} ${e.callsign || 'Flight'}${routeTag}`, 256),
         ...(isHttpImageUrl(track) ? { url: track } : {}),
         description: clipEmbed(
-            `${routeLine}**${e.username || 'A pilot'}** ${isTakeoff ? 'departed' : 'landed'} on **${e.server || 'unknown'}**.`
+            `**${e.username || 'A pilot'}** ${isTakeoff ? 'departed' : 'landed'} on **${e.server || 'unknown'}**.`
             + (isHttpImageUrl(track) ? `\n[🔭 Track on Inflight](${track})` : ''),
             2048),
         image: { url: 'attachment://card.png' },
         footer: { text: 'Powered by Inflight' },
         timestamp: new Date(Number(e.timestamp) || Date.now()).toISOString(),
     };
+    // The route map rides as a SECOND embed whose only content is the map
+    // image — Discord stacks it full-width under the card. No map (unknown
+    // airports, render hiccup) just means a one-embed message, as before.
+    const embeds = [embed];
+    const attachments = [{ id: 0, filename: 'card.png' }];
+    if (mapPng) {
+        embeds.push({
+            color: accentFor(e).int,
+            image: { url: 'attachment://map.png' },
+        });
+        attachments.push({ id: 1, filename: 'map.png' });
+    }
+
     // The card rendered, but the multipart upload can still fail (a transient
     // Discord error, an oversize/edge-case attachment). Don't let a render success
     // become worse than a render failure: on ANY upload error fall back to the
     // plain JSON embed so the notification still goes out.
     try {
         const form = new FormData();
-        form.append('payload_json', JSON.stringify({
-            embeds: [embed],
-            attachments: [{ id: 0, filename: 'card.png' }],
-        }));
+        form.append('payload_json', JSON.stringify({ embeds, attachments }));
         form.append('files[0]', new Blob([png], { type: 'image/png' }), 'card.png');
+        if (mapPng) form.append('files[1]', new Blob([mapPng], { type: 'image/png' }), 'map.png');
         return await axios.post(webhookUrl, form);
     } catch (err) {
         console.warn('[va-events] card upload failed, falling back to embed:', err.message);
@@ -2877,14 +2909,19 @@ const handleVaEvent = async (e) => {
     }
 
     // One media lookup and one Sharp render shared by every target (the card
-    // PNG doesn't vary per webhook; only the embed's VA logo does).
+    // and map PNGs don't vary per webhook; only the embed's VA logo does).
+    // The two renders are independent — run them in parallel.
     const media = await enrichEventMedia(e);
-    const png = await renderVaEventCard(e, media);
+    const [card, map] = await Promise.all([
+        renderVaEventCard(e, media),
+        renderVaRouteMapImage(e),
+    ]);
+    const prerendered = { card, map };
 
     // Independent try/catches so one broken webhook can't suppress the other.
     if (centralWebhook) {
         try {
-            await postVaEventCard(centralWebhook, e, media, png);
+            await postVaEventCard(centralWebhook, e, media, prerendered);
             console.log(`🔔 VA ${e.event}: ${e.callsign} (${e.username}) on ${e.server}`);
         } catch (err) {
             console.error('[va-events] central Discord post failed:', err.message);
@@ -2894,7 +2931,7 @@ const handleVaEvent = async (e) => {
         try {
             // The matched VA owns this card — prefer its own logo for the author icon.
             const partnerMedia = partnerAd.logoUrl ? { ...media, vaLogoUrl: partnerAd.logoUrl } : media;
-            await postVaEventCard(partnerAd.flightEventsWebhookUrl, e, partnerMedia, png);
+            await postVaEventCard(partnerAd.flightEventsWebhookUrl, e, partnerMedia, prerendered);
             console.log(`🔔 partner VA ${e.event} → ${partnerAd.name} (${e.callsign})`);
         } catch (err) {
             console.error(`[va-events] partner webhook post failed for ${partnerAd.name}:`, err.message);
@@ -3000,8 +3037,18 @@ const toResolvePayload = (cfg) => ({
     mapStyle: cfg.mapStyle || 'mapbox://styles/mapbox/dark-v11',
     freeStyle: cfg.freeStyle || 'dark',
     theme: cfg.theme || 'dark',
-    brandColor: cfg.brandColor || '',   // header colour; '' lets the widget sample the logo
+    // Legacy single colour for older widget builds; mirrors accent's first stop.
+    brandColor: cfg.brandColor || (cfg.accent && cfg.accent[0]) || '',
     servers: cfg.servers || [],
+    // Header & appearance customization. accent is served as a CSV string
+    // ("#0ea5e9,#8b5cf6"); '' lets the widget sample the VA logo.
+    header: cfg.header || 'on',
+    headerPos: cfg.headerPos || 'top',
+    accent: (cfg.accent && cfg.accent.length) ? cfg.accent.join(',') : '',
+    gradient: cfg.gradient || 'auto',
+    gradientAngle: (cfg.gradientAngle == null) ? 120 : cfg.gradientAngle,
+    compact: !!cfg.compact,
+    ...(cfg.radius == null ? {} : { radius: cfg.radius }), // omit => widget default
 });
 
 // GET /api/embed/resolve?token=…&origin=… — PUBLIC. The widget runs in the VA's
@@ -3067,6 +3114,38 @@ const applyEmbedFields = (cfg, body) => {
     if (body.theme !== undefined) cfg.theme = EMBED_THEMES.includes(body.theme) ? body.theme : 'dark';
     if (body.brandColor !== undefined) cfg.brandColor = normalizeHexColor(body.brandColor);
     if (body.servers !== undefined) cfg.servers = toStringList(body.servers);
+
+    // --- Header & appearance customization ---
+    // header/gradient accept their string forms ('off') or a boolean for
+    // convenience (header:false hides, gradient:false = flat).
+    if (body.header !== undefined) {
+        cfg.header = (body.header === false || String(body.header).trim().toLowerCase() === 'off') ? 'off' : 'on';
+    }
+    if (body.headerPos !== undefined) {
+        cfg.headerPos = EMBED_HEADER_POSITIONS.includes(body.headerPos) ? body.headerPos : 'top';
+    }
+    if (body.accent !== undefined) {
+        // Accepts an array or CSV of up to 3 hex stops; invalid entries drop out.
+        // No brandColor mirroring here — toResolvePayload derives the legacy
+        // colour from accent[0] at read time, so there's one source of truth.
+        cfg.accent = toStringList(body.accent).map(normalizeHexColor).filter(Boolean).slice(0, 3);
+    }
+    if (body.gradient !== undefined) {
+        cfg.gradient = (body.gradient === false || String(body.gradient).trim().toLowerCase() === 'off') ? 'off' : 'auto';
+    }
+    if (body.gradientAngle !== undefined) {
+        const n = Number(body.gradientAngle);
+        cfg.gradientAngle = (body.gradientAngle === '' || body.gradientAngle === null || !Number.isFinite(n))
+            ? 120 : ((Math.round(n) % 360) + 360) % 360; // wrap into 0–359
+    }
+    if (body.compact !== undefined) {
+        cfg.compact = body.compact === true || body.compact === 1 || body.compact === '1' || body.compact === 'true';
+    }
+    if (body.radius !== undefined) {
+        const n = Number(body.radius);
+        cfg.radius = (body.radius === '' || body.radius === null || !Number.isFinite(n))
+            ? null : Math.min(32, Math.max(0, Math.round(n)));
+    }
 
     if (body.allowedOrigins !== undefined) cfg.allowedOrigins = toStringList(body.allowedOrigins);
     if (body.revoked !== undefined) cfg.revoked = !!body.revoked;

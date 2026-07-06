@@ -52,12 +52,65 @@ To embed it on their site, they paste this iframe:
 | `mapStyle`   | `mapbox://styles/mapbox/dark-v11`         | Mapbox style URL (mapbox provider). |
 | `freeStyle`  | `dark` \| `liberty` \| `bright` \| `positron` \| URL | Free style (free provider). Defaults to `dark`. |
 | `theme`      | `dark` or `light`                         | UI chrome theme. |
-| `brandColor` | `%231d4ed8`                               | Header colour as a hex value (encode `#` as `%23`). Blank = the widget samples the VA logo. |
+| `color`      | `%230ea5e9,%238b5cf6`                     | Header colour(s) — see §1.1. Supersedes `brandColor`. |
+| `brandColor` | `%231d4ed8`                               | **Legacy** single header colour (encode `#` as `%23`). Still works; prefer `color`. |
+| `header`     | `off`                                     | Hide the header bar — see §1.1. |
+| `headerPos`  | `top` \| `bottom` \| `left` \| `right`    | Header placement — see §1.1. |
+| `gradient`   | `off`                                     | Keep a single colour flat (no auto companion). |
+| `angle`      | `90`                                      | Gradient direction in degrees (default 120). |
+| `compact`    | `1`                                       | Slimmer header (smaller logo, tighter padding). |
+| `radius`     | `0`                                       | Widget corner radius in px, 0–32 (0 = square). |
 | `servers`    | `Expert`                                  | IF session names to scan (substring match). Empty = all. |
 
 > **Free vs Mapbox:** if you don't pass a `mapboxToken`, the map automatically
 > uses the free, key-less OpenFreeMap source (flat map). Pass a token to get the
 > Mapbox globe.
+
+### 1.1 Header & appearance customization
+
+All of these work **both** as query params (preview links) and as fields in the
+token config returned by `/api/embed/resolve` (see §3).
+
+**Header visibility**
+
+- `header=off` — hide the header bar entirely. The "Powered by Inflight"
+  attribution then floats over the widget as a pill with the live pilot count
+  (bottom-right in roster mode, bottom-left in map mode). It is always
+  rendered — the attribution can never be fully removed.
+
+**Header placement**
+
+- `headerPos=top` — default, classic top bar.
+- `headerPos=bottom` — bar sits under the content.
+- `headerPos=left` — vertical brand rail on the left (bigger logo, wrapping VA
+  name, Powered-by pinned at the rail's foot).
+- `headerPos=right` — same rail, on the right.
+- Rails auto-collapse to the top bar under ~560px wide.
+
+**Header colours & gradients**
+
+- `color=#1e3a8a` — one brand colour. Auto-expands into a rich two-stop
+  gradient using a derived companion shade.
+- `color=#0ea5e9,#8b5cf6` — two (up to three) comma-separated colours →
+  multi-stop gradient header.
+- `gradient=off` — keep a single colour flat (no auto companion).
+- `angle=90` — gradient direction in degrees (default 120).
+- Omit `color` entirely → auto: the widget samples the VA logo's most vivid
+  colours; two-tone logos gradient their own two colours. Text, borders and
+  the wordmark are contrast-computed (WCAG) against the blend of all stops.
+
+**Density & shape**
+
+- `compact=1` — slimmer header (smaller logo, tighter padding).
+- `radius=0` — widget corner radius in px, 0–32 (0 = square corners).
+
+Examples:
+
+```
+https://inflight.info/embed.html?va=OCEAN&color=%230ea5e9,%238b5cf6&angle=90
+https://inflight.info/embed.html?va=OCEAN&header=off
+https://inflight.info/embed.html?va=OCEAN&headerPos=left&compact=1&radius=0
+```
 
 ---
 
@@ -141,9 +194,23 @@ so you can lock a token to one or more domains.
   "freeStyle": "dark",
   "theme": "dark",
   "brandColor": "#1d4ed8",
-  "servers": ["Expert"]
+  "servers": ["Expert"],
+
+  "header": "off",             // hide the header bar
+  "headerPos": "left",         // top | bottom | left | right
+  "accent": "#0ea5e9,#8b5cf6", // string, CSV, or array — 2+ = gradient
+  "gradient": "auto",          // "off" = flat single colour
+  "gradientAngle": 120,        // degrees
+  "compact": true,
+  "radius": 14                 // corner radius px 0–32; omit = widget default
 }
 ```
+
+`accent` supersedes `brandColor` (the widget's legacy single header colour) and
+accepts a plain string, a CSV string, or an array of up to three hex stops.
+When you serve `accent`, keep mirroring its first stop into `brandColor` so
+older cached widget builds still get a header colour — the built-in resolver
+does this automatically.
 
 `hubs` also accepts the alternate keys `icao` or `hub`. Prefixes are full airline
 names (case preserved); suffixes are tags.
@@ -196,8 +263,16 @@ const EMBED_CONFIGS = {
     mapboxToken: 'pk.eyJ...the-vas-own-token...',
     mapStyle: 'mapbox://styles/mapbox/dark-v11',
     theme: 'dark',
-    brandColor: '#1d4ed8',            // header colour; omit/'' to sample the logo
+    brandColor: '#1d4ed8',            // legacy single header colour (see accent)
     servers: ['Expert'],
+    // Header & appearance customization (all optional — see §1.1)
+    header: 'on',                     // 'off' hides the bar (Powered-by floats as a pill)
+    headerPos: 'top',                 // top | bottom | left | right
+    accent: ['#0ea5e9', '#8b5cf6'],   // up to 3 stops; 2+ = gradient; empty = sample the logo
+    gradient: 'auto',                 // 'off' = flat single colour
+    gradientAngle: 120,               // degrees
+    compact: false,                   // slimmer header
+    radius: 14,                       // corner radius px 0–32; omit = widget default
     // Optional allow-list of sites that may embed this token. Empty/undefined = any.
     allowedOrigins: ['https://oceanva.org', 'https://www.oceanva.org'],
     revoked: false,
@@ -237,8 +312,17 @@ router.get('/api/embed/resolve', (req, res) => {
     mapStyle: cfg.mapStyle || 'mapbox://styles/mapbox/dark-v11',
     freeStyle: cfg.freeStyle || 'dark',
     theme: cfg.theme || 'dark',
-    brandColor: cfg.brandColor || '',  // header colour; '' lets the widget sample the logo
+    // Legacy single colour — mirror accent's first stop for older widget builds.
+    brandColor: cfg.brandColor || (Array.isArray(cfg.accent) ? cfg.accent[0] : '') || '',
     servers: cfg.servers || [],
+    // Header & appearance customization (§1.1)
+    header: cfg.header || 'on',
+    headerPos: cfg.headerPos || 'top',
+    accent: Array.isArray(cfg.accent) ? cfg.accent.join(',') : (cfg.accent || ''),
+    gradient: cfg.gradient || 'auto',
+    gradientAngle: cfg.gradientAngle == null ? 120 : cfg.gradientAngle,
+    compact: !!cfg.compact,
+    ...(cfg.radius == null ? {} : { radius: cfg.radius }),
   });
 });
 

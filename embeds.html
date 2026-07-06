@@ -205,13 +205,64 @@
                     </div>
                 </div>
 
-                <div>
-                    <label class="block text-sm font-semibold mb-1.5">Header colour</label>
-                    <div class="flex items-center gap-2">
-                        <input id="f_brandColorPicker" type="color" value="#1d4ed8" oninput="syncBrandColor('picker')" class="h-11 w-12 shrink-0 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 cursor-pointer p-1">
-                        <input id="f_brandColor" placeholder="#1d4ed8 (blank = sample the logo)" oninput="syncBrandColor('text')" class="flex-1 px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none mono text-sm">
+                <!-- Header & appearance — mirrors the widget's customization params
+                     (header off, placement rail, gradient accent stops, density, radius). -->
+                <div class="rounded-2xl border-2 border-zinc-200 dark:border-zinc-800 p-4 space-y-4">
+                    <label class="text-sm font-semibold flex items-center gap-2"><i class="fa-solid fa-palette text-sky-500"></i> Header &amp; appearance</label>
+
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div>
+                            <label class="block text-sm font-semibold mb-1.5">Header</label>
+                            <select id="f_header" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                                <option value="on">Shown</option>
+                                <option value="off">Hidden</option>
+                            </select>
+                            <p class="text-xs text-zinc-400 mt-1">Hidden = the "Powered by Inflight" pill floats over the widget with the live pilot count. It can never be fully removed.</p>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-semibold mb-1.5">Header position</label>
+                            <select id="f_headerPos" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                                <option value="top">Top bar (default)</option>
+                                <option value="bottom">Bottom bar</option>
+                                <option value="left">Left rail</option>
+                                <option value="right">Right rail</option>
+                            </select>
+                            <p class="text-xs text-zinc-400 mt-1">Rails auto-collapse to the top bar under ~560px wide.</p>
+                        </div>
                     </div>
-                    <p class="text-xs text-zinc-400 mt-1">Hex colour for the embed header. Blank = the widget samples the VA logo.</p>
+
+                    <div>
+                        <label class="block text-sm font-semibold mb-1.5">Header colours (up to 3)</label>
+                        <div class="flex items-center gap-2">
+                            <input id="f_accentPicker" type="color" value="#1d4ed8" oninput="syncAccent('picker')" class="h-11 w-12 shrink-0 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 cursor-pointer p-1">
+                            <input id="f_accent" placeholder="#0ea5e9, #8b5cf6 (blank = sample the logo)" oninput="syncAccent('text')" class="flex-1 px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none mono text-sm">
+                        </div>
+                        <p class="text-xs text-zinc-400 mt-1">One colour auto-expands into a two-stop gradient; two or three comma-separated colours become a multi-stop gradient. Blank = the widget samples the VA logo's most vivid colours.</p>
+                    </div>
+
+                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                        <div>
+                            <label class="block text-sm font-semibold mb-1.5">Gradient</label>
+                            <select id="f_gradient" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                                <option value="auto">Auto (default)</option>
+                                <option value="off">Off — flat colour</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-semibold mb-1.5">Angle (°)</label>
+                            <input id="f_gradientAngle" type="number" min="0" max="360" step="1" placeholder="120" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-semibold mb-1.5">Radius (px)</label>
+                            <input id="f_radius" type="number" min="0" max="32" step="1" placeholder="default" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                        </div>
+                        <div class="flex items-end">
+                            <label class="flex items-center gap-2 text-sm font-semibold cursor-pointer pb-2.5">
+                                <input type="checkbox" id="f_compact" class="w-4 h-4 rounded accent-sky-500"> Compact
+                            </label>
+                        </div>
+                    </div>
+                    <p class="text-xs text-zinc-400">Compact = slimmer header (smaller logo, tighter padding). Radius 0 = square corners; blank = the widget's default.</p>
                 </div>
 
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -417,6 +468,9 @@
                         <span class="px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 font-medium"><i class="fa-solid ${c.mode === 'map' ? 'fa-map' : 'fa-list'} mr-1"></i>${esc(c.mode || 'roster')}</span>
                         <span class="px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 font-medium"><i class="fa-solid fa-layer-group mr-1"></i>${esc(provider)}</span>
                         <span class="px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 font-medium" title="Resolve hits"><i class="fa-solid fa-bolt mr-1"></i>${c.resolveCount || 0}</span>
+                        ${c.header === 'off' ? `<span class="px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 font-medium" title="Header hidden — Powered-by floats as a pill"><i class="fa-solid fa-eye-slash mr-1"></i>no header</span>` : ''}
+                        ${(c.headerPos && c.headerPos !== 'top') ? `<span class="px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 font-medium" title="Header position"><i class="fa-solid fa-table-columns mr-1"></i>${esc(c.headerPos)}</span>` : ''}
+                        ${c.compact ? `<span class="px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 font-medium" title="Compact header"><i class="fa-solid fa-compress mr-1"></i>compact</span>` : ''}
                     </div>
 
                     <div class="text-xs text-zinc-400 mb-1 truncate" title="${esc(origins)}"><i class="fa-solid fa-globe mr-1"></i>${esc(origins)}</div>
@@ -673,7 +727,7 @@
         function openModal() {
             document.getElementById('form').reset();
             document.getElementById('f_id').value = '';
-            setBrandColor('');
+            setAccent('');
             document.getElementById('formError').classList.add('hidden');
             resetVaConnector();
             document.getElementById('modalTitle').textContent = 'New embed';
@@ -699,7 +753,15 @@
             document.getElementById('f_mode').value = c.mode || 'roster';
             document.getElementById('f_provider').value = c.provider || '';
             document.getElementById('f_theme').value = c.theme || 'dark';
-            setBrandColor(c.brandColor || '');
+            // Older configs only carry the legacy brandColor — surface it as the
+            // first accent stop so re-saving migrates it forward.
+            setAccent((c.accent && c.accent.length) ? c.accent.join(', ') : (c.brandColor || ''));
+            document.getElementById('f_header').value = c.header || 'on';
+            document.getElementById('f_headerPos').value = c.headerPos || 'top';
+            document.getElementById('f_gradient').value = c.gradient || 'auto';
+            document.getElementById('f_gradientAngle').value = (c.gradientAngle == null) ? '' : c.gradientAngle;
+            document.getElementById('f_compact').checked = !!c.compact;
+            document.getElementById('f_radius').value = (c.radius == null) ? '' : c.radius;
             document.getElementById('f_mapboxToken').value = c.mapboxToken || '';
             document.getElementById('f_mapStyle').value = c.mapStyle || '';
             document.getElementById('f_freeStyle').value = c.freeStyle || 'dark';
@@ -719,23 +781,30 @@
             return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
         }
 
-        // Keep the hex text field and the native colour swatch in step. The text
-        // field is the source of truth (blank = let the widget sample the logo);
-        // the swatch just mirrors it and offers a picker.
-        function syncBrandColor(from) {
-            const text = document.getElementById('f_brandColor');
-            const picker = document.getElementById('f_brandColorPicker');
-            if (from === 'picker') { text.value = picker.value; return; }
-            if (/^#?[0-9a-fA-F]{6}$/.test(text.value.trim())) {
-                picker.value = '#' + text.value.trim().replace(/^#/, '');
+        // Keep the CSV colour field and the native colour swatch in step. The
+        // text field is the source of truth (blank = let the widget sample the
+        // logo); the swatch mirrors the FIRST stop and offers a picker for it —
+        // extra stops are typed as comma-separated hex values.
+        function syncAccent(from) {
+            const text = document.getElementById('f_accent');
+            const picker = document.getElementById('f_accentPicker');
+            if (from === 'picker') {
+                const rest = text.value.split(',').map(s => s.trim()).filter(Boolean).slice(1);
+                text.value = [picker.value].concat(rest).join(', ');
+                return;
+            }
+            const first = (text.value.split(',')[0] || '').trim();
+            if (/^#?[0-9a-fA-F]{6}$/.test(first)) {
+                picker.value = '#' + first.replace(/^#/, '');
             }
         }
-        function setBrandColor(hex) {
-            const text = document.getElementById('f_brandColor');
-            const picker = document.getElementById('f_brandColorPicker');
-            text.value = hex || '';
-            picker.value = /^#?[0-9a-fA-F]{6}$/.test((hex || '').trim())
-                ? '#' + hex.trim().replace(/^#/, '') : '#1d4ed8';
+        function setAccent(csv) {
+            const text = document.getElementById('f_accent');
+            const picker = document.getElementById('f_accentPicker');
+            text.value = csv || '';
+            const first = ((csv || '').split(',')[0] || '').trim();
+            picker.value = /^#?[0-9a-fA-F]{6}$/.test(first)
+                ? '#' + first.replace(/^#/, '') : '#1d4ed8';
         }
 
         function collect() {
@@ -749,7 +818,15 @@
                 mode: v('f_mode'),
                 provider: v('f_provider'),
                 theme: v('f_theme'),
-                brandColor: v('f_brandColor'),
+                // accent supersedes brandColor; the server mirrors the first
+                // stop into brandColor for older cached widget builds.
+                accent: v('f_accent'),
+                header: v('f_header'),
+                headerPos: v('f_headerPos'),
+                gradient: v('f_gradient'),
+                gradientAngle: v('f_gradientAngle'),
+                compact: document.getElementById('f_compact').checked,
+                radius: v('f_radius'),
                 mapboxToken: v('f_mapboxToken'),
                 mapStyle: v('f_mapStyle'),
                 freeStyle: v('f_freeStyle'),

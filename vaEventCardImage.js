@@ -9,7 +9,14 @@
  *
  * Branding split: this IMAGE carries the Inflight (our) logo; the VA's own logo
  * lives in the Discord message embed around it (see buildVaEventPayload /
- * postVaEventCard). No route map and no "Powered by Inflight" footer on the card.
+ * postVaEventCard). No "Powered by Inflight" footer on the card.
+ *
+ * Route map: rendered as its OWN image (renderVaRouteMapImage), posted as a
+ * second attachment below the card so neither visual gets squeezed. Offline
+ * only — land silhouettes from data/world-land.json, great-circle arc, DEP/ARR
+ * markers, live aircraft position; no map provider, key or network call, so it
+ * can never 400 or leak a token. Unknown airports → null → the message simply
+ * carries the card alone.
  *
  * Everything is best-effort and degrades gracefully: any image we can't fetch is
  * replaced by a styled placeholder, and if rendering throws the caller falls
@@ -21,7 +28,7 @@ const fs = require('fs');
 const path = require('path');
 const sharp = require('sharp');
 const axios = require('axios');
-const { extractRoute, isHttpUrl } = require('./vaEventCard');
+const { extractRoute, isHttpUrl, accentFor } = require('./vaEventCard');
 
 const WIDTH = 1200;
 const HEIGHT = 600;
@@ -33,6 +40,71 @@ let BRAND_LOGO_BUF = null;
 try {
     BRAND_LOGO_BUF = fs.readFileSync(path.join(__dirname, 'assets', 'brand', 'inflight-logo.png'));
 } catch { BRAND_LOGO_BUF = null; }
+
+// --- Route distance (great-circle) -------------------------------------------
+// data/airport-coords.json maps uppercase ICAO -> [lat, lon] for the majors, so
+// the card can show an approximate leg length. A miss just hides the figure.
+let AIRPORT_COORDS = {};
+try {
+    AIRPORT_COORDS = require('./data/airport-coords.json');
+} catch { AIRPORT_COORDS = {}; }
+
+const coordsOf = (icao) => {
+    const v = icao ? AIRPORT_COORDS[String(icao).toUpperCase()] : null;
+    return (Array.isArray(v) && v.length === 2 && v.every(Number.isFinite)) ? v : null;
+};
+
+// Haversine distance in nautical miles, or null when either end is unknown —
+// or when it rounds to 0 (same-airport pattern work: "≈ 0 NM" is just noise).
+const routeDistanceNm = (dep, arr) => {
+    const a = coordsOf(dep), b = coordsOf(arr);
+    if (!a || !b) return null;
+    const rad = (d) => d * Math.PI / 180;
+    const dLat = rad(b[0] - a[0]), dLon = rad(b[1] - a[1]);
+    const h = Math.sin(dLat / 2) ** 2
+        + Math.cos(rad(a[0])) * Math.cos(rad(b[0])) * Math.sin(dLon / 2) ** 2;
+    const nm = Math.round(3440.065 * 2 * Math.asin(Math.sqrt(h))); // Earth radius in nm
+    return nm > 0 ? nm : null;
+};
+
+// --- World land rings (offline basemap for the route map) --------------------
+// data/world-land.json holds simplified Natural Earth land outlines as
+// [lon, lat] rings. Ring bounding boxes are precomputed once so a render only
+// projects the rings that actually intersect the cropped view.
+let LAND_RINGS = [];
+try {
+    const land = require('./data/world-land.json');
+    LAND_RINGS = (land.rings || []).map((ring) => {
+        let minLon = 999, maxLon = -999, minLat = 999, maxLat = -999;
+        for (const [lon, lat] of ring) {
+            if (lon < minLon) minLon = lon; if (lon > maxLon) maxLon = lon;
+            if (lat < minLat) minLat = lat; if (lat > maxLat) maxLat = lat;
+        }
+        return { ring, minLon, maxLon, minLat, maxLat };
+    });
+} catch { LAND_RINGS = []; }
+
+// "14:32 UTC · 6 JUL 2026" for the card header — the embed's own timestamp is
+// rendered in the viewer's local time, so the card pins the aviation-standard Z.
+const MONTHS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+const utcStamp = (ts) => {
+    const t = new Date(Number(ts) || Date.now());
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(t.getUTCHours())}:${pad(t.getUTCMinutes())} UTC · ${t.getUTCDate()} ${MONTHS[t.getUTCMonth()]} ${t.getUTCFullYear()}`;
+};
+
+// Rough per-glyph width estimate (em) for DejaVu Sans Bold caps/digits, so the
+// route line can size itself: a wide ICAO like OMDB must not overflow the left
+// column into the photo. Estimates err wide, which only shortens the dashes.
+const CHAR_W = {
+    I: 0.34, J: 0.55, L: 0.60, F: 0.62, T: 0.64, M: 0.98, W: 0.98,
+    // Chip text mixes in digits, spaces and symbols — size those too instead of
+    // papering over them with a blanket fudge factor.
+    ' ': 0.32, '·': 0.34, '≈': 0.60, '→': 0.98, ',': 0.32,
+    0: 0.64, 1: 0.64, 2: 0.64, 3: 0.64, 4: 0.64, 5: 0.64, 6: 0.64, 7: 0.64, 8: 0.64, 9: 0.64,
+};
+const estTextW = (s, font) =>
+    Array.from(String(s)).reduce((w, ch) => w + (CHAR_W[ch] || 0.74), 0) * font;
 
 // XML-escape text destined for the SVG.
 const esc = (s) => String(s == null ? '' : s)
@@ -86,20 +158,219 @@ const contain = async (buf, w, h) => {
 // --- Card geometry ----------------------------------------------------------
 // Left column = brand + route + details; right column = the aircraft photo,
 // kept at its original 688x300 size (the bigger version read as too large) and
-// vertically centred in the right column so removing the map leaves no gap.
+// vertically centred in the right column. The route map is deliberately NOT on
+// this card — it renders as its own image so neither visual gets squeezed.
 const LOGO = { x: 28, y: 28, w: 300, h: 56 };       // OUR brand logo (top-left)
 const PHOTO = { x: 488, y: 184, w: 688, h: 300 };   // aircraft photo (original size, centred)
+
+// Standalone route-map image dimensions (a wide banner that sits below the
+// card in the same Discord message).
+const MAP_IMG = { w: 1200, h: 420 };
+
+// --- Route map (offline SVG mini-map) ----------------------------------------
+const rad = (d) => d * Math.PI / 180;
+const deg = (r) => r * 180 / Math.PI;
+const toVec = (lat, lon) => {
+    const p = rad(lat), l = rad(lon);
+    return [Math.cos(p) * Math.cos(l), Math.cos(p) * Math.sin(l), Math.sin(p)];
+};
+
+// Great-circle between two [lat, lon] points as `n` interpolated points
+// (inclusive), with longitudes unwrapped into a continuous sequence so a
+// dateline crossing doesn't fold the arc back across the map.
+const greatCirclePoints = (a, b, n = 64) => {
+    const v1 = toVec(a[0], a[1]), v2 = toVec(b[0], b[1]);
+    const dot = Math.min(1, Math.max(-1, v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2]));
+    const w = Math.acos(dot);
+    // Same point (w≈0) or antipodal (w≈π): SLERP divides by sin(w)≈0 and
+    // produces garbage coordinates. There's no single great circle for an
+    // antipodal pair anyway, so fall back to plain lat/lon interpolation.
+    const degenerate = w < 1e-6 || Math.PI - w < 1e-4;
+    const pts = [];
+    for (let i = 0; i <= n; i++) {
+        const t = i / n;
+        if (degenerate) {
+            pts.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+            continue;
+        }
+        const s = Math.sin(w);
+        const v = [0, 1, 2].map(k => (Math.sin((1 - t) * w) * v1[k] + Math.sin(t * w) * v2[k]) / s);
+        let lat = deg(Math.asin(Math.max(-1, Math.min(1, v[2]))));
+        let lon = deg(Math.atan2(v[1], v[0]));
+        if (pts.length) {
+            const prev = pts[pts.length - 1][1];
+            while (lon - prev > 180) lon -= 360;
+            while (lon - prev < -180) lon += 360;
+        }
+        pts.push([lat, lon]);
+    }
+    return pts;
+};
+
+// Build the route-map SVG fragment for the given panel rect, or null when
+// either endpoint is missing from the coords index. Pure string building.
+const buildRouteMapSvg = (route, pos, accent, MAP) => {
+    const a = coordsOf(route.dep), b = coordsOf(route.arr);
+    if (!a || !b) return null;
+
+    const arc = greatCirclePoints(a, b);
+
+    // Aircraft position, unwrapped near the arc's longitude domain.
+    let posPt = null;
+    if (pos && Number.isFinite(pos.lat) && Number.isFinite(pos.lon)) {
+        let lon = pos.lon;
+        const ref = arc[Math.floor(arc.length / 2)][1];
+        while (lon - ref > 180) lon -= 360;
+        while (lon - ref < -180) lon += 360;
+        posPt = [pos.lat, lon];
+    }
+
+    // View box over the arc (+ position), padded, with minimum spans so a
+    // short hop still shows some geography.
+    const all = posPt ? arc.concat([posPt]) : arc;
+    let minLat = 90, maxLat = -90, minLon = Infinity, maxLon = -Infinity;
+    for (const [lat, lon] of all) {
+        if (lat < minLat) minLat = lat; if (lat > maxLat) maxLat = lat;
+        if (lon < minLon) minLon = lon; if (lon > maxLon) maxLon = lon;
+    }
+    let latSpan = Math.max(maxLat - minLat, 0.1) * 1.45;
+    let lonSpan = Math.max(maxLon - minLon, 0.1) * 1.35;
+    latSpan = Math.max(latSpan, 4);
+    lonSpan = Math.max(lonSpan, 8);
+    const midLat = (minLat + maxLat) / 2, midLon = (minLon + maxLon) / 2;
+
+    // Equirectangular with the standard parallel at mid-latitude, then widen
+    // whichever span is short so the view fills the panel's aspect ratio.
+    const k = Math.max(0.25, Math.cos(rad(Math.min(80, Math.abs(midLat)))));
+    const panelAspect = MAP.w / MAP.h;
+    if ((lonSpan * k) / latSpan < panelAspect) lonSpan = latSpan * panelAspect / k;
+    else latSpan = (lonSpan * k) / panelAspect;
+
+    let latMin = midLat - latSpan / 2, latMax = midLat + latSpan / 2;
+    if (latMax > 88) { latMax = 88; latMin = latMax - latSpan; }
+    if (latMin < -88) { latMin = -88; latMax = latMin + latSpan; }
+    const lonMin = midLon - lonSpan / 2, lonMax = midLon + lonSpan / 2;
+    const scale = MAP.h / latSpan; // px per degree (same for x via k)
+
+    const px = (lat, lon) =>
+        [MAP.x + (lon - lonMin) * k * scale, MAP.y + (latMax - lat) * scale];
+    const fmt = (n) => Math.round(n * 10) / 10;
+
+    // Land: draw every ring (tried at -360/0/+360 shifts) that intersects the
+    // view. even-odd fill keeps any lake holes honest.
+    let landPath = '';
+    for (const { ring, minLon: rMinLon, maxLon: rMaxLon, minLat: rMinLat, maxLat: rMaxLat } of LAND_RINGS) {
+        if (rMaxLat < latMin || rMinLat > latMax) continue;
+        for (const off of [-360, 0, 360]) {
+            if (rMaxLon + off < lonMin || rMinLon + off > lonMax) continue;
+            let d = '';
+            for (const [lon, lat] of ring) {
+                const [x, y] = px(lat, lon + off);
+                d += (d ? 'L' : 'M') + fmt(x) + ' ' + fmt(y);
+            }
+            landPath += d + 'Z';
+        }
+    }
+
+    // Graticule: pick a step that yields a handful of lines, not a grid soup.
+    const gStep = [1, 2, 5, 10, 15, 30, 45].find(s => lonSpan / s <= 9) || 60;
+    let grid = '';
+    for (let lon = Math.ceil(lonMin / gStep) * gStep; lon <= lonMax; lon += gStep) {
+        const [x] = px(0, lon);
+        grid += `<line x1="${fmt(x)}" y1="${MAP.y}" x2="${fmt(x)}" y2="${MAP.y + MAP.h}" stroke="#1a2332" stroke-width="1"/>`;
+    }
+    for (let lat = Math.ceil(latMin / gStep) * gStep; lat <= latMax; lat += gStep) {
+        const [, y] = px(lat, lonMin);
+        grid += `<line x1="${MAP.x}" y1="${fmt(y)}" x2="${MAP.x + MAP.w}" y2="${fmt(y)}" stroke="#1a2332" stroke-width="1"/>`;
+    }
+
+    // Route arc: soft glow underlay + crisp accent line.
+    let arcD = '';
+    for (const [lat, lon] of arc) {
+        const [x, y] = px(lat, lon);
+        arcD += (arcD ? 'L' : 'M') + fmt(x) + ' ' + fmt(y);
+    }
+
+    // Marks/labels scale continuously with panel height (≈1.4 on the 420px
+    // standalone banner) instead of flipping at a magic threshold.
+    const S = Math.min(1.5, Math.max(1, MAP.h / 300));
+
+    // Endpoint markers + ICAO labels (label flips to the left near the right
+    // edge; a dark shadow copy keeps it readable over land or ocean).
+    const marker = (pt, icao, filled) => {
+        const [x, y] = px(pt[0], pt[1]);
+        const flip = x > MAP.x + MAP.w - 90 * S;
+        const lx = flip ? x - 12 * S : x + 12 * S;
+        const anchor = flip ? 'end' : 'start';
+        const label = (dx, dy, fill) =>
+            `<text x="${fmt(lx + dx)}" y="${fmt(y + 5 * S + dy)}" text-anchor="${anchor}" font-family="DejaVu Sans, Arial, sans-serif" font-size="${Math.round(16 * S)}" font-weight="bold" fill="${fill}">${esc(icao)}</text>`;
+        return (filled
+            ? `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${6 * S}" fill="${accent}"/>`
+            : `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${6 * S}" fill="#0d1117" stroke="${accent}" stroke-width="${3 * S}"/>`)
+            + label(1.5, 1.5, '#0d1117') + label(0, 0, '#dfe6f0');
+    };
+    // Anchor markers to the arc's own (longitude-unwrapped) endpoints — the raw
+    // a/b lons can sit a full world away from the view after dateline handling.
+    let markers = marker(arc[0], clipText(route.dep, 5), false)
+        + marker(arc[arc.length - 1], clipText(route.arr, 5), true);
+    if (posPt) {
+        const [x, y] = px(posPt[0], posPt[1]);
+        markers += `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${8 * S}" fill="${accent}" fill-opacity="0.25"/>`
+            + `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${3.5 * S}" fill="#ffffff"/>`;
+    }
+
+    return `
+        <clipPath id="mapClip"><rect x="${MAP.x}" y="${MAP.y}" width="${MAP.w}" height="${MAP.h}" rx="16"/></clipPath>
+        <rect x="${MAP.x}" y="${MAP.y}" width="${MAP.w}" height="${MAP.h}" rx="16" fill="#0c1420"/>
+        <g clip-path="url(#mapClip)">
+            ${grid}
+            <path d="${landPath}" fill="#1b2739" fill-rule="evenodd" stroke="#2b3a52" stroke-width="1"/>
+            <path d="${arcD}" fill="none" stroke="${accent}" stroke-width="${7 * S}" stroke-opacity="0.22" stroke-linecap="round"/>
+            <path d="${arcD}" fill="none" stroke="${accent}" stroke-width="${2.5 * S}" stroke-linecap="round"/>
+            ${markers}
+        </g>
+        <rect x="${MAP.x + 1}" y="${MAP.y + 1}" width="${MAP.w - 2}" height="${MAP.h - 2}" rx="15" fill="none" stroke="#2a3342" stroke-width="2"/>`;
+};
+
+// Render the route map as its OWN wide-banner PNG (posted as a second image
+// below the card). Returns a Buffer, or null when the route can't be mapped —
+// the message then just carries the card, exactly as before.
+const renderVaRouteMapImage = async (e = {}) => {
+    try {
+        const route = extractRoute(e);
+        const accent = accentFor(e).hex;
+        const inner = buildRouteMapSvg(route, e.position, accent, { x: 0, y: 0, w: MAP_IMG.w, h: MAP_IMG.h });
+        if (!inner) return null;
+
+        // Corner chip: DEP → ARR plus the leg distance when we know it.
+        const distNm = routeDistanceNm(route.dep, route.arr);
+        const chipTxt = `${clipText(route.dep, 5)} → ${clipText(route.arr, 5)}`
+            + (distNm == null ? '' : `  ·  ≈ ${distNm.toLocaleString('en-US')} NM`);
+        const chipW = Math.round(estTextW(chipTxt, 20)) + 44;
+        const chip = `
+            <rect x="${MAP_IMG.w - chipW - 20}" y="20" width="${chipW}" height="40" rx="20" fill="#0d1117" fill-opacity="0.82"/>
+            <text x="${MAP_IMG.w - 20 - chipW / 2}" y="46" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="20" font-weight="bold" fill="#dfe6f0">${esc(chipTxt)}</text>`;
+
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${MAP_IMG.w}" height="${MAP_IMG.h}">${inner}${chip}</svg>`;
+        return await sharp(Buffer.from(svg)).png().toBuffer();
+    } catch (err) {
+        console.error('[va-events] route map render failed:', err.message);
+        return null;
+    }
+};
 
 // Build the background/text SVG. `has` flags which bitmaps will be composited so
 // we draw placeholders only where an image is missing.
 const buildBaseSvg = (e, route, has) => {
     const isTakeoff = e.event === 'takeoff';
-    const accent = isTakeoff ? '#2ecc71' : '#f1c40f';
+    const accent = accentFor(e).hex;
     const ac = e.aircraft || {};
     const pos = e.position || {};
     const eventWord = isTakeoff ? 'DEPARTURE' : 'ARRIVAL';
-    const depTxt = route.dep || '????';
-    const arrTxt = route.arr || '????';
+    // Real ICAOs are 4 chars; clip malformed longer input so it can't spill
+    // across the route line into the photo column.
+    const depTxt = clipText(route.dep || '????', 5);
+    const arrTxt = clipText(route.arr || '????', 5);
     const aircraftLine = ac.aircraftName
         ? (ac.liveryName ? `${ac.aircraftName} · ${ac.liveryName}` : ac.aircraftName) : '—';
     const altGs = [
@@ -124,6 +395,33 @@ const buildBaseSvg = (e, route, has) => {
         ry += 56;
     }
 
+    const distNm = routeDistanceNm(route.dep, route.arr);
+    const distSvg = distNm == null ? '' : `
+        <text x="456" y="150" text-anchor="end" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="bold" letter-spacing="1.5" fill="#7a8699">≈ ${distNm.toLocaleString('en-US')} NM</text>`;
+
+    // Route line: departure left-anchored, arrival right-anchored against the
+    // column edge (x=456) so wide glyphs can never spill into the photo. The
+    // dashed flight path + plane fill whatever room is left between the two,
+    // degrading to just the plane (or nothing) when the ICAOs crowd it out.
+    const ROUTE_FONT = 48;
+    const routeText = (x, anchor, txt) =>
+        `<text x="${x}" y="212"${anchor === 'end' ? ' text-anchor="end"' : ''} font-family="DejaVu Sans, Arial, sans-serif" font-size="${ROUTE_FONT}" font-weight="bold" fill="#eef2f7">${esc(txt)}</text>`;
+    const gapL = 28 + estTextW(depTxt, ROUTE_FONT) + 16;   // path start
+    const gapR = 456 - estTextW(arrTxt, ROUTE_FONT) - 16;  // path end
+    const mid = (gapL + gapR) / 2;
+    let pathSvg = '';
+    if (gapR - gapL >= 120) {
+        pathSvg = `
+        <line x1="${gapL}" y1="195" x2="${mid - 24}" y2="195" stroke="${accent}" stroke-width="3" stroke-dasharray="2 9" stroke-linecap="round"/>
+        <text x="${mid}" y="206" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="30" fill="${accent}">✈</text>
+        <line x1="${mid + 24}" y1="195" x2="${gapR - 12}" y2="195" stroke="${accent}" stroke-width="3" stroke-dasharray="2 9" stroke-linecap="round"/>
+        <circle cx="${gapR - 4}" cy="195" r="5" fill="${accent}"/>`;
+    } else if (gapR - gapL >= 44) {
+        pathSvg = `
+        <text x="${mid}" y="206" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="30" fill="${accent}">✈</text>`;
+    }
+    const routeSvg = routeText(28, 'start', depTxt) + routeText(456, 'end', arrTxt) + pathSvg;
+
     const photoPlaceholder = has.photo ? '' : `
         <rect x="${PHOTO.x}" y="${PHOTO.y}" width="${PHOTO.w}" height="${PHOTO.h}" rx="16" fill="#161b22" stroke="#262d38"/>
         <text x="${PHOTO.x + PHOTO.w / 2}" y="${PHOTO.y + PHOTO.h / 2 - 6}" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="84" fill="#2b3340">✈</text>
@@ -138,19 +436,25 @@ const buildBaseSvg = (e, route, has) => {
                 <stop offset="0" stop-color="#0d1117"/>
                 <stop offset="1" stop-color="#11161f"/>
             </linearGradient>
+            <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+                <stop offset="0" stop-color="${accent}" stop-opacity="0.12"/>
+                <stop offset="1" stop-color="${accent}" stop-opacity="0"/>
+            </radialGradient>
         </defs>
         <rect width="${WIDTH}" height="${HEIGHT}" fill="url(#bg)"/>
+        <!-- soft accent glow behind the header so the card isn't a flat slab -->
+        <circle cx="1020" cy="60" r="520" fill="url(#glow)"/>
         <rect x="0" y="0" width="8" height="${HEIGHT}" fill="${accent}"/>
         <!-- header -->
         ${logoText}
+        <text x="956" y="58" text-anchor="end" font-family="DejaVu Sans, Arial, sans-serif" font-size="18" font-weight="bold" letter-spacing="1" fill="#7a8699">${esc(utcStamp(e.timestamp))}</text>
         <rect x="980" y="30" width="192" height="42" rx="21" fill="${accent}"/>
         <text x="1076" y="58" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="22" font-weight="bold" fill="#0d1117">${eventWord}</text>
         <line x1="28" y1="96" x2="1172" y2="96" stroke="#222a35" stroke-width="2"/>
-        <!-- route (horizontal A -> B) -->
+        <!-- route (horizontal A -> B with a dashed flight path + leg distance) -->
         <text x="28" y="150" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="bold" letter-spacing="2" fill="#7a8699">ROUTE</text>
-        <text x="28" y="212" font-family="DejaVu Sans, Arial, sans-serif" font-size="52" font-weight="bold" fill="#eef2f7">${esc(depTxt)}</text>
-        <text x="232" y="208" font-family="DejaVu Sans, Arial, sans-serif" font-size="44" fill="${accent}">→</text>
-        <text x="296" y="212" font-family="DejaVu Sans, Arial, sans-serif" font-size="52" font-weight="bold" fill="#eef2f7">${esc(arrTxt)}</text>
+        ${distSvg}
+        ${routeSvg}
         <line x1="28" y1="244" x2="456" y2="244" stroke="#222a35" stroke-width="2"/>
         ${rowsSvg}
         ${photoPlaceholder}
@@ -180,7 +484,16 @@ const renderVaEventCard = async (e = {}, media = {}) => {
             const top = LOGO.y + Math.max(0, Math.round((LOGO.h - (meta.height || LOGO.h)) / 2));
             layers.push({ input: brand, left: LOGO.x, top });
         }
-        if (photo) layers.push({ input: photo, left: PHOTO.x, top: PHOTO.y });
+        if (photo) {
+            layers.push({ input: photo, left: PHOTO.x, top: PHOTO.y });
+            // Thin frame over the photo so it sits in the card instead of
+            // floating on it (the placeholder already draws its own stroke).
+            layers.push({
+                input: Buffer.from(
+                    `<svg xmlns="http://www.w3.org/2000/svg" width="${PHOTO.w}" height="${PHOTO.h}"><rect x="1" y="1" width="${PHOTO.w - 2}" height="${PHOTO.h - 2}" rx="15" fill="none" stroke="#2a3342" stroke-width="2"/></svg>`),
+                left: PHOTO.x, top: PHOTO.y,
+            });
+        }
 
         return await sharp(baseSvg).composite(layers).png().toBuffer();
     } catch (err) {
@@ -189,4 +502,4 @@ const renderVaEventCard = async (e = {}, media = {}) => {
     }
 };
 
-module.exports = { renderVaEventCard };
+module.exports = { renderVaEventCard, renderVaRouteMapImage };

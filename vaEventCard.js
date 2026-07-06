@@ -21,6 +21,21 @@
 // default host; trailing slashes are trimmed so we can append paths safely.
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://inflight.info').replace(/\/+$/, '');
 
+// Where "Track on Inflight" links send people: ALWAYS the public tracker site,
+// never this backend. PUBLIC_BASE_URL often points at the backend host (that's
+// where /assets lives), which used to leak into the card's click-through link.
+// Override with TRACK_BASE_URL only if the tracker itself moves.
+const TRACK_BASE_URL = (process.env.TRACK_BASE_URL || 'https://inflight.info').replace(/\/+$/, '');
+
+// Event accent colours, shared by every renderer so the embed stripe, card
+// artwork and route map can't drift apart. Discord wants the int form; SVG
+// wants the hex string.
+const EVENT_ACCENT = {
+    takeoff: { hex: '#2ecc71', int: 0x2ecc71 }, // green
+    landing: { hex: '#f1c40f', int: 0xf1c40f }, // gold
+};
+const accentFor = (e) => EVENT_ACCENT[e && e.event === 'takeoff' ? 'takeoff' : 'landing'];
+
 // Only well-formed http(s) URLs may be handed to Discord's image proxy; anything
 // else (null, '', a relative path stored in the DB) is omitted rather than risk
 // a 400 that would drop the entire webhook message.
@@ -34,9 +49,8 @@ const clip = (s, max, fallback = '—') => {
 };
 
 // The "Track on Inflight" link shown on every card. No per-flight deep link
-// exists yet, so this points at the tracker home; override the base with
-// PUBLIC_BASE_URL if the site moves.
-const trackUrl = () => PUBLIC_BASE_URL;
+// exists yet, so this points at the tracker home.
+const trackUrl = () => TRACK_BASE_URL;
 
 // Build a static map image URL with a plane marker at the flight's position, so
 // the card literally shows WHERE the aircraft is. Prefers Mapbox (set
@@ -51,7 +65,7 @@ const flightMapImageUrl = (lat, lon, isTakeoff) => {
     if (token) {
         // Mapbox expects lon,lat ordering. The maki "airport" glyph is a plane
         // silhouette, so the marker itself reads as an aircraft on the map.
-        const color = isTakeoff ? '2ecc71' : 'f1c40f';
+        const color = accentFor({ event: isTakeoff ? 'takeoff' : 'landing' }).hex.slice(1);
         const marker = `pin-l-airport+${color}(${lo},${la})`;
         return `https://api.mapbox.com/styles/v1/mapbox/dark-v11/static/${marker}/${lo},${la},${zoom},0/640x320@2x?access_token=${encodeURIComponent(token)}`;
     }
@@ -103,7 +117,7 @@ const buildVaEventPayload = (e = {}, media = {}) => {
     const va = e.va || {};
     const pos = e.position || {};
     const ac = e.aircraft || {};
-    const accent = isTakeoff ? 0x2ecc71 : 0xf1c40f; // green takeoff / gold landing
+    const accent = accentFor(e).int;
 
     const hasCoords = Number.isFinite(pos.lat) && Number.isFinite(pos.lon);
     const coords = hasCoords ? `${pos.lat.toFixed(3)}, ${pos.lon.toFixed(3)}` : null;
@@ -142,7 +156,7 @@ const buildVaEventPayload = (e = {}, media = {}) => {
             name: clip(`${va.name || va.code || 'Virtual Airline'} · ${isTakeoff ? 'Departure' : 'Arrival'}`, 256),
             ...(isHttpUrl(media.vaLogoUrl) ? { icon_url: media.vaLogoUrl } : {}),
         },
-        title: clip(`${isTakeoff ? '🛫' : '🛬'}  ${e.callsign || 'Unknown flight'}`, 256),
+        title: clip(`${isTakeoff ? '🛫' : '🛬'}  ${e.callsign || 'Unknown flight'}${(dep || arr) ? `  ·  ${dep || '????'} → ${arr || '????'}` : ''}`, 256),
         ...(isHttpUrl(track) ? { url: track } : {}),
         description: clip(
             `**${e.username || 'A pilot'}** ${isTakeoff ? 'just departed' : 'just landed'} on **${e.server || 'unknown'}**`
@@ -165,4 +179,4 @@ const buildVaEventPayload = (e = {}, media = {}) => {
     return { embeds: [embed] };
 };
 
-module.exports = { buildVaEventPayload, extractRoute, flightMapImageUrl, isHttpUrl, clip, trackUrl, PUBLIC_BASE_URL };
+module.exports = { buildVaEventPayload, extractRoute, flightMapImageUrl, isHttpUrl, clip, trackUrl, accentFor, PUBLIC_BASE_URL };
