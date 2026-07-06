@@ -21,6 +21,12 @@
 // default host; trailing slashes are trimmed so we can append paths safely.
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://inflight.info').replace(/\/+$/, '');
 
+// Where "Track on Inflight" links send people: ALWAYS the public tracker site,
+// never this backend. PUBLIC_BASE_URL often points at the backend host (that's
+// where /assets lives), which used to leak into the card's click-through link.
+// Override with TRACK_BASE_URL only if the tracker itself moves.
+const TRACK_BASE_URL = (process.env.TRACK_BASE_URL || 'https://inflight.info').replace(/\/+$/, '');
+
 // Only well-formed http(s) URLs may be handed to Discord's image proxy; anything
 // else (null, '', a relative path stored in the DB) is omitted rather than risk
 // a 400 that would drop the entire webhook message.
@@ -34,9 +40,8 @@ const clip = (s, max, fallback = '—') => {
 };
 
 // The "Track on Inflight" link shown on every card. No per-flight deep link
-// exists yet, so this points at the tracker home; override the base with
-// PUBLIC_BASE_URL if the site moves.
-const trackUrl = () => PUBLIC_BASE_URL;
+// exists yet, so this points at the tracker home.
+const trackUrl = () => TRACK_BASE_URL;
 
 // Build a static map image URL with a plane marker at the flight's position, so
 // the card literally shows WHERE the aircraft is. Prefers Mapbox (set
@@ -142,7 +147,7 @@ const buildVaEventPayload = (e = {}, media = {}) => {
             name: clip(`${va.name || va.code || 'Virtual Airline'} · ${isTakeoff ? 'Departure' : 'Arrival'}`, 256),
             ...(isHttpUrl(media.vaLogoUrl) ? { icon_url: media.vaLogoUrl } : {}),
         },
-        title: clip(`${isTakeoff ? '🛫' : '🛬'}  ${e.callsign || 'Unknown flight'}`, 256),
+        title: clip(`${isTakeoff ? '🛫' : '🛬'}  ${e.callsign || 'Unknown flight'}${(dep || arr) ? `  ·  ${dep || '????'} → ${arr || '????'}` : ''}`, 256),
         ...(isHttpUrl(track) ? { url: track } : {}),
         description: clip(
             `**${e.username || 'A pilot'}** ${isTakeoff ? 'just departed' : 'just landed'} on **${e.server || 'unknown'}**`

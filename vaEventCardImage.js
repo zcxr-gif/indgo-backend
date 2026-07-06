@@ -34,6 +34,46 @@ try {
     BRAND_LOGO_BUF = fs.readFileSync(path.join(__dirname, 'assets', 'brand', 'inflight-logo.png'));
 } catch { BRAND_LOGO_BUF = null; }
 
+// --- Route distance (great-circle) -------------------------------------------
+// data/airport-coords.json maps uppercase ICAO -> [lat, lon] for the majors, so
+// the card can show an approximate leg length. A miss just hides the figure.
+let AIRPORT_COORDS = {};
+try {
+    AIRPORT_COORDS = require('./data/airport-coords.json');
+} catch { AIRPORT_COORDS = {}; }
+
+const coordsOf = (icao) => {
+    const v = icao ? AIRPORT_COORDS[String(icao).toUpperCase()] : null;
+    return (Array.isArray(v) && v.length === 2 && v.every(Number.isFinite)) ? v : null;
+};
+
+// Haversine distance in nautical miles, or null when either end is unknown.
+const routeDistanceNm = (dep, arr) => {
+    const a = coordsOf(dep), b = coordsOf(arr);
+    if (!a || !b) return null;
+    const rad = (d) => d * Math.PI / 180;
+    const dLat = rad(b[0] - a[0]), dLon = rad(b[1] - a[1]);
+    const h = Math.sin(dLat / 2) ** 2
+        + Math.cos(rad(a[0])) * Math.cos(rad(b[0])) * Math.sin(dLon / 2) ** 2;
+    return Math.round(3440.065 * 2 * Math.asin(Math.sqrt(h))); // Earth radius in nm
+};
+
+// "14:32 UTC · 6 JUL 2026" for the card header — the embed's own timestamp is
+// rendered in the viewer's local time, so the card pins the aviation-standard Z.
+const MONTHS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+const utcStamp = (ts) => {
+    const t = new Date(Number(ts) || Date.now());
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(t.getUTCHours())}:${pad(t.getUTCMinutes())} UTC · ${t.getUTCDate()} ${MONTHS[t.getUTCMonth()]} ${t.getUTCFullYear()}`;
+};
+
+// Rough per-glyph width estimate (em) for DejaVu Sans Bold caps/digits, so the
+// route line can size itself: a wide ICAO like OMDB must not overflow the left
+// column into the photo. Estimates err wide, which only shortens the dashes.
+const CHAR_W = { I: 0.34, J: 0.55, L: 0.60, F: 0.62, T: 0.64, M: 0.98, W: 0.98 };
+const estTextW = (s, font) =>
+    Array.from(String(s)).reduce((w, ch) => w + (CHAR_W[ch] || 0.74), 0) * font;
+
 // XML-escape text destined for the SVG.
 const esc = (s) => String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -124,6 +164,33 @@ const buildBaseSvg = (e, route, has) => {
         ry += 56;
     }
 
+    const distNm = routeDistanceNm(route.dep, route.arr);
+    const distSvg = distNm == null ? '' : `
+        <text x="456" y="150" text-anchor="end" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="bold" letter-spacing="1.5" fill="#7a8699">≈ ${distNm.toLocaleString('en-US')} NM</text>`;
+
+    // Route line: departure left-anchored, arrival right-anchored against the
+    // column edge (x=456) so wide glyphs can never spill into the photo. The
+    // dashed flight path + plane fill whatever room is left between the two,
+    // degrading to just the plane (or nothing) when the ICAOs crowd it out.
+    const ROUTE_FONT = 48;
+    const routeText = (x, anchor, txt) =>
+        `<text x="${x}" y="212"${anchor === 'end' ? ' text-anchor="end"' : ''} font-family="DejaVu Sans, Arial, sans-serif" font-size="${ROUTE_FONT}" font-weight="bold" fill="#eef2f7">${esc(txt)}</text>`;
+    const gapL = 28 + estTextW(depTxt, ROUTE_FONT) + 16;   // path start
+    const gapR = 456 - estTextW(arrTxt, ROUTE_FONT) - 16;  // path end
+    const mid = (gapL + gapR) / 2;
+    let pathSvg = '';
+    if (gapR - gapL >= 120) {
+        pathSvg = `
+        <line x1="${gapL}" y1="195" x2="${mid - 24}" y2="195" stroke="${accent}" stroke-width="3" stroke-dasharray="2 9" stroke-linecap="round"/>
+        <text x="${mid}" y="206" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="30" fill="${accent}">✈</text>
+        <line x1="${mid + 24}" y1="195" x2="${gapR - 12}" y2="195" stroke="${accent}" stroke-width="3" stroke-dasharray="2 9" stroke-linecap="round"/>
+        <circle cx="${gapR - 4}" cy="195" r="5" fill="${accent}"/>`;
+    } else if (gapR - gapL >= 44) {
+        pathSvg = `
+        <text x="${mid}" y="206" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="30" fill="${accent}">✈</text>`;
+    }
+    const routeSvg = routeText(28, 'start', depTxt) + routeText(456, 'end', arrTxt) + pathSvg;
+
     const photoPlaceholder = has.photo ? '' : `
         <rect x="${PHOTO.x}" y="${PHOTO.y}" width="${PHOTO.w}" height="${PHOTO.h}" rx="16" fill="#161b22" stroke="#262d38"/>
         <text x="${PHOTO.x + PHOTO.w / 2}" y="${PHOTO.y + PHOTO.h / 2 - 6}" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="84" fill="#2b3340">✈</text>
@@ -138,19 +205,25 @@ const buildBaseSvg = (e, route, has) => {
                 <stop offset="0" stop-color="#0d1117"/>
                 <stop offset="1" stop-color="#11161f"/>
             </linearGradient>
+            <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+                <stop offset="0" stop-color="${accent}" stop-opacity="0.12"/>
+                <stop offset="1" stop-color="${accent}" stop-opacity="0"/>
+            </radialGradient>
         </defs>
         <rect width="${WIDTH}" height="${HEIGHT}" fill="url(#bg)"/>
+        <!-- soft accent glow behind the header so the card isn't a flat slab -->
+        <circle cx="1020" cy="60" r="520" fill="url(#glow)"/>
         <rect x="0" y="0" width="8" height="${HEIGHT}" fill="${accent}"/>
         <!-- header -->
         ${logoText}
+        <text x="956" y="58" text-anchor="end" font-family="DejaVu Sans, Arial, sans-serif" font-size="18" font-weight="bold" letter-spacing="1" fill="#7a8699">${esc(utcStamp(e.timestamp))}</text>
         <rect x="980" y="30" width="192" height="42" rx="21" fill="${accent}"/>
         <text x="1076" y="58" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="22" font-weight="bold" fill="#0d1117">${eventWord}</text>
         <line x1="28" y1="96" x2="1172" y2="96" stroke="#222a35" stroke-width="2"/>
-        <!-- route (horizontal A -> B) -->
+        <!-- route (horizontal A -> B with a dashed flight path + leg distance) -->
         <text x="28" y="150" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="bold" letter-spacing="2" fill="#7a8699">ROUTE</text>
-        <text x="28" y="212" font-family="DejaVu Sans, Arial, sans-serif" font-size="52" font-weight="bold" fill="#eef2f7">${esc(depTxt)}</text>
-        <text x="232" y="208" font-family="DejaVu Sans, Arial, sans-serif" font-size="44" fill="${accent}">→</text>
-        <text x="296" y="212" font-family="DejaVu Sans, Arial, sans-serif" font-size="52" font-weight="bold" fill="#eef2f7">${esc(arrTxt)}</text>
+        ${distSvg}
+        ${routeSvg}
         <line x1="28" y1="244" x2="456" y2="244" stroke="#222a35" stroke-width="2"/>
         ${rowsSvg}
         ${photoPlaceholder}
@@ -180,7 +253,16 @@ const renderVaEventCard = async (e = {}, media = {}) => {
             const top = LOGO.y + Math.max(0, Math.round((LOGO.h - (meta.height || LOGO.h)) / 2));
             layers.push({ input: brand, left: LOGO.x, top });
         }
-        if (photo) layers.push({ input: photo, left: PHOTO.x, top: PHOTO.y });
+        if (photo) {
+            layers.push({ input: photo, left: PHOTO.x, top: PHOTO.y });
+            // Thin frame over the photo so it sits in the card instead of
+            // floating on it (the placeholder already draws its own stroke).
+            layers.push({
+                input: Buffer.from(
+                    `<svg xmlns="http://www.w3.org/2000/svg" width="${PHOTO.w}" height="${PHOTO.h}"><rect x="1" y="1" width="${PHOTO.w - 2}" height="${PHOTO.h - 2}" rx="15" fill="none" stroke="#2a3342" stroke-width="2"/></svg>`),
+                left: PHOTO.x, top: PHOTO.y,
+            });
+        }
 
         return await sharp(baseSvg).composite(layers).png().toBuffer();
     } catch (err) {

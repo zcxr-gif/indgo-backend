@@ -2659,7 +2659,7 @@ const postVaEventCard = async (webhookUrl, e, media, prerenderedPng) => {
 
     const isTakeoff = e.event === 'takeoff';
     const { dep, arr } = extractRoute(e);
-    const routeLine = (dep || arr) ? `\`${dep || '????'} → ${arr || '????'}\`  ·  ` : '';
+    const routeTag = (dep || arr) ? `  ·  ${dep || '????'} → ${arr || '????'}` : '';
     const track = trackUrl();
     const vaName = e.va?.name || e.va?.code || 'Virtual Airline';
     const embed = {
@@ -2671,10 +2671,12 @@ const postVaEventCard = async (webhookUrl, e, media, prerenderedPng) => {
             ...(isHttpImageUrl(media && media.vaLogoUrl) ? { icon_url: media.vaLogoUrl } : {}),
         },
         // Clip title/description: an over-long callsign/VA name must not 400 the POST.
-        title: clipEmbed(`${isTakeoff ? '🛫' : '🛬'} ${e.callsign || 'Flight'}`, 256),
+        // The route rides in the title so it reads at a glance; the card image
+        // below repeats it big anyway.
+        title: clipEmbed(`${isTakeoff ? '🛫' : '🛬'} ${e.callsign || 'Flight'}${routeTag}`, 256),
         ...(isHttpImageUrl(track) ? { url: track } : {}),
         description: clipEmbed(
-            `${routeLine}**${e.username || 'A pilot'}** ${isTakeoff ? 'departed' : 'landed'} on **${e.server || 'unknown'}**.`
+            `**${e.username || 'A pilot'}** ${isTakeoff ? 'departed' : 'landed'} on **${e.server || 'unknown'}**.`
             + (isHttpImageUrl(track) ? `\n[🔭 Track on Inflight](${track})` : ''),
             2048),
         image: { url: 'attachment://card.png' },
