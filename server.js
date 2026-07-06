@@ -2644,18 +2644,22 @@ const isDuplicateVaEvent = (e) => {
 // can be unit-tested in isolation and shared verbatim by every delivery path. The
 // DB-backed media lookups that feed it (aircraft photo, VA logo) stay here.
 const { buildVaEventPayload, extractRoute, isHttpUrl: isHttpImageUrl, clip: clipEmbed, trackUrl } = require('./vaEventCard');
-const { renderVaEventCard } = require('./vaEventCardImage');
+const { renderVaEventCard, renderVaRouteMapImage } = require('./vaEventCardImage');
 
-// Deliver one event to a Discord webhook as our composite image card: render the
-// PNG and attach it (the embed points at attachment://card.png). If rendering
-// fails for any reason, fall back to the plain JSON embed so the notification
-// still goes out. Used by every delivery path (central feed, partner webhook,
-// staff test) so they all render identically. The card PNG doesn't depend on
-// the VA logo (that lives in the embed), so a caller posting the same event to
-// several webhooks can render once and pass the buffer in as `prerenderedPng`.
-const postVaEventCard = async (webhookUrl, e, media, prerenderedPng) => {
-    const png = prerenderedPng !== undefined ? prerenderedPng : await renderVaEventCard(e, media);
+// Deliver one event to a Discord webhook as our composite image card plus (when
+// the route can be mapped) a separate route-map image in the same message: two
+// embeds, so the map sits full-width BELOW the card instead of being squeezed
+// into it. If card rendering fails, fall back to the plain JSON embed so the
+// notification still goes out. Used by every delivery path (central feed,
+// partner webhook, staff test) so they all render identically. Neither PNG
+// depends on the VA logo (that lives in the embed), so a caller posting the
+// same event to several webhooks can render once and pass the buffers in as
+// `prerendered` ({ card, map }).
+const postVaEventCard = async (webhookUrl, e, media, prerendered) => {
+    const pre = prerendered || {};
+    const png = pre.card !== undefined ? pre.card : await renderVaEventCard(e, media);
     if (!png) return axios.post(webhookUrl, buildVaEventPayload(e, media));
+    const mapPng = pre.map !== undefined ? pre.map : await renderVaRouteMapImage(e);
 
     const isTakeoff = e.event === 'takeoff';
     const { dep, arr } = extractRoute(e);
@@ -2683,17 +2687,28 @@ const postVaEventCard = async (webhookUrl, e, media, prerenderedPng) => {
         footer: { text: 'Powered by Inflight' },
         timestamp: new Date(Number(e.timestamp) || Date.now()).toISOString(),
     };
+    // The route map rides as a SECOND embed whose only content is the map
+    // image — Discord stacks it full-width under the card. No map (unknown
+    // airports, render hiccup) just means a one-embed message, as before.
+    const embeds = [embed];
+    const attachments = [{ id: 0, filename: 'card.png' }];
+    if (mapPng) {
+        embeds.push({
+            color: isTakeoff ? 0x2ecc71 : 0xf1c40f,
+            image: { url: 'attachment://map.png' },
+        });
+        attachments.push({ id: 1, filename: 'map.png' });
+    }
+
     // The card rendered, but the multipart upload can still fail (a transient
     // Discord error, an oversize/edge-case attachment). Don't let a render success
     // become worse than a render failure: on ANY upload error fall back to the
     // plain JSON embed so the notification still goes out.
     try {
         const form = new FormData();
-        form.append('payload_json', JSON.stringify({
-            embeds: [embed],
-            attachments: [{ id: 0, filename: 'card.png' }],
-        }));
+        form.append('payload_json', JSON.stringify({ embeds, attachments }));
         form.append('files[0]', new Blob([png], { type: 'image/png' }), 'card.png');
+        if (mapPng) form.append('files[1]', new Blob([mapPng], { type: 'image/png' }), 'map.png');
         return await axios.post(webhookUrl, form);
     } catch (err) {
         console.warn('[va-events] card upload failed, falling back to embed:', err.message);
@@ -2894,14 +2909,17 @@ const handleVaEvent = async (e) => {
     }
 
     // One media lookup and one Sharp render shared by every target (the card
-    // PNG doesn't vary per webhook; only the embed's VA logo does).
+    // and map PNGs don't vary per webhook; only the embed's VA logo does).
     const media = await enrichEventMedia(e);
-    const png = await renderVaEventCard(e, media);
+    const prerendered = {
+        card: await renderVaEventCard(e, media),
+        map: await renderVaRouteMapImage(e),
+    };
 
     // Independent try/catches so one broken webhook can't suppress the other.
     if (centralWebhook) {
         try {
-            await postVaEventCard(centralWebhook, e, media, png);
+            await postVaEventCard(centralWebhook, e, media, prerendered);
             console.log(`🔔 VA ${e.event}: ${e.callsign} (${e.username}) on ${e.server}`);
         } catch (err) {
             console.error('[va-events] central Discord post failed:', err.message);
@@ -2911,7 +2929,7 @@ const handleVaEvent = async (e) => {
         try {
             // The matched VA owns this card — prefer its own logo for the author icon.
             const partnerMedia = partnerAd.logoUrl ? { ...media, vaLogoUrl: partnerAd.logoUrl } : media;
-            await postVaEventCard(partnerAd.flightEventsWebhookUrl, e, partnerMedia, png);
+            await postVaEventCard(partnerAd.flightEventsWebhookUrl, e, partnerMedia, prerendered);
             console.log(`🔔 partner VA ${e.event} → ${partnerAd.name} (${e.callsign})`);
         } catch (err) {
             console.error(`[va-events] partner webhook post failed for ${partnerAd.name}:`, err.message);

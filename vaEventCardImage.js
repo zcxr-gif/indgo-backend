@@ -11,12 +11,12 @@
  * lives in the Discord message embed around it (see buildVaEventPayload /
  * postVaEventCard). No "Powered by Inflight" footer on the card.
  *
- * Route map: when both endpoints resolve in data/airport-coords.json, the right
- * column stacks the aircraft photo over an offline mini-map (land silhouettes
- * from data/world-land.json, great-circle arc, DEP/ARR markers, live aircraft
- * position). No map provider, key or network call — it's all drawn into the
- * card's own SVG, so it can never 400 or leak a token. Unknown airports simply
- * fall back to the original full-height photo layout.
+ * Route map: rendered as its OWN image (renderVaRouteMapImage), posted as a
+ * second attachment below the card so neither visual gets squeezed. Offline
+ * only — land silhouettes from data/world-land.json, great-circle arc, DEP/ARR
+ * markers, live aircraft position; no map provider, key or network call, so it
+ * can never 400 or leak a token. Unknown airports → null → the message simply
+ * carries the card alone.
  *
  * Everything is best-effort and degrades gracefully: any image we can't fetch is
  * replaced by a styled placeholder, and if rendering throws the caller falls
@@ -148,14 +148,16 @@ const contain = async (buf, w, h) => {
 };
 
 // --- Card geometry ----------------------------------------------------------
-// Left column = brand + route + details. Right column: when the route map can
-// be drawn the photo stacks on top of it; otherwise the photo keeps its
-// original 688x300 size, vertically centred, so unknown airports look exactly
-// like the pre-map card.
-const LOGO = { x: 28, y: 28, w: 300, h: 56 };            // OUR brand logo (top-left)
-const PHOTO_FULL = { x: 488, y: 184, w: 688, h: 300 };   // photo, no-map layout
-const PHOTO_STACK = { x: 488, y: 112, w: 688, h: 252 };  // photo above the map
-const MAP = { x: 488, y: 380, w: 688, h: 196 };          // route map panel
+// Left column = brand + route + details; right column = the aircraft photo,
+// kept at its original 688x300 size (the bigger version read as too large) and
+// vertically centred in the right column. The route map is deliberately NOT on
+// this card — it renders as its own image so neither visual gets squeezed.
+const LOGO = { x: 28, y: 28, w: 300, h: 56 };       // OUR brand logo (top-left)
+const PHOTO = { x: 488, y: 184, w: 688, h: 300 };   // aircraft photo (original size, centred)
+
+// Standalone route-map image dimensions (a wide banner that sits below the
+// card in the same Discord message).
+const MAP_IMG = { w: 1200, h: 420 };
 
 // --- Route map (offline SVG mini-map) ----------------------------------------
 const rad = (d) => d * Math.PI / 180;
@@ -193,10 +195,9 @@ const greatCirclePoints = (a, b, n = 64) => {
     return pts;
 };
 
-// Build the route-map SVG fragment for the MAP panel, or null when either
-// endpoint is missing from the coords index (caller then uses the no-map
-// layout). Pure string building — the map is part of the card's base SVG.
-const buildRouteMapSvg = (route, pos, accent) => {
+// Build the route-map SVG fragment for the given panel rect, or null when
+// either endpoint is missing from the coords index. Pure string building.
+const buildRouteMapSvg = (route, pos, accent, MAP) => {
     const a = coordsOf(route.dep), b = coordsOf(route.arr);
     if (!a || !b) return null;
 
@@ -278,27 +279,30 @@ const buildRouteMapSvg = (route, pos, accent) => {
         arcD += (arcD ? 'L' : 'M') + fmt(x) + ' ' + fmt(y);
     }
 
+    // Marks/labels scale up a bit on tall panels (the standalone banner).
+    const S = MAP.h >= 300 ? 1.35 : 1;
+
     // Endpoint markers + ICAO labels (label flips to the left near the right
     // edge; a dark shadow copy keeps it readable over land or ocean).
     const marker = (pt, icao, filled) => {
         const [x, y] = px(pt[0], pt[1]);
-        const flip = x > MAP.x + MAP.w - 90;
-        const lx = flip ? x - 12 : x + 12;
+        const flip = x > MAP.x + MAP.w - 90 * S;
+        const lx = flip ? x - 12 * S : x + 12 * S;
         const anchor = flip ? 'end' : 'start';
         const label = (dx, dy, fill) =>
-            `<text x="${fmt(lx + dx)}" y="${fmt(y + 5 + dy)}" text-anchor="${anchor}" font-family="DejaVu Sans, Arial, sans-serif" font-size="16" font-weight="bold" fill="${fill}">${esc(icao)}</text>`;
+            `<text x="${fmt(lx + dx)}" y="${fmt(y + 5 * S + dy)}" text-anchor="${anchor}" font-family="DejaVu Sans, Arial, sans-serif" font-size="${Math.round(16 * S)}" font-weight="bold" fill="${fill}">${esc(icao)}</text>`;
         return (filled
-            ? `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="6" fill="${accent}"/>`
-            : `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="6" fill="#0d1117" stroke="${accent}" stroke-width="3"/>`)
-            + label(1, 1, '#0d1117') + label(0, 0, '#dfe6f0');
+            ? `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${6 * S}" fill="${accent}"/>`
+            : `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${6 * S}" fill="#0d1117" stroke="${accent}" stroke-width="${3 * S}"/>`)
+            + label(1.5, 1.5, '#0d1117') + label(0, 0, '#dfe6f0');
     };
     // Anchor markers to the arc's own (longitude-unwrapped) endpoints — the raw
     // a/b lons can sit a full world away from the view after dateline handling.
     let markers = marker(arc[0], route.dep, false) + marker(arc[arc.length - 1], route.arr, true);
     if (posPt) {
         const [x, y] = px(posPt[0], posPt[1]);
-        markers += `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="8" fill="${accent}" fill-opacity="0.25"/>`
-            + `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="3.5" fill="#ffffff"/>`;
+        markers += `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${8 * S}" fill="${accent}" fill-opacity="0.25"/>`
+            + `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${3.5 * S}" fill="#ffffff"/>`;
     }
 
     return `
@@ -307,18 +311,42 @@ const buildRouteMapSvg = (route, pos, accent) => {
         <g clip-path="url(#mapClip)">
             ${grid}
             <path d="${landPath}" fill="#1b2739" fill-rule="evenodd" stroke="#2b3a52" stroke-width="1"/>
-            <path d="${arcD}" fill="none" stroke="${accent}" stroke-width="7" stroke-opacity="0.22" stroke-linecap="round"/>
-            <path d="${arcD}" fill="none" stroke="${accent}" stroke-width="2.5" stroke-linecap="round"/>
+            <path d="${arcD}" fill="none" stroke="${accent}" stroke-width="${7 * S}" stroke-opacity="0.22" stroke-linecap="round"/>
+            <path d="${arcD}" fill="none" stroke="${accent}" stroke-width="${2.5 * S}" stroke-linecap="round"/>
             ${markers}
         </g>
         <rect x="${MAP.x + 1}" y="${MAP.y + 1}" width="${MAP.w - 2}" height="${MAP.h - 2}" rx="15" fill="none" stroke="#2a3342" stroke-width="2"/>`;
 };
 
+// Render the route map as its OWN wide-banner PNG (posted as a second image
+// below the card). Returns a Buffer, or null when the route can't be mapped —
+// the message then just carries the card, exactly as before.
+const renderVaRouteMapImage = async (e = {}) => {
+    try {
+        const route = extractRoute(e);
+        const accent = e.event === 'takeoff' ? '#2ecc71' : '#f1c40f';
+        const inner = buildRouteMapSvg(route, e.position, accent, { x: 0, y: 0, w: MAP_IMG.w, h: MAP_IMG.h });
+        if (!inner) return null;
+
+        // Corner chip: DEP → ARR plus the leg distance when we know it.
+        const distNm = routeDistanceNm(route.dep, route.arr);
+        const chipTxt = `${route.dep} → ${route.arr}${distNm == null ? '' : `  ·  ≈ ${distNm.toLocaleString('en-US')} NM`}`;
+        const chipW = Math.round(estTextW(chipTxt, 20) * 0.72) + 44; // CHAR_W is tuned for bold ICAO caps; mixed text runs narrower
+        const chip = `
+            <rect x="${MAP_IMG.w - chipW - 20}" y="20" width="${chipW}" height="40" rx="20" fill="#0d1117" fill-opacity="0.82"/>
+            <text x="${MAP_IMG.w - 20 - chipW / 2}" y="46" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="20" font-weight="bold" fill="#dfe6f0">${esc(chipTxt)}</text>`;
+
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${MAP_IMG.w}" height="${MAP_IMG.h}">${inner}${chip}</svg>`;
+        return await sharp(Buffer.from(svg)).png().toBuffer();
+    } catch (err) {
+        console.error('[va-events] route map render failed:', err.message);
+        return null;
+    }
+};
+
 // Build the background/text SVG. `has` flags which bitmaps will be composited so
-// we draw placeholders only where an image is missing. `photoRect` is the box
-// the photo will occupy (stacked when `mapSvg` is present, full otherwise).
-const buildBaseSvg = (e, route, has, photoRect, mapSvg) => {
-    const PHOTO = photoRect;
+// we draw placeholders only where an image is missing.
+const buildBaseSvg = (e, route, has) => {
     const isTakeoff = e.event === 'takeoff';
     const accent = isTakeoff ? '#2ecc71' : '#f1c40f';
     const ac = e.aircraft || {};
@@ -413,7 +441,6 @@ const buildBaseSvg = (e, route, has, photoRect, mapSvg) => {
         <line x1="28" y1="244" x2="456" y2="244" stroke="#222a35" stroke-width="2"/>
         ${rowsSvg}
         ${photoPlaceholder}
-        ${mapSvg || ''}
     </svg>`);
 };
 
@@ -423,12 +450,6 @@ const renderVaEventCard = async (e = {}, media = {}) => {
     try {
         const route = extractRoute(e);
 
-        // Route map first: it decides the right-column layout. null (unknown
-        // airport, no data) keeps the classic full-height photo.
-        const accent = e.event === 'takeoff' ? '#2ecc71' : '#f1c40f';
-        const mapSvg = buildRouteMapSvg(route, e.position, accent);
-        const PHOTO = mapSvg ? PHOTO_STACK : PHOTO_FULL;
-
         // The aircraft photo is the only remote bitmap; the brand logo is local.
         const photoRaw = await fetchImage(media.aircraftImageUrl);
         const [photo, brand] = await Promise.all([
@@ -437,7 +458,7 @@ const renderVaEventCard = async (e = {}, media = {}) => {
         ]);
 
         const has = { photo: !!photo, brand: !!brand };
-        const baseSvg = buildBaseSvg(e, route, has, PHOTO, mapSvg);
+        const baseSvg = buildBaseSvg(e, route, has);
 
         const layers = [];
         if (brand) {
@@ -464,4 +485,4 @@ const renderVaEventCard = async (e = {}, media = {}) => {
     }
 };
 
-module.exports = { renderVaEventCard };
+module.exports = { renderVaEventCard, renderVaRouteMapImage };
