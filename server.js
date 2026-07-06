@@ -293,6 +293,7 @@ const VaTermsAcceptance = mongoose.models.VaTermsAcceptance
 const EMBED_MODES = ['roster', 'map'];
 const EMBED_PROVIDERS = ['mapbox', 'free'];
 const EMBED_THEMES = ['dark', 'light'];
+const EMBED_HEADER_POSITIONS = ['top', 'bottom', 'left', 'right'];
 
 const EmbedConfigSchema = new mongoose.Schema({
     // Opaque token the VA embeds in their iframe URL. Generated on create.
@@ -327,8 +328,22 @@ const EmbedConfigSchema = new mongoose.Schema({
     theme: { type: String, enum: EMBED_THEMES, default: 'dark' },
     // Header/accent colour, stored as a hex string like "#1d4ed8". Empty lets the
     // widget fall back to sampling the VA logo for its header colour.
+    // LEGACY: superseded by `accent` below, but still served (mirroring accent's
+    // first stop) so older cached widget builds keep their header colour.
     brandColor: { type: String, trim: true, default: '' },
     servers: { type: [String], default: [] },                         // IF session names to scan
+
+    // --- Header & appearance customization (mirrors embed.html query params) ---
+    header: { type: String, enum: ['on', 'off'], default: 'on' },     // 'off' hides the bar; Powered-by floats as a pill
+    headerPos: { type: String, enum: EMBED_HEADER_POSITIONS, default: 'top' }, // left/right = vertical brand rail
+    // Accent colour stops, up to 3 "#rrggbb" strings. One stop auto-expands into
+    // a gradient with a derived companion shade; 2–3 stops = multi-stop gradient.
+    // Empty => the widget samples the VA logo's most vivid colours.
+    accent: { type: [String], default: [] },
+    gradient: { type: String, enum: ['auto', 'off'], default: 'auto' }, // 'off' keeps a single colour flat
+    gradientAngle: { type: Number, default: 120 },                    // degrees
+    compact: { type: Boolean, default: false },                       // slimmer header
+    radius: { type: Number, default: null },                          // widget corner radius px 0–32; null = widget default
 
     // --- Access control ---
     allowedOrigins: { type: [String], default: [] }, // empty => any site may embed
@@ -3000,8 +3015,18 @@ const toResolvePayload = (cfg) => ({
     mapStyle: cfg.mapStyle || 'mapbox://styles/mapbox/dark-v11',
     freeStyle: cfg.freeStyle || 'dark',
     theme: cfg.theme || 'dark',
-    brandColor: cfg.brandColor || '',   // header colour; '' lets the widget sample the logo
+    // Legacy single colour for older widget builds; mirrors accent's first stop.
+    brandColor: cfg.brandColor || (cfg.accent && cfg.accent[0]) || '',
     servers: cfg.servers || [],
+    // Header & appearance customization. accent is served as a CSV string
+    // ("#0ea5e9,#8b5cf6"); '' lets the widget sample the VA logo.
+    header: cfg.header || 'on',
+    headerPos: cfg.headerPos || 'top',
+    accent: (cfg.accent && cfg.accent.length) ? cfg.accent.join(',') : '',
+    gradient: cfg.gradient || 'auto',
+    gradientAngle: (cfg.gradientAngle == null) ? 120 : cfg.gradientAngle,
+    compact: !!cfg.compact,
+    ...(cfg.radius == null ? {} : { radius: cfg.radius }), // omit => widget default
 });
 
 // GET /api/embed/resolve?token=…&origin=… — PUBLIC. The widget runs in the VA's
@@ -3067,6 +3092,39 @@ const applyEmbedFields = (cfg, body) => {
     if (body.theme !== undefined) cfg.theme = EMBED_THEMES.includes(body.theme) ? body.theme : 'dark';
     if (body.brandColor !== undefined) cfg.brandColor = normalizeHexColor(body.brandColor);
     if (body.servers !== undefined) cfg.servers = toStringList(body.servers);
+
+    // --- Header & appearance customization ---
+    // header/gradient accept their string forms ('off') or a boolean for
+    // convenience (header:false hides, gradient:false = flat).
+    if (body.header !== undefined) {
+        cfg.header = (body.header === false || String(body.header).trim().toLowerCase() === 'off') ? 'off' : 'on';
+    }
+    if (body.headerPos !== undefined) {
+        cfg.headerPos = EMBED_HEADER_POSITIONS.includes(body.headerPos) ? body.headerPos : 'top';
+    }
+    if (body.accent !== undefined) {
+        // Accepts an array or CSV of up to 3 hex stops; invalid entries drop out.
+        cfg.accent = toStringList(body.accent).map(normalizeHexColor).filter(Boolean).slice(0, 3);
+        // Mirror the first stop into the legacy brandColor unless it was set
+        // explicitly, so older cached widget builds keep their header colour.
+        if (body.brandColor === undefined) cfg.brandColor = cfg.accent[0] || '';
+    }
+    if (body.gradient !== undefined) {
+        cfg.gradient = (body.gradient === false || String(body.gradient).trim().toLowerCase() === 'off') ? 'off' : 'auto';
+    }
+    if (body.gradientAngle !== undefined) {
+        const n = Number(body.gradientAngle);
+        cfg.gradientAngle = (body.gradientAngle === '' || body.gradientAngle === null || !Number.isFinite(n))
+            ? 120 : ((Math.round(n) % 360) + 360) % 360; // wrap into 0–359
+    }
+    if (body.compact !== undefined) {
+        cfg.compact = body.compact === true || body.compact === 1 || body.compact === '1' || body.compact === 'true';
+    }
+    if (body.radius !== undefined) {
+        const n = Number(body.radius);
+        cfg.radius = (body.radius === '' || body.radius === null || !Number.isFinite(n))
+            ? null : Math.min(32, Math.max(0, Math.round(n)));
+    }
 
     if (body.allowedOrigins !== undefined) cfg.allowedOrigins = toStringList(body.allowedOrigins);
     if (body.revoked !== undefined) cfg.revoked = !!body.revoked;
