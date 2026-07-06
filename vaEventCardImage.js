@@ -28,7 +28,7 @@ const fs = require('fs');
 const path = require('path');
 const sharp = require('sharp');
 const axios = require('axios');
-const { extractRoute, isHttpUrl } = require('./vaEventCard');
+const { extractRoute, isHttpUrl, accentFor } = require('./vaEventCard');
 
 const WIDTH = 1200;
 const HEIGHT = 600;
@@ -54,7 +54,8 @@ const coordsOf = (icao) => {
     return (Array.isArray(v) && v.length === 2 && v.every(Number.isFinite)) ? v : null;
 };
 
-// Haversine distance in nautical miles, or null when either end is unknown.
+// Haversine distance in nautical miles, or null when either end is unknown —
+// or when it rounds to 0 (same-airport pattern work: "≈ 0 NM" is just noise).
 const routeDistanceNm = (dep, arr) => {
     const a = coordsOf(dep), b = coordsOf(arr);
     if (!a || !b) return null;
@@ -62,7 +63,8 @@ const routeDistanceNm = (dep, arr) => {
     const dLat = rad(b[0] - a[0]), dLon = rad(b[1] - a[1]);
     const h = Math.sin(dLat / 2) ** 2
         + Math.cos(rad(a[0])) * Math.cos(rad(b[0])) * Math.sin(dLon / 2) ** 2;
-    return Math.round(3440.065 * 2 * Math.asin(Math.sqrt(h))); // Earth radius in nm
+    const nm = Math.round(3440.065 * 2 * Math.asin(Math.sqrt(h))); // Earth radius in nm
+    return nm > 0 ? nm : null;
 };
 
 // --- World land rings (offline basemap for the route map) --------------------
@@ -94,7 +96,13 @@ const utcStamp = (ts) => {
 // Rough per-glyph width estimate (em) for DejaVu Sans Bold caps/digits, so the
 // route line can size itself: a wide ICAO like OMDB must not overflow the left
 // column into the photo. Estimates err wide, which only shortens the dashes.
-const CHAR_W = { I: 0.34, J: 0.55, L: 0.60, F: 0.62, T: 0.64, M: 0.98, W: 0.98 };
+const CHAR_W = {
+    I: 0.34, J: 0.55, L: 0.60, F: 0.62, T: 0.64, M: 0.98, W: 0.98,
+    // Chip text mixes in digits, spaces and symbols — size those too instead of
+    // papering over them with a blanket fudge factor.
+    ' ': 0.32, '·': 0.34, '≈': 0.60, '→': 0.98, ',': 0.32,
+    0: 0.64, 1: 0.64, 2: 0.64, 3: 0.64, 4: 0.64, 5: 0.64, 6: 0.64, 7: 0.64, 8: 0.64, 9: 0.64,
+};
 const estTextW = (s, font) =>
     Array.from(String(s)).reduce((w, ch) => w + (CHAR_W[ch] || 0.74), 0) * font;
 
@@ -174,15 +182,19 @@ const greatCirclePoints = (a, b, n = 64) => {
     const v1 = toVec(a[0], a[1]), v2 = toVec(b[0], b[1]);
     const dot = Math.min(1, Math.max(-1, v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2]));
     const w = Math.acos(dot);
+    // Same point (w≈0) or antipodal (w≈π): SLERP divides by sin(w)≈0 and
+    // produces garbage coordinates. There's no single great circle for an
+    // antipodal pair anyway, so fall back to plain lat/lon interpolation.
+    const degenerate = w < 1e-6 || Math.PI - w < 1e-4;
     const pts = [];
     for (let i = 0; i <= n; i++) {
         const t = i / n;
-        let v;
-        if (w < 1e-6) v = v1;
-        else {
-            const s = Math.sin(w);
-            v = [0, 1, 2].map(k => (Math.sin((1 - t) * w) * v1[k] + Math.sin(t * w) * v2[k]) / s);
+        if (degenerate) {
+            pts.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+            continue;
         }
+        const s = Math.sin(w);
+        const v = [0, 1, 2].map(k => (Math.sin((1 - t) * w) * v1[k] + Math.sin(t * w) * v2[k]) / s);
         let lat = deg(Math.asin(Math.max(-1, Math.min(1, v[2]))));
         let lon = deg(Math.atan2(v[1], v[0]));
         if (pts.length) {
@@ -279,8 +291,9 @@ const buildRouteMapSvg = (route, pos, accent, MAP) => {
         arcD += (arcD ? 'L' : 'M') + fmt(x) + ' ' + fmt(y);
     }
 
-    // Marks/labels scale up a bit on tall panels (the standalone banner).
-    const S = MAP.h >= 300 ? 1.35 : 1;
+    // Marks/labels scale continuously with panel height (≈1.4 on the 420px
+    // standalone banner) instead of flipping at a magic threshold.
+    const S = Math.min(1.5, Math.max(1, MAP.h / 300));
 
     // Endpoint markers + ICAO labels (label flips to the left near the right
     // edge; a dark shadow copy keeps it readable over land or ocean).
@@ -298,7 +311,8 @@ const buildRouteMapSvg = (route, pos, accent, MAP) => {
     };
     // Anchor markers to the arc's own (longitude-unwrapped) endpoints — the raw
     // a/b lons can sit a full world away from the view after dateline handling.
-    let markers = marker(arc[0], route.dep, false) + marker(arc[arc.length - 1], route.arr, true);
+    let markers = marker(arc[0], clipText(route.dep, 5), false)
+        + marker(arc[arc.length - 1], clipText(route.arr, 5), true);
     if (posPt) {
         const [x, y] = px(posPt[0], posPt[1]);
         markers += `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${8 * S}" fill="${accent}" fill-opacity="0.25"/>`
@@ -324,14 +338,15 @@ const buildRouteMapSvg = (route, pos, accent, MAP) => {
 const renderVaRouteMapImage = async (e = {}) => {
     try {
         const route = extractRoute(e);
-        const accent = e.event === 'takeoff' ? '#2ecc71' : '#f1c40f';
+        const accent = accentFor(e).hex;
         const inner = buildRouteMapSvg(route, e.position, accent, { x: 0, y: 0, w: MAP_IMG.w, h: MAP_IMG.h });
         if (!inner) return null;
 
         // Corner chip: DEP → ARR plus the leg distance when we know it.
         const distNm = routeDistanceNm(route.dep, route.arr);
-        const chipTxt = `${route.dep} → ${route.arr}${distNm == null ? '' : `  ·  ≈ ${distNm.toLocaleString('en-US')} NM`}`;
-        const chipW = Math.round(estTextW(chipTxt, 20) * 0.72) + 44; // CHAR_W is tuned for bold ICAO caps; mixed text runs narrower
+        const chipTxt = `${clipText(route.dep, 5)} → ${clipText(route.arr, 5)}`
+            + (distNm == null ? '' : `  ·  ≈ ${distNm.toLocaleString('en-US')} NM`);
+        const chipW = Math.round(estTextW(chipTxt, 20)) + 44;
         const chip = `
             <rect x="${MAP_IMG.w - chipW - 20}" y="20" width="${chipW}" height="40" rx="20" fill="#0d1117" fill-opacity="0.82"/>
             <text x="${MAP_IMG.w - 20 - chipW / 2}" y="46" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="20" font-weight="bold" fill="#dfe6f0">${esc(chipTxt)}</text>`;
@@ -348,12 +363,14 @@ const renderVaRouteMapImage = async (e = {}) => {
 // we draw placeholders only where an image is missing.
 const buildBaseSvg = (e, route, has) => {
     const isTakeoff = e.event === 'takeoff';
-    const accent = isTakeoff ? '#2ecc71' : '#f1c40f';
+    const accent = accentFor(e).hex;
     const ac = e.aircraft || {};
     const pos = e.position || {};
     const eventWord = isTakeoff ? 'DEPARTURE' : 'ARRIVAL';
-    const depTxt = route.dep || '????';
-    const arrTxt = route.arr || '????';
+    // Real ICAOs are 4 chars; clip malformed longer input so it can't spill
+    // across the route line into the photo column.
+    const depTxt = clipText(route.dep || '????', 5);
+    const arrTxt = clipText(route.arr || '????', 5);
     const aircraftLine = ac.aircraftName
         ? (ac.liveryName ? `${ac.aircraftName} · ${ac.liveryName}` : ac.aircraftName) : '—';
     const altGs = [

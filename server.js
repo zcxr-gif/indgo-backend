@@ -2643,7 +2643,7 @@ const isDuplicateVaEvent = (e) => {
 // The Discord embed card for a takeoff/landing lives in its own pure module so it
 // can be unit-tested in isolation and shared verbatim by every delivery path. The
 // DB-backed media lookups that feed it (aircraft photo, VA logo) stay here.
-const { buildVaEventPayload, extractRoute, isHttpUrl: isHttpImageUrl, clip: clipEmbed, trackUrl } = require('./vaEventCard');
+const { buildVaEventPayload, extractRoute, isHttpUrl: isHttpImageUrl, clip: clipEmbed, trackUrl, accentFor } = require('./vaEventCard');
 const { renderVaEventCard, renderVaRouteMapImage } = require('./vaEventCardImage');
 
 // Deliver one event to a Discord webhook as our composite image card plus (when
@@ -2667,7 +2667,7 @@ const postVaEventCard = async (webhookUrl, e, media, prerendered) => {
     const track = trackUrl();
     const vaName = e.va?.name || e.va?.code || 'Virtual Airline';
     const embed = {
-        color: isTakeoff ? 0x2ecc71 : 0xf1c40f,
+        color: accentFor(e).int,
         // The VA's own logo lives here, in the message (the card image carries our
         // brand). Author icon = small round logo next to the VA name.
         author: {
@@ -2694,7 +2694,7 @@ const postVaEventCard = async (webhookUrl, e, media, prerendered) => {
     const attachments = [{ id: 0, filename: 'card.png' }];
     if (mapPng) {
         embeds.push({
-            color: isTakeoff ? 0x2ecc71 : 0xf1c40f,
+            color: accentFor(e).int,
             image: { url: 'attachment://map.png' },
         });
         attachments.push({ id: 1, filename: 'map.png' });
@@ -2910,11 +2910,13 @@ const handleVaEvent = async (e) => {
 
     // One media lookup and one Sharp render shared by every target (the card
     // and map PNGs don't vary per webhook; only the embed's VA logo does).
+    // The two renders are independent — run them in parallel.
     const media = await enrichEventMedia(e);
-    const prerendered = {
-        card: await renderVaEventCard(e, media),
-        map: await renderVaRouteMapImage(e),
-    };
+    const [card, map] = await Promise.all([
+        renderVaEventCard(e, media),
+        renderVaRouteMapImage(e),
+    ]);
+    const prerendered = { card, map };
 
     // Independent try/catches so one broken webhook can't suppress the other.
     if (centralWebhook) {
@@ -3124,10 +3126,9 @@ const applyEmbedFields = (cfg, body) => {
     }
     if (body.accent !== undefined) {
         // Accepts an array or CSV of up to 3 hex stops; invalid entries drop out.
+        // No brandColor mirroring here — toResolvePayload derives the legacy
+        // colour from accent[0] at read time, so there's one source of truth.
         cfg.accent = toStringList(body.accent).map(normalizeHexColor).filter(Boolean).slice(0, 3);
-        // Mirror the first stop into the legacy brandColor unless it was set
-        // explicitly, so older cached widget builds keep their header colour.
-        if (body.brandColor === undefined) cfg.brandColor = cfg.accent[0] || '';
     }
     if (body.gradient !== undefined) {
         cfg.gradient = (body.gradient === false || String(body.gradient).trim().toLowerCase() === 'off') ? 'off' : 'auto';
