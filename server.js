@@ -314,6 +314,10 @@ const EmbedConfigSchema = new mongoose.Schema({
     // ICAO code. Case is preserved so it matches the in-game callsign exactly.
     callsignPrefixes: { type: [String], default: [] }, // empty => widget falls back to [va.code]
     callsignSuffixes: { type: [String], default: [] }, // tag(s) carried after the number, e.g. "VA"
+    // Untagged callsigns matched by PREFIX ONLY and always included, even when
+    // the prefixes above run in tag mode. Staff / charter / plain airline names
+    // that fly alongside the tagged members. See EMBEDBACKEND.md §2c.
+    regularCallsigns: { type: [String], default: [] },
 
     // Hub ICAOs. Each becomes a map marker whose window lists the VA's inbound
     // pilots. Stored uppercase, e.g. ["CYYZ", "CYUL", "CYVR"].
@@ -344,6 +348,16 @@ const EmbedConfigSchema = new mongoose.Schema({
     gradientAngle: { type: Number, default: 120 },                    // degrees
     compact: { type: Boolean, default: false },                       // slimmer header
     radius: { type: Number, default: null },                          // widget corner radius px 0–32; null = widget default
+
+    // --- Flight-card customization (map mode) — see EMBEDBACKEND.md §1 ---
+    // Purely cosmetic; the widget turns these into CSS on the tap/detail card.
+    // Colours may be hex, rgb()/rgba() or a named colour; empty = widget default.
+    card: {
+        color:   { type: String, trim: true, default: '' }, // card surface colour
+        text:    { type: String, trim: true, default: '' }, // card text colour
+        opacity: { type: Number, default: null },           // 0–1 OR 0–100; null = default
+        blur:    { type: Number, default: null },           // backdrop blur px 0–40; null = auto
+    },
 
     // --- Access control ---
     allowedOrigins: { type: [String], default: [] }, // empty => any site may embed
@@ -1850,6 +1864,30 @@ app.get('/api/airports/:icao', async (req, res) => {
     }
 });
 
+// ICAO -> [lat, lon] for the majors, shared with the flight-event route map
+// (vaEventCardImage.js loads the same file). Powers /api/airport/:icao below.
+let AIRPORT_COORDS = {};
+try { AIRPORT_COORDS = require('./data/airport-coords.json'); } catch { AIRPORT_COORDS = {}; }
+
+// GET /api/airport/:icao — PUBLIC. The embed's airport window (aerial hero, hub
+// pins, on-map runway/taxiway layout) needs the field's coordinates; everything
+// else on that view is client-side (OSM + Esri imagery). CORS-open like
+// /api/embed/resolve (global cors() sends Access-Control-Allow-Origin: *).
+// See EMBEDBACKEND.md §3.
+app.get('/api/airport/:icao', (req, res) => {
+    res.set('Cache-Control', 'public, max-age=86400');
+    const icao = String(req.params.icao || '').trim().toUpperCase();
+    const coords = AIRPORT_COORDS[icao];
+    if (!coords || !Array.isArray(coords) || coords.length < 2) {
+        return res.status(404).json({ ok: false, error: 'unknown airport' });
+    }
+    const [latitude, longitude] = coords;
+    // name defaults to the ICAO (the coord set is code-keyed only); lat/lon are
+    // what the client actually requires. Aliases lat/lon are sent too so either
+    // field name the widget reads resolves.
+    res.json({ ok: true, icao, name: icao, latitude, longitude, lat: latitude, lon: longitude });
+});
+
 /**
  * DELETE: Remove all images/data for an airport
  */
@@ -3023,6 +3061,28 @@ const normalizeHexColor = (raw) => {
     return /^[0-9a-fA-F]{6}$/.test(v) ? '#' + v.toLowerCase() : '';
 };
 
+// Colour names the flight-card accepts besides hex / rgb() (mirrors the widget's
+// palette in EMBEDBACKEND.md §1). Kept lowercase for case-insensitive matching.
+const CARD_COLOR_NAMES = new Set([
+    'white', 'black', 'red', 'crimson', 'orange', 'amber', 'yellow', 'gold',
+    'lime', 'green', 'emerald', 'teal', 'cyan', 'sky', 'blue', 'navy', 'indigo',
+    'violet', 'purple', 'magenta', 'pink', 'rose', 'slate', 'gray', 'grey', 'silver',
+]);
+
+// Normalize a flight-card colour: accepts a hex string (→ "#rrggbb"), an
+// rgb()/rgba() expression (passed through), or one of the named colours above
+// (lowercased). Anything else — including blank — becomes '', telling the widget
+// to fall back to its default card colour.
+const normalizeCardColor = (raw) => {
+    const v = String(raw == null ? '' : raw).trim();
+    if (!v) return '';
+    const hex = normalizeHexColor(v);
+    if (hex) return hex;
+    if (/^rgba?\(\s*[\d.]+%?\s*,\s*[\d.]+%?\s*,\s*[\d.]+%?\s*(,\s*[\d.]+%?\s*)?\)$/i.test(v)) return v;
+    if (CARD_COLOR_NAMES.has(v.toLowerCase())) return v.toLowerCase();
+    return '';
+};
+
 // Build the public resolve payload from a stored config — only the fields the
 // widget needs, with the same defaults documented in EMBEDBACKEND.md.
 const toResolvePayload = (cfg) => ({
@@ -3030,6 +3090,7 @@ const toResolvePayload = (cfg) => ({
     va: { code: cfg.va.code, name: cfg.va.name || cfg.va.code, logo: cfg.va.logo || '' },
     callsignPrefixes: (cfg.callsignPrefixes && cfg.callsignPrefixes.length) ? cfg.callsignPrefixes : [cfg.va.code],
     callsignSuffixes: cfg.callsignSuffixes || [],
+    regularCallsigns: cfg.regularCallsigns || [],
     hubs: cfg.hubs || [],
     mode: cfg.mode || 'roster',
     provider: cfg.provider || (cfg.mapboxToken ? 'mapbox' : 'free'),
@@ -3049,6 +3110,17 @@ const toResolvePayload = (cfg) => ({
     gradientAngle: (cfg.gradientAngle == null) ? 120 : cfg.gradientAngle,
     compact: !!cfg.compact,
     ...(cfg.radius == null ? {} : { radius: cfg.radius }), // omit => widget default
+    // Flight-card customization (map mode). Served as a nested object, only when
+    // at least one field is set, so the widget keeps its defaults otherwise.
+    ...(() => {
+        const c = cfg.card || {};
+        const out = {};
+        if (c.color)          out.color   = c.color;
+        if (c.text)           out.text    = c.text;
+        if (c.opacity != null) out.opacity = c.opacity;
+        if (c.blur != null)    out.blur    = c.blur;
+        return Object.keys(out).length ? { card: out } : {};
+    })(),
 });
 
 // GET /api/embed/resolve?token=…&origin=… — PUBLIC. The widget runs in the VA's
@@ -3101,6 +3173,11 @@ const applyEmbedFields = (cfg, body) => {
     // match the in-game callsign. Suffixes are short tags, normalized uppercase.
     if (body.callsignPrefixes !== undefined) cfg.callsignPrefixes = toStringList(body.callsignPrefixes);
     if (body.callsignSuffixes !== undefined) cfg.callsignSuffixes = toStringList(body.callsignSuffixes).map(s => s.toUpperCase());
+    // Untagged, prefix-only callsigns (always included). Accepts the "callsigns"
+    // alias too. Full names, case preserved — matched like prefixes, never tags.
+    if (body.regularCallsigns !== undefined || body.callsigns !== undefined) {
+        cfg.regularCallsigns = toStringList(body.regularCallsigns ?? body.callsigns);
+    }
     // hubs accepts the body keys "hubs", "icao" or "hub"; stored uppercase ICAO.
     if (body.hubs !== undefined || body.icao !== undefined || body.hub !== undefined) {
         cfg.hubs = toStringList(body.hubs ?? body.icao ?? body.hub).map(s => s.toUpperCase());
@@ -3145,6 +3222,31 @@ const applyEmbedFields = (cfg, body) => {
         const n = Number(body.radius);
         cfg.radius = (body.radius === '' || body.radius === null || !Number.isFinite(n))
             ? null : Math.min(32, Math.max(0, Math.round(n)));
+    }
+
+    // --- Flight-card customization (map mode). Accepts a nested `card` object
+    // or the flat aliases cardColor/cardBg, cardText/textColor,
+    // cardOpacity/opacity, cardBlur (see EMBEDBACKEND.md §1). ---
+    if (!cfg.card) cfg.card = {};
+    const card = (body.card && typeof body.card === 'object') ? body.card : {};
+    const firstDefined = (...vals) => vals.find(x => x !== undefined);
+    const cColor   = firstDefined(card.color,   body.cardColor,   body.cardBg);
+    const cText    = firstDefined(card.text,    body.cardText,    body.textColor);
+    const cOpacity = firstDefined(card.opacity, body.cardOpacity, body.opacity);
+    const cBlur    = firstDefined(card.blur,    body.cardBlur);
+    if (cColor !== undefined) cfg.card.color = normalizeCardColor(cColor);
+    if (cText !== undefined)  cfg.card.text  = normalizeCardColor(cText);
+    if (cOpacity !== undefined) {
+        const n = Number(cOpacity);
+        // 0–1 or 0–100 are both valid (the widget interprets the scale); clamp to
+        // the outer 0–100 bound and drop anything non-numeric back to the default.
+        cfg.card.opacity = (cOpacity === '' || cOpacity === null || !Number.isFinite(n))
+            ? null : Math.min(100, Math.max(0, n));
+    }
+    if (cBlur !== undefined) {
+        const n = Number(cBlur);
+        cfg.card.blur = (cBlur === '' || cBlur === null || !Number.isFinite(n))
+            ? null : Math.min(40, Math.max(0, Math.round(n)));
     }
 
     if (body.allowedOrigins !== undefined) cfg.allowedOrigins = toStringList(body.allowedOrigins);

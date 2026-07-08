@@ -46,6 +46,7 @@ To embed it on their site, they paste this iframe:
 | `mode`       | `map` or `roster`                         | Defaults to `roster`. |
 | `prefixes`   | `Air%20Canada,United`                     | **Full airline name(s)** you fly under (see Callsign matching). Defaults to `[va]`. |
 | `suffixes`   | `VA,EX`                                    | Your trailing tag(s) (see Callsign matching). |
+| `regulars`   | `OCEAN%20STAFF,Shamrock`                  | Untagged callsigns, prefix-only, always included (alias `callsigns`). See §2. |
 | `hubs`       | `CYYZ,CYUL,CYVR`                          | Hub ICAOs. Each becomes a map marker listing your inbound pilots. |
 | `provider`   | `mapbox` or `free`                        | Auto: `free` when no Mapbox token. |
 | `mapboxToken`| `pk.eyJ…`                                 | The VA's own Mapbox token (mapbox provider only). |
@@ -61,6 +62,10 @@ To embed it on their site, they paste this iframe:
 | `compact`    | `1`                                       | Slimmer header (smaller logo, tighter padding). |
 | `radius`     | `0`                                       | Widget corner radius in px, 0–32 (0 = square). |
 | `servers`    | `Expert`                                  | IF session names to scan (substring match). Empty = all. |
+| `cardColor`  | `%230b1220`                               | Flight-card surface colour (alias `cardBg`) — see §1.2. |
+| `cardText`   | `white`                                   | Flight-card text colour (alias `textColor`) — see §1.2. |
+| `cardOpacity`| `0.6`                                     | Flight-card opacity, 0–1 or 0–100 (alias `opacity`) — see §1.2. |
+| `cardBlur`   | `14`                                      | Flight-card backdrop blur px, 0–40 — see §1.2. |
 
 > **Free vs Mapbox:** if you don't pass a `mapboxToken`, the map automatically
 > uses the free, key-less OpenFreeMap source (flat map). Pass a token to get the
@@ -112,6 +117,35 @@ https://inflight.info/embed.html?va=OCEAN&header=off
 https://inflight.info/embed.html?va=OCEAN&headerPos=left&compact=1&radius=0
 ```
 
+### 1.2 Flight-card customization (map mode)
+
+Controls the look of the tap/detail flight card. Purely cosmetic → CSS only.
+All optional; omit to keep the widget defaults.
+
+In the resolve payload, nest them under `card`:
+
+```jsonc
+{
+  "card": {
+    "opacity": 0.6,        // 0–1 OR 0–100. How see-through the card is.
+                           //   below ~0.9 auto-frosts the map behind it.
+    "color":   "#0b1220",  // card surface colour: hex, rgb(), or a name ("navy")
+    "text":    "white",    // card text colour: hex, rgb(), or a name ("red","white")
+    "blur":    14          // optional backdrop blur in px (0–40). Auto when translucent.
+  }
+}
+```
+
+**Accepted colour names** (besides hex / `rgb()`): white, black, red, crimson,
+orange, amber, yellow, gold, lime, green, emerald, teal, cyan, sky, blue, navy,
+indigo, violet, purple, magenta, pink, rose, slate, gray/grey, silver.
+
+**Flat aliases** (if you don't want a nested object) are accepted in the resolve
+payload too: `cardColor` (or `cardBg`), `cardText` (or `textColor`),
+`cardOpacity` (or `opacity`), `cardBlur`.
+
+Preview params: `&cardOpacity=0.6 &cardColor=%230b1220 &cardText=white &cardBlur=14`
+
 ---
 
 ## 2. Callsign matching (important)
@@ -120,16 +154,37 @@ A flight counts as yours only when it matches the **full airline name** you fly
 under — and, *if* you use a tag, also carries that tag. This stops the embed from
 grabbing every callsign that merely ends in a common tag like `VA`.
 
-- **Prefix rule** — `prefixes` are the *complete* airline name, e.g.
-  `"Air Canada"` (not the ICAO code `ACA`). `"Air Canada"` matches
-  `Air Canada 001VA` and **only** Air Canada — never Air France or AirAsia.
-- **Suffix rule** — `suffixes` are your tag(s), e.g. `"VA"`, `"EX"`. A bare tag
-  never matches on its own.
+- **Prefix rule** (`callsignPrefixes`) — the airline / base callsigns the VA
+  flies under. Each is the *complete* airline name, e.g. `"Air Canada"` (not the
+  ICAO code `ACA`). The widget compacts it (removes spaces/separators) and
+  matches it against the START of the flight's compacted callsign, so it matches
+  the whole airline — `"Air Canada"` matches `Air Canada 001VA` and **only** Air
+  Canada, never Air France or AirAsia. Defaults to `[va]` when omitted.
+- **Suffix rule** (`callsignSuffixes`) — optional tags (tag mode). When set, a
+  flight must match a declared prefix **and** carry one of these tags on
+  **either of the callsign's last two tokens** — so a pilot may append a second
+  trailing tag and still match. One configured tag is enough. A bare tag never
+  matches on its own. To run a tag across several airlines, list each airline in
+  `callsignPrefixes`.
+- **Regular callsigns** (`regularCallsigns`) — untagged callsigns matched by
+  **prefix only** (never require a suffix tag) and **always included**, even when
+  the prefixes above are running in tag mode. Use for staff / charter / plain
+  airline callsigns alongside your tagged members. Alias in preview URLs:
+  `callsigns`.
 
-Combining them:
+**How they combine (per flight):**
 
-- `prefixes` only → matches any callsign starting with that full airline name.
-- `prefixes` + `suffixes` → must match the airline **and** carry the tag.
+1. If it prefix-matches any `regularCallsigns` → **included** (no tag needed).
+2. Else if it prefix-matches any `callsignPrefixes`:
+   - no `callsignSuffixes` set → **included** (prefix-only mode)
+   - `callsignSuffixes` set → included **only** if a tag is on one of the last
+     two tokens.
+3. Otherwise → not this VA.
+
+Suffix examples (`prefixes: ["Air Canada"]`, `suffixes: ["VA"]`):
+
+- `Air Canada 001VA` ✓ · `Air Canada 001VA CX` ✓ (extra trailing tag) ·
+  `Air Canada 001 VA EX` ✓ · `Air Canada 001` ✗ (no tag)
 
 Examples (`prefixes: ["Air Canada"]`, `suffixes: ["VA"]`):
 
@@ -186,6 +241,7 @@ so you can lock a token to one or more domains.
   "va":   { "code": "Air Canada Virtual", "name": "Air Canada Virtual", "logo": "https://…/logo.png" },
   "callsignPrefixes": ["Air Canada"],
   "callsignSuffixes": ["VA"],
+  "regularCallsigns": ["OCEAN STAFF", "Shamrock"],
   "hubs": ["CYYZ", "CYUL", "CYVR"],
   "mode": "map",
   "provider": "mapbox",
@@ -202,7 +258,14 @@ so you can lock a token to one or more domains.
   "gradient": "auto",          // "off" = flat single colour
   "gradientAngle": 120,        // degrees
   "compact": true,
-  "radius": 14                 // corner radius px 0–32; omit = widget default
+  "radius": 14,                // corner radius px 0–32; omit = widget default
+
+  "card": {                    // flight-card styling (map mode) — see §1.2
+    "opacity": 0.6,            //   0–1 or 0–100; <0.9 auto-frosts the map
+    "color": "#0b1220",        //   hex, rgb(), or a colour name
+    "text": "white",
+    "blur": 14                 //   backdrop blur px 0–40; omit = auto
+  }
 }
 ```
 
@@ -213,7 +276,12 @@ older cached widget builds still get a header colour — the built-in resolver
 does this automatically.
 
 `hubs` also accepts the alternate keys `icao` or `hub`. Prefixes are full airline
-names (case preserved); suffixes are tags.
+names (case preserved); suffixes are tags; `regularCallsigns` (alias `callsigns`)
+are untagged, prefix-only, always-included names (see §2).
+
+`card` is optional and cosmetic (see §1.2). Serve it as a nested object, or use
+the flat aliases `cardColor`/`cardBg`, `cardText`/`textColor`,
+`cardOpacity`/`opacity`, `cardBlur`. Colours accept hex, `rgb()`, or a name.
 
 Every field except `va.code` is optional and falls back to a sensible default.
 Omit `mapboxToken` (or set `provider:"free"`) to serve the free map.
@@ -257,6 +325,7 @@ const EMBED_CONFIGS = {
     va: { code: 'Air Canada Virtual', name: 'Air Canada Virtual', logo: 'https://cdn.example.com/acav.png' },
     callsignPrefixes: ['Air Canada'], // full airline name(s), case preserved
     callsignSuffixes: ['VA'],
+    regularCallsigns: ['OCEAN STAFF'], // untagged, prefix-only, always included
     hubs: ['CYYZ', 'CYUL', 'CYVR'],   // hub ICAOs → markers + inbound pilots
     mode: 'map',
     provider: 'mapbox',
@@ -273,6 +342,8 @@ const EMBED_CONFIGS = {
     gradientAngle: 120,               // degrees
     compact: false,                   // slimmer header
     radius: 14,                       // corner radius px 0–32; omit = widget default
+    // Flight-card styling (map mode, all optional — see §1.2)
+    card: { opacity: 0.6, color: '#0b1220', text: 'white', blur: 14 },
     // Optional allow-list of sites that may embed this token. Empty/undefined = any.
     allowedOrigins: ['https://oceanva.org', 'https://www.oceanva.org'],
     revoked: false,
@@ -305,6 +376,7 @@ router.get('/api/embed/resolve', (req, res) => {
     va: cfg.va,
     callsignPrefixes: cfg.callsignPrefixes || [cfg.va.code],
     callsignSuffixes: cfg.callsignSuffixes || [],
+    regularCallsigns: cfg.regularCallsigns || [],
     hubs: cfg.hubs || [],
     mode: cfg.mode || 'roster',
     provider: cfg.provider || (cfg.mapboxToken ? 'mapbox' : 'free'),
@@ -323,6 +395,8 @@ router.get('/api/embed/resolve', (req, res) => {
     gradientAngle: cfg.gradientAngle == null ? 120 : cfg.gradientAngle,
     compact: !!cfg.compact,
     ...(cfg.radius == null ? {} : { radius: cfg.radius }),
+    // Flight-card styling (map mode) — serve only when set (see §1.2).
+    ...(cfg.card && Object.keys(cfg.card).length ? { card: cfg.card } : {}),
   });
 });
 
@@ -344,7 +418,51 @@ When a `token` is present it always wins; any other URL params are ignored.
 
 ---
 
-## 4. Distribution checklist
+## 4. Map data endpoints (gates + airport)
+
+The map-mode features (gates-by-terminal list, gate-occupant usernames, the
+flight card's "Departed Gate X", the airport-window aerial hero + hub pins +
+on-map runway/taxiway layout) call two more backend endpoints. Both are the same
+ones the main tracker uses, and both must be CORS-open to the embed origin (the
+built-in resolver serves `Access-Control-Allow-Origin: *` globally).
+
+### `GET /api/gates/{ICAO}`  — gate features
+
+Powers the airport-window "Gates by terminal" list, gate-occupant usernames, and
+the flight card's "Departed Gate X". Returns an **array** (or
+`{ "gates": [ … ] }`). Each gate object — any one of the listed field aliases
+works:
+
+```jsonc
+{
+  "name":      "A12",          // or "ident" / "gateName" / "id"  (the label)
+  "latitude":  40.6413,        // or "lat" / "location.lat"  / "location.latitude"
+  "longitude": -73.7781,       // or "lon" / "location.lon"  / "location.longitude"
+  "terminal":  "A"             // OPTIONAL. or "concourse" / "pier". If omitted the
+                               //   terminal is inferred from the gate-name prefix
+                               //   ("A12" → Terminal A; numeric-only → "Gates").
+}
+```
+
+Latitude/longitude are **required per gate** for occupant + departure-gate
+matching.
+
+### `GET /api/airport/{ICAO}`  — airport coordinates
+
+The airport window's aerial hero, hub pins and on-map runway/taxiway layout all
+need the field's coordinates:
+
+```jsonc
+{ "latitude": 40.63, "longitude": -73.77, "name": "…", "elevation": 13 }
+```
+
+Aliases `lat`/`lon` are also accepted. Runways/taxiways, takeoff/landing pins
+and the aerial image itself are fully client-side (OSM + Esri imagery) and need
+**no** backend work beyond these coordinates.
+
+---
+
+## 5. Distribution checklist
 
 1. Create a config entry for the VA (code, name, logo, prefixes/suffixes,
    Mapbox token or free provider, allowed origins). Tip: in the staff embed
