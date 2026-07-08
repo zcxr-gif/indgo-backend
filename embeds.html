@@ -550,7 +550,7 @@
                     const res = await fetch('/api/va-ads?status=all&sort=name&limit=100');
                     if (!res.ok) throw new Error('load failed');
                     const json = await res.json();
-                    VA_DIRECTORY = (json.data || []).filter(v => v && (v.callsign || v.name));
+                    VA_DIRECTORY = (json.data || []).filter(v => v && (v.callsign || (v.callsigns && v.callsigns.length) || v.name));
                 } catch {
                     VA_DIRECTORY = [];
                 }
@@ -565,7 +565,7 @@
             const dir = await loadVaDirectory();
 
             const list = (q
-                ? dir.filter(v => `${v.name || ''} ${v.callsign || ''}`.toLowerCase().includes(q))
+                ? dir.filter(v => `${v.name || ''} ${(v.callsigns && v.callsigns.length ? v.callsigns.join(' ') : (v.callsign || ''))}`.toLowerCase().includes(q))
                 : dir
             ).slice(0, 30);
 
@@ -577,6 +577,10 @@
 
             box.innerHTML = list.map((v, i) => {
                 const idx = dir.indexOf(v);
+                // Every callsign the VA flies under; all become embed prefixes.
+                const signs = (Array.isArray(v.callsigns) && v.callsigns.length ? v.callsigns : (v.callsign ? [v.callsign] : []))
+                    .map(c => String(c).trim()).filter(Boolean);
+                const signLabel = signs.join(', ');
                 const logo = v.logoUrl
                     ? `<img src="${esc(v.logoUrl)}" alt="" class="w-8 h-8 rounded-lg object-cover bg-zinc-100 dark:bg-zinc-800 shrink-0">`
                     : `<div class="w-8 h-8 rounded-lg bg-zinc-100 dark:bg-zinc-800 grid place-items-center text-zinc-400 shrink-0"><i class="fa-solid fa-plane"></i></div>`;
@@ -584,10 +588,10 @@
                 <button type="button" onmousedown="event.preventDefault()" onclick="pickVa(${idx})" class="w-full flex items-center gap-3 px-3 py-2.5 text-left hover:bg-zinc-50 dark:hover:bg-zinc-800 transition ${i ? 'border-t border-zinc-100 dark:border-zinc-800' : ''}">
                     ${logo}
                     <div class="min-w-0 flex-1">
-                        <div class="font-medium truncate">${esc(v.name || v.callsign)}</div>
-                        <div class="text-xs text-zinc-400 truncate">${v.callsign ? esc(v.callsign) : 'no callsign on file'}${v.region ? ' · ' + esc(v.region) : ''}</div>
+                        <div class="font-medium truncate">${esc(v.name || signLabel)}</div>
+                        <div class="text-xs text-zinc-400 truncate">${signLabel ? esc(signLabel) : 'no callsign on file'}${v.region ? ' · ' + esc(v.region) : ''}</div>
                     </div>
-                    ${v.callsign ? `<span class="text-xs font-mono px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500 shrink-0">${esc(v.callsign)}</span>` : ''}
+                    ${signs.length ? `<span class="text-xs font-mono px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500 shrink-0">${esc(signs.length > 1 ? signs.length + ' callsigns' : signs[0])}</span>` : ''}
                 </button>`;
             }).join('');
             box.classList.remove('hidden');
@@ -596,13 +600,20 @@
         function pickVa(idx) {
             const v = (VA_DIRECTORY || [])[idx];
             if (!v) return;
-            const code = (v.callsign || '').trim().toUpperCase();
+            // A VA may fly under several callsigns (parent brand + sub-fleets).
+            // The first is the primary VA code; every one becomes a prefix.
+            const callsigns = (Array.isArray(v.callsigns) && v.callsigns.length
+                ? v.callsigns
+                : (v.callsign ? [v.callsign] : []))
+                .map(c => String(c).trim()).filter(Boolean);
+            const code = (callsigns[0] || '').toUpperCase();
             document.getElementById('f_va_code').value = code;
             document.getElementById('f_va_name').value = v.name || '';
             document.getElementById('f_va_logo').value = v.logoUrl || '';
-            // Prefix rule matches the full airline name, so the VA's callsign is
-            // the prefix (preserve its case for an exact in-game match).
-            if (v.callsign) document.getElementById('f_prefixes').value = v.callsign.trim();
+            // Prefix rule matches the full airline name, so each of the VA's
+            // callsigns becomes a prefix (case preserved for an exact in-game
+            // match). The embed then claims flights under any of them.
+            if (callsigns.length) document.getElementById('f_prefixes').value = callsigns.join(', ');
             // Pull the VA's hubs straight from the directory record if it has any.
             if (Array.isArray(v.hubs) && v.hubs.length) {
                 document.getElementById('f_hubs').value = v.hubs.join(', ');
