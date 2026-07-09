@@ -29,12 +29,26 @@ const path = require('path');
 const sharp = require('sharp');
 const axios = require('axios');
 const {
-    extractRoute, isHttpUrl, resolveAccent, normalizeCardOptions,
+    extractRoute, isHttpUrl, resolveAccent, resolveMapLine, normalizeCardOptions,
     routeDistanceNm, eteTextFor,
 } = require('./vaEventCard');
 
 const WIDTH = 1200;
 const HEIGHT = 600;
+
+// --- Route-map basemap palettes ----------------------------------------------
+// Each map style is just a set of fill/stroke colours; the geometry is identical.
+// `ocean` is the panel background, `land`/`landStroke` the continents, `grid`
+// the graticule, and `label`/`labelShadow` the ICAO endpoint labels. Callers
+// pick a style by key (validated in normalizeCardOptions); unknown keys fall
+// back to 'dark'.
+const MAP_PALETTES = {
+    dark:     { ocean: '#0c1420', land: '#1b2739', landStroke: '#2b3a52', grid: '#1a2332', frame: '#2a3342', label: '#dfe6f0', labelShadow: '#0d1117', chipBg: '#0d1117', chipText: '#dfe6f0' },
+    midnight: { ocean: '#0a1a2f', land: '#123a5e', landStroke: '#1e5a8a', grid: '#123048', frame: '#1e4a6e', label: '#eaf4ff', labelShadow: '#04101f', chipBg: '#041020', chipText: '#eaf4ff' },
+    light:    { ocean: '#dbe7f2', land: '#f4f7fa', landStroke: '#b8c6d6', grid: '#c6d4e2', frame: '#a9bacb', label: '#1f2d3d', labelShadow: '#ffffff', chipBg: '#ffffff', chipText: '#1f2d3d' },
+    mono:     { ocean: '#111315', land: '#26292d', landStroke: '#3a3f45', grid: '#1c1f22', frame: '#3a3f45', label: '#e8eaed', labelShadow: '#0a0b0c', chipBg: '#0a0b0c', chipText: '#e8eaed' },
+};
+const paletteFor = (style) => MAP_PALETTES[style] || MAP_PALETTES.dark;
 
 // --- Brand logo (local asset, loaded once) ----------------------------------
 // This is OUR logo, shown top-left of the card. The VA's logo goes in the
@@ -202,7 +216,7 @@ const greatCirclePoints = (a, b, n = 64) => {
 
 // Build the route-map SVG fragment for the given panel rect, or null when
 // either endpoint is missing from the coords index. Pure string building.
-const buildRouteMapSvg = (route, pos, accent, MAP) => {
+const buildRouteMapSvg = (route, pos, lineColor, pal, MAP) => {
     const a = coordsOf(route.dep), b = coordsOf(route.arr);
     if (!a || !b) return null;
 
@@ -270,11 +284,11 @@ const buildRouteMapSvg = (route, pos, accent, MAP) => {
     let grid = '';
     for (let lon = Math.ceil(lonMin / gStep) * gStep; lon <= lonMax; lon += gStep) {
         const [x] = px(0, lon);
-        grid += `<line x1="${fmt(x)}" y1="${MAP.y}" x2="${fmt(x)}" y2="${MAP.y + MAP.h}" stroke="#1a2332" stroke-width="1"/>`;
+        grid += `<line x1="${fmt(x)}" y1="${MAP.y}" x2="${fmt(x)}" y2="${MAP.y + MAP.h}" stroke="${pal.grid}" stroke-width="1"/>`;
     }
     for (let lat = Math.ceil(latMin / gStep) * gStep; lat <= latMax; lat += gStep) {
         const [, y] = px(lat, lonMin);
-        grid += `<line x1="${MAP.x}" y1="${fmt(y)}" x2="${MAP.x + MAP.w}" y2="${fmt(y)}" stroke="#1a2332" stroke-width="1"/>`;
+        grid += `<line x1="${MAP.x}" y1="${fmt(y)}" x2="${MAP.x + MAP.w}" y2="${fmt(y)}" stroke="${pal.grid}" stroke-width="1"/>`;
     }
 
     // Route arc: soft glow underlay + crisp accent line.
@@ -298,9 +312,9 @@ const buildRouteMapSvg = (route, pos, accent, MAP) => {
         const label = (dx, dy, fill) =>
             `<text x="${fmt(lx + dx)}" y="${fmt(y + 5 * S + dy)}" text-anchor="${anchor}" font-family="DejaVu Sans, Arial, sans-serif" font-size="${Math.round(16 * S)}" font-weight="bold" fill="${fill}">${esc(icao)}</text>`;
         return (filled
-            ? `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${6 * S}" fill="${accent}"/>`
-            : `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${6 * S}" fill="#0d1117" stroke="${accent}" stroke-width="${3 * S}"/>`)
-            + label(1.5, 1.5, '#0d1117') + label(0, 0, '#dfe6f0');
+            ? `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${6 * S}" fill="${lineColor}"/>`
+            : `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${6 * S}" fill="${pal.ocean}" stroke="${lineColor}" stroke-width="${3 * S}"/>`)
+            + label(1.5, 1.5, pal.labelShadow) + label(0, 0, pal.label);
     };
     // Anchor markers to the arc's own (longitude-unwrapped) endpoints — the raw
     // a/b lons can sit a full world away from the view after dateline handling.
@@ -308,31 +322,37 @@ const buildRouteMapSvg = (route, pos, accent, MAP) => {
         + marker(arc[arc.length - 1], clipText(route.arr, 5), true);
     if (posPt) {
         const [x, y] = px(posPt[0], posPt[1]);
-        markers += `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${8 * S}" fill="${accent}" fill-opacity="0.25"/>`
-            + `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${3.5 * S}" fill="#ffffff"/>`;
+        markers += `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${8 * S}" fill="${lineColor}" fill-opacity="0.25"/>`
+            + `<circle cx="${fmt(x)}" cy="${fmt(y)}" r="${3.5 * S}" fill="${pal.label}"/>`;
     }
 
     return `
         <clipPath id="mapClip"><rect x="${MAP.x}" y="${MAP.y}" width="${MAP.w}" height="${MAP.h}" rx="16"/></clipPath>
-        <rect x="${MAP.x}" y="${MAP.y}" width="${MAP.w}" height="${MAP.h}" rx="16" fill="#0c1420"/>
+        <rect x="${MAP.x}" y="${MAP.y}" width="${MAP.w}" height="${MAP.h}" rx="16" fill="${pal.ocean}"/>
         <g clip-path="url(#mapClip)">
             ${grid}
-            <path d="${landPath}" fill="#1b2739" fill-rule="evenodd" stroke="#2b3a52" stroke-width="1"/>
-            <path d="${arcD}" fill="none" stroke="${accent}" stroke-width="${7 * S}" stroke-opacity="0.22" stroke-linecap="round"/>
-            <path d="${arcD}" fill="none" stroke="${accent}" stroke-width="${2.5 * S}" stroke-linecap="round"/>
+            <path d="${landPath}" fill="${pal.land}" fill-rule="evenodd" stroke="${pal.landStroke}" stroke-width="1"/>
+            <path d="${arcD}" fill="none" stroke="${lineColor}" stroke-width="${7 * S}" stroke-opacity="0.22" stroke-linecap="round"/>
+            <path d="${arcD}" fill="none" stroke="${lineColor}" stroke-width="${2.5 * S}" stroke-linecap="round"/>
             ${markers}
         </g>
-        <rect x="${MAP.x + 1}" y="${MAP.y + 1}" width="${MAP.w - 2}" height="${MAP.h - 2}" rx="15" fill="none" stroke="#2a3342" stroke-width="2"/>`;
+        <rect x="${MAP.x + 1}" y="${MAP.y + 1}" width="${MAP.w - 2}" height="${MAP.h - 2}" rx="15" fill="none" stroke="${pal.frame}" stroke-width="2"/>`;
 };
 
 // Render the route map as its OWN wide-banner PNG (posted as a second image
 // below the card). Returns a Buffer, or null when the route can't be mapped —
 // the message then just carries the card, exactly as before.
+// Logo box on the route map (top-left corner). Sits over a rounded pill so the
+// brand mark reads on any basemap style.
+const MAP_LOGO = { x: 20, y: 16, w: 150, h: 40 };
+
 const renderVaRouteMapImage = async (e = {}, opts) => {
     try {
+        const o = normalizeCardOptions(opts || {});
         const route = extractRoute(e);
-        const accent = resolveAccent(e, normalizeCardOptions(opts || {})).hex;
-        const inner = buildRouteMapSvg(route, e.position, accent, { x: 0, y: 0, w: MAP_IMG.w, h: MAP_IMG.h });
+        const line = resolveMapLine(e, o);
+        const pal = paletteFor(o.mapStyle);
+        const inner = buildRouteMapSvg(route, e.position, line, pal, { x: 0, y: 0, w: MAP_IMG.w, h: MAP_IMG.h });
         if (!inner) return null;
 
         // Corner chip: DEP → ARR plus the leg distance when we know it.
@@ -341,27 +361,54 @@ const renderVaRouteMapImage = async (e = {}, opts) => {
             + (distNm == null ? '' : `  ·  ≈ ${distNm.toLocaleString('en-US')} NM`);
         const chipW = Math.round(estTextW(chipTxt, 20)) + 44;
         const chip = `
-            <rect x="${MAP_IMG.w - chipW - 20}" y="20" width="${chipW}" height="40" rx="20" fill="#0d1117" fill-opacity="0.82"/>
-            <text x="${MAP_IMG.w - 20 - chipW / 2}" y="46" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="20" font-weight="bold" fill="#dfe6f0">${esc(chipTxt)}</text>`;
+            <rect x="${MAP_IMG.w - chipW - 20}" y="20" width="${chipW}" height="40" rx="20" fill="${pal.chipBg}" fill-opacity="0.82"/>
+            <text x="${MAP_IMG.w - 20 - chipW / 2}" y="46" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="20" font-weight="bold" fill="${pal.chipText}">${esc(chipTxt)}</text>`;
 
-        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${MAP_IMG.w}" height="${MAP_IMG.h}">${inner}${chip}</svg>`;
-        return await sharp(Buffer.from(svg)).png().toBuffer();
+        // Inflight logo, top-left, on a translucent pill (always shown — the map
+        // is branded just like the card). Falls back to a wordmark if the asset
+        // is missing. The pill is ALWAYS dark (never the map palette's chip
+        // colour): the brand mark is light, so a white pill on the 'light' style
+        // would hide it. The brand bitmap is composited after the SVG rasterizes.
+        const brand = BRAND_LOGO_BUF ? await contain(BRAND_LOGO_BUF, MAP_LOGO.w, MAP_LOGO.h) : null;
+        const pillW = MAP_LOGO.w + 24;
+        const pill = `<rect x="${MAP_LOGO.x - 12}" y="${MAP_LOGO.y - 8}" width="${pillW}" height="${MAP_LOGO.h + 16}" rx="20" fill="#0d1117" fill-opacity="0.82"/>`;
+        const wordmark = brand ? '' :
+            `<text x="${MAP_LOGO.x}" y="${MAP_LOGO.y + 28}" font-family="DejaVu Sans, Arial, sans-serif" font-size="26" font-weight="bold" fill="#eef2f7">Inflight</text>`;
+
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${MAP_IMG.w}" height="${MAP_IMG.h}">${inner}${pill}${wordmark}${chip}</svg>`;
+        const base = await sharp(Buffer.from(svg)).png().toBuffer();
+        if (!brand) return base;
+        const meta = await sharp(brand).metadata();
+        const top = MAP_LOGO.y + Math.max(0, Math.round((MAP_LOGO.h - (meta.height || MAP_LOGO.h)) / 2));
+        return await sharp(base).composite([{ input: brand, left: MAP_LOGO.x, top }]).png().toBuffer();
     } catch (err) {
         console.error('[va-events] route map render failed:', err.message);
         return null;
     }
 };
 
-// Which detail keys render as a left-column row on the card. `distance` is shown
-// in the route header (as "≈ N NM"), not as a row, so it's excluded here.
+// Which detail keys render as a detail-column row on the card. `distance` is
+// shown in the route header (as "≈ N NM"), not as a row, so it's excluded here.
 const CARD_ROW_KEYS = new Set(['pilot', 'callsign', 'aircraft', 'server', 'altspeed', 'ete', 'position']);
-const MAX_CARD_ROWS = 6; // more than this crowds the fixed-height left column
+const MAX_CARD_ROWS = 6; // more than this crowds the fixed-height detail column
+
+// Resolve the horizontal layout for a card. The text/route/detail column keeps
+// the SAME width either way (so text metrics don't change); only its x-origin
+// and the photo's x-origin swap when the VA puts the photo on the left. When no
+// photo is shown, the content always sits on the left (the classic layout).
+const cardLayout = (o) => {
+    const photoLeft = o.showPhoto && o.photoSide === 'left';
+    return photoLeft
+        ? { photoLeft: true, photoX: 24, cx: 740, cxR: 1168 }
+        : { photoLeft: false, photoX: PHOTO.x, cx: 28, cxR: 456 };
+};
 
 // Build the background/text SVG. `has` flags which bitmaps will be composited so
 // we draw placeholders only where an image is missing. `opts` is a (normalized)
 // VA card customization — accent colour, which fields to show, photo on/off.
 const buildBaseSvg = (e, route, has, opts) => {
     const o = normalizeCardOptions(opts || {});
+    const { photoX, cx, cxR } = cardLayout(o);
     const isTakeoff = e.event === 'takeoff';
     const accent = resolveAccent(e, o).hex;
     const ac = e.aircraft || {};
@@ -410,24 +457,24 @@ const buildBaseSvg = (e, route, has, opts) => {
     let ry = 300;
     for (const [label, value] of rows) {
         rowsSvg += `
-            <text x="28" y="${ry}" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="bold" letter-spacing="1.5" fill="#7a8699">${esc(label)}</text>
-            <text x="28" y="${ry + 26}" font-family="DejaVu Sans, Arial, sans-serif" font-size="24" font-weight="bold" fill="#eef2f7">${esc(value)}</text>`;
+            <text x="${cx}" y="${ry}" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="bold" letter-spacing="1.5" fill="#7a8699">${esc(label)}</text>
+            <text x="${cx}" y="${ry + 26}" font-family="DejaVu Sans, Arial, sans-serif" font-size="24" font-weight="bold" fill="#eef2f7">${esc(value)}</text>`;
         ry += rowStep;
     }
 
     const distNm = routeDistanceNm(route.dep, route.arr);
     const distSvg = (distNm == null || !o.fields.includes('distance')) ? '' : `
-        <text x="456" y="150" text-anchor="end" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="bold" letter-spacing="1.5" fill="#7a8699">≈ ${distNm.toLocaleString('en-US')} NM</text>`;
+        <text x="${cxR}" y="150" text-anchor="end" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="bold" letter-spacing="1.5" fill="#7a8699">≈ ${distNm.toLocaleString('en-US')} NM</text>`;
 
     // Route line: departure left-anchored, arrival right-anchored against the
-    // column edge (x=456) so wide glyphs can never spill into the photo. The
+    // column's right edge (cxR) so wide glyphs can never spill into the photo. The
     // dashed flight path + plane fill whatever room is left between the two,
     // degrading to just the plane (or nothing) when the ICAOs crowd it out.
     const ROUTE_FONT = 48;
     const routeText = (x, anchor, txt) =>
         `<text x="${x}" y="212"${anchor === 'end' ? ' text-anchor="end"' : ''} font-family="DejaVu Sans, Arial, sans-serif" font-size="${ROUTE_FONT}" font-weight="bold" fill="#eef2f7">${esc(txt)}</text>`;
-    const gapL = 28 + estTextW(depTxt, ROUTE_FONT) + 16;   // path start
-    const gapR = 456 - estTextW(arrTxt, ROUTE_FONT) - 16;  // path end
+    const gapL = cx + estTextW(depTxt, ROUTE_FONT) + 16;    // path start
+    const gapR = cxR - estTextW(arrTxt, ROUTE_FONT) - 16;   // path end
     const mid = (gapL + gapR) / 2;
     let pathSvg = '';
     if (gapR - gapL >= 120) {
@@ -440,14 +487,14 @@ const buildBaseSvg = (e, route, has, opts) => {
         pathSvg = `
         <text x="${mid}" y="206" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="30" fill="${accent}">✈</text>`;
     }
-    const routeSvg = routeText(28, 'start', depTxt) + routeText(456, 'end', arrTxt) + pathSvg;
+    const routeSvg = routeText(cx, 'start', depTxt) + routeText(cxR, 'end', arrTxt) + pathSvg;
 
     // Placeholder only when a photo was wanted but couldn't be shown. A VA that
-    // turned the photo OFF gets a clean right column, not an "unavailable" box.
+    // turned the photo OFF gets a clean column, not an "unavailable" box.
     const photoPlaceholder = (has.photo || !o.showPhoto) ? '' : `
-        <rect x="${PHOTO.x}" y="${PHOTO.y}" width="${PHOTO.w}" height="${PHOTO.h}" rx="16" fill="#161b22" stroke="#262d38"/>
-        <text x="${PHOTO.x + PHOTO.w / 2}" y="${PHOTO.y + PHOTO.h / 2 - 6}" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="84" fill="#2b3340">✈</text>
-        <text x="${PHOTO.x + PHOTO.w / 2}" y="${PHOTO.y + PHOTO.h / 2 + 44}" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="20" fill="#3a4452">Aircraft image unavailable</text>`;
+        <rect x="${photoX}" y="${PHOTO.y}" width="${PHOTO.w}" height="${PHOTO.h}" rx="16" fill="#161b22" stroke="#262d38"/>
+        <text x="${photoX + PHOTO.w / 2}" y="${PHOTO.y + PHOTO.h / 2 - 6}" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="84" fill="#2b3340">✈</text>
+        <text x="${photoX + PHOTO.w / 2}" y="${PHOTO.y + PHOTO.h / 2 + 44}" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="20" fill="#3a4452">Aircraft image unavailable</text>`;
     // Header logo is OUR brand bitmap; without the asset, fall back to wordmark text.
     const logoText = has.brand ? '' : `
         <text x="${LOGO.x}" y="${LOGO.y + 42}" font-family="DejaVu Sans, Arial, sans-serif" font-size="34" font-weight="bold" fill="#eef2f7">Inflight</text>`;
@@ -474,10 +521,10 @@ const buildBaseSvg = (e, route, has, opts) => {
         <text x="1076" y="58" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="22" font-weight="bold" fill="#0d1117">${eventWord}</text>
         <line x1="28" y1="96" x2="1172" y2="96" stroke="#222a35" stroke-width="2"/>
         <!-- route (horizontal A -> B with a dashed flight path + leg distance) -->
-        <text x="28" y="150" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="bold" letter-spacing="2" fill="#7a8699">ROUTE</text>
+        <text x="${cx}" y="150" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="bold" letter-spacing="2" fill="#7a8699">ROUTE</text>
         ${distSvg}
         ${routeSvg}
-        <line x1="28" y1="244" x2="456" y2="244" stroke="#222a35" stroke-width="2"/>
+        <line x1="${cx}" y1="244" x2="${cxR}" y2="244" stroke="#222a35" stroke-width="2"/>
         ${rowsSvg}
         ${photoPlaceholder}
     </svg>`);
@@ -500,6 +547,7 @@ const renderVaEventCard = async (e = {}, media = {}, opts) => {
         ]);
 
         const has = { photo: !!photo, brand: !!brand };
+        const { photoX } = cardLayout(o);
         const baseSvg = buildBaseSvg(e, route, has, o);
 
         const layers = [];
@@ -510,13 +558,13 @@ const renderVaEventCard = async (e = {}, media = {}, opts) => {
             layers.push({ input: brand, left: LOGO.x, top });
         }
         if (photo) {
-            layers.push({ input: photo, left: PHOTO.x, top: PHOTO.y });
+            layers.push({ input: photo, left: photoX, top: PHOTO.y });
             // Thin frame over the photo so it sits in the card instead of
             // floating on it (the placeholder already draws its own stroke).
             layers.push({
                 input: Buffer.from(
                     `<svg xmlns="http://www.w3.org/2000/svg" width="${PHOTO.w}" height="${PHOTO.h}"><rect x="1" y="1" width="${PHOTO.w - 2}" height="${PHOTO.h - 2}" rx="15" fill="none" stroke="#2a3342" stroke-width="2"/></svg>`),
-                left: PHOTO.x, top: PHOTO.y,
+                left: photoX, top: PHOTO.y,
             });
         }
 

@@ -302,6 +302,33 @@
                     <label class="flex items-center gap-2 text-sm font-medium select-none"><input id="pfCardShowMap" type="checkbox" class="w-4 h-4 rounded pf-edit"> <span data-i18n="fe.card.showMap">Route map</span></label>
                 </div>
 
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.card.photoSide">Aircraft photo side</label>
+                        <select id="pfCardPhotoSide" class="field pf-edit">
+                            <option value="right" data-i18n="fe.card.right">Right</option>
+                            <option value="left" data-i18n="fe.card.left">Left</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.card.mapStyle">Map style</label>
+                        <select id="pfCardMapStyle" class="field pf-edit">
+                            <option value="dark" data-i18n="fe.card.mapDark">Dark</option>
+                            <option value="midnight" data-i18n="fe.card.mapMidnight">Midnight blue</option>
+                            <option value="light" data-i18n="fe.card.mapLight">Light</option>
+                            <option value="mono" data-i18n="fe.card.mapMono">Mono</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.card.mapLine">Route line colour</label>
+                        <div class="flex items-center gap-2">
+                            <input id="pfCardMapLinePicker" type="color" value="#2ecc71" class="w-9 h-9 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-transparent p-0.5 shrink-0 pf-edit">
+                            <input id="pfCardMapLine" type="text" maxlength="9" placeholder="e.g. white" class="field pf-edit">
+                            <button type="button" id="pfCardMapLineClear" class="text-xs font-medium text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200 shrink-0 pf-edit" data-i18n="fe.card.default">Default</button>
+                        </div>
+                    </div>
+                </div>
+
                 <div>
                     <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.card.fields">Details to show</label>
                     <div id="pfCardFields" class="grid grid-cols-2 sm:grid-cols-4 gap-2">
@@ -315,6 +342,17 @@
                         <label class="flex items-center gap-2 text-sm select-none"><input type="checkbox" class="fe-field w-4 h-4 rounded pf-edit" value="position"> <span data-i18n="fe.card.f.position">Position</span></label>
                     </div>
                     <p class="text-[11px] text-zinc-400 mt-1.5" data-i18n="fe.card.fieldsHelp">Route (departure → arrival) is always shown. ETE only appears on departures.</p>
+                </div>
+
+                <!-- Live preview — rendered from the current settings, nothing is posted -->
+                <div class="rounded-2xl border border-zinc-200 dark:border-zinc-800 p-3 bg-zinc-50/60 dark:bg-zinc-900/40">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-xs font-semibold text-zinc-500 dark:text-zinc-400" data-i18n="fe.card.preview">Live preview</span>
+                        <span id="pfCardPreviewSpin" class="hidden text-[11px] text-zinc-400" data-i18n="fe.card.rendering">Rendering…</span>
+                    </div>
+                    <img id="pfCardPreviewImg" alt="Card preview" class="w-full rounded-xl hidden">
+                    <img id="pfCardPreviewMap" alt="Route map preview" class="w-full rounded-xl mt-2 hidden">
+                    <p id="pfCardPreviewNote" class="hidden text-xs text-zinc-500 dark:text-zinc-400 py-6 text-center"></p>
                 </div>
 
                 <div class="flex items-center gap-3 flex-wrap">
@@ -929,33 +967,88 @@
             $('pfCardShowPhoto').checked = c.showPhoto !== false;
             $('pfCardShowMap').checked = c.showMap !== false;
             $('pfCardTitle').value = c.title || '';
+            $('pfCardPhotoSide').value = c.photoSide === 'left' ? 'left' : 'right';
+            $('pfCardMapStyle').value = ['dark', 'midnight', 'light', 'mono'].includes(c.mapStyle) ? c.mapStyle : 'dark';
+            const mapLine = (c.mapLine || '').trim();
+            $('pfCardMapLine').value = mapLine;
+            $('pfCardMapLinePicker').value = /^#[0-9a-fA-F]{6}$/.test(mapLine) ? mapLine : '#2ecc71';
             const chosen = Array.isArray(c.fields) && c.fields.length
                 ? c.fields : ['pilot', 'callsign', 'aircraft', 'server', 'altspeed', 'distance', 'ete'];
             document.querySelectorAll('.fe-field').forEach(el => { el.checked = chosen.includes(el.value); });
+            updateCardPreview();
         }
-        // Keep the colour swatch and the hex text field in sync both ways.
-        $('pfCardAccentPicker').addEventListener('input', (e) => { $('pfCardAccent').value = e.target.value; });
-        $('pfCardAccent').addEventListener('input', (e) => {
-            const v = e.target.value.trim();
-            if (/^#[0-9a-fA-F]{6}$/.test(v)) $('pfCardAccentPicker').value = v;
-        });
-        $('pfCardAccentClear').addEventListener('click', () => {
-            $('pfCardAccent').value = ''; $('pfCardAccentPicker').value = '#2ecc71';
-        });
-        $('pfCardSaveBtn').addEventListener('click', async () => {
-            const card = {
+        // Read the current form into a card-options object (used by save + preview).
+        function readCardForm() {
+            return {
                 accent: $('pfCardAccent').value.trim(),
                 layout: $('pfCardLayout').value,
                 showPhoto: $('pfCardShowPhoto').checked,
                 showMap: $('pfCardShowMap').checked,
+                photoSide: $('pfCardPhotoSide').value,
+                mapStyle: $('pfCardMapStyle').value,
+                mapLine: $('pfCardMapLine').value.trim(),
                 title: $('pfCardTitle').value.trim(),
                 fields: [...document.querySelectorAll('.fe-field')].filter(el => el.checked).map(el => el.value),
             };
+        }
+        // Debounced live preview: render the card from the CURRENT (unsaved) form
+        // via the preview endpoint (nothing is posted to Discord).
+        let cardPreviewTimer = null;
+        async function updateCardPreview() {
+            if ($('pfCardCustomize').classList.contains('hidden')) return;
+            clearTimeout(cardPreviewTimer);
+            cardPreviewTimer = setTimeout(async () => {
+                const img = $('pfCardPreviewImg'), mapImg = $('pfCardPreviewMap'), note = $('pfCardPreviewNote');
+                $('pfCardPreviewSpin').classList.remove('hidden');
+                try {
+                    const data = await api('/flight-events/preview', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ card: readCardForm() }),
+                    });
+                    if (data && data.layout === 'compact') {
+                        img.classList.add('hidden'); mapImg.classList.add('hidden');
+                        note.textContent = t('fe.card.compactNote'); note.classList.remove('hidden');
+                    } else {
+                        note.classList.add('hidden');
+                        if (data && data.card) { img.src = data.card; img.classList.remove('hidden'); } else img.classList.add('hidden');
+                        if (data && data.map) { mapImg.src = data.map; mapImg.classList.remove('hidden'); } else mapImg.classList.add('hidden');
+                    }
+                } catch (err) {
+                    note.textContent = t('fe.card.previewFail'); note.classList.remove('hidden');
+                } finally { $('pfCardPreviewSpin').classList.add('hidden'); }
+            }, 350);
+        }
+        // Keep the colour swatch and the hex text field in sync both ways.
+        $('pfCardAccentPicker').addEventListener('input', (e) => { $('pfCardAccent').value = e.target.value; updateCardPreview(); });
+        $('pfCardAccent').addEventListener('input', (e) => {
+            const v = e.target.value.trim();
+            if (/^#[0-9a-fA-F]{6}$/.test(v)) $('pfCardAccentPicker').value = v;
+            updateCardPreview();
+        });
+        $('pfCardAccentClear').addEventListener('click', () => {
+            $('pfCardAccent').value = ''; $('pfCardAccentPicker').value = '#2ecc71'; updateCardPreview();
+        });
+        // Route-line colour swatch/text sync + clear.
+        $('pfCardMapLinePicker').addEventListener('input', (e) => { $('pfCardMapLine').value = e.target.value; updateCardPreview(); });
+        $('pfCardMapLine').addEventListener('input', (e) => {
+            const v = e.target.value.trim();
+            if (/^#[0-9a-fA-F]{6}$/.test(v)) $('pfCardMapLinePicker').value = v;
+            updateCardPreview();
+        });
+        $('pfCardMapLineClear').addEventListener('click', () => {
+            $('pfCardMapLine').value = ''; $('pfCardMapLinePicker').value = '#2ecc71'; updateCardPreview();
+        });
+        // Any other control change re-renders the preview.
+        ['pfCardLayout', 'pfCardShowPhoto', 'pfCardShowMap', 'pfCardPhotoSide', 'pfCardMapStyle', 'pfCardTitle']
+            .forEach(id => $(id).addEventListener('change', updateCardPreview));
+        $('pfCardTitle').addEventListener('input', updateCardPreview);
+        document.querySelectorAll('.fe-field').forEach(el => el.addEventListener('change', updateCardPreview));
+        $('pfCardSaveBtn').addEventListener('click', async () => {
             $('pfCardSaveBtn').disabled = true;
             try {
                 const { va } = await api('/flight-events/customize', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ card }),
+                    body: JSON.stringify({ card: readCardForm() }),
                 });
                 vaProfile = va; fillCardForm(va, true);
                 flash('pfCardMsg', t('fe.card.saved'), true);

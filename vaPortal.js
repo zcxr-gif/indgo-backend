@@ -639,7 +639,7 @@ async function uploadSubmissionFile(s3Client, file) {
  * @param {Function} [deps.uploadVaImage] (s3Client, file, ref, kind) => url
  * @param {Function} [deps.deleteVaImage] (s3Client, url) => Promise
  */
-function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent }) {
+function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent, renderCardPreview }) {
     // Webhook URLs are secrets, so the profile API never echoes one back in full.
     // Surface just enough for the owner to recognise what's saved: the trailing
     // chars of the webhook id. Defensive against malformed stored values.
@@ -975,6 +975,25 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, 
         } catch (err) {
             console.error('VA portal flight-events customize error:', err);
             res.status(500).json({ error: 'Could not save your card customization.' });
+        }
+    });
+
+    // Live preview of the card for arbitrary (unsaved) options — renders only,
+    // posts nothing. Lets an owner see how their customization looks before they
+    // save or send a Discord test.
+    app.post('/api/va-portal/flight-events/preview', requirePortalOwner, async (req, res) => {
+        try {
+            if (typeof renderCardPreview !== 'function') {
+                return res.status(500).json({ error: 'Preview is unavailable right now.' });
+            }
+            if (!req.portal.vaAdId) return res.status(404).json({ error: 'No VA is linked to this account.' });
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId).select('name callsign callsigns logoUrl').lean();
+            if (!ad) return res.status(404).json({ error: 'Your VA listing could not be found.' });
+            const preview = await renderCardPreview(ad, (req.body && req.body.card) || req.body || {});
+            res.json(preview);
+        } catch (err) {
+            console.error('VA portal flight-events preview error:', err);
+            res.status(500).json({ error: 'Could not render a preview.' });
         }
     });
 
