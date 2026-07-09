@@ -29,6 +29,7 @@ const { PutObjectCommand } = require('@aws-sdk/client-s3');
 
 // Reuse the staff portal's auth so our oversight routes accept a staff session.
 const { requireAuth: requireStaffSession } = require('./staffAuth');
+const { normalizeCardOptions } = require('./vaEventCard');
 
 // Where the embed widget is hosted. The portal surfaces a VA's embed link as a
 // read-only, copyable URL; it never lets the VA change the underlying config.
@@ -703,6 +704,9 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, 
             flightEventsApproved: !!ad.flightEventsApproved,
             flightEventsRequested: !!ad.flightEventsRequestedAt,
             flightEventsWebhookHint: ad.flightEventsWebhookUrl ? maskWebhookUrl(ad.flightEventsWebhookUrl) : '',
+            // The (normalized) card customization — colours/layout/fields — so the
+            // portal can render the current selection. Always a full, valid object.
+            flightEventsCard: normalizeCardOptions(ad.flightEventsCard || {}),
         };
     };
 
@@ -949,6 +953,31 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, 
         }
     });
 
+    // Owner customizes the look of their flight-event card — accent colour,
+    // layout (full card vs. compact embed), which detail fields to show, and
+    // whether to include the aircraft photo / route map. The payload is fully
+    // normalized before storing, so a malformed body can never break the card.
+    // The Inflight brand mark stays on every card regardless (not customizable).
+    app.post('/api/va-portal/flight-events/customize', requirePortalOwner, async (req, res) => {
+        try {
+            if (!req.portal.vaAdId) return res.status(404).json({ error: 'No VA is linked to this account.' });
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId).select('+flightEventsWebhookUrl');
+            if (!ad) return res.status(404).json({ error: 'Your VA listing could not be found.' });
+
+            ad.flightEventsCard = normalizeCardOptions((req.body && req.body.card) || req.body || {});
+            await ad.save();
+            logActivity({
+                vaAdId: ad._id, vaName: ad.name,
+                actorName: req.portal.displayName || req.portal.username, actorRole: 'owner',
+                action: 'flight-events.customize', detail: 'Updated flight-event card appearance',
+            });
+            res.json({ va: portalVa(ad) });
+        } catch (err) {
+            console.error('VA portal flight-events customize error:', err);
+            res.status(500).json({ error: 'Could not save your card customization.' });
+        }
+    });
+
     // Owner sends a sample takeoff card to their own saved webhook, so they can
     // confirm delivery works (and see the card) without waiting for a real flight.
     // Posts via the same renderer/path as live events, so a failure here surfaces
@@ -957,7 +986,7 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, 
         try {
             if (!req.portal.vaAdId) return res.status(404).json({ error: 'No VA is linked to this account.' });
             const ad = await VirtualAirlineAd.findById(req.portal.vaAdId)
-                .select('+flightEventsWebhookUrl name callsign callsigns logoUrl');
+                .select('+flightEventsWebhookUrl name callsign callsigns logoUrl flightEventsCard');
             if (!ad) return res.status(404).json({ error: 'Your VA listing could not be found.' });
             if (!ad.flightEventsWebhookUrl) return res.status(400).json({ error: 'Save a webhook first, then send a test.' });
             if (typeof isDiscordWebhookUrl === 'function' && !isDiscordWebhookUrl(ad.flightEventsWebhookUrl)) {

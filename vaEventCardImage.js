@@ -28,7 +28,10 @@ const fs = require('fs');
 const path = require('path');
 const sharp = require('sharp');
 const axios = require('axios');
-const { extractRoute, isHttpUrl, accentFor } = require('./vaEventCard');
+const {
+    extractRoute, isHttpUrl, resolveAccent, normalizeCardOptions,
+    routeDistanceNm, eteTextFor,
+} = require('./vaEventCard');
 
 const WIDTH = 1200;
 const HEIGHT = 600;
@@ -54,18 +57,8 @@ const coordsOf = (icao) => {
     return (Array.isArray(v) && v.length === 2 && v.every(Number.isFinite)) ? v : null;
 };
 
-// Haversine distance in nautical miles, or null when either end is unknown —
-// or when it rounds to 0 (same-airport pattern work: "≈ 0 NM" is just noise).
-const routeDistanceNm = (dep, arr) => {
-    const a = coordsOf(dep), b = coordsOf(arr);
-    if (!a || !b) return null;
-    const rad = (d) => d * Math.PI / 180;
-    const dLat = rad(b[0] - a[0]), dLon = rad(b[1] - a[1]);
-    const h = Math.sin(dLat / 2) ** 2
-        + Math.cos(rad(a[0])) * Math.cos(rad(b[0])) * Math.sin(dLon / 2) ** 2;
-    const nm = Math.round(3440.065 * 2 * Math.asin(Math.sqrt(h))); // Earth radius in nm
-    return nm > 0 ? nm : null;
-};
+// Leg distance (nm) is computed by the shared vaEventCard module so the image
+// card and the JSON embed can never disagree; `routeDistanceNm` is imported above.
 
 // --- World land rings (offline basemap for the route map) --------------------
 // data/world-land.json holds simplified Natural Earth land outlines as
@@ -335,10 +328,10 @@ const buildRouteMapSvg = (route, pos, accent, MAP) => {
 // Render the route map as its OWN wide-banner PNG (posted as a second image
 // below the card). Returns a Buffer, or null when the route can't be mapped —
 // the message then just carries the card, exactly as before.
-const renderVaRouteMapImage = async (e = {}) => {
+const renderVaRouteMapImage = async (e = {}, opts) => {
     try {
         const route = extractRoute(e);
-        const accent = accentFor(e).hex;
+        const accent = resolveAccent(e, normalizeCardOptions(opts || {})).hex;
         const inner = buildRouteMapSvg(route, e.position, accent, { x: 0, y: 0, w: MAP_IMG.w, h: MAP_IMG.h });
         if (!inner) return null;
 
@@ -359,11 +352,18 @@ const renderVaRouteMapImage = async (e = {}) => {
     }
 };
 
+// Which detail keys render as a left-column row on the card. `distance` is shown
+// in the route header (as "≈ N NM"), not as a row, so it's excluded here.
+const CARD_ROW_KEYS = new Set(['pilot', 'callsign', 'aircraft', 'server', 'altspeed', 'ete', 'position']);
+const MAX_CARD_ROWS = 6; // more than this crowds the fixed-height left column
+
 // Build the background/text SVG. `has` flags which bitmaps will be composited so
-// we draw placeholders only where an image is missing.
-const buildBaseSvg = (e, route, has) => {
+// we draw placeholders only where an image is missing. `opts` is a (normalized)
+// VA card customization — accent colour, which fields to show, photo on/off.
+const buildBaseSvg = (e, route, has, opts) => {
+    const o = normalizeCardOptions(opts || {});
     const isTakeoff = e.event === 'takeoff';
-    const accent = accentFor(e).hex;
+    const accent = resolveAccent(e, o).hex;
     const ac = e.aircraft || {};
     const pos = e.position || {};
     const eventWord = isTakeoff ? 'DEPARTURE' : 'ARRIVAL';
@@ -377,26 +377,46 @@ const buildBaseSvg = (e, route, has) => {
         Number.isFinite(pos.alt_ft) ? `${Math.round(pos.alt_ft).toLocaleString()} ft` : null,
         Number.isFinite(pos.gs_kt) ? `${Math.round(pos.gs_kt)} kt` : null,
     ].filter(Boolean).join('  ·  ') || '—';
+    const posTxt = (Number.isFinite(pos.lat) && Number.isFinite(pos.lon))
+        ? `${pos.lat.toFixed(2)}, ${pos.lon.toFixed(2)}` : null;
 
-    // Left-column detail rows: [label, value]
-    const rows = [
-        ['PILOT', clipText(e.username, 26)],
-        ['CALLSIGN', clipText(e.callsign, 26)],
-        ['AIRCRAFT', clipText(aircraftLine, 30)],
-        ['SERVER', clipText(e.server, 26)],
-        ['ALT · SPEED', altGs],
-    ];
+    // Left-column detail rows in the VA's chosen order, skipping fields with no
+    // value and any that don't render as a row. [label, value] pairs.
+    const ROW_VALUE = {
+        pilot: clipText(e.username, 26),
+        callsign: clipText(e.callsign, 26),
+        aircraft: clipText(aircraftLine, 30),
+        server: clipText(e.server, 26),
+        altspeed: altGs,
+        ete: eteTextFor(e),
+        position: posTxt,
+    };
+    const ROW_LABEL = {
+        pilot: 'PILOT', callsign: 'CALLSIGN', aircraft: 'AIRCRAFT',
+        server: 'SERVER', altspeed: 'ALT · SPEED', ete: 'ETE', position: 'POSITION',
+    };
+    const rows = [];
+    for (const key of o.fields) {
+        if (!CARD_ROW_KEYS.has(key)) continue;
+        const value = ROW_VALUE[key];
+        if (value == null || value === '') continue;
+        rows.push([ROW_LABEL[key], value]);
+        if (rows.length >= MAX_CARD_ROWS) break;
+    }
+    // Spacing compresses gracefully as rows are added so a full column still
+    // fits inside the fixed card height (rows run from y=300 to ~y=560).
+    const rowStep = rows.length > 1 ? Math.min(56, Math.round((560 - 300) / (rows.length - 1))) : 56;
     let rowsSvg = '';
     let ry = 300;
     for (const [label, value] of rows) {
         rowsSvg += `
             <text x="28" y="${ry}" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="bold" letter-spacing="1.5" fill="#7a8699">${esc(label)}</text>
             <text x="28" y="${ry + 26}" font-family="DejaVu Sans, Arial, sans-serif" font-size="24" font-weight="bold" fill="#eef2f7">${esc(value)}</text>`;
-        ry += 56;
+        ry += rowStep;
     }
 
     const distNm = routeDistanceNm(route.dep, route.arr);
-    const distSvg = distNm == null ? '' : `
+    const distSvg = (distNm == null || !o.fields.includes('distance')) ? '' : `
         <text x="456" y="150" text-anchor="end" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="bold" letter-spacing="1.5" fill="#7a8699">≈ ${distNm.toLocaleString('en-US')} NM</text>`;
 
     // Route line: departure left-anchored, arrival right-anchored against the
@@ -422,7 +442,9 @@ const buildBaseSvg = (e, route, has) => {
     }
     const routeSvg = routeText(28, 'start', depTxt) + routeText(456, 'end', arrTxt) + pathSvg;
 
-    const photoPlaceholder = has.photo ? '' : `
+    // Placeholder only when a photo was wanted but couldn't be shown. A VA that
+    // turned the photo OFF gets a clean right column, not an "unavailable" box.
+    const photoPlaceholder = (has.photo || !o.showPhoto) ? '' : `
         <rect x="${PHOTO.x}" y="${PHOTO.y}" width="${PHOTO.w}" height="${PHOTO.h}" rx="16" fill="#161b22" stroke="#262d38"/>
         <text x="${PHOTO.x + PHOTO.w / 2}" y="${PHOTO.y + PHOTO.h / 2 - 6}" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="84" fill="#2b3340">✈</text>
         <text x="${PHOTO.x + PHOTO.w / 2}" y="${PHOTO.y + PHOTO.h / 2 + 44}" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="20" fill="#3a4452">Aircraft image unavailable</text>`;
@@ -463,19 +485,22 @@ const buildBaseSvg = (e, route, has) => {
 
 // Render the composite PNG for one event. Returns a Buffer, or null if rendering
 // failed (caller then falls back to the plain embed).
-const renderVaEventCard = async (e = {}, media = {}) => {
+const renderVaEventCard = async (e = {}, media = {}, opts) => {
     try {
+        const o = normalizeCardOptions(opts || {});
         const route = extractRoute(e);
 
         // The aircraft photo is the only remote bitmap; the brand logo is local.
-        const photoRaw = await fetchImage(media.aircraftImageUrl);
+        // Skip the photo fetch entirely when the VA turned the photo off. The
+        // brand logo is ALWAYS drawn — it's not customizable.
+        const photoRaw = o.showPhoto ? await fetchImage(media.aircraftImageUrl) : null;
         const [photo, brand] = await Promise.all([
             photoRaw ? coverRounded(photoRaw, PHOTO.w, PHOTO.h) : null,
             BRAND_LOGO_BUF ? contain(BRAND_LOGO_BUF, LOGO.w, LOGO.h) : null,
         ]);
 
         const has = { photo: !!photo, brand: !!brand };
-        const baseSvg = buildBaseSvg(e, route, has);
+        const baseSvg = buildBaseSvg(e, route, has, o);
 
         const layers = [];
         if (brand) {

@@ -216,6 +216,21 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // timestamp lets the portal show a "pending approval" state.
     flightEventsApproved: { type: Boolean, default: false },
     flightEventsRequestedAt: { type: Date, default: null },
+    // Per-VA customization of the takeoff/landing card the VA receives (colours,
+    // layout, which fields to show, whether to include the aircraft photo / route
+    // map). Every field is optional and falls back to the default look; the
+    // Inflight brand mark is deliberately NOT customizable (always drawn on the
+    // card and always in the embed footer). Shape is validated on write via
+    // normalizeCardOptions() from vaEventCard.js. Only ever applied to THIS VA's
+    // own webhook — the central feed always uses the default card.
+    flightEventsCard: {
+        accent:    { type: String, trim: true, default: '' },      // '#rrggbb' or '' = event colour
+        layout:    { type: String, enum: ['card', 'compact'], default: 'card' },
+        showMap:   { type: Boolean, default: true },               // post the route-map image
+        showPhoto: { type: Boolean, default: true },               // aircraft photo on the card
+        title:     { type: String, trim: true, default: '' },      // custom embed title; '' = default
+        fields:    { type: [String], default: [] },                // ordered subset; [] = default set
+    },
 
     // --- Analytics ---
     views: { type: Number, default: 0 },                            // detail-page impressions
@@ -2362,6 +2377,8 @@ const flightEventsStatus = (ad) => ({
     enabled: !!ad.flightEventsEnabled,
     approved: !!ad.flightEventsApproved,
     requestedAt: ad.flightEventsRequestedAt || null,
+    // The (normalized) card customization, so editors can render the current state.
+    card: normalizeCardOptions(ad.flightEventsCard || {}),
 });
 
 // GET: Diagnose why a live callsign did/didn't deliver to a partner webhook.
@@ -2439,7 +2456,7 @@ app.get('/api/va-ads/flight-events/by-code', requireAuth, async (req, res) => {
         if (!code) return res.status(400).json({ message: 'Pass ?code=…' });
         const bases = [...new Set([normalizeCallsignBase(code), callsignAirlineBase(code)].filter(Boolean))];
 
-        const sel = '+flightEventsWebhookUrl name callsign callsigns flightEventsEnabled flightEventsApproved flightEventsRequestedAt';
+        const sel = '+flightEventsWebhookUrl name callsign callsigns flightEventsEnabled flightEventsApproved flightEventsRequestedAt flightEventsCard';
         // Prefer a base-callsign match; fall back to an exact (case-insensitive)
         // name match so embeds linked by name still resolve.
         let ad = bases.length
@@ -2463,7 +2480,7 @@ app.get('/api/va-ads/flight-events/by-code', requireAuth, async (req, res) => {
 app.get('/api/va-ads/:id/flight-events', requireAuth, async (req, res) => {
     try {
         const ad = await VirtualAirlineAd.findById(req.params.id)
-            .select('+flightEventsWebhookUrl name callsign callsigns flightEventsEnabled flightEventsApproved flightEventsRequestedAt')
+            .select('+flightEventsWebhookUrl name callsign callsigns flightEventsEnabled flightEventsApproved flightEventsRequestedAt flightEventsCard')
             .lean();
         if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
         res.json({ data: flightEventsStatus(ad) });
@@ -2497,6 +2514,9 @@ app.patch('/api/va-ads/:id/flight-events', requireAuth, async (req, res) => {
         }
         if (b.approved !== undefined) ad.flightEventsApproved = b.approved === true || b.approved === 'true';
         if (b.enabled !== undefined) ad.flightEventsEnabled = b.enabled === true || b.enabled === 'true';
+        // Card customization (colours / layout / fields). Normalized before store
+        // so an invalid payload can never produce a broken card.
+        if (b.card !== undefined) ad.flightEventsCard = normalizeCardOptions(b.card);
 
         await ad.save();
         res.json({ message: 'Flight-event webhook updated.', data: flightEventsStatus(ad) });
@@ -2513,7 +2533,7 @@ app.patch('/api/va-ads/:id/flight-events', requireAuth, async (req, res) => {
 app.post('/api/va-ads/:id/flight-events/test', requireAuth, async (req, res) => {
     try {
         const ad = await VirtualAirlineAd.findById(req.params.id)
-            .select('+flightEventsWebhookUrl name callsign callsigns logoUrl');
+            .select('+flightEventsWebhookUrl name callsign callsigns logoUrl flightEventsCard');
         if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
         if (!ad.flightEventsWebhookUrl) {
             return res.status(400).json({ message: 'No webhook saved for this VA yet.' });
@@ -2686,8 +2706,17 @@ const isDuplicateVaEvent = (e) => {
 // The Discord embed card for a takeoff/landing lives in its own pure module so it
 // can be unit-tested in isolation and shared verbatim by every delivery path. The
 // DB-backed media lookups that feed it (aircraft photo, VA logo) stay here.
-const { buildVaEventPayload, extractRoute, isHttpUrl: isHttpImageUrl, clip: clipEmbed, trackUrl, accentFor } = require('./vaEventCard');
+const {
+    buildVaEventPayload, extractRoute, isHttpUrl: isHttpImageUrl, clip: clipEmbed,
+    trackUrl, resolveAccent, normalizeCardOptions, DEFAULT_CARD_OPTIONS,
+    PUBLIC_BASE_URL: CARD_PUBLIC_BASE_URL,
+} = require('./vaEventCard');
 const { renderVaEventCard, renderVaRouteMapImage } = require('./vaEventCardImage');
+
+// Pull a VA ad's saved card customization into a normalized options object. A
+// plain ad (or the central feed) yields the default look. Kept in one place so
+// every delivery path applies the VA's config identically.
+const resolveCardOpts = (ad) => normalizeCardOptions((ad && ad.flightEventsCard) || {});
 
 // Deliver one event to a Discord webhook as our composite image card plus (when
 // the route can be mapped) a separate route-map image in the same message: two
@@ -2698,19 +2727,31 @@ const { renderVaEventCard, renderVaRouteMapImage } = require('./vaEventCardImage
 // depends on the VA logo (that lives in the embed), so a caller posting the
 // same event to several webhooks can render once and pass the buffers in as
 // `prerendered` ({ card, map }).
-const postVaEventCard = async (webhookUrl, e, media, prerendered) => {
+const postVaEventCard = async (webhookUrl, e, media, prerendered, opts) => {
+    const o = normalizeCardOptions(opts || {});
+    // Compact layout: skip the image entirely and post the plain (customized)
+    // Discord embed. The brand mark still rides in that embed's footer.
+    if (o.layout === 'compact') {
+        return axios.post(webhookUrl, buildVaEventPayload(e, media, o));
+    }
+
     const pre = prerendered || {};
-    const png = pre.card !== undefined ? pre.card : await renderVaEventCard(e, media);
-    if (!png) return axios.post(webhookUrl, buildVaEventPayload(e, media));
-    const mapPng = pre.map !== undefined ? pre.map : await renderVaRouteMapImage(e);
+    const png = pre.card !== undefined ? pre.card : await renderVaEventCard(e, media, o);
+    if (!png) return axios.post(webhookUrl, buildVaEventPayload(e, media, o));
+    // Route map only when the VA hasn't turned it off.
+    const mapPng = !o.showMap ? null
+        : (pre.map !== undefined ? pre.map : await renderVaRouteMapImage(e, o));
 
     const isTakeoff = e.event === 'takeoff';
     const { dep, arr } = extractRoute(e);
     const routeTag = (dep || arr) ? `  ·  ${dep || '????'} → ${arr || '????'}` : '';
     const track = trackUrl();
+    const accentInt = resolveAccent(e, o).int;
     const vaName = e.va?.name || e.va?.code || 'Virtual Airline';
+    // The Inflight brand mark ALWAYS rides in the footer icon — not customizable.
+    const brandIcon = `${CARD_PUBLIC_BASE_URL}/assets/brand/inflight-logo.png`;
     const embed = {
-        color: accentFor(e).int,
+        color: accentInt,
         // The VA's own logo lives here, in the message (the card image carries our
         // brand). Author icon = small round logo next to the VA name.
         author: {
@@ -2718,26 +2759,29 @@ const postVaEventCard = async (webhookUrl, e, media, prerendered) => {
             ...(isHttpImageUrl(media && media.vaLogoUrl) ? { icon_url: media.vaLogoUrl } : {}),
         },
         // Clip title/description: an over-long callsign/VA name must not 400 the POST.
-        // The route rides in the title so it reads at a glance; the card image
-        // below repeats it big anyway.
-        title: clipEmbed(`${isTakeoff ? '🛫' : '🛬'} ${e.callsign || 'Flight'}${routeTag}`, 256),
+        // A VA custom title wins; otherwise the route rides in the title so it
+        // reads at a glance (the card image below repeats it big anyway).
+        title: clipEmbed(o.title || `${isTakeoff ? '🛫' : '🛬'} ${e.callsign || 'Flight'}${routeTag}`, 256),
         ...(isHttpImageUrl(track) ? { url: track } : {}),
         description: clipEmbed(
             `**${e.username || 'A pilot'}** ${isTakeoff ? 'departed' : 'landed'} on **${e.server || 'unknown'}**.`
             + (isHttpImageUrl(track) ? `\n[🔭 Track on Inflight](${track})` : ''),
             2048),
         image: { url: 'attachment://card.png' },
-        footer: { text: 'Powered by Inflight' },
+        footer: {
+            text: 'Powered by Inflight',
+            ...(isHttpImageUrl(brandIcon) ? { icon_url: brandIcon } : {}),
+        },
         timestamp: new Date(Number(e.timestamp) || Date.now()).toISOString(),
     };
     // The route map rides as a SECOND embed whose only content is the map
     // image — Discord stacks it full-width under the card. No map (unknown
-    // airports, render hiccup) just means a one-embed message, as before.
+    // airports, render hiccup, or VA turned it off) just means a one-embed message.
     const embeds = [embed];
     const attachments = [{ id: 0, filename: 'card.png' }];
     if (mapPng) {
         embeds.push({
-            color: accentFor(e).int,
+            color: accentInt,
             image: { url: 'attachment://map.png' },
         });
         attachments.push({ id: 1, filename: 'map.png' });
@@ -2787,7 +2831,9 @@ const sendVaTestEvent = async (ad) => {
     const sample = buildVaSampleEvent(ad);
     const media = await enrichEventMedia(sample);
     if (ad.logoUrl) media.vaLogoUrl = ad.logoUrl;
-    await postVaEventCard(ad.flightEventsWebhookUrl, sample, media);
+    // Post the sample with the VA's own card customization so the test preview
+    // matches exactly what their real flights will look like.
+    await postVaEventCard(ad.flightEventsWebhookUrl, sample, media, undefined, resolveCardOpts(ad));
 };
 
 // Find a real community photo of the flown aircraft (type + livery) to use as the
@@ -2886,7 +2932,7 @@ const resolveVaEventPartner = async (e) => {
                 { flightEventsEnabled: true },
                 { flightEventsWebhookUrl: { $ne: null } },
             ],
-        }).select('name callsigns logoUrl +flightEventsWebhookUrl').lean();
+        }).select('name callsigns logoUrl flightEventsCard +flightEventsWebhookUrl').lean();
     } catch (err) {
         console.error('[va-events] partner lookup failed:', err.message);
         return null;
@@ -2951,20 +2997,26 @@ const handleVaEvent = async (e) => {
         return;
     }
 
-    // One media lookup and one Sharp render shared by every target (the card
-    // and map PNGs don't vary per webhook; only the embed's VA logo does).
-    // The two renders are independent — run them in parallel.
+    // One media lookup shared by every target. The central feed ALWAYS uses the
+    // default card, so render that once (only when a central webhook exists) and
+    // share it. A partner VA may have customized its card, so it renders its own
+    // unless its config is the default look (then it reuses the central render).
     const media = await enrichEventMedia(e);
-    const [card, map] = await Promise.all([
-        renderVaEventCard(e, media),
-        renderVaRouteMapImage(e),
-    ]);
-    const prerendered = { card, map };
+    const partnerOpts = partnerAd ? resolveCardOpts(partnerAd) : null;
+
+    let centralPre;
+    if (centralWebhook) {
+        const [card, map] = await Promise.all([
+            renderVaEventCard(e, media),
+            renderVaRouteMapImage(e),
+        ]);
+        centralPre = { card, map };
+    }
 
     // Independent try/catches so one broken webhook can't suppress the other.
     if (centralWebhook) {
         try {
-            await postVaEventCard(centralWebhook, e, media, prerendered);
+            await postVaEventCard(centralWebhook, e, media, centralPre);
             console.log(`🔔 VA ${e.event}: ${e.callsign} (${e.username}) on ${e.server}`);
         } catch (err) {
             console.error('[va-events] central Discord post failed:', err.message);
@@ -2974,7 +3026,12 @@ const handleVaEvent = async (e) => {
         try {
             // The matched VA owns this card — prefer its own logo for the author icon.
             const partnerMedia = partnerAd.logoUrl ? { ...media, vaLogoUrl: partnerAd.logoUrl } : media;
-            await postVaEventCard(partnerAd.flightEventsWebhookUrl, e, partnerMedia, prerendered);
+            // Reuse the central render only when this VA hasn't customized the card
+            // (same default look) and we actually rendered it; otherwise let
+            // postVaEventCard render to the VA's own spec (or skip it for compact).
+            const isDefault = JSON.stringify(partnerOpts) === JSON.stringify(DEFAULT_CARD_OPTIONS);
+            const pre = (isDefault && centralPre) ? centralPre : undefined;
+            await postVaEventCard(partnerAd.flightEventsWebhookUrl, e, partnerMedia, pre, partnerOpts);
             console.log(`🔔 partner VA ${e.event} → ${partnerAd.name} (${e.callsign})`);
         } catch (err) {
             console.error(`[va-events] partner webhook post failed for ${partnerAd.name}:`, err.message);

@@ -261,6 +261,68 @@
                     <p id="pfFlightMsg" class="hidden text-sm font-medium break-words"></p>
                 </div>
             </div>
+
+            <!-- Card appearance customization (shown once a webhook is on file) -->
+            <div id="pfCardCustomize" class="hidden surface rounded-2xl p-5 sm:p-6 space-y-4 mt-4">
+                <div class="flex items-start gap-3">
+                    <div class="w-9 h-9 rounded-xl bg-zinc-100 dark:bg-zinc-800 grid place-items-center shrink-0"><i data-lucide="palette" class="w-4 h-4 text-zinc-500 dark:text-zinc-400"></i></div>
+                    <div class="min-w-0">
+                        <p class="text-sm font-semibold" data-i18n="fe.card.title">Card appearance</p>
+                        <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5" data-i18n="fe.card.sub">Make the flight card your own — colour, layout and which details it shows. The Inflight logo always stays on the card.</p>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.card.accent">Accent colour</label>
+                        <div class="flex items-center gap-2">
+                            <input id="pfCardAccentPicker" type="color" value="#2ecc71" class="w-9 h-9 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-transparent p-0.5 shrink-0 pf-edit">
+                            <input id="pfCardAccent" type="text" placeholder="#2ecc71" maxlength="7" class="field pf-edit">
+                            <button type="button" id="pfCardAccentClear" class="text-xs font-medium text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200 shrink-0 pf-edit" data-i18n="fe.card.default">Default</button>
+                        </div>
+                        <p class="text-[11px] text-zinc-400 mt-1" data-i18n="fe.card.accentHelp">Leave on Default to keep green takeoffs / gold landings.</p>
+                    </div>
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.card.layout">Layout</label>
+                        <select id="pfCardLayout" class="field pf-edit">
+                            <option value="card" data-i18n="fe.card.layoutCard">Full image card</option>
+                            <option value="compact" data-i18n="fe.card.layoutCompact">Compact (text only)</option>
+                        </select>
+                        <p class="text-[11px] text-zinc-400 mt-1" data-i18n="fe.card.layoutHelp">Compact skips the rendered image for a lighter post.</p>
+                    </div>
+                </div>
+
+                <div>
+                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.card.customTitle">Custom title <span class="font-normal text-zinc-400" data-i18n="fe.card.optional">· optional</span></label>
+                    <input id="pfCardTitle" type="text" maxlength="240" placeholder="e.g. ✈️ Ocean Virtual flight" data-i18n-ph="fe.card.titlePh" class="field pf-edit">
+                </div>
+
+                <div class="flex items-center gap-5 flex-wrap">
+                    <label class="flex items-center gap-2 text-sm font-medium select-none"><input id="pfCardShowPhoto" type="checkbox" class="w-4 h-4 rounded pf-edit"> <span data-i18n="fe.card.showPhoto">Aircraft photo</span></label>
+                    <label class="flex items-center gap-2 text-sm font-medium select-none"><input id="pfCardShowMap" type="checkbox" class="w-4 h-4 rounded pf-edit"> <span data-i18n="fe.card.showMap">Route map</span></label>
+                </div>
+
+                <div>
+                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.card.fields">Details to show</label>
+                    <div id="pfCardFields" class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                        <label class="flex items-center gap-2 text-sm select-none"><input type="checkbox" class="fe-field w-4 h-4 rounded pf-edit" value="pilot"> <span data-i18n="fe.card.f.pilot">Pilot</span></label>
+                        <label class="flex items-center gap-2 text-sm select-none"><input type="checkbox" class="fe-field w-4 h-4 rounded pf-edit" value="callsign"> <span data-i18n="fe.card.f.callsign">Callsign</span></label>
+                        <label class="flex items-center gap-2 text-sm select-none"><input type="checkbox" class="fe-field w-4 h-4 rounded pf-edit" value="aircraft"> <span data-i18n="fe.card.f.aircraft">Aircraft</span></label>
+                        <label class="flex items-center gap-2 text-sm select-none"><input type="checkbox" class="fe-field w-4 h-4 rounded pf-edit" value="server"> <span data-i18n="fe.card.f.server">Server</span></label>
+                        <label class="flex items-center gap-2 text-sm select-none"><input type="checkbox" class="fe-field w-4 h-4 rounded pf-edit" value="altspeed"> <span data-i18n="fe.card.f.altspeed">Alt · Speed</span></label>
+                        <label class="flex items-center gap-2 text-sm select-none"><input type="checkbox" class="fe-field w-4 h-4 rounded pf-edit" value="distance"> <span data-i18n="fe.card.f.distance">Distance</span></label>
+                        <label class="flex items-center gap-2 text-sm select-none"><input type="checkbox" class="fe-field w-4 h-4 rounded pf-edit" value="ete"> <span data-i18n="fe.card.f.ete">ETE</span></label>
+                        <label class="flex items-center gap-2 text-sm select-none"><input type="checkbox" class="fe-field w-4 h-4 rounded pf-edit" value="position"> <span data-i18n="fe.card.f.position">Position</span></label>
+                    </div>
+                    <p class="text-[11px] text-zinc-400 mt-1.5" data-i18n="fe.card.fieldsHelp">Route (departure → arrival) is always shown. ETE only appears on departures.</p>
+                </div>
+
+                <div class="flex items-center gap-3 flex-wrap">
+                    <button type="button" id="pfCardSaveBtn" class="btn pf-edit" data-i18n="fe.card.save">Save appearance</button>
+                    <p id="pfCardMsg" class="hidden text-sm font-medium break-words"></p>
+                </div>
+            </div>
+
             <p id="flightReadonly" class="hidden text-xs text-zinc-400 mt-3 flex items-center gap-1.5"><i data-lucide="lock" class="w-3.5 h-3.5"></i> <span data-i18n="fe.readonly">Only the VA owner can manage flight notifications.</span></p>
         </section>
 
@@ -743,6 +805,10 @@
                 fToggle.classList.add('hidden'); fToggle.classList.remove('flex');
                 $('pfFlightWebhook').placeholder = 'https://discord.com/api/webhooks/…';
             }
+            // Card appearance customization — shown once a webhook is on file
+            // (requested or approved) so owners can style it while they wait.
+            fillCardForm(va, editable);
+
             // Image previews
             if (va.logoUrl) $('pfLogoPreview').innerHTML = `<img src="${esc(va.logoUrl)}" class="w-full h-full object-cover">`;
             if (va.bannerUrl) { $('pfBannerPreview').style.backgroundImage = `url('${va.bannerUrl}')`; $('pfBannerPreview').innerHTML = ''; }
@@ -845,6 +911,56 @@
                 flash('pfFlightMsg', message || t('fe.testSent'), true);
             } catch (err) { flash('pfFlightMsg', err.message, false); }
             finally { $('pfFlightTestBtn').disabled = false; }
+        });
+
+        // ---------- Flight-event card appearance ----------
+        // Populate the customization panel from the VA's saved card config and
+        // reveal it once a webhook is on file. Defaults keep the standard look.
+        function fillCardForm(va, editable) {
+            const wrap = $('pfCardCustomize');
+            const show = editable && (va.flightEventsConfigured || va.flightEventsRequested || va.flightEventsApproved);
+            wrap.classList.toggle('hidden', !show);
+            if (!show) return;
+            const c = va.flightEventsCard || {};
+            const accent = (c.accent || '').trim();
+            $('pfCardAccent').value = accent;
+            $('pfCardAccentPicker').value = /^#[0-9a-fA-F]{6}$/.test(accent) ? accent : '#2ecc71';
+            $('pfCardLayout').value = c.layout === 'compact' ? 'compact' : 'card';
+            $('pfCardShowPhoto').checked = c.showPhoto !== false;
+            $('pfCardShowMap').checked = c.showMap !== false;
+            $('pfCardTitle').value = c.title || '';
+            const chosen = Array.isArray(c.fields) && c.fields.length
+                ? c.fields : ['pilot', 'callsign', 'aircraft', 'server', 'altspeed', 'distance', 'ete'];
+            document.querySelectorAll('.fe-field').forEach(el => { el.checked = chosen.includes(el.value); });
+        }
+        // Keep the colour swatch and the hex text field in sync both ways.
+        $('pfCardAccentPicker').addEventListener('input', (e) => { $('pfCardAccent').value = e.target.value; });
+        $('pfCardAccent').addEventListener('input', (e) => {
+            const v = e.target.value.trim();
+            if (/^#[0-9a-fA-F]{6}$/.test(v)) $('pfCardAccentPicker').value = v;
+        });
+        $('pfCardAccentClear').addEventListener('click', () => {
+            $('pfCardAccent').value = ''; $('pfCardAccentPicker').value = '#2ecc71';
+        });
+        $('pfCardSaveBtn').addEventListener('click', async () => {
+            const card = {
+                accent: $('pfCardAccent').value.trim(),
+                layout: $('pfCardLayout').value,
+                showPhoto: $('pfCardShowPhoto').checked,
+                showMap: $('pfCardShowMap').checked,
+                title: $('pfCardTitle').value.trim(),
+                fields: [...document.querySelectorAll('.fe-field')].filter(el => el.checked).map(el => el.value),
+            };
+            $('pfCardSaveBtn').disabled = true;
+            try {
+                const { va } = await api('/flight-events/customize', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ card }),
+                });
+                vaProfile = va; fillCardForm(va, true);
+                flash('pfCardMsg', t('fe.card.saved'), true);
+            } catch (err) { flash('pfCardMsg', err.message, false); }
+            finally { $('pfCardSaveBtn').disabled = false; }
         });
 
         // ---------- Embed requests (owner only; embeds are staff-provisioned) ----------
