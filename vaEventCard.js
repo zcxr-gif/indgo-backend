@@ -54,6 +54,11 @@ const DEFAULT_CARD_FIELDS = ['pilot', 'callsign', 'aircraft', 'server', 'altspee
 // 'compact' = the plain Discord embed only (no image upload), for VAs who want
 // a lighter post.
 const CARD_LAYOUTS = ['card', 'compact'];
+// Which side of the card the aircraft photo sits on.
+const PHOTO_SIDES = ['right', 'left'];
+// Route-map basemap looks. The concrete colour palettes live in the image
+// renderer; here we only validate the chosen key.
+const MAP_STYLES = ['dark', 'midnight', 'light', 'mono'];
 
 // A validated "#rrggbb" hex or '' (meaning: use the event's default colour).
 // Accepts "#rgb"/"#rrggbb" with or without the leading '#'.
@@ -61,6 +66,21 @@ const normalizeHex = (raw) => {
     let v = String(raw == null ? '' : raw).trim().replace(/^#/, '');
     if (/^[0-9a-fA-F]{3}$/.test(v)) v = v.split('').map(c => c + c).join('');
     return /^[0-9a-fA-F]{6}$/.test(v) ? '#' + v.toLowerCase() : '';
+};
+
+// Like normalizeHex but also accepts a small set of colour names (so a VA can
+// ask for e.g. a plain white route line). '' means "fall back to the accent".
+const NAMED_COLORS = {
+    white: '#ffffff', black: '#000000', red: '#ff4d4f', orange: '#ff9800',
+    amber: '#ffc107', yellow: '#ffd400', lime: '#84cc16', green: '#2ecc71',
+    teal: '#14b8a6', cyan: '#22d3ee', sky: '#38bdf8', blue: '#3b82f6',
+    indigo: '#6366f1', violet: '#8b5cf6', purple: '#a855f7', pink: '#ec4899',
+    gray: '#9ca3af', grey: '#9ca3af', silver: '#cbd5e1',
+};
+const normalizeColor = (raw) => {
+    const v = String(raw == null ? '' : raw).trim().toLowerCase();
+    if (!v) return '';
+    return NAMED_COLORS[v] || normalizeHex(v);
 };
 
 // Coerce arbitrary stored/posted input into a safe card-options object. Unknown
@@ -78,6 +98,9 @@ const normalizeCardOptions = (raw = {}) => {
         layout: CARD_LAYOUTS.includes(o.layout) ? o.layout : 'card',
         showMap: o.showMap === undefined ? true : !!o.showMap,
         showPhoto: o.showPhoto === undefined ? true : !!o.showPhoto,
+        photoSide: PHOTO_SIDES.includes(o.photoSide) ? o.photoSide : 'right',
+        mapStyle: MAP_STYLES.includes(o.mapStyle) ? o.mapStyle : 'dark',
+        mapLine: normalizeColor(o.mapLine),
         title: String(o.title == null ? '' : o.title).trim().slice(0, 240),
         fields: fields.length ? fields : DEFAULT_CARD_FIELDS.slice(),
     };
@@ -94,6 +117,13 @@ const resolveAccent = (e, opts) => {
     const hex = opts && normalizeHex(opts.accent);
     if (hex) return { hex, int: parseInt(hex.slice(1), 16) };
     return accentFor(e);
+};
+
+// The colour of the route line + endpoint markers on the map: an explicit
+// mapLine override when set, otherwise the resolved accent. Returns a hex string.
+const resolveMapLine = (e, opts) => {
+    const hex = opts && normalizeColor(opts.mapLine);
+    return hex || resolveAccent(e, opts).hex;
 };
 
 // Only well-formed http(s) URLs may be handed to Discord's image proxy; anything
@@ -314,6 +344,7 @@ module.exports = {
     // Derived route figures (shared with the image renderer).
     routeDistanceNm, eteMinutes, formatDuration, eteTextFor,
     // Card customization vocabulary + helpers (shared with the API/UI/renderer).
-    CARD_FIELD_KEYS, DEFAULT_CARD_FIELDS, CARD_LAYOUTS, DEFAULT_CARD_OPTIONS,
-    normalizeCardOptions, resolveAccent, normalizeHex,
+    CARD_FIELD_KEYS, DEFAULT_CARD_FIELDS, CARD_LAYOUTS, PHOTO_SIDES, MAP_STYLES,
+    DEFAULT_CARD_OPTIONS, normalizeCardOptions, resolveAccent, resolveMapLine,
+    normalizeHex, normalizeColor,
 };

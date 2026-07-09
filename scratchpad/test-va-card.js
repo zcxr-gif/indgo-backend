@@ -113,6 +113,15 @@ check(JSON.stringify(normalizeCardOptions({}).fields) === JSON.stringify(DEFAULT
 check(normalizeCardOptions({ accent: 'nope' }).accent === '', 'invalid accent → empty (default colour)');
 check(normalizeCardOptions({ fields: ['bogus', 'pilot', 'pilot'] }).fields.join() === 'pilot', 'fields deduped & filtered');
 check(normalizeCardOptions({ layout: 'weird' }).layout === 'card', 'unknown layout → card');
+check(normalizeCardOptions({}).photoSide === 'right', 'default photoSide = right');
+check(normalizeCardOptions({ photoSide: 'left' }).photoSide === 'left', 'photoSide left honoured');
+check(normalizeCardOptions({ photoSide: 'up' }).photoSide === 'right', 'invalid photoSide → right');
+check(normalizeCardOptions({}).mapStyle === 'dark', 'default mapStyle = dark');
+check(normalizeCardOptions({ mapStyle: 'midnight' }).mapStyle === 'midnight', 'mapStyle midnight honoured');
+check(normalizeCardOptions({ mapStyle: 'neon' }).mapStyle === 'dark', 'unknown mapStyle → dark');
+check(normalizeCardOptions({ mapLine: 'white' }).mapLine === '#ffffff', 'mapLine name → hex');
+check(normalizeCardOptions({ mapLine: '#abc' }).mapLine === '#aabbcc', 'mapLine short hex expands');
+check(normalizeCardOptions({ mapLine: 'not-a-colour' }).mapLine === '', 'invalid mapLine → empty (uses accent)');
 
 // 9. Derived route figures.
 check(routeDistanceNm('EGLL', 'KJFK') > 2500, 'EGLL→KJFK distance resolves (>2500 NM)');

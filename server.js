@@ -840,7 +840,7 @@ registerAuthRoutes(app);
 // sendVaTestEvent is defined further down (with the card renderer); wrap it in a
 // lambda so this call site doesn't touch it before it's initialised — the wrapper
 // only resolves it at request time, when the "send test" button is clicked.
-registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent: (ad) => sendVaTestEvent(ad) });
+registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent: (ad) => sendVaTestEvent(ad), renderCardPreview: (ad, opts) => renderCardPreview(ad, opts) });
 
 // Health Check — public, unauthenticated (for uptime/platform monitors).
 // NOTE: the site is staff-only, so the homepage ("/") is gated below; point any
@@ -2554,6 +2554,22 @@ app.post('/api/va-ads/:id/flight-events/test', requireAuth, async (req, res) => 
     }
 });
 
+// POST: Render a live preview of the card for arbitrary (unsaved) options. STAFF.
+// Renders only — nothing is posted to Discord — so the manager can show staff how
+// the current settings will look before they save.
+app.post('/api/va-ads/:id/flight-events/preview', requireAuth, async (req, res) => {
+    try {
+        const ad = await VirtualAirlineAd.findById(req.params.id)
+            .select('name callsign callsigns logoUrl').lean();
+        if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+        const preview = await renderCardPreview(ad, (req.body && req.body.card) || {});
+        res.json(preview);
+    } catch (error) {
+        console.error('VA Ad flight-events preview error:', error.message);
+        res.status(500).json({ message: 'Could not render a preview.' });
+    }
+});
+
 // POST: Track a click-through (e.g. on the join/apply link). Returns the target
 // URL so the frontend can redirect after recording the click.
 app.post('/api/va-ads/:id/click', async (req, res) => {
@@ -2834,6 +2850,30 @@ const sendVaTestEvent = async (ad) => {
     // Post the sample with the VA's own card customization so the test preview
     // matches exactly what their real flights will look like.
     await postVaEventCard(ad.flightEventsWebhookUrl, sample, media, undefined, resolveCardOpts(ad));
+};
+
+// Render a live preview of the card + route map for the given (unsaved) options,
+// WITHOUT posting anything to Discord — powers the "see how it looks" preview in
+// the VA portal and the staff webhook manager. Returns data-URI PNGs (or a
+// compact flag when the layout is text-only). Reuses the exact renderers the
+// live delivery uses, so the preview is faithful. Best-effort: a render miss
+// just yields nulls rather than throwing.
+const renderCardPreview = async (ad, rawOpts) => {
+    const opts = normalizeCardOptions(rawOpts || {});
+    const sample = buildVaSampleEvent(ad || {});
+    const media = await enrichEventMedia(sample);
+    if (ad && ad.logoUrl) media.vaLogoUrl = ad.logoUrl;
+    if (opts.layout === 'compact') {
+        // No image in compact mode; hand back the embed so the UI can show a
+        // faithful text preview of what will be posted.
+        return { layout: 'compact', embed: buildVaEventPayload(sample, media, opts).embeds[0] };
+    }
+    const [card, map] = await Promise.all([
+        renderVaEventCard(sample, media, opts),
+        opts.showMap ? renderVaRouteMapImage(sample, opts) : null,
+    ]);
+    const dataUri = (buf) => buf ? 'data:image/png;base64,' + buf.toString('base64') : null;
+    return { layout: 'card', card: dataUri(card), map: dataUri(map) };
 };
 
 // Find a real community photo of the flown aircraft (type + livery) to use as the
@@ -3422,6 +3462,7 @@ const STAFF_ONLY_PATHS = new Set([
     '/VA-ADMIN-MANUAL.md',
     '/embeds', '/embeds.html',
     '/EMBEDBACKEND.md',
+    '/webhooks', '/webhooks.html',
     '/graphic-designer', '/graphic-designer.html',
     '/va-submissions', '/va-submissions.html',
 ]);
@@ -3465,6 +3506,13 @@ app.get('/va-ads', (req, res) => {
 // Accessible via yoursite.com/embeds (staff-only — see guard above)
 app.get('/embeds', (req, res) => {
     res.sendFile(path.join(__dirname, 'embeds.html'));
+});
+
+// Specific route for the Webhooks Manager (per-VA flight-event webhook + card
+// appearance). Standalone so staff never have to open an embed to manage a
+// webhook. Accessible via yoursite.com/webhooks (staff-only — see guard above)
+app.get('/webhooks', (req, res) => {
+    res.sendFile(path.join(__dirname, 'webhooks.html'));
 });
 
 // Specific route for the VA Admin Manual (staff reference, rendered from Markdown)

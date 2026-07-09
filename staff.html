@@ -285,6 +285,12 @@
                         <p class="text-sm text-zinc-500 dark:text-zinc-400 mt-1 flex-1">Mint, configure, revoke and copy embed widget tokens for VAs.</p>
                         <span class="mt-5 inline-flex items-center gap-1.5 text-sm font-medium text-zinc-700 dark:text-zinc-300">Open <i data-lucide="arrow-right" class="w-4 h-4 transition-transform group-hover:translate-x-1"></i></span>
                     </a>
+                    <a href="/webhooks" data-roles="admin,staff" class="surface lift rounded-2xl p-6 flex flex-col group">
+                        <div class="w-12 h-12 rounded-2xl bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200 grid place-items-center mb-5"><i data-lucide="webhook" class="w-[22px] h-[22px]"></i></div>
+                        <h3 class="font-semibold text-lg tracking-tight">Webhooks Manager</h3>
+                        <p class="text-sm text-zinc-500 dark:text-zinc-400 mt-1 flex-1">Set, approve, test and style each VA's takeoff/landing webhook — no embed needed.</p>
+                        <span class="mt-5 inline-flex items-center gap-1.5 text-sm font-medium text-zinc-700 dark:text-zinc-300">Open <i data-lucide="arrow-right" class="w-4 h-4 transition-transform group-hover:translate-x-1"></i></span>
+                    </a>
                     <a href="/graphic-designer" data-roles="admin,staff,graphic_designer" class="surface lift rounded-2xl p-6 flex flex-col group">
                         <div class="w-12 h-12 rounded-2xl bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200 grid place-items-center mb-5"><i data-lucide="palette" class="w-[22px] h-[22px]"></i></div>
                         <h3 class="font-semibold text-lg tracking-tight">Graphic Designer</h3>
@@ -608,6 +614,8 @@
                             ' · requested ' + relTime(w.requestedAt) +
                         '</div>' +
                     '</div>' +
+                    '<a href="/webhooks?va=' + encodeURIComponent(w.id) + '" class="shrink-0 text-xs font-semibold px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 active:scale-95 transition inline-flex items-center gap-1.5">' +
+                        '<i data-lucide="sliders-horizontal" class="w-3.5 h-3.5"></i>Manage</a>' +
                     '<button onclick="approveWebhook(\'' + w.id + '\', this)" class="shrink-0 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-3 py-1.5 rounded-lg active:scale-95 transition inline-flex items-center gap-1.5">' +
                         '<i data-lucide="check" class="w-3.5 h-3.5"></i>Approve</button>' +
                 '</div>'

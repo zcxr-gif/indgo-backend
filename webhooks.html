@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Webhooks Manager</title>
+    <script>
+        // Staff session guard: if any API call comes back 401 (session expired),
+        // bounce to the portal login, preserving where we were.
+        (function () {
+            const _fetch = window.fetch;
+            window.fetch = async function (...args) {
+                const res = await _fetch.apply(this, args);
+                if (res.status === 401) {
+                    location.href = '/staff?next=' + encodeURIComponent(location.pathname + location.search);
+                }
+                return res;
+            };
+        })();
+    </script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet">
+    <script>
+        tailwind.config = { darkMode: 'class', theme: { extend: { colors: { slate: { 950: '#020617' } } } } }
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    </style>
+</head>
+<body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 transition-colors duration-300 min-h-screen">
+
+    <!-- Navigation -->
+    <nav class="sticky top-0 z-40 bg-white/80 dark:bg-zinc-900/80 backdrop-blur-md border-b border-zinc-200 dark:border-zinc-800">
+        <div class="max-w-4xl mx-auto px-4 h-16 flex items-center justify-between">
+            <div class="flex items-center gap-2.5">
+                <a href="/staff" title="Back to hub" class="w-9 h-9 grid place-items-center rounded-xl hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition-colors">
+                    <i class="fa-solid fa-arrow-left"></i>
+                </a>
+                <div class="w-10 h-10 bg-amber-500 text-white rounded-xl flex items-center justify-center">
+                    <i class="fa-solid fa-bolt text-lg"></i>
+                </div>
+                <h1 class="text-xl font-bold tracking-tight hidden sm:block">Webhooks Manager</h1>
+            </div>
+            <button onclick="toggleDarkMode()" class="p-2 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-full transition-colors">
+                <i id="themeIcon" class="fa-solid fa-moon text-zinc-600 dark:text-yellow-400 text-lg"></i>
+            </button>
+        </div>
+    </nav>
+
+    <main class="max-w-4xl mx-auto px-4 py-8 space-y-6">
+        <div>
+            <h2 class="text-lg font-bold tracking-tight">Flight-event webhooks</h2>
+            <p class="text-sm text-zinc-500 dark:text-zinc-400 mt-1">Pick a VA to manage its takeoff/landing Discord webhook and card appearance — no embed needed. One webhook per VA.</p>
+        </div>
+
+        <!-- VA picker -->
+        <div class="rounded-2xl border-2 border-zinc-200 dark:border-zinc-800 p-4 space-y-3">
+            <label class="block text-sm font-semibold">Virtual Airline</label>
+            <input id="vaFilter" type="text" placeholder="Filter by name or callsign…" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none text-sm">
+            <select id="vaPicker" size="1" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none text-sm">
+                <option value="">Loading VAs…</option>
+            </select>
+        </div>
+
+        <!-- Empty state -->
+        <div id="emptyState" class="rounded-2xl border-2 border-dashed border-zinc-200 dark:border-zinc-800 p-10 text-center text-sm text-zinc-400">
+            <i class="fa-solid fa-bolt text-2xl text-zinc-300 dark:text-zinc-600 mb-2"></i>
+            <p>Select a VA above to manage its flight-event webhook.</p>
+        </div>
+
+        <!-- Webhook panel -->
+        <div id="webhookPanel" class="hidden rounded-2xl border-2 border-zinc-200 dark:border-zinc-800 p-4 space-y-3">
+            <div class="flex items-center justify-between gap-2">
+                <label class="text-base font-semibold flex items-center gap-2"><i class="fa-solid fa-bolt text-amber-500"></i> <span id="wh_vaTitle">Flight-event webhook</span></label>
+                <span id="wh_status" class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-500">—</span>
+            </div>
+            <p class="text-xs text-zinc-400">Takeoffs &amp; landings matched to this VA are posted to its own Discord channel.</p>
+            <input id="wh_url" placeholder="https://discord.com/api/webhooks/… (paste to set on the VA's behalf)" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none mono text-sm">
+            <p id="wh_hint" class="hidden text-xs text-zinc-400 mono"></p>
+            <div class="flex items-center gap-2 flex-wrap">
+                <button type="button" onclick="saveWebhookUrl()" class="bg-zinc-900 hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 text-white text-xs font-semibold px-3 py-2 rounded-lg active:scale-95 transition">Save webhook</button>
+                <button type="button" id="wh_approveBtn" onclick="toggleWebhookApproved()" class="text-xs font-semibold px-3 py-2 rounded-lg active:scale-95 transition"></button>
+                <button type="button" id="wh_testBtn" onclick="sendWebhookTest()" class="text-xs font-semibold px-3 py-2 rounded-lg active:scale-95 transition border-2 border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800">Send test</button>
+                <label class="flex items-center gap-2 text-xs font-semibold text-zinc-600 dark:text-zinc-300 ml-auto cursor-pointer">
+                    <input type="checkbox" id="wh_enabled" onchange="toggleWebhookEnabled()" class="w-4 h-4 rounded accent-emerald-500"> Enabled
+                </label>
+            </div>
+
+            <!-- Card appearance -->
+            <div class="mt-2 pt-3 border-t-2 border-zinc-100 dark:border-zinc-800 space-y-3">
+                <div class="flex items-center justify-between gap-2">
+                    <label class="text-sm font-semibold flex items-center gap-2"><i class="fa-solid fa-palette text-zinc-400"></i> Card appearance</label>
+                    <span class="text-[11px] text-zinc-400">Inflight logo always shown</span>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-xs font-semibold mb-1.5 text-zinc-500">Accent colour</label>
+                        <div class="flex items-center gap-2">
+                            <input id="wh_card_accentPicker" type="color" value="#2ecc71" class="w-9 h-9 rounded-lg border-2 border-zinc-200 dark:border-zinc-700 bg-transparent p-0.5 shrink-0">
+                            <input id="wh_card_accent" type="text" maxlength="7" placeholder="#2ecc71 (blank = default)" class="w-full px-3 py-2 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none mono text-sm">
+                            <button type="button" id="wh_card_accentClear" class="text-xs font-medium text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200 shrink-0">Default</button>
+                        </div>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold mb-1.5 text-zinc-500">Layout</label>
+                        <select id="wh_card_layout" class="w-full px-3 py-2 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none text-sm">
+                            <option value="card">Full image card</option>
+                            <option value="compact">Compact (text only)</option>
+                        </select>
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-xs font-semibold mb-1.5 text-zinc-500">Custom title <span class="font-normal text-zinc-400">· optional</span></label>
+                    <input id="wh_card_title" type="text" maxlength="240" placeholder="Leave blank for the default title" class="w-full px-3 py-2 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none text-sm">
+                </div>
+                <div class="flex items-center gap-5 flex-wrap">
+                    <label class="flex items-center gap-2 text-sm font-medium select-none cursor-pointer"><input id="wh_card_showPhoto" type="checkbox" class="w-4 h-4 rounded accent-emerald-500"> Aircraft photo</label>
+                    <label class="flex items-center gap-2 text-sm font-medium select-none cursor-pointer"><input id="wh_card_showMap" type="checkbox" class="w-4 h-4 rounded accent-emerald-500"> Route map</label>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div>
+                        <label class="block text-xs font-semibold mb-1.5 text-zinc-500">Aircraft photo side</label>
+                        <select id="wh_card_photoSide" class="w-full px-3 py-2 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none text-sm">
+                            <option value="right">Right</option>
+                            <option value="left">Left</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold mb-1.5 text-zinc-500">Map style</label>
+                        <select id="wh_card_mapStyle" class="w-full px-3 py-2 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none text-sm">
+                            <option value="dark">Dark</option>
+                            <option value="midnight">Midnight blue</option>
+                            <option value="light">Light</option>
+                            <option value="mono">Mono</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold mb-1.5 text-zinc-500">Route line colour</label>
+                        <div class="flex items-center gap-2">
+                            <input id="wh_card_mapLinePicker" type="color" value="#2ecc71" class="w-9 h-9 rounded-lg border-2 border-zinc-200 dark:border-zinc-700 bg-transparent p-0.5 shrink-0">
+                            <input id="wh_card_mapLine" type="text" maxlength="9" placeholder="e.g. white" class="w-full px-3 py-2 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none mono text-sm">
+                            <button type="button" id="wh_card_mapLineClear" class="text-xs font-medium text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200 shrink-0">Default</button>
+                        </div>
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-xs font-semibold mb-1.5 text-zinc-500">Details to show</label>
+                    <div id="wh_card_fields" class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                        <label class="flex items-center gap-2 text-sm select-none cursor-pointer"><input type="checkbox" class="wh-field w-4 h-4 rounded accent-emerald-500" value="pilot"> Pilot</label>
+                        <label class="flex items-center gap-2 text-sm select-none cursor-pointer"><input type="checkbox" class="wh-field w-4 h-4 rounded accent-emerald-500" value="callsign"> Callsign</label>
+                        <label class="flex items-center gap-2 text-sm select-none cursor-pointer"><input type="checkbox" class="wh-field w-4 h-4 rounded accent-emerald-500" value="aircraft"> Aircraft</label>
+                        <label class="flex items-center gap-2 text-sm select-none cursor-pointer"><input type="checkbox" class="wh-field w-4 h-4 rounded accent-emerald-500" value="server"> Server</label>
+                        <label class="flex items-center gap-2 text-sm select-none cursor-pointer"><input type="checkbox" class="wh-field w-4 h-4 rounded accent-emerald-500" value="altspeed"> Alt · Speed</label>
+                        <label class="flex items-center gap-2 text-sm select-none cursor-pointer"><input type="checkbox" class="wh-field w-4 h-4 rounded accent-emerald-500" value="distance"> Distance</label>
+                        <label class="flex items-center gap-2 text-sm select-none cursor-pointer"><input type="checkbox" class="wh-field w-4 h-4 rounded accent-emerald-500" value="ete"> ETE</label>
+                        <label class="flex items-center gap-2 text-sm select-none cursor-pointer"><input type="checkbox" class="wh-field w-4 h-4 rounded accent-emerald-500" value="position"> Position</label>
+                    </div>
+                    <p class="text-xs text-zinc-400 mt-1.5">Route (departure → arrival) is always shown. ETE only appears on departures.</p>
+                </div>
+                <!-- Live preview — rendered from the current settings; nothing is posted. -->
+                <div class="rounded-xl border-2 border-zinc-100 dark:border-zinc-800 p-3 bg-zinc-50/60 dark:bg-zinc-900/40">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-xs font-semibold text-zinc-500">Live preview</span>
+                        <span id="wh_card_previewSpin" class="hidden text-[11px] text-zinc-400">Rendering…</span>
+                    </div>
+                    <img id="wh_card_previewImg" alt="Card preview" class="w-full rounded-lg hidden">
+                    <img id="wh_card_previewMap" alt="Route map preview" class="w-full rounded-lg mt-2 hidden">
+                    <p id="wh_card_previewNote" class="hidden text-xs text-zinc-500 py-6 text-center"></p>
+                </div>
+                <div>
+                    <button type="button" id="wh_cardSaveBtn" onclick="saveWebhookCard()" class="bg-zinc-900 hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 text-white text-xs font-semibold px-3 py-2 rounded-lg active:scale-95 transition">Save appearance</button>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Toast -->
+    <div id="toast" class="hidden fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 px-4 py-2.5 rounded-xl shadow-lg font-medium text-sm"></div>
+
+    <script>
+        let webhookAd = null;   // the currently-loaded VA's flight-event status
+        let VAS = [];           // directory listing for the picker
+
+        // ---- theme ----
+        function toggleDarkMode() {
+            document.documentElement.classList.toggle('dark');
+            const dark = document.documentElement.classList.contains('dark');
+            localStorage.setItem('embedTheme', dark ? 'dark' : 'light');
+            document.getElementById('themeIcon').className = dark ? 'fa-solid fa-sun text-yellow-400 text-lg' : 'fa-solid fa-moon text-zinc-600 text-lg';
+        }
+        (function () {
+            const saved = localStorage.getItem('embedTheme');
+            const dark = saved ? saved === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
+            if (dark) document.documentElement.classList.add('dark');
+            document.getElementById('themeIcon').className = dark ? 'fa-solid fa-sun text-yellow-400 text-lg' : 'fa-solid fa-moon text-zinc-600 text-lg';
+        })();
+
+        function toast(msg) {
+            const t = document.getElementById('toast');
+            t.textContent = msg;
+            t.classList.remove('hidden');
+            clearTimeout(t._timer);
+            t._timer = setTimeout(() => t.classList.add('hidden'), 2200);
+        }
+        const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+
+        // ---- VA picker ----
+        async function loadVaList() {
+            try {
+                const res = await fetch('/api/va-ads?status=all&limit=100&sort=name');
+                const json = await res.json().catch(() => ({}));
+                const list = Array.isArray(json) ? json : (json.data || json.ads || []);
+                VAS = list.map(a => ({
+                    id: a._id,
+                    name: a.name || a.callsign || 'Unnamed VA',
+                    code: a.callsign || (Array.isArray(a.callsigns) ? a.callsigns[0] : '') || '',
+                })).sort((x, y) => x.name.localeCompare(y.name));
+                renderVaOptions('');
+                // Deep link: /webhooks?va=<id> preselects and loads that VA, so the
+                // staff inbox / embed manager can jump straight here.
+                const wanted = new URLSearchParams(location.search).get('va');
+                if (wanted && VAS.some(v => v.id === wanted)) {
+                    document.getElementById('vaPicker').value = wanted;
+                    loadVa(wanted);
+                }
+            } catch {
+                document.getElementById('vaPicker').innerHTML = '<option value="">Could not load VAs</option>';
+            }
+        }
+        function renderVaOptions(filter) {
+            const sel = document.getElementById('vaPicker');
+            const f = filter.trim().toLowerCase();
+            const items = f ? VAS.filter(v => (v.name + ' ' + v.code).toLowerCase().includes(f)) : VAS;
+            const current = sel.value;
+            sel.innerHTML = '<option value="">— Select a VA —</option>' +
+                items.map(v => `<option value="${esc(v.id)}">${esc(v.name)}${v.code ? ' · ' + esc(v.code) : ''}</option>`).join('');
+            if (items.some(v => v.id === current)) sel.value = current;
+        }
+        document.getElementById('vaFilter').addEventListener('input', (e) => renderVaOptions(e.target.value));
+        document.getElementById('vaPicker').addEventListener('change', (e) => loadVa(e.target.value));
+
+        async function loadVa(id) {
+            const panel = document.getElementById('webhookPanel');
+            const empty = document.getElementById('emptyState');
+            if (!id) { panel.classList.add('hidden'); empty.classList.remove('hidden'); webhookAd = null; return; }
+            try {
+                const res = await fetch(`/api/va-ads/${id}/flight-events`);
+                const json = await res.json().catch(() => ({}));
+                if (!res.ok || !json.data || !json.data.id) { toast('Could not load this VA\'s webhook.'); return; }
+                webhookAd = Object.assign({}, json.data);
+                document.getElementById('wh_url').value = '';
+                empty.classList.add('hidden');
+                panel.classList.remove('hidden');
+                renderWebhookPanel();
+            } catch { toast('Could not load this VA\'s webhook.'); }
+        }
+
+        // ---- webhook panel (shared behaviour with the embed manager) ----
+        function renderWebhookPanel() {
+            if (!webhookAd) return;
+            const s = webhookAd;
+            document.getElementById('wh_vaTitle').textContent = s.name || 'Flight-event webhook';
+            const pill = document.getElementById('wh_status');
+            const approveBtn = document.getElementById('wh_approveBtn');
+            document.getElementById('wh_enabled').checked = !!s.enabled;
+            const testBtn = document.getElementById('wh_testBtn');
+            testBtn.disabled = !s.configured;
+            testBtn.classList.toggle('opacity-40', !s.configured);
+            testBtn.classList.toggle('cursor-not-allowed', !s.configured);
+            const hint = document.getElementById('wh_hint');
+            if (s.configured && s.hint) { hint.textContent = 'On file: ' + s.hint; hint.classList.remove('hidden'); }
+            else { hint.classList.add('hidden'); }
+
+            let label, cls;
+            if (!s.configured) { label = 'No webhook'; cls = 'bg-zinc-100 dark:bg-zinc-800 text-zinc-500'; }
+            else if (s.approved) { label = 'Approved'; cls = 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300'; }
+            else { label = 'Pending approval'; cls = 'bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300'; }
+            pill.textContent = label;
+            pill.className = 'text-[11px] font-semibold px-2 py-0.5 rounded-full ' + cls;
+
+            if (s.approved) {
+                approveBtn.textContent = 'Unapprove';
+                approveBtn.className = 'text-xs font-semibold px-3 py-2 rounded-lg active:scale-95 transition border-2 border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800';
+            } else {
+                approveBtn.textContent = 'Approve';
+                approveBtn.className = 'text-xs font-semibold px-3 py-2 rounded-lg active:scale-95 transition bg-emerald-600 hover:bg-emerald-500 text-white';
+            }
+
+            const c = s.card || {};
+            const accent = (c.accent || '').trim();
+            document.getElementById('wh_card_accent').value = accent;
+            document.getElementById('wh_card_accentPicker').value = /^#[0-9a-fA-F]{6}$/.test(accent) ? accent : '#2ecc71';
+            document.getElementById('wh_card_layout').value = c.layout === 'compact' ? 'compact' : 'card';
+            document.getElementById('wh_card_showPhoto').checked = c.showPhoto !== false;
+            document.getElementById('wh_card_showMap').checked = c.showMap !== false;
+            document.getElementById('wh_card_title').value = c.title || '';
+            document.getElementById('wh_card_photoSide').value = c.photoSide === 'left' ? 'left' : 'right';
+            document.getElementById('wh_card_mapStyle').value = ['dark', 'midnight', 'light', 'mono'].includes(c.mapStyle) ? c.mapStyle : 'dark';
+            const mapLine = (c.mapLine || '').trim();
+            document.getElementById('wh_card_mapLine').value = mapLine;
+            document.getElementById('wh_card_mapLinePicker').value = /^#[0-9a-fA-F]{6}$/.test(mapLine) ? mapLine : '#2ecc71';
+            const chosen = Array.isArray(c.fields) && c.fields.length
+                ? c.fields : ['pilot', 'callsign', 'aircraft', 'server', 'altspeed', 'distance', 'ete'];
+            document.querySelectorAll('.wh-field').forEach(el => { el.checked = chosen.includes(el.value); });
+            updateWhCardPreview();
+        }
+
+        async function patchWebhook(body, okMsg) {
+            if (!webhookAd || !webhookAd.id) return;
+            try {
+                const res = await fetch(`/api/va-ads/${webhookAd.id}/flight-events`, {
+                    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                const json = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(json.message || 'Update failed');
+                webhookAd = Object.assign({ id: webhookAd.id }, json.data || {});
+                renderWebhookPanel();
+                if (okMsg) toast(okMsg);
+            } catch (err) { toast(err.message || 'Update failed'); }
+        }
+        function toggleWebhookApproved() {
+            if (webhookAd) patchWebhook({ approved: !webhookAd.approved }, webhookAd.approved ? 'Approval revoked' : 'Webhook approved');
+        }
+        function toggleWebhookEnabled() {
+            patchWebhook({ enabled: document.getElementById('wh_enabled').checked });
+        }
+        function saveWebhookUrl() {
+            const el = document.getElementById('wh_url');
+            const url = el.value.trim();
+            patchWebhook({ webhookUrl: url }, url ? 'Webhook saved' : 'Webhook cleared');
+            el.value = '';
+        }
+        async function sendWebhookTest() {
+            if (!webhookAd || !webhookAd.id) return;
+            const btn = document.getElementById('wh_testBtn');
+            const orig = btn.textContent;
+            btn.disabled = true; btn.textContent = 'Sending…';
+            try {
+                const res = await fetch(`/api/va-ads/${webhookAd.id}/flight-events/test`, { method: 'POST' });
+                const json = await res.json().catch(() => ({}));
+                toast(res.ok ? (json.message || 'Test sent') : (json.message || 'Test failed'));
+            } catch { toast('Test failed'); }
+            finally { btn.disabled = false; btn.textContent = orig; }
+        }
+
+        // ---- card appearance ----
+        function readWhCard() {
+            return {
+                accent: document.getElementById('wh_card_accent').value.trim(),
+                layout: document.getElementById('wh_card_layout').value,
+                showPhoto: document.getElementById('wh_card_showPhoto').checked,
+                showMap: document.getElementById('wh_card_showMap').checked,
+                photoSide: document.getElementById('wh_card_photoSide').value,
+                mapStyle: document.getElementById('wh_card_mapStyle').value,
+                mapLine: document.getElementById('wh_card_mapLine').value.trim(),
+                title: document.getElementById('wh_card_title').value.trim(),
+                fields: [...document.querySelectorAll('.wh-field')].filter(el => el.checked).map(el => el.value),
+            };
+        }
+        let whPreviewTimer = null;
+        function updateWhCardPreview() {
+            if (!webhookAd || !webhookAd.id) return;
+            clearTimeout(whPreviewTimer);
+            whPreviewTimer = setTimeout(async () => {
+                const img = document.getElementById('wh_card_previewImg');
+                const mapImg = document.getElementById('wh_card_previewMap');
+                const note = document.getElementById('wh_card_previewNote');
+                document.getElementById('wh_card_previewSpin').classList.remove('hidden');
+                try {
+                    const res = await fetch(`/api/va-ads/${webhookAd.id}/flight-events/preview`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ card: readWhCard() }),
+                    });
+                    const data = await res.json().catch(() => ({}));
+                    if (!res.ok) throw new Error();
+                    if (data.layout === 'compact') {
+                        img.classList.add('hidden'); mapImg.classList.add('hidden');
+                        note.textContent = 'Compact layout — posts as a text embed, no image.'; note.classList.remove('hidden');
+                    } else {
+                        note.classList.add('hidden');
+                        if (data.card) { img.src = data.card; img.classList.remove('hidden'); } else img.classList.add('hidden');
+                        if (data.map) { mapImg.src = data.map; mapImg.classList.remove('hidden'); } else mapImg.classList.add('hidden');
+                    }
+                } catch {
+                    note.textContent = 'Could not render a preview right now.'; note.classList.remove('hidden');
+                } finally { document.getElementById('wh_card_previewSpin').classList.add('hidden'); }
+            }, 350);
+        }
+        function saveWebhookCard() { patchWebhook({ card: readWhCard() }, 'Card appearance saved'); }
+
+        // Colour swatch/text sync + clear, and live-preview triggers for every control.
+        document.getElementById('wh_card_accentPicker').addEventListener('input', (e) => { document.getElementById('wh_card_accent').value = e.target.value; updateWhCardPreview(); });
+        document.getElementById('wh_card_accent').addEventListener('input', (e) => { const v = e.target.value.trim(); if (/^#[0-9a-fA-F]{6}$/.test(v)) document.getElementById('wh_card_accentPicker').value = v; updateWhCardPreview(); });
+        document.getElementById('wh_card_accentClear').addEventListener('click', () => { document.getElementById('wh_card_accent').value = ''; document.getElementById('wh_card_accentPicker').value = '#2ecc71'; updateWhCardPreview(); });
+        document.getElementById('wh_card_mapLinePicker').addEventListener('input', (e) => { document.getElementById('wh_card_mapLine').value = e.target.value; updateWhCardPreview(); });
+        document.getElementById('wh_card_mapLine').addEventListener('input', (e) => { const v = e.target.value.trim(); if (/^#[0-9a-fA-F]{6}$/.test(v)) document.getElementById('wh_card_mapLinePicker').value = v; updateWhCardPreview(); });
+        document.getElementById('wh_card_mapLineClear').addEventListener('click', () => { document.getElementById('wh_card_mapLine').value = ''; document.getElementById('wh_card_mapLinePicker').value = '#2ecc71'; updateWhCardPreview(); });
+        ['wh_card_layout', 'wh_card_showPhoto', 'wh_card_showMap', 'wh_card_photoSide', 'wh_card_mapStyle', 'wh_card_title'].forEach(id => document.getElementById(id).addEventListener('change', updateWhCardPreview));
+        document.getElementById('wh_card_title').addEventListener('input', updateWhCardPreview);
+        document.querySelectorAll('.wh-field').forEach(el => el.addEventListener('change', updateWhCardPreview));
+
+        loadVaList();
+    </script>
+</body>
+</html>

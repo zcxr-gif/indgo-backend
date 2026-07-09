@@ -148,7 +148,7 @@
                         <label class="text-sm font-semibold flex items-center gap-2"><i class="fa-solid fa-bolt text-amber-500"></i> Flight-event webhook</label>
                         <span id="wh_status" class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-500">—</span>
                     </div>
-                    <p class="text-xs text-zinc-400">Takeoffs &amp; landings matched to this VA are posted to its own Discord channel. This is the same webhook staff approve in the VA Ads manager — one per VA.</p>
+                    <p class="text-xs text-zinc-400">Takeoffs &amp; landings matched to this VA are posted to its own Discord channel — one per VA. You can also manage this without opening an embed in the dedicated <a href="/webhooks" class="font-semibold underline hover:text-zinc-600 dark:hover:text-zinc-200">Webhooks Manager</a>.</p>
                     <input id="wh_url" placeholder="https://discord.com/api/webhooks/… (paste to set on the VA's behalf)" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none mono text-sm">
                     <p id="wh_hint" class="hidden text-xs text-zinc-400 mono"></p>
                     <div class="flex items-center gap-2 flex-wrap">
@@ -192,6 +192,32 @@
                             <label class="flex items-center gap-2 text-sm font-medium select-none cursor-pointer"><input id="wh_card_showPhoto" type="checkbox" class="w-4 h-4 rounded accent-emerald-500"> Aircraft photo</label>
                             <label class="flex items-center gap-2 text-sm font-medium select-none cursor-pointer"><input id="wh_card_showMap" type="checkbox" class="w-4 h-4 rounded accent-emerald-500"> Route map</label>
                         </div>
+                        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                            <div>
+                                <label class="block text-xs font-semibold mb-1.5 text-zinc-500">Aircraft photo side</label>
+                                <select id="wh_card_photoSide" class="w-full px-3 py-2 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none text-sm">
+                                    <option value="right">Right</option>
+                                    <option value="left">Left</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-semibold mb-1.5 text-zinc-500">Map style</label>
+                                <select id="wh_card_mapStyle" class="w-full px-3 py-2 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none text-sm">
+                                    <option value="dark">Dark</option>
+                                    <option value="midnight">Midnight blue</option>
+                                    <option value="light">Light</option>
+                                    <option value="mono">Mono</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-semibold mb-1.5 text-zinc-500">Route line colour</label>
+                                <div class="flex items-center gap-2">
+                                    <input id="wh_card_mapLinePicker" type="color" value="#2ecc71" class="w-9 h-9 rounded-lg border-2 border-zinc-200 dark:border-zinc-700 bg-transparent p-0.5 shrink-0">
+                                    <input id="wh_card_mapLine" type="text" maxlength="9" placeholder="e.g. white" class="w-full px-3 py-2 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none mono text-sm">
+                                    <button type="button" id="wh_card_mapLineClear" class="text-xs font-medium text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200 shrink-0">Default</button>
+                                </div>
+                            </div>
+                        </div>
                         <div>
                             <label class="block text-xs font-semibold mb-1.5 text-zinc-500">Details to show</label>
                             <div id="wh_card_fields" class="grid grid-cols-2 sm:grid-cols-4 gap-2">
@@ -205,6 +231,16 @@
                                 <label class="flex items-center gap-2 text-sm select-none cursor-pointer"><input type="checkbox" class="wh-field w-4 h-4 rounded accent-emerald-500" value="position"> Position</label>
                             </div>
                             <p class="text-xs text-zinc-400 mt-1.5">Route (departure → arrival) is always shown. ETE only appears on departures.</p>
+                        </div>
+                        <!-- Live preview — rendered from the current settings; nothing is posted. -->
+                        <div class="rounded-xl border-2 border-zinc-100 dark:border-zinc-800 p-3 bg-zinc-50/60 dark:bg-zinc-900/40">
+                            <div class="flex items-center justify-between mb-2">
+                                <span class="text-xs font-semibold text-zinc-500">Live preview</span>
+                                <span id="wh_card_previewSpin" class="hidden text-[11px] text-zinc-400">Rendering…</span>
+                            </div>
+                            <img id="wh_card_previewImg" alt="Card preview" class="w-full rounded-lg hidden">
+                            <img id="wh_card_previewMap" alt="Route map preview" class="w-full rounded-lg mt-2 hidden">
+                            <p id="wh_card_previewNote" class="hidden text-xs text-zinc-500 py-6 text-center"></p>
                         </div>
                         <div>
                             <button type="button" id="wh_cardSaveBtn" onclick="saveWebhookCard()" class="bg-zinc-900 hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 text-white text-xs font-semibold px-3 py-2 rounded-lg active:scale-95 transition">Save appearance</button>
@@ -786,34 +822,75 @@
             document.getElementById('wh_card_showPhoto').checked = c.showPhoto !== false;
             document.getElementById('wh_card_showMap').checked = c.showMap !== false;
             document.getElementById('wh_card_title').value = c.title || '';
+            document.getElementById('wh_card_photoSide').value = c.photoSide === 'left' ? 'left' : 'right';
+            document.getElementById('wh_card_mapStyle').value = ['dark', 'midnight', 'light', 'mono'].includes(c.mapStyle) ? c.mapStyle : 'dark';
+            const mapLine = (c.mapLine || '').trim();
+            document.getElementById('wh_card_mapLine').value = mapLine;
+            document.getElementById('wh_card_mapLinePicker').value = /^#[0-9a-fA-F]{6}$/.test(mapLine) ? mapLine : '#2ecc71';
             const chosen = Array.isArray(c.fields) && c.fields.length
                 ? c.fields : ['pilot', 'callsign', 'aircraft', 'server', 'altspeed', 'distance', 'ete'];
             document.querySelectorAll('.wh-field').forEach(el => { el.checked = chosen.includes(el.value); });
+            updateWhCardPreview();
         }
 
-        // Keep the colour swatch and hex field in sync, and a "Default" clear.
-        document.getElementById('wh_card_accentPicker').addEventListener('input', (e) => {
-            document.getElementById('wh_card_accent').value = e.target.value;
-        });
-        document.getElementById('wh_card_accent').addEventListener('input', (e) => {
-            const v = e.target.value.trim();
-            if (/^#[0-9a-fA-F]{6}$/.test(v)) document.getElementById('wh_card_accentPicker').value = v;
-        });
-        document.getElementById('wh_card_accentClear').addEventListener('click', () => {
-            document.getElementById('wh_card_accent').value = '';
-            document.getElementById('wh_card_accentPicker').value = '#2ecc71';
-        });
-
-        function saveWebhookCard() {
-            const card = {
+        // Read the staff card form into an options object (used by save + preview).
+        function readWhCard() {
+            return {
                 accent: document.getElementById('wh_card_accent').value.trim(),
                 layout: document.getElementById('wh_card_layout').value,
                 showPhoto: document.getElementById('wh_card_showPhoto').checked,
                 showMap: document.getElementById('wh_card_showMap').checked,
+                photoSide: document.getElementById('wh_card_photoSide').value,
+                mapStyle: document.getElementById('wh_card_mapStyle').value,
+                mapLine: document.getElementById('wh_card_mapLine').value.trim(),
                 title: document.getElementById('wh_card_title').value.trim(),
                 fields: [...document.querySelectorAll('.wh-field')].filter(el => el.checked).map(el => el.value),
             };
-            patchWebhook({ card }, 'Card appearance saved');
+        }
+        // Debounced live preview against the staff preview endpoint (renders only).
+        let whPreviewTimer = null;
+        function updateWhCardPreview() {
+            if (!webhookAd || !webhookAd.id) return;
+            clearTimeout(whPreviewTimer);
+            whPreviewTimer = setTimeout(async () => {
+                const img = document.getElementById('wh_card_previewImg');
+                const mapImg = document.getElementById('wh_card_previewMap');
+                const note = document.getElementById('wh_card_previewNote');
+                document.getElementById('wh_card_previewSpin').classList.remove('hidden');
+                try {
+                    const res = await fetch(`/api/va-ads/${webhookAd.id}/flight-events/preview`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ card: readWhCard() }),
+                    });
+                    const data = await res.json().catch(() => ({}));
+                    if (!res.ok) throw new Error();
+                    if (data.layout === 'compact') {
+                        img.classList.add('hidden'); mapImg.classList.add('hidden');
+                        note.textContent = 'Compact layout — posts as a text embed, no image.'; note.classList.remove('hidden');
+                    } else {
+                        note.classList.add('hidden');
+                        if (data.card) { img.src = data.card; img.classList.remove('hidden'); } else img.classList.add('hidden');
+                        if (data.map) { mapImg.src = data.map; mapImg.classList.remove('hidden'); } else mapImg.classList.add('hidden');
+                    }
+                } catch {
+                    note.textContent = 'Could not render a preview right now.'; note.classList.remove('hidden');
+                } finally { document.getElementById('wh_card_previewSpin').classList.add('hidden'); }
+            }, 350);
+        }
+
+        // Colour swatch/text sync + clear, and live-preview triggers for every control.
+        document.getElementById('wh_card_accentPicker').addEventListener('input', (e) => { document.getElementById('wh_card_accent').value = e.target.value; updateWhCardPreview(); });
+        document.getElementById('wh_card_accent').addEventListener('input', (e) => { const v = e.target.value.trim(); if (/^#[0-9a-fA-F]{6}$/.test(v)) document.getElementById('wh_card_accentPicker').value = v; updateWhCardPreview(); });
+        document.getElementById('wh_card_accentClear').addEventListener('click', () => { document.getElementById('wh_card_accent').value = ''; document.getElementById('wh_card_accentPicker').value = '#2ecc71'; updateWhCardPreview(); });
+        document.getElementById('wh_card_mapLinePicker').addEventListener('input', (e) => { document.getElementById('wh_card_mapLine').value = e.target.value; updateWhCardPreview(); });
+        document.getElementById('wh_card_mapLine').addEventListener('input', (e) => { const v = e.target.value.trim(); if (/^#[0-9a-fA-F]{6}$/.test(v)) document.getElementById('wh_card_mapLinePicker').value = v; updateWhCardPreview(); });
+        document.getElementById('wh_card_mapLineClear').addEventListener('click', () => { document.getElementById('wh_card_mapLine').value = ''; document.getElementById('wh_card_mapLinePicker').value = '#2ecc71'; updateWhCardPreview(); });
+        ['wh_card_layout', 'wh_card_showPhoto', 'wh_card_showMap', 'wh_card_photoSide', 'wh_card_mapStyle', 'wh_card_title'].forEach(id => document.getElementById(id).addEventListener('change', updateWhCardPreview));
+        document.getElementById('wh_card_title').addEventListener('input', updateWhCardPreview);
+        document.querySelectorAll('.wh-field').forEach(el => el.addEventListener('change', updateWhCardPreview));
+
+        function saveWebhookCard() {
+            patchWebhook({ card: readWhCard() }, 'Card appearance saved');
         }
 
         async function patchWebhook(body, okMsg) {
