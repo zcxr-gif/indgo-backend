@@ -2,11 +2,12 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>VA Partnership Portal — Inflight</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title data-i18n="meta.title">VA Partnership Portal — Inflight</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
-    <script>tailwind.config = { darkMode: 'class' };</script>
+    <script src="/va-portal.i18n.js"></script>
+    <script>tailwind.config = { darkMode: 'class', theme: { extend: { screens: { xs: '400px' } } } };</script>
     <!-- Apply the saved theme before paint so there's no light/dark flash. -->
     <script>(function(){try{var t=localStorage.getItem('va_portal_theme');document.documentElement.classList.toggle('dark', t!=='light');}catch(e){document.documentElement.classList.add('dark');}})();</script>
     <style>
@@ -33,6 +34,14 @@
         .dark .hub-bg { background-image: radial-gradient(rgba(255,255,255,.03) 1px, transparent 1px); }
         input, select, textarea { font-family: inherit; }
         ::placeholder { color: #a1a1aa; }
+        /* iOS Safari zooms the page in whenever a focused form control has a
+           font-size below 16px. Keep the crisp 14px look on desktop, but hand
+           phones a 16px control so tapping into a field never triggers that
+           zoom. Targets the actual typeable controls (not buttons/labels). */
+        @media (max-width: 640px) {
+            input:not([type=checkbox]):not([type=radio]),
+            select, textarea, .field { font-size: 16px; }
+        }
         .field { width: 100%; padding: .625rem .875rem; border-radius: .75rem; background: rgba(244,244,245,.7); border: 1px solid transparent; outline: none; font-size: .875rem; transition: .15s; }
         .dark .field { background: rgba(39,39,42,.7); }
         .field:focus { background: #fff; border-color: #d4d4d8; box-shadow: 0 0 0 4px rgba(24,24,27,.05); }
@@ -52,16 +61,19 @@
     <!-- ============ BOOT ============ -->
     <div id="bootLoader" class="min-h-screen flex flex-col items-center justify-center gap-4 text-zinc-400">
         <div class="loader"></div>
-        <p class="text-sm font-medium">Loading portal…</p>
+        <p class="text-sm font-medium" data-i18n="boot.loading">Loading portal…</p>
     </div>
 
     <!-- ============ LOGIN ============ -->
-    <div id="loginView" class="hidden min-h-screen hub-bg relative overflow-hidden flex items-center justify-center px-5">
+    <div id="loginView" class="hidden min-h-screen hub-bg relative overflow-hidden flex items-center justify-center px-5 py-16">
         <!-- Floating constellation of partnered-VA logos, filled by loadPartnerLogos() -->
         <div id="partnerHalo" class="pointer-events-none absolute inset-0 z-0"></div>
 
-        <!-- Theme toggle (top-right) -->
-        <button onclick="toggleTheme()" title="Toggle theme" class="absolute top-5 right-5 z-20 w-10 h-10 grid place-items-center rounded-full surface text-zinc-600 dark:text-zinc-300 hover:scale-105 transition"><span id="loginThemeIcon"></span></button>
+        <!-- Language + theme controls (top-right) -->
+        <div class="absolute top-4 right-4 sm:top-5 sm:right-5 z-20 flex items-center gap-2">
+            <div id="loginLangPicker"></div>
+            <button onclick="toggleTheme()" data-i18n-title="common.theme" title="Toggle theme" class="w-10 h-10 grid place-items-center rounded-full surface text-zinc-600 dark:text-zinc-300 hover:scale-105 transition"><span id="loginThemeIcon"></span></button>
+        </div>
 
         <div class="relative z-10 w-full max-w-sm fade-in">
             <div class="text-center mb-8">
@@ -71,24 +83,24 @@
                     <img src="/assets/brand/inflight-logo.png" alt="Inflight" class="h-10 w-auto select-none"
                          onerror="this.parentElement.innerHTML='<i data-lucide=&quot;handshake&quot; class=&quot;w-8 h-8 text-white&quot;></i>'; if (window.lucide) lucide.createIcons();">
                 </div>
-                <h1 class="text-2xl font-extrabold tracking-tight">VA Partnership Portal</h1>
-                <p class="text-sm text-zinc-500 dark:text-zinc-400 mt-1.5">Sign in to your partnered Virtual Airline.</p>
+                <h1 class="text-2xl font-extrabold tracking-tight" data-i18n="login.title">VA Partnership Portal</h1>
+                <p class="text-sm text-zinc-500 dark:text-zinc-400 mt-1.5" data-i18n="login.subtitle">Sign in to your partnered Virtual Airline.</p>
             </div>
             <form id="loginForm" class="surface rounded-2xl p-6 space-y-3">
-                <input id="loginUser" type="text" placeholder="Username" autocomplete="username" required class="field">
-                <input id="loginPass" type="password" placeholder="Password" autocomplete="current-password" required class="field">
+                <input id="loginUser" type="text" placeholder="Username" data-i18n-ph="login.username" autocomplete="username" required class="field">
+                <input id="loginPass" type="password" placeholder="Password" data-i18n-ph="login.password" autocomplete="current-password" required class="field">
                 <p id="loginMsg" class="hidden text-sm font-medium text-rose-500"></p>
-                <button type="submit" class="btn w-full">Sign in</button>
+                <button type="submit" class="btn w-full" data-i18n="login.signin">Sign in</button>
             </form>
             <p class="text-center text-xs text-zinc-400 dark:text-zinc-600 mt-6">
-                Are you Inflight staff? <a href="/staff" class="underline hover:text-zinc-600 dark:hover:text-zinc-300">Staff hub</a>
+                <span data-i18n="login.staffPrompt">Are you Inflight staff?</span> <a href="/staff" class="underline hover:text-zinc-600 dark:hover:text-zinc-300" data-i18n="login.staffHub">Staff hub</a>
             </p>
 
             <!-- Partnered VA logos (crisp strip under the card) -->
             <div id="partnerStrip" class="hidden mt-9">
                 <div class="flex items-center gap-3 mb-4">
                     <div class="h-px flex-1 bg-zinc-200 dark:bg-zinc-800"></div>
-                    <p class="text-[11px] font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-600">Our partnered VAs</p>
+                    <p class="text-[11px] font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-600" data-i18n="login.partners">Our partnered VAs</p>
                     <div class="h-px flex-1 bg-zinc-200 dark:bg-zinc-800"></div>
                 </div>
                 <div id="partnerLogos" class="flex flex-wrap items-center justify-center gap-2.5"></div>
@@ -110,19 +122,21 @@
                         <img src="/assets/brand/inflight-logo.png" alt="" class="absolute -right-6 -bottom-8 h-40 sm:h-52 opacity-20 select-none pointer-events-none" onerror="this.remove()">
                     </div>
                     <div class="absolute inset-0 bg-gradient-to-t from-black/55 via-black/10 to-transparent"></div>
-                    <!-- Co-brand ribbon: Inflight × {VA} official tracker -->
-                    <div class="absolute bottom-3 right-3 max-w-[calc(100%-1.5rem)]">
+                    <!-- Co-brand ribbon: Inflight × {VA} official tracker. Hidden on the
+                         narrowest phones so it never collides with the avatar overlay. -->
+                    <div class="hidden xs:block absolute bottom-3 right-3 max-w-[calc(100%-1.5rem)]">
                         <div class="flex items-center gap-2 px-3 py-1.5 rounded-full bg-black/45 backdrop-blur-md border border-white/15 shadow-lg">
                             <img src="/assets/brand/inflight-logo.png" alt="Inflight" class="h-4 w-auto select-none" onerror="this.remove()">
                             <span class="text-white/70 text-[11px] font-bold leading-none">×</span>
-                            <span id="cobrandVaName" class="text-white text-[11px] font-bold leading-none truncate max-w-[9rem] sm:max-w-[14rem]">Your VA</span>
-                            <span class="hidden sm:inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-emerald-300 leading-none pl-1.5 border-l border-white/15"><i data-lucide="radar" class="w-3 h-3"></i>Official tracker</span>
+                            <span id="cobrandVaName" class="text-white text-[11px] font-bold leading-none truncate max-w-[8rem] sm:max-w-[14rem]">Your VA</span>
+                            <span class="hidden sm:inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-emerald-300 leading-none pl-1.5 border-l border-white/15"><i data-lucide="radar" class="w-3 h-3"></i><span data-i18n="hero.officialTracker">Official tracker</span></span>
                         </div>
                     </div>
                     <!-- Top-right controls -->
                     <div class="absolute top-3 right-3 flex items-center gap-2">
-                        <button onclick="toggleTheme()" title="Toggle theme" class="w-9 h-9 grid place-items-center rounded-full bg-white/85 dark:bg-zinc-900/80 backdrop-blur text-zinc-700 dark:text-zinc-200 hover:scale-105 transition shadow"><span id="dashThemeIcon"></span></button>
-                        <button onclick="logout()" title="Sign out" class="w-9 h-9 grid place-items-center rounded-full bg-white/85 dark:bg-zinc-900/80 backdrop-blur text-zinc-700 dark:text-zinc-200 hover:scale-105 transition shadow"><i data-lucide="log-out" class="w-4 h-4"></i></button>
+                        <div id="dashLangPicker"></div>
+                        <button onclick="toggleTheme()" data-i18n-title="common.theme" title="Toggle theme" class="w-9 h-9 grid place-items-center rounded-full bg-white/85 dark:bg-zinc-900/80 backdrop-blur text-zinc-700 dark:text-zinc-200 hover:scale-105 transition shadow"><span id="dashThemeIcon"></span></button>
+                        <button onclick="logout()" data-i18n-title="common.signout" title="Sign out" class="w-9 h-9 grid place-items-center rounded-full bg-white/85 dark:bg-zinc-900/80 backdrop-blur text-zinc-700 dark:text-zinc-200 hover:scale-105 transition shadow"><i data-lucide="log-out" class="w-4 h-4"></i></button>
                     </div>
                 </div>
                 <div class="px-5 sm:px-7 pb-5">
@@ -133,7 +147,7 @@
                         <div class="pb-1 min-w-0">
                             <h1 id="vaName" class="text-xl sm:text-2xl font-extrabold tracking-tight leading-tight truncate">—</h1>
                             <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
-                                Signed in as <span id="acctName" class="font-medium text-zinc-700 dark:text-zinc-200">—</span> · <span id="acctRole" class="capitalize">—</span>
+                                <span data-i18n="hero.signedInAs">Signed in as</span> <span id="acctName" class="font-medium text-zinc-700 dark:text-zinc-200">—</span> · <span id="acctRole" class="capitalize">—</span>
                             </p>
                         </div>
                     </div>
@@ -144,130 +158,130 @@
 
         <!-- Must-change-password banner -->
         <div id="pwBanner" class="hidden mb-5 surface rounded-2xl p-4 border-amber-300/60 bg-amber-50/60 dark:bg-amber-500/5 fade-in">
-            <p class="text-sm text-amber-700 dark:text-amber-300 flex items-center gap-2"><i data-lucide="alert-triangle" class="w-4 h-4"></i> You're using a temporary password. Please set your own in <button onclick="switchTab('account')" class="underline font-semibold">Account</button>.</p>
+            <p class="text-sm text-amber-700 dark:text-amber-300 flex items-center gap-2"><i data-lucide="alert-triangle" class="w-4 h-4 shrink-0"></i> <span><span data-i18n="pw.temp1">You're using a temporary password. Please set your own in</span> <button onclick="switchTab('account')" class="underline font-semibold" data-i18n="pw.tempAccount">Account</button>.</span></p>
         </div>
 
         <!-- Tab nav -->
         <nav class="surface rounded-2xl p-1.5 mb-6 flex items-center gap-1 overflow-x-auto fade-in">
-            <button class="tab active" data-tab="submit" onclick="switchTab('submit')"><i data-lucide="send" class="w-4 h-4"></i> Submit</button>
-            <button class="tab" data-tab="events" onclick="switchTab('events')"><i data-lucide="calendar" class="w-4 h-4"></i> Events</button>
-            <button class="tab" data-tab="flightevents" onclick="switchTab('flightevents')"><i data-lucide="plane-takeoff" class="w-4 h-4"></i> Flight events</button>
-            <button class="tab" data-tab="profile" onclick="switchTab('profile')"><i data-lucide="building-2" class="w-4 h-4"></i> VA Profile</button>
-            <button class="tab" data-tab="embed" onclick="switchTab('embed')"><i data-lucide="code-2" class="w-4 h-4"></i> Embed</button>
-            <button id="tabTeamBtn" class="tab hidden" data-tab="team" onclick="switchTab('team')"><i data-lucide="users" class="w-4 h-4"></i> Team</button>
-            <button class="tab" data-tab="account" onclick="switchTab('account')"><i data-lucide="user-cog" class="w-4 h-4"></i> Account</button>
+            <button class="tab active" data-tab="submit" onclick="switchTab('submit')"><i data-lucide="send" class="w-4 h-4"></i> <span data-i18n="tab.submit">Submit</span></button>
+            <button class="tab" data-tab="events" onclick="switchTab('events')"><i data-lucide="calendar" class="w-4 h-4"></i> <span data-i18n="tab.events">Events</span></button>
+            <button class="tab" data-tab="flightevents" onclick="switchTab('flightevents')"><i data-lucide="plane-takeoff" class="w-4 h-4"></i> <span data-i18n="tab.flightevents">Flight events</span></button>
+            <button class="tab" data-tab="profile" onclick="switchTab('profile')"><i data-lucide="building-2" class="w-4 h-4"></i> <span data-i18n="tab.profile">VA Profile</span></button>
+            <button class="tab" data-tab="embed" onclick="switchTab('embed')"><i data-lucide="code-2" class="w-4 h-4"></i> <span data-i18n="tab.embed">Embed</span></button>
+            <button id="tabTeamBtn" class="tab hidden" data-tab="team" onclick="switchTab('team')"><i data-lucide="users" class="w-4 h-4"></i> <span data-i18n="tab.team">Team</span></button>
+            <button class="tab" data-tab="account" onclick="switchTab('account')"><i data-lucide="user-cog" class="w-4 h-4"></i> <span data-i18n="tab.account">Account</span></button>
         </nav>
 
         <!-- ===== TAB: SUBMIT ===== -->
         <section id="panel-submit" class="tab-panel">
             <div class="mb-3">
-                <h2 class="text-base font-bold tracking-tight">Submit to Inflight</h2>
-                <p class="text-sm text-zinc-500 dark:text-zinc-400">Send us anything — documents, requests, reports, feedback or files. We'll triage it and follow up.</p>
+                <h2 class="text-base font-bold tracking-tight" data-i18n="submit.heading">Submit to Inflight</h2>
+                <p class="text-sm text-zinc-500 dark:text-zinc-400" data-i18n="submit.sub">Send us anything — documents, requests, reports, feedback or files. We'll triage it and follow up.</p>
             </div>
-            <form id="subForm" class="surface rounded-2xl p-6 space-y-3 mb-6">
+            <form id="subForm" class="surface rounded-2xl p-5 sm:p-6 space-y-3 mb-6">
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
                     <select id="subCategory" class="field sm:col-span-1">
-                        <option value="document">Document</option>
-                        <option value="request">Request</option>
-                        <option value="report">Report</option>
-                        <option value="feedback">Feedback</option>
-                        <option value="other" selected>Other</option>
+                        <option value="document" data-i18n="cat.document">Document</option>
+                        <option value="request" data-i18n="cat.request">Request</option>
+                        <option value="report" data-i18n="cat.report">Report</option>
+                        <option value="feedback" data-i18n="cat.feedback">Feedback</option>
+                        <option value="other" selected data-i18n="cat.other">Other</option>
                     </select>
-                    <input id="subTitle" type="text" placeholder="Title / subject" required maxlength="200" class="field sm:col-span-2">
+                    <input id="subTitle" type="text" placeholder="Title / subject" data-i18n-ph="submit.titlePh" required maxlength="200" class="field sm:col-span-2">
                 </div>
-                <textarea id="subBody" rows="4" placeholder="Tell us everything — details, context, anything you need…" maxlength="8000" class="field"></textarea>
-                <input id="subLinks" type="text" placeholder="Links (comma or newline separated, optional)" class="field">
+                <textarea id="subBody" rows="4" placeholder="Tell us everything — details, context, anything you need…" data-i18n-ph="submit.bodyPh" maxlength="8000" class="field"></textarea>
+                <input id="subLinks" type="text" placeholder="Links (comma or newline separated, optional)" data-i18n-ph="submit.linksPh" class="field">
                 <div>
-                    <label class="text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-1.5 flex items-center gap-1.5"><i data-lucide="paperclip" class="w-3.5 h-3.5"></i> Attachments (up to 8 files)</label>
+                    <label class="text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-1.5 flex items-center gap-1.5"><i data-lucide="paperclip" class="w-3.5 h-3.5"></i> <span data-i18n="submit.attachments">Attachments (up to 8 files)</span></label>
                     <input id="subFiles" type="file" multiple class="block w-full text-sm text-zinc-500 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-zinc-900 file:text-white dark:file:bg-white dark:file:text-zinc-900">
                 </div>
                 <div class="flex items-center gap-3">
-                    <button type="submit" id="subBtn" class="btn">Submit</button>
+                    <button type="submit" id="subBtn" class="btn" data-i18n="submit.btn">Submit</button>
                     <p id="subMsg" class="hidden text-sm font-medium"></p>
                 </div>
             </form>
 
             <div class="flex items-center justify-between mb-3">
-                <h2 class="text-base font-bold tracking-tight">Your submissions</h2>
-                <button onclick="loadSubmissions()" title="Refresh" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500 transition"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+                <h2 class="text-base font-bold tracking-tight" data-i18n="submit.yours">Your submissions</h2>
+                <button onclick="loadSubmissions()" data-i18n-title="common.refresh" title="Refresh" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500 transition"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
             </div>
-            <div id="subList" class="space-y-3"><div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400">Loading…</div></div>
+            <div id="subList" class="space-y-3"><div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400" data-i18n="submit.loading">Loading…</div></div>
         </section>
 
         <!-- ===== TAB: EVENTS ===== -->
         <section id="panel-events" class="tab-panel hidden">
             <div class="mb-3">
-                <h2 class="text-base font-bold tracking-tight">Schedule an event</h2>
-                <p class="text-sm text-zinc-500 dark:text-zinc-400">Group flights, fly-ins and briefings for your VA. Events auto-clear two weeks after they run.</p>
+                <h2 class="text-base font-bold tracking-tight" data-i18n="events.heading">Schedule an event</h2>
+                <p class="text-sm text-zinc-500 dark:text-zinc-400" data-i18n="events.sub">Group flights, fly-ins and briefings for your VA. Events auto-clear two weeks after they run.</p>
             </div>
-            <form id="evForm" class="surface rounded-2xl p-6 space-y-3 mb-6">
+            <form id="evForm" class="surface rounded-2xl p-5 sm:p-6 space-y-3 mb-6">
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <input id="evTitle" type="text" placeholder="Event title" required maxlength="120" class="field">
+                    <input id="evTitle" type="text" placeholder="Event title" data-i18n-ph="events.titlePh" required maxlength="120" class="field">
                     <input id="evWhen" type="datetime-local" required class="field">
                 </div>
-                <input id="evLink" type="text" placeholder="Link (sign-up, briefing… optional)" maxlength="300" class="field">
-                <textarea id="evDesc" rows="2" placeholder="Details (optional)" maxlength="1000" class="field"></textarea>
+                <input id="evLink" type="text" placeholder="Link (sign-up, briefing… optional)" data-i18n-ph="events.linkPh" maxlength="300" class="field">
+                <textarea id="evDesc" rows="2" placeholder="Details (optional)" data-i18n-ph="events.descPh" maxlength="1000" class="field"></textarea>
                 <div class="flex items-center gap-3">
-                    <button type="submit" class="btn">Add event</button>
+                    <button type="submit" class="btn" data-i18n="events.add">Add event</button>
                     <p id="evMsg" class="hidden text-sm font-medium"></p>
                 </div>
             </form>
             <div class="flex items-center justify-between mb-3">
-                <h2 class="text-base font-bold tracking-tight">Upcoming events</h2>
-                <button onclick="loadEvents()" title="Refresh" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500 transition"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+                <h2 class="text-base font-bold tracking-tight" data-i18n="events.upcoming">Upcoming events</h2>
+                <button onclick="loadEvents()" data-i18n-title="common.refresh" title="Refresh" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500 transition"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
             </div>
-            <div id="evList" class="space-y-2"><div class="surface rounded-2xl p-5 text-center text-sm text-zinc-400">Loading…</div></div>
+            <div id="evList" class="space-y-2"><div class="surface rounded-2xl p-5 text-center text-sm text-zinc-400" data-i18n="submit.loading">Loading…</div></div>
         </section>
 
         <!-- ===== TAB: FLIGHT EVENTS ===== -->
         <section id="panel-flightevents" class="tab-panel hidden">
             <div class="mb-3">
-                <h2 class="text-base font-bold tracking-tight">Takeoff &amp; landing notifications</h2>
-                <p class="text-sm text-zinc-500 dark:text-zinc-400">Get a Discord post in your own server every time one of your pilots takes off or lands.</p>
+                <h2 class="text-base font-bold tracking-tight" data-i18n="fe.heading">Takeoff &amp; landing notifications</h2>
+                <p class="text-sm text-zinc-500 dark:text-zinc-400" data-i18n="fe.sub">Get a Discord post in your own server every time one of your pilots takes off or lands.</p>
             </div>
-            <div class="surface rounded-2xl p-6 space-y-4">
+            <div class="surface rounded-2xl p-5 sm:p-6 space-y-4">
                 <div class="flex items-start gap-3">
                     <div class="w-9 h-9 rounded-xl bg-zinc-100 dark:bg-zinc-800 grid place-items-center shrink-0"><i data-lucide="plane-takeoff" class="w-4 h-4 text-zinc-500 dark:text-zinc-400"></i></div>
                     <div class="min-w-0">
-                        <p class="text-sm font-semibold">How it works</p>
-                        <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">Create a <span class="font-medium">webhook</span> in the Discord channel you want flights posted to (Channel settings → Integrations → Webhooks), paste its URL below and request access. Our team reviews it and switches delivery on for you.</p>
+                        <p class="text-sm font-semibold" data-i18n="fe.howTitle">How it works</p>
+                        <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5" data-i18n="fe.howBody">Create a webhook in the Discord channel you want flights posted to (Channel settings → Integrations → Webhooks), paste its URL below and request access. Our team reviews it and switches delivery on for you.</p>
                     </div>
                 </div>
                 <p id="pfFlightState" class="hidden text-xs font-medium break-words"></p>
                 <div>
-                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Discord webhook URL</label>
+                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.webhookLabel">Discord webhook URL</label>
                     <input id="pfFlightWebhook" type="url" placeholder="https://discord.com/api/webhooks/…" class="field pf-edit">
                 </div>
                 <div class="flex items-center gap-3 flex-wrap">
-                    <button type="button" id="pfFlightRequestBtn" class="btn pf-edit">Request access</button>
-                    <button type="button" id="pfFlightTestBtn" class="hidden btn pf-edit">Send test</button>
+                    <button type="button" id="pfFlightRequestBtn" class="btn pf-edit" data-i18n="fe.request">Request access</button>
+                    <button type="button" id="pfFlightTestBtn" class="hidden btn pf-edit" data-i18n="fe.sendTest">Send test</button>
                     <label id="pfFlightToggleWrap" class="hidden items-center gap-2 text-sm font-medium select-none">
-                        <input id="pfFlightEnabled" type="checkbox" class="w-4 h-4 rounded pf-edit"> Delivery on
+                        <input id="pfFlightEnabled" type="checkbox" class="w-4 h-4 rounded pf-edit"> <span data-i18n="fe.deliveryOn">Delivery on</span>
                     </label>
                     <p id="pfFlightMsg" class="hidden text-sm font-medium break-words"></p>
                 </div>
             </div>
-            <p id="flightReadonly" class="hidden text-xs text-zinc-400 mt-3 flex items-center gap-1.5"><i data-lucide="lock" class="w-3.5 h-3.5"></i> Only the VA owner can manage flight notifications.</p>
+            <p id="flightReadonly" class="hidden text-xs text-zinc-400 mt-3 flex items-center gap-1.5"><i data-lucide="lock" class="w-3.5 h-3.5"></i> <span data-i18n="fe.readonly">Only the VA owner can manage flight notifications.</span></p>
         </section>
 
         <!-- ===== TAB: VA PROFILE ===== -->
         <section id="panel-profile" class="tab-panel hidden">
             <div class="mb-3">
-                <h2 class="text-base font-bold tracking-tight">Your VA profile</h2>
-                <p id="profileHint" class="text-sm text-zinc-500 dark:text-zinc-400">Keep your listing fresh — update your logo, banner, callsigns and details any time.</p>
+                <h2 class="text-base font-bold tracking-tight" data-i18n="pf.heading">Your VA profile</h2>
+                <p id="profileHint" class="text-sm text-zinc-500 dark:text-zinc-400" data-i18n="pf.hintEdit">Keep your listing fresh — update your logo, banner, callsigns and details any time.</p>
             </div>
-            <form id="profileForm" class="surface rounded-2xl p-6 space-y-5">
+            <form id="profileForm" class="surface rounded-2xl p-5 sm:p-6 space-y-5">
                 <!-- Images -->
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div>
-                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Logo</label>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="pf.logo">Logo</label>
                         <div class="flex items-center gap-3">
                             <div id="pfLogoPreview" class="w-16 h-16 rounded-xl bg-zinc-100 dark:bg-zinc-800 grid place-items-center overflow-hidden shrink-0"><i data-lucide="image" class="w-5 h-5 text-zinc-400"></i></div>
                             <input id="pfLogo" type="file" accept="image/*" class="block w-full text-xs text-zinc-500 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-zinc-900 file:text-white dark:file:bg-white dark:file:text-zinc-900 pf-edit">
                         </div>
                     </div>
                     <div>
-                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Banner</label>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="pf.banner">Banner</label>
                         <div class="flex items-center gap-3">
                             <div id="pfBannerPreview" class="w-24 h-14 rounded-xl bg-zinc-100 dark:bg-zinc-800 grid place-items-center overflow-hidden shrink-0 bg-cover bg-center"><i data-lucide="image" class="w-5 h-5 text-zinc-400"></i></div>
                             <input id="pfBanner" type="file" accept="image/*" class="block w-full text-xs text-zinc-500 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-zinc-900 file:text-white dark:file:bg-white dark:file:text-zinc-900 pf-edit">
@@ -277,126 +291,126 @@
 
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div>
-                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">VA name</label>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="pf.name">VA name</label>
                         <input id="pfName" type="text" disabled class="field opacity-70 cursor-not-allowed">
-                        <p class="text-[11px] text-zinc-400 mt-1">Contact Inflight staff to rename your VA.</p>
+                        <p class="text-[11px] text-zinc-400 mt-1" data-i18n="pf.nameHelp">Contact Inflight staff to rename your VA.</p>
                     </div>
                     <div>
-                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Callsigns <span class="font-normal text-zinc-400">· comma separated</span></label>
-                        <input id="pfCallsigns" type="text" placeholder="e.g. OCEANIC, OCEAN HEAVY" class="field pf-edit">
-                        <p class="text-[11px] text-zinc-400 mt-1">Add every callsign your pilots fly under — the first is your primary.</p>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block"><span data-i18n="pf.callsigns">Callsigns</span> <span class="font-normal text-zinc-400" data-i18n="pf.callsignsNote">· comma separated</span></label>
+                        <input id="pfCallsigns" type="text" placeholder="e.g. OCEANIC, OCEAN HEAVY" data-i18n-ph="pf.callsignsPh" class="field pf-edit">
+                        <p class="text-[11px] text-zinc-400 mt-1" data-i18n="pf.callsignsHelp">Add every callsign your pilots fly under — the first is your primary.</p>
                     </div>
                 </div>
 
                 <div>
-                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Tagline</label>
-                    <input id="pfTagline" type="text" maxlength="140" placeholder="A short hook for your VA" class="field pf-edit">
+                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="pf.tagline">Tagline</label>
+                    <input id="pfTagline" type="text" maxlength="140" placeholder="A short hook for your VA" data-i18n-ph="pf.taglinePh" class="field pf-edit">
                 </div>
                 <div>
-                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Description</label>
-                    <textarea id="pfDescription" rows="4" maxlength="4000" placeholder="Tell pilots about your VA…" class="field pf-edit"></textarea>
+                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="pf.description">Description</label>
+                    <textarea id="pfDescription" rows="4" maxlength="4000" placeholder="Tell pilots about your VA…" data-i18n-ph="pf.descriptionPh" class="field pf-edit"></textarea>
                 </div>
 
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div>
-                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Region</label>
-                        <input id="pfRegion" type="text" placeholder="e.g. Europe, Global" class="field pf-edit">
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="pf.region">Region</label>
+                        <input id="pfRegion" type="text" placeholder="e.g. Europe, Global" data-i18n-ph="pf.regionPh" class="field pf-edit">
                     </div>
                     <div>
-                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Pilot count</label>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="pf.pilotCount">Pilot count</label>
                         <input id="pfPilotCount" type="number" min="0" class="field pf-edit">
                     </div>
                     <div>
-                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Hubs <span class="font-normal text-zinc-400">· ICAO, comma separated</span></label>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block"><span data-i18n="pf.hubs">Hubs</span> <span class="font-normal text-zinc-400" data-i18n="pf.hubsNote">· ICAO, comma separated</span></label>
                         <input id="pfHubs" type="text" placeholder="EGLL, KJFK" class="field pf-edit">
                     </div>
                     <div>
-                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Fleet <span class="font-normal text-zinc-400">· comma separated</span></label>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block"><span data-i18n="pf.fleet">Fleet</span> <span class="font-normal text-zinc-400" data-i18n="pf.fleetNote">· comma separated</span></label>
                         <input id="pfFleet" type="text" placeholder="A320, B738" class="field pf-edit">
                     </div>
                     <div>
-                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Minimum IF grade</label>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="pf.minGrade">Minimum IF grade</label>
                         <select id="pfMinGrade" class="field pf-edit">
-                            <option value="">No requirement</option>
-                            <option value="1">Grade 1+</option>
-                            <option value="2">Grade 2+</option>
-                            <option value="3">Grade 3+</option>
-                            <option value="4">Grade 4+</option>
-                            <option value="5">Grade 5</option>
+                            <option value="" data-i18n="pf.gradeNone">No requirement</option>
+                            <option value="1" data-i18n="pf.grade1">Grade 1+</option>
+                            <option value="2" data-i18n="pf.grade2">Grade 2+</option>
+                            <option value="3" data-i18n="pf.grade3">Grade 3+</option>
+                            <option value="4" data-i18n="pf.grade4">Grade 4+</option>
+                            <option value="5" data-i18n="pf.grade5">Grade 5</option>
                         </select>
                     </div>
                     <div class="flex items-end">
                         <label class="flex items-center gap-2 text-sm font-medium select-none">
-                            <input id="pfRecruiting" type="checkbox" class="w-4 h-4 rounded pf-edit"> Currently recruiting
+                            <input id="pfRecruiting" type="checkbox" class="w-4 h-4 rounded pf-edit"> <span data-i18n="pf.recruiting">Currently recruiting</span>
                         </label>
                     </div>
                 </div>
 
                 <div>
-                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Joining requirements</label>
-                    <textarea id="pfRequirements" rows="2" placeholder="Anything pilots should know before applying" class="field pf-edit"></textarea>
+                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="pf.requirements">Joining requirements</label>
+                    <textarea id="pfRequirements" rows="2" placeholder="Anything pilots should know before applying" data-i18n-ph="pf.requirementsPh" class="field pf-edit"></textarea>
                 </div>
                 <div>
-                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Tags <span class="font-normal text-zinc-400">· comma separated</span></label>
-                    <input id="pfTags" type="text" placeholder="long-haul, realism, friendly" class="field pf-edit">
+                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block"><span data-i18n="pf.tags">Tags</span> <span class="font-normal text-zinc-400" data-i18n="pf.fleetNote">· comma separated</span></label>
+                    <input id="pfTags" type="text" placeholder="long-haul, realism, friendly" data-i18n-ph="pf.tagsPh" class="field pf-edit">
                 </div>
 
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div>
-                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Website</label>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="pf.website">Website</label>
                         <input id="pfWebsite" type="url" placeholder="https://…" class="field pf-edit">
                     </div>
                     <div>
-                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Discord invite <span class="font-normal text-zinc-400">· optional</span></label>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block"><span data-i18n="pf.discord">Discord invite</span> <span class="font-normal text-zinc-400" data-i18n="pf.discordNote">· optional</span></label>
                         <!-- type=text (not url) so a bare "discord.gg/…" never blocks saving; the server adds the scheme. -->
-                        <input id="pfDiscord" type="text" placeholder="discord.gg/… (leave blank if none)" class="field pf-edit">
+                        <input id="pfDiscord" type="text" placeholder="discord.gg/… (leave blank if none)" data-i18n-ph="pf.discordPh" class="field pf-edit">
                     </div>
                     <div>
-                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">IFC thread</label>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="pf.ifc">IFC thread</label>
                         <input id="pfIfc" type="url" placeholder="https://community.infiniteflight.com/…" class="field pf-edit">
                     </div>
                     <div>
-                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block">Application link</label>
-                        <input id="pfApplication" type="url" placeholder="Where pilots apply" class="field pf-edit">
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="pf.application">Application link</label>
+                        <input id="pfApplication" type="url" placeholder="Where pilots apply" data-i18n-ph="pf.applicationPh" class="field pf-edit">
                     </div>
                 </div>
 
                 <div id="profileActions" class="flex items-center gap-3 pt-1">
-                    <button type="submit" id="pfBtn" class="btn">Save changes</button>
+                    <button type="submit" id="pfBtn" class="btn" data-i18n="pf.save">Save changes</button>
                     <p id="pfMsg" class="hidden text-sm font-medium"></p>
                 </div>
             </form>
-            <p id="profileReadonly" class="hidden text-xs text-zinc-400 mt-3 flex items-center gap-1.5"><i data-lucide="lock" class="w-3.5 h-3.5"></i> Only the VA owner can edit this profile.</p>
+            <p id="profileReadonly" class="hidden text-xs text-zinc-400 mt-3 flex items-center gap-1.5"><i data-lucide="lock" class="w-3.5 h-3.5"></i> <span data-i18n="pf.readonly">Only the VA owner can edit this profile.</span></p>
         </section>
 
         <!-- ===== TAB: EMBED ===== -->
         <section id="panel-embed" class="tab-panel hidden">
             <div class="mb-3 flex items-start justify-between gap-3 flex-wrap">
                 <div>
-                    <h2 class="text-base font-bold tracking-tight">Your live map embed</h2>
-                    <p class="text-sm text-zinc-500 dark:text-zinc-400">Copy your embed link or iframe to drop your live pilot map onto your own site. These are managed by Inflight — copy only, no editing.</p>
+                    <h2 class="text-base font-bold tracking-tight" data-i18n="embed.heading">Your live map embed</h2>
+                    <p class="text-sm text-zinc-500 dark:text-zinc-400" data-i18n="embed.sub">Copy your embed link or iframe to drop your live pilot map onto your own site. These are managed by Inflight — copy only, no editing.</p>
                 </div>
                 <div class="flex items-center gap-2 shrink-0">
-                    <button type="button" id="embedRequestBtn" class="btn">Request an embed</button>
+                    <button type="button" id="embedRequestBtn" class="btn" data-i18n="embed.request">Request an embed</button>
                     <p id="embedReqMsg" class="hidden text-sm font-medium"></p>
                 </div>
             </div>
-            <div id="embedList" class="space-y-3"><div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400">Loading…</div></div>
+            <div id="embedList" class="space-y-3"><div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400" data-i18n="submit.loading">Loading…</div></div>
         </section>
 
         <!-- ===== TAB: TEAM (owner only) ===== -->
         <section id="panel-team" class="tab-panel hidden">
             <div class="mb-3">
-                <h2 class="text-base font-bold tracking-tight">Your team</h2>
-                <p class="text-sm text-zinc-500 dark:text-zinc-400">Give your own staff portal access. They can submit and view your VA's inbox, but can't manage accounts.</p>
+                <h2 class="text-base font-bold tracking-tight" data-i18n="team.heading">Your team</h2>
+                <p class="text-sm text-zinc-500 dark:text-zinc-400" data-i18n="team.sub">Give your own staff portal access. They can submit and view your VA's inbox, but can't manage accounts.</p>
             </div>
-            <div class="surface rounded-2xl p-6 mb-4">
-                <p class="text-sm font-semibold mb-3 flex items-center gap-2"><i data-lucide="user-plus" class="w-4 h-4"></i> Add a staff member</p>
+            <div class="surface rounded-2xl p-5 sm:p-6 mb-4">
+                <p class="text-sm font-semibold mb-3 flex items-center gap-2"><i data-lucide="user-plus" class="w-4 h-4"></i> <span data-i18n="team.add">Add a staff member</span></p>
                 <form id="teamForm" class="grid grid-cols-1 sm:grid-cols-4 gap-3">
-                    <input id="tmName" type="text" placeholder="Display name" class="field sm:col-span-1">
-                    <input id="tmUser" type="text" placeholder="Username" required class="field sm:col-span-1">
-                    <input id="tmPass" type="text" placeholder="Password (min 8)" required class="field sm:col-span-1">
-                    <button type="submit" class="btn sm:col-span-1">Add member</button>
+                    <input id="tmName" type="text" placeholder="Display name" data-i18n-ph="team.namePh" class="field sm:col-span-1">
+                    <input id="tmUser" type="text" placeholder="Username" data-i18n-ph="team.userPh" required class="field sm:col-span-1">
+                    <input id="tmPass" type="text" placeholder="Password (min 8)" data-i18n-ph="team.passPh" required class="field sm:col-span-1">
+                    <button type="submit" class="btn sm:col-span-1" data-i18n="team.addBtn">Add member</button>
                 </form>
                 <p id="teamMsg" class="hidden text-sm font-medium mt-3"></p>
             </div>
@@ -406,22 +420,27 @@
         <!-- ===== TAB: ACCOUNT ===== -->
         <section id="panel-account" class="tab-panel hidden">
             <div class="mb-3">
-                <h2 class="text-base font-bold tracking-tight">Account</h2>
-                <p class="text-sm text-zinc-500 dark:text-zinc-400">Manage your sign-in.</p>
+                <h2 class="text-base font-bold tracking-tight" data-i18n="acct.heading">Account</h2>
+                <p class="text-sm text-zinc-500 dark:text-zinc-400" data-i18n="acct.sub">Manage your sign-in.</p>
             </div>
-            <div class="surface rounded-2xl p-6 max-w-md">
-                <p class="text-sm font-semibold mb-3 flex items-center gap-2"><i data-lucide="key-round" class="w-4 h-4"></i> Change password</p>
+            <div class="surface rounded-2xl p-5 sm:p-6 max-w-md">
+                <p class="text-sm font-semibold mb-3 flex items-center gap-2"><i data-lucide="key-round" class="w-4 h-4"></i> <span data-i18n="acct.changePw">Change password</span></p>
                 <form id="pwForm" class="space-y-3">
-                    <input id="pwCurrent" type="password" placeholder="Current password" autocomplete="current-password" required class="field">
-                    <input id="pwNew" type="password" placeholder="New password (min 8 chars)" autocomplete="new-password" required class="field">
+                    <input id="pwCurrent" type="password" placeholder="Current password" data-i18n-ph="acct.current" autocomplete="current-password" required class="field">
+                    <input id="pwNew" type="password" placeholder="New password (min 8 chars)" data-i18n-ph="acct.new" autocomplete="new-password" required class="field">
                     <p id="pwMsg" class="hidden text-sm font-medium"></p>
-                    <button type="submit" class="btn">Update password</button>
+                    <button type="submit" class="btn" data-i18n="acct.update">Update password</button>
                 </form>
             </div>
         </section>
     </div>
 
     <script>
+        // Safety net: if va-portal.i18n.js somehow fails to load, keep the page
+        // working (static markup stays English; dynamic labels fall back to keys)
+        // instead of throwing on the first t() call.
+        if (typeof window.t !== 'function') window.t = (k, v) => k;
+
         const API = '/api/va-portal';
         let me = null;
         let vaProfile = null;
@@ -466,7 +485,7 @@
                 try { document.execCommand('copy'); } catch {}
                 ta.remove();
             }
-            toast((label || 'Copied') + ' copied to clipboard');
+            toast((label || 'Copied') + ' ' + t('common.copied'));
         }
         let toastTimer = null;
         function toast(msg) {
@@ -488,10 +507,59 @@
             resolved: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300',
             archived: 'bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400',
         };
-        const STATUS_LABEL = { open: 'Open', in_review: 'In review', resolved: 'Resolved', archived: 'Archived' };
+        // Status + category labels are resolved through i18n at render time so a
+        // language switch re-labels existing rows.
+        const statusLabel = (s) => t('status.' + s) || s;
+        const catLabel = (c) => t('cat.' + c) || c;
+
+        // ---------- i18n ----------
+        // Apply all data-i18n tags, then (re)draw icons since some translated
+        // nodes sit next to lucide placeholders.
+        function applyI18n() { if (window.I18N) window.I18N.apply(); drawIcons(); }
+
+        // Build the two language pickers (login + dashboard). A native <select>
+        // is deliberate: it gives a proper full-screen wheel on mobile and needs
+        // no custom dropdown/focus/keyboard handling.
+        function renderLangPickers() {
+            if (!window.I18N) return;
+            const opts = I18N.langs.map(l =>
+                `<option value="${l.code}" ${l.code === I18N.lang ? 'selected' : ''}>${l.flag} ${esc(l.label)}</option>`
+            ).join('');
+            [['loginLangPicker', false], ['dashLangPicker', true]].forEach(([id, glassy]) => {
+                const host = $(id);
+                if (!host) return;
+                const base = glassy
+                    ? 'bg-white/85 dark:bg-zinc-900/80 backdrop-blur text-zinc-700 dark:text-zinc-200 shadow'
+                    : 'surface text-zinc-600 dark:text-zinc-300';
+                host.innerHTML =
+                    `<div class="relative ${glassy ? 'h-9' : 'h-10'} rounded-full ${base} flex items-center pl-2.5 pr-1">
+                        <i data-lucide="globe" class="w-4 h-4 pointer-events-none shrink-0"></i>
+                        <select aria-label="${esc(t('common.language'))}" onchange="I18N.setLang(this.value)"
+                            class="appearance-none bg-transparent outline-none cursor-pointer text-xs font-semibold pl-1.5 pr-1 py-2 max-w-[7.5rem]">
+                            ${opts}
+                        </select>
+                    </div>`;
+            });
+            drawIcons();
+        }
+
+        // Re-localise everything when the language changes: static tags, the
+        // pickers themselves, and any dynamic panels already rendered.
+        document.addEventListener('i18n:changed', () => {
+            applyI18n();
+            renderLangPickers();
+            if (me) {
+                $('acctRole').textContent = t('role.' + me.role) || me.role;
+                loadSubmissions(); loadEvents(); loadEmbeds();
+                if (vaProfile) { paintHero(); fillProfileForm(vaProfile, me.role === 'owner'); }
+                if (me.role === 'owner') loadTeam();
+            }
+        });
 
         // ---------- Auth ----------
         async function boot() {
+            applyI18n();
+            renderLangPickers();
             setThemeIcons();
             try {
                 const { account } = await api('/auth/me');
@@ -576,7 +644,7 @@
             hide('bootLoader'); hide('loginView'); show('dashView');
             $('vaName').textContent = me.vaName || 'Your VA';
             $('acctName').textContent = me.displayName || me.username;
-            $('acctRole').textContent = me.role;
+            $('acctRole').textContent = t('role.' + me.role) || me.role;
             if (me.mustChangePassword) show('pwBanner');
             if (me.role === 'owner') show('tabTeamBtn');
             loadProfile();        // also paints the hero banner/logo/callsigns
@@ -623,7 +691,7 @@
                 return `<span class="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 inline-flex items-center gap-1"><i data-lucide="radio" class="w-3 h-3"></i>${esc(base)} ##VA</span>`;
             }).join('')
                 + (va.region ? `<span class="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 inline-flex items-center gap-1"><i data-lucide="globe" class="w-3 h-3"></i>${esc(va.region)}</span>` : '')
-                + (va.recruiting ? `<span class="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300 inline-flex items-center gap-1"><i data-lucide="user-plus" class="w-3 h-3"></i>Recruiting</span>` : '');
+                + (va.recruiting ? `<span class="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300 inline-flex items-center gap-1"><i data-lucide="user-plus" class="w-3 h-3"></i>${esc(t('chip.recruiting'))}</span>` : '');
             drawIcons();
         }
 
@@ -655,23 +723,23 @@
             // The test button only makes sense once an approved webhook is on file.
             fTestBtn.classList.toggle('hidden', !(va.flightEventsApproved && va.flightEventsConfigured));
             if (va.flightEventsApproved) {
-                fState.textContent = '✅ Approved' + (va.flightEventsConfigured ? ' · webhook ' + (va.flightEventsWebhookHint || '') : '');
+                fState.textContent = t('fe.stApproved') + (va.flightEventsConfigured ? ' · ' + t('fe.webhook') + ' ' + (va.flightEventsWebhookHint || '') : '');
                 fState.className = 'text-xs font-medium text-emerald-500';
                 fState.classList.remove('hidden');
-                fReqBtn.textContent = 'Replace webhook';
+                fReqBtn.textContent = t('fe.replace');
                 fToggle.classList.remove('hidden'); fToggle.classList.add('flex');
                 $('pfFlightEnabled').checked = !!va.flightEventsEnabled;
-                $('pfFlightWebhook').placeholder = 'Paste a new webhook to replace the saved one';
+                $('pfFlightWebhook').placeholder = t('fe.replacePh');
             } else if (va.flightEventsRequested) {
-                fState.textContent = '⏳ Requested — pending staff approval' + (va.flightEventsWebhookHint ? ' · webhook ' + va.flightEventsWebhookHint : '');
+                fState.textContent = t('fe.stPending') + (va.flightEventsWebhookHint ? ' · ' + t('fe.webhook') + ' ' + va.flightEventsWebhookHint : '');
                 fState.className = 'text-xs font-medium text-amber-500';
                 fState.classList.remove('hidden');
-                fReqBtn.textContent = 'Update request';
+                fReqBtn.textContent = t('fe.updateReq');
                 fToggle.classList.add('hidden'); fToggle.classList.remove('flex');
                 $('pfFlightWebhook').placeholder = 'https://discord.com/api/webhooks/…';
             } else {
                 fState.classList.add('hidden');
-                fReqBtn.textContent = 'Request access';
+                fReqBtn.textContent = t('fe.request');
                 fToggle.classList.add('hidden'); fToggle.classList.remove('flex');
                 $('pfFlightWebhook').placeholder = 'https://discord.com/api/webhooks/…';
             }
@@ -685,9 +753,7 @@
             $('profileReadonly').classList.toggle('hidden', editable);
             $('embedRequestBtn').classList.toggle('hidden', !editable);
             $('flightReadonly').classList.toggle('hidden', editable);
-            $('profileHint').textContent = editable
-                ? 'Keep your listing fresh — update your logo, banner, callsigns and details any time.'
-                : 'This is your VA listing as pilots see it. Ask your VA owner to make changes.';
+            $('profileHint').textContent = editable ? t('pf.hintEdit') : t('pf.hintReadonly');
         }
 
         async function loadProfile() {
@@ -739,7 +805,7 @@
                 vaProfile = va;
                 paintHero();
                 $('pfLogo').value = ''; $('pfBanner').value = '';
-                flash('pfMsg', 'Saved — your listing is updated.', true);
+                flash('pfMsg', t('pf.saved'), true);
                 loadEmbeds(); // callsign changes may surface different embeds
             } catch (err) { flash('pfMsg', err.message, false); }
             finally { $('pfBtn').disabled = false; }
@@ -748,7 +814,7 @@
         // ---------- Flight events (request → staff approval) ----------
         $('pfFlightRequestBtn').addEventListener('click', async () => {
             const url = $('pfFlightWebhook').value.trim();
-            if (!url) { flash('pfFlightMsg', 'Paste your Discord webhook URL first.', false); return; }
+            if (!url) { flash('pfFlightMsg', t('fe.needUrl'), false); return; }
             $('pfFlightRequestBtn').disabled = true;
             try {
                 const { va } = await api('/flight-events/request', {
@@ -756,7 +822,7 @@
                     body: JSON.stringify({ flightEventsWebhookUrl: url }),
                 });
                 vaProfile = va; fillProfileForm(va, true); drawIcons();
-                flash('pfFlightMsg', va.flightEventsApproved ? 'Webhook updated.' : 'Request sent — our team will review it.', true);
+                flash('pfFlightMsg', va.flightEventsApproved ? t('fe.updated') : t('fe.requested'), true);
             } catch (err) { flash('pfFlightMsg', err.message, false); }
             finally { $('pfFlightRequestBtn').disabled = false; }
         });
@@ -767,7 +833,7 @@
                     body: JSON.stringify({ enabled: e.target.checked }),
                 });
                 vaProfile = va;
-                flash('pfFlightMsg', e.target.checked ? 'Delivery resumed.' : 'Delivery paused.', true);
+                flash('pfFlightMsg', e.target.checked ? t('fe.resumed') : t('fe.paused'), true);
             } catch (err) { e.target.checked = !e.target.checked; flash('pfFlightMsg', err.message, false); }
         });
         // Fire a sample takeoff card at the saved webhook so the owner can confirm
@@ -776,7 +842,7 @@
             $('pfFlightTestBtn').disabled = true;
             try {
                 const { message } = await api('/flight-events/test', { method: 'POST' });
-                flash('pfFlightMsg', message || 'Test event sent — check your Discord channel.', true);
+                flash('pfFlightMsg', message || t('fe.testSent'), true);
             } catch (err) { flash('pfFlightMsg', err.message, false); }
             finally { $('pfFlightTestBtn').disabled = false; }
         });
@@ -789,15 +855,15 @@
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ note: '' }),
                 });
-                flash('embedReqMsg', 'Request sent — our team will set it up.', true);
+                flash('embedReqMsg', t('embed.requested'), true);
             } catch (err) { flash('embedReqMsg', err.message, false); }
             finally { $('embedRequestBtn').disabled = false; }
         });
 
         // ---------- Embeds (read-only) ----------
         let embedsCache = [];
-        function copyEmbedUrl(i) { const em = embedsCache[i]; if (em) copyText(em.url, 'Embed link'); }
-        function copyEmbedIframe(i) { const em = embedsCache[i]; if (em) copyText(em.iframe, 'iframe snippet'); }
+        function copyEmbedUrl(i) { const em = embedsCache[i]; if (em) copyText(em.url, t('embed.link')); }
+        function copyEmbedIframe(i) { const em = embedsCache[i]; if (em) copyText(em.iframe, 'iframe'); }
         async function loadEmbeds() {
             try {
                 const { embeds } = await api('/va');
@@ -806,7 +872,7 @@
                 if (!embeds || !embeds.length) {
                     box.innerHTML = `<div class="surface rounded-2xl p-8 text-center text-sm text-zinc-400">
                         <i data-lucide="code-2" class="w-6 h-6 mx-auto mb-2 text-zinc-300 dark:text-zinc-600"></i>
-                        No embed link yet. Ask your Inflight VA rep to set one up for you.
+                        ${esc(t('embed.empty'))}
                     </div>`;
                     drawIcons();
                     return;
@@ -814,17 +880,17 @@
                 box.innerHTML = embeds.map((em, i) => `
                     <div class="surface rounded-2xl p-5">
                         <div class="flex items-center justify-between gap-3 mb-3">
-                            <p class="font-semibold text-sm truncate flex items-center gap-2"><i data-lucide="map" class="w-4 h-4"></i>${esc(em.label || 'Live map')}<span class="text-[10px] uppercase tracking-wide text-zinc-400">${esc(em.mode || '')}</span></p>
-                            ${em.revoked ? '<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-rose-100 text-rose-600 dark:bg-rose-500/15 dark:text-rose-300">Inactive</span>' : '<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">Active</span>'}
+                            <p class="font-semibold text-sm truncate flex items-center gap-2"><i data-lucide="map" class="w-4 h-4"></i>${esc(em.label || t('embed.liveMap'))}<span class="text-[10px] uppercase tracking-wide text-zinc-400">${esc(em.mode || '')}</span></p>
+                            ${em.revoked ? `<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-rose-100 text-rose-600 dark:bg-rose-500/15 dark:text-rose-300">${esc(t('embed.inactive'))}</span>` : `<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">${esc(t('embed.active'))}</span>`}
                         </div>
-                        <label class="text-[11px] font-semibold uppercase tracking-wide text-zinc-400">Embed link</label>
+                        <label class="text-[11px] font-semibold uppercase tracking-wide text-zinc-400">${esc(t('embed.link'))}</label>
                         <div class="flex items-center gap-2 mt-1 mb-3">
                             <code class="flex-1 min-w-0 truncate text-xs px-3 py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-500">${esc(em.url)}</code>
                             <button onclick="copyEmbedUrl(${i})" class="btn shrink-0 py-2 px-3 text-xs"><i data-lucide="copy" class="w-3.5 h-3.5"></i></button>
                         </div>
                         <div class="flex items-center gap-2">
-                            <button onclick="copyEmbedIframe(${i})" class="text-xs font-medium px-3 py-2 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition inline-flex items-center gap-1.5"><i data-lucide="code" class="w-3.5 h-3.5"></i> Copy iframe</button>
-                            <a href="${esc(em.url)}" target="_blank" rel="noopener" class="text-xs font-medium px-3 py-2 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition inline-flex items-center gap-1.5"><i data-lucide="external-link" class="w-3.5 h-3.5"></i> Preview</a>
+                            <button onclick="copyEmbedIframe(${i})" class="text-xs font-medium px-3 py-2 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition inline-flex items-center gap-1.5"><i data-lucide="code" class="w-3.5 h-3.5"></i> ${esc(t('embed.copyIframe'))}</button>
+                            <a href="${esc(em.url)}" target="_blank" rel="noopener" class="text-xs font-medium px-3 py-2 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition inline-flex items-center gap-1.5"><i data-lucide="external-link" class="w-3.5 h-3.5"></i> ${esc(t('embed.preview'))}</a>
                         </div>
                     </div>`).join('');
                 drawIcons();
@@ -838,7 +904,7 @@
             try {
                 const { submissions } = await api('/submissions');
                 if (!submissions.length) {
-                    $('subList').innerHTML = '<div class="surface rounded-2xl p-8 text-center text-sm text-zinc-400">No submissions yet. Use the form above to send us anything.</div>';
+                    $('subList').innerHTML = `<div class="surface rounded-2xl p-8 text-center text-sm text-zinc-400">${esc(t('submit.empty'))}</div>`;
                     return;
                 }
                 $('subList').innerHTML = submissions.map(s => `
@@ -846,8 +912,8 @@
                         <div class="flex items-start justify-between gap-3">
                             <div class="min-w-0">
                                 <div class="flex items-center gap-2 flex-wrap mb-1">
-                                    <span class="text-[11px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400">${esc(s.category)}</span>
-                                    <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full ${STATUS_STYLE[s.status] || ''}">${STATUS_LABEL[s.status] || esc(s.status)}</span>
+                                    <span class="text-[11px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400">${esc(catLabel(s.category))}</span>
+                                    <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full ${STATUS_STYLE[s.status] || ''}">${esc(statusLabel(s.status))}</span>
                                 </div>
                                 <h3 class="font-semibold tracking-tight truncate">${esc(s.title)}</h3>
                             </div>
@@ -856,7 +922,7 @@
                         ${s.body ? `<p class="text-sm text-zinc-600 dark:text-zinc-300 mt-2 whitespace-pre-wrap">${esc(s.body)}</p>` : ''}
                         ${(s.links && s.links.length) ? `<div class="mt-3 flex flex-wrap gap-2">${s.links.map(l => `<a href="${esc(l)}" target="_blank" rel="noopener" class="text-xs text-blue-600 dark:text-blue-400 hover:underline inline-flex items-center gap-1"><i data-lucide="link" class="w-3 h-3"></i>${esc(l.replace(/^https?:\/\//,'').slice(0,40))}</a>`).join('')}</div>` : ''}
                         ${(s.attachments && s.attachments.length) ? `<div class="mt-3 flex flex-wrap gap-2">${s.attachments.map(a => `<a href="${esc(a.url)}" target="_blank" rel="noopener" class="text-xs px-2.5 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 inline-flex items-center gap-1.5"><i data-lucide="paperclip" class="w-3 h-3"></i>${esc((a.name||'file').slice(0,28))}</a>`).join('')}</div>` : ''}
-                        <p class="text-[11px] text-zinc-400 mt-3">by ${esc(s.submittedByName)}</p>
+                        <p class="text-[11px] text-zinc-400 mt-3">${esc(t('submit.by', { name: s.submittedByName }))}</p>
                     </div>`).join('');
                 drawIcons();
             } catch (err) {
@@ -876,7 +942,7 @@
                 for (const f of $('subFiles').files) fd.append('attachments', f);
                 await api('/submissions', { method: 'POST', body: fd });
                 $('subForm').reset();
-                flash('subMsg', 'Submitted — thank you!', true);
+                flash('subMsg', t('submit.ok'), true);
                 loadSubmissions();
             } catch (err) { flash('subMsg', err.message, false); }
             finally { $('subBtn').disabled = false; }
@@ -889,7 +955,7 @@
             try {
                 const { events } = await api('/events');
                 if (!events.length) {
-                    $('evList').innerHTML = '<div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400">No upcoming events.</div>';
+                    $('evList').innerHTML = `<div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400">${esc(t('events.empty'))}</div>`;
                     return;
                 }
                 $('evList').innerHTML = events.map(e => `
@@ -900,7 +966,7 @@
                             ${e.description ? `<p class="text-sm text-zinc-600 dark:text-zinc-300 mt-1.5 whitespace-pre-wrap">${esc(e.description)}</p>` : ''}
                             ${e.link ? `<a href="${esc(e.link)}" target="_blank" rel="noopener" class="text-xs text-blue-600 dark:text-blue-400 hover:underline inline-flex items-center gap-1 mt-1.5"><i data-lucide="link" class="w-3 h-3"></i>${esc(e.link.replace(/^https?:\/\//,'').slice(0,40))}</a>` : ''}
                         </div>
-                        <button onclick="deleteEvent('${e.id}')" title="Remove" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-rose-50 dark:hover:bg-rose-500/10 text-rose-500 shrink-0"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                        <button onclick="deleteEvent('${e.id}')" title="${esc(t('common.remove'))}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-rose-50 dark:hover:bg-rose-500/10 text-rose-500 shrink-0"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
                     </div>`).join('');
                 drawIcons();
             } catch (err) {
@@ -917,13 +983,13 @@
                     body: JSON.stringify({ title: $('evTitle').value, startsAt: $('evWhen').value, link: $('evLink').value, description: $('evDesc').value }),
                 });
                 $('evForm').reset();
-                flash('evMsg', 'Event added.', true);
+                flash('evMsg', t('events.ok'), true);
                 loadEvents();
             } catch (err) { flash('evMsg', err.message, false); }
         });
 
         async function deleteEvent(id) {
-            if (!confirm('Remove this event?')) return;
+            if (!confirm(t('events.confirmRemove'))) return;
             try { await api('/events/' + id, { method: 'DELETE' }); loadEvents(); }
             catch (err) { alert(err.message); }
         }
@@ -936,7 +1002,7 @@
                 const ownerRow = team.find(t => t.role === 'owner');
                 let html = '';
                 if (ownerRow) html += teamRow(ownerRow, true);
-                if (!members.length) html += '<div class="surface rounded-2xl p-5 text-center text-sm text-zinc-400">No staff yet. Add a teammate above to give them portal access.</div>';
+                if (!members.length) html += `<div class="surface rounded-2xl p-5 text-center text-sm text-zinc-400">${esc(t('team.empty'))}</div>`;
                 else html += members.map(m => teamRow(m, false)).join('');
                 $('teamList').innerHTML = html;
                 drawIcons();
@@ -948,13 +1014,13 @@
         function teamRow(m, isOwner) {
             return `<div class="surface rounded-2xl p-4 flex items-center justify-between gap-3">
                 <div class="min-w-0">
-                    <p class="font-semibold text-sm truncate">${esc(m.displayName)} ${isOwner ? '<span class="text-[10px] uppercase tracking-wide text-zinc-400 ml-1">owner</span>' : ''}</p>
-                    <p class="text-xs text-zinc-400">@${esc(m.username)} ${m.active ? '' : '· <span class="text-rose-500">disabled</span>'}</p>
+                    <p class="font-semibold text-sm truncate">${esc(m.displayName)} ${isOwner ? `<span class="text-[10px] uppercase tracking-wide text-zinc-400 ml-1">${esc(t('team.owner'))}</span>` : ''}</p>
+                    <p class="text-xs text-zinc-400">@${esc(m.username)} ${m.active ? '' : `· <span class="text-rose-500">${esc(t('team.disabled'))}</span>`}</p>
                 </div>
                 ${isOwner ? '' : `<div class="flex items-center gap-1.5">
-                    <button onclick="resetMember('${m.id}')" title="Reset password" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"><i data-lucide="key-round" class="w-4 h-4"></i></button>
-                    <button onclick="toggleMember('${m.id}', ${!m.active})" title="${m.active ? 'Disable' : 'Enable'}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"><i data-lucide="${m.active ? 'user-x' : 'user-check'}" class="w-4 h-4"></i></button>
-                    <button onclick="deleteMember('${m.id}')" title="Remove" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-rose-50 dark:hover:bg-rose-500/10 text-rose-500"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                    <button onclick="resetMember('${m.id}')" title="${esc(t('team.reset'))}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"><i data-lucide="key-round" class="w-4 h-4"></i></button>
+                    <button onclick="toggleMember('${m.id}', ${!m.active})" title="${m.active ? esc(t('team.disable')) : esc(t('team.enable'))}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"><i data-lucide="${m.active ? 'user-x' : 'user-check'}" class="w-4 h-4"></i></button>
+                    <button onclick="deleteMember('${m.id}')" title="${esc(t('common.remove'))}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-rose-50 dark:hover:bg-rose-500/10 text-rose-500"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
                 </div>`}
             </div>`;
         }
@@ -968,7 +1034,7 @@
                     body: JSON.stringify({ displayName: $('tmName').value, username: $('tmUser').value, password: $('tmPass').value }),
                 });
                 $('teamForm').reset();
-                flash('teamMsg', 'Team member added.', true);
+                flash('teamMsg', t('team.added'), true);
                 loadTeam();
             } catch (err) { flash('teamMsg', err.message, false); }
         });
@@ -978,13 +1044,13 @@
             catch (err) { alert(err.message); }
         }
         async function resetMember(id) {
-            const password = prompt('New password for this team member (min 8 characters):');
+            const password = prompt(t('team.resetPrompt'));
             if (!password) return;
-            try { await api('/team/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) }); alert('Password updated.'); }
+            try { await api('/team/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) }); alert(t('team.resetOk')); }
             catch (err) { alert(err.message); }
         }
         async function deleteMember(id) {
-            if (!confirm('Remove this team member? They will lose portal access.')) return;
+            if (!confirm(t('team.confirmRemove'))) return;
             try { await api('/team/' + id, { method: 'DELETE' }); loadTeam(); }
             catch (err) { alert(err.message); }
         }
@@ -1000,7 +1066,7 @@
                 });
                 $('pwForm').reset();
                 hide('pwBanner');
-                flash('pwMsg', 'Password updated.', true);
+                flash('pwMsg', t('acct.updated'), true);
             } catch (err) { flash('pwMsg', err.message, false); }
         });
 
