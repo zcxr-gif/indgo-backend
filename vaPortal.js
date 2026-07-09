@@ -71,6 +71,11 @@ const VaPortalAccountSchema = new mongoose.Schema({
     vaAdId: { type: mongoose.Schema.Types.ObjectId, ref: 'VirtualAirlineAd', default: null, index: true },
     vaName: { type: String, default: '' },
 
+    // Discord user this account was provisioned for (when the bot created it).
+    // Lets /va_addrep stay idempotent per person and /va_removerep find the
+    // matching account to pause. Null for accounts created by hand.
+    discordUserId: { type: String, default: null, index: true },
+
     active: { type: Boolean, default: true },
     // How the account came to exist, for the oversight UI: 'bot' (auto on
     // approval), 'staff' (created manually), or 'owner' (a VA invited a teammate).
@@ -411,6 +416,7 @@ async function provisionOwnerAccount(ad, opts = {}) {
         role: 'owner',
         vaAdId: ad._id,
         vaName: ad.name || '',
+        discordUserId: ad.ownerId || null,
         createdVia,
         createdByName,
         mustChangePassword: true,
@@ -421,6 +427,97 @@ async function provisionOwnerAccount(ad, opts = {}) {
         action: 'account.provision', detail: `Owner account @${username} created`,
     });
     return { account, created: true, username, password };
+}
+
+/**
+ * Provision (or revive) a portal *staff* account for one of a VA's Discord
+ * representatives — the companion to the bot's /va_addrep. Keyed on the rep's
+ * Discord user id so re-adding the same person never mints a duplicate:
+ *   - no account yet            → create one, return the plaintext password once
+ *   - account exists, disabled  → reactivate it with a fresh temporary password
+ *   - account exists, active    → return it untouched (password: null)
+ *
+ * If the rep already holds the VA's OWNER account, that account is returned
+ * as-is (role untouched) — the owner doesn't need a second login.
+ *
+ * @param {Object} ad    a VirtualAirlineAd document (needs _id and name)
+ * @param {Object} opts
+ * @param {string} opts.discordUserId    the rep's Discord user id (required)
+ * @param {string} [opts.discordUsername] used to build a readable username
+ * @param {string} [opts.displayName]
+ * @param {string} [opts.createdByName='Inflight Bot']
+ * @returns {{account: Object, created: boolean, reactivated: boolean, username: string, password: string|null}}
+ */
+async function provisionRepAccount(ad, opts = {}) {
+    if (!ad || !ad._id) throw new Error('provisionRepAccount requires a VA ad with an _id.');
+    const { discordUserId, discordUsername = '', displayName = '', createdByName = 'Inflight Bot' } = opts;
+    if (!discordUserId) throw new Error('provisionRepAccount requires the rep\'s Discord user id.');
+
+    const existing = await VaPortalAccount.findOne({ vaAdId: ad._id, discordUserId: String(discordUserId) });
+    if (existing) {
+        if (existing.active) {
+            return { account: existing, created: false, reactivated: false, username: existing.username, password: null };
+        }
+        // Paused (e.g. after /va_removerep) — revive it with a fresh temp password.
+        const password = generatePassword();
+        existing.passwordHash = await bcrypt.hash(password, 12);
+        existing.mustChangePassword = true;
+        existing.active = true;
+        if (ad.name) existing.vaName = ad.name;
+        await existing.save();
+        logActivity({
+            vaAdId: ad._id, vaName: ad.name, actorName: createdByName, actorRole: 'bot',
+            action: 'account.reactivate', detail: `Rep account @${existing.username} reactivated`,
+        });
+        return { account: existing, created: false, reactivated: true, username: existing.username, password };
+    }
+
+    const base = discordUsername || displayName || `${ad.name || 'va'}-rep`;
+    const username = await uniqueUsernameFrom(base);
+    const password = generatePassword();
+    const passwordHash = await bcrypt.hash(password, 12);
+    const account = await VaPortalAccount.create({
+        username,
+        displayName: displayName || discordUsername || username,
+        passwordHash,
+        role: 'staff',
+        vaAdId: ad._id,
+        vaName: ad.name || '',
+        discordUserId: String(discordUserId),
+        createdVia: 'bot',
+        createdByName,
+        mustChangePassword: true,
+        active: true,
+    });
+    logActivity({
+        vaAdId: ad._id, vaName: ad.name, actorName: createdByName, actorRole: 'bot',
+        action: 'account.provision', detail: `Rep account @${username} created`,
+    });
+    return { account, created: true, reactivated: false, username, password };
+}
+
+/**
+ * Pause the portal account(s) the bot provisioned for a Discord rep of a VA —
+ * the companion to /va_removerep. Deactivates rather than deletes (the account
+ * and its history survive, and /va_addrep revives it). Owner accounts are left
+ * alone: removing someone as a rep must never lock the VA owner out.
+ *
+ * @returns {Promise<number>} how many accounts were paused
+ */
+async function deactivateRepAccount(ad, discordUserId, { actorName = 'Inflight Bot' } = {}) {
+    if (!ad || !ad._id || !discordUserId) return 0;
+    const res = await VaPortalAccount.updateMany(
+        { vaAdId: ad._id, discordUserId: String(discordUserId), role: { $ne: 'owner' }, active: true },
+        { $set: { active: false } }
+    );
+    const n = res.modifiedCount || 0;
+    if (n) {
+        logActivity({
+            vaAdId: ad._id, vaName: ad.name, actorName, actorRole: 'bot',
+            action: 'account.deactivate', detail: `Rep portal access paused (${n} account${n === 1 ? '' : 's'})`,
+        });
+    }
+    return n;
 }
 
 /**
@@ -732,7 +829,12 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, 
             if (b.region !== undefined) ad.region = String(b.region).trim() || 'Global';
             if (b.requirements !== undefined) ad.requirements = String(b.requirements);
             if (b.websiteUrl !== undefined) ad.websiteUrl = String(b.websiteUrl).trim() || null;
-            if (b.discordUrl !== undefined) ad.discordUrl = String(b.discordUrl).trim() || null;
+            // Discord invite is optional, and a bare "discord.gg/…" is accepted —
+            // we add the scheme rather than bounce the save on a missing https://.
+            if (b.discordUrl !== undefined) {
+                const raw = String(b.discordUrl).trim();
+                ad.discordUrl = raw ? (/^https?:\/\//i.test(raw) ? raw : `https://${raw}`) : null;
+            }
             if (b.ifcThreadUrl !== undefined) ad.ifcThreadUrl = String(b.ifcThreadUrl).trim() || null;
             if (b.applicationUrl !== undefined) ad.applicationUrl = String(b.applicationUrl).trim() || null;
             // NOTE: flight-event delivery is intentionally NOT editable here — it
@@ -1351,6 +1453,8 @@ module.exports = {
     VaPortalActivity,
     registerVaPortalRoutes,
     provisionOwnerAccount,
+    provisionRepAccount,
+    deactivateRepAccount,
     purgeVaData,
     requirePortalPage,
     SUBMISSION_CATEGORIES,

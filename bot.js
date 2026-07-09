@@ -421,7 +421,8 @@ async function postToChannel(channelId, payload) {
 
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, models = {}) => {
     const { DailyPilotStats, VirtualAirlineAd, Giveaway, VaTermsAcceptance,
-            provisionVaPortalAccount, purgeVaData } = models;
+            provisionVaPortalAccount, provisionVaPortalRepAccount,
+            deactivateVaPortalRepAccount, purgeVaData } = models;
 
     // NOTE: `Options.cacheEverything()` is the *opposite* of what we want — it
     // caches everything with no caps and silently ignores the limits passed to
@@ -851,7 +852,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_callsign').setLabel('Radio Callsign (pilots fly as NAME ##VA)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(20).setPlaceholder('e.g. Ocean (pilots fly as OCEAN ##VA)')),
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_type').setLabel('Type — VA or VO').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(2).setPlaceholder('VA')),
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_tagline').setLabel('Short description / tagline').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(140)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_links').setLabel('Website + Discord (one per line)').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(300))
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_links').setLabel('Website / Discord invite (both optional)').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(300).setPlaceholder('https://yourva.com\ndiscord.gg/… (optional — one per line)'))
         );
         return modal;
     };
@@ -3001,11 +3002,14 @@ client.on('interactionCreate', async (interaction) => {
                 const tagline = (interaction.fields.getTextInputValue('va_tagline') || '').trim().slice(0, 140);
                 const linksRaw = (interaction.fields.getTextInputValue('va_links') || '').trim();
 
-                // Parse the free-text links field: a discord invite vs a generic website.
+                // Parse the free-text links field: a discord invite vs a generic
+                // website. Both are optional; a bare "discord.gg/…" (no scheme)
+                // is accepted and normalised into a clickable https:// link.
                 let websiteUrl = null, discordUrl = null;
                 for (const line of linksRaw.split(/[\n,]+/).map(s => s.trim()).filter(Boolean)) {
-                    if (/discord(\.gg|app\.com|\.com)/i.test(line)) discordUrl = line;
-                    else if (!websiteUrl) websiteUrl = line;
+                    if (/discord(\.gg|app\.com|\.com)/i.test(line)) {
+                        discordUrl = /^https?:\/\//i.test(line) ? line : `https://${line}`;
+                    } else if (!websiteUrl) websiteUrl = line;
                 }
 
                 try {
@@ -3369,12 +3373,61 @@ client.on('interactionCreate', async (interaction) => {
                         const repRole = await ensureVaRepRole(interaction.guild);
                         await member.roles.add(vaRole).catch(() => {});
                         if (repRole) await member.roles.add(repRole).catch(() => {});
-                        return interaction.editReply(`✅ Added <@${user.id}> as a rep of **${vaName}** (VA channel + reps chat access granted).`);
+
+                        // Give the rep their own Partnership Portal login too.
+                        // Idempotent per Discord user: re-adding someone revives a
+                        // paused account instead of minting a duplicate.
+                        let portalLine = '';
+                        if (typeof provisionVaPortalRepAccount === 'function') {
+                            try {
+                                const { created, reactivated, username, password } = await provisionVaPortalRepAccount(ad, {
+                                    discordUserId: user.id,
+                                    discordUsername: user.username,
+                                    displayName: member.displayName || user.username,
+                                    createdByName: `Bot (added by ${interaction.user.username})`,
+                                });
+                                if (password) {
+                                    // Credentials go to the rep in a DM, never into the channel.
+                                    const dmOk = await user.send(
+                                        `👋 You've been added as a representative of **${ad.name}** on Inflight!\n\n` +
+                                        `🔐 **Your VA Partnership Portal account is ready.**\n` +
+                                        `Log in at ${VA_PORTAL_URL} to submit documents, requests and reports for your VA.\n` +
+                                        `• Username: \`${username}\`\n` +
+                                        `• Temporary password: \`${password}\`\n` +
+                                        `Please change your password after your first login.`
+                                    ).then(() => true).catch(() => false);
+                                    portalLine = dmOk
+                                        ? `\n🔐 Portal account \`@${username}\` ${reactivated ? 'reactivated' : 'created'} — credentials DM'd to them.`
+                                        : `\n🔐 Portal account \`@${username}\` ${reactivated ? 'reactivated' : 'created'}, but their DMs are closed. ` +
+                                          `Temporary password: ||\`${password}\`|| — please pass it on privately.`;
+                                } else if (!created) {
+                                    portalLine = `\n🔐 They already have portal access as \`@${username}\`.`;
+                                }
+                            } catch (e) {
+                                console.error('❌ va_addrep portal provision error:', e);
+                                portalLine = '\n⚠️ Could not set up their portal account — create one manually from the VA Ads manager.';
+                            }
+                        }
+                        return interaction.editReply(`✅ Added <@${user.id}> as a rep of **${vaName}** (VA channel + reps chat access granted).${portalLine}`);
                     } else {
                         // Remove only the VA-specific role; keep the shared rep role since
                         // the user may represent other VAs.
                         await member.roles.remove(vaRole).catch(() => {});
-                        return interaction.editReply(`✅ Removed <@${user.id}> from **${vaName}**. (They keep the shared VA Rep role in case they rep other VAs — remove it manually if needed.)`);
+
+                        // Pause (don't delete) any portal account the bot provisioned
+                        // for them on this VA; /va_addrep revives it.
+                        let portalLine = '';
+                        if (typeof deactivateVaPortalRepAccount === 'function') {
+                            try {
+                                const paused = await deactivateVaPortalRepAccount(ad, user.id, {
+                                    actorName: `Bot (removed by ${interaction.user.username})`,
+                                });
+                                if (paused) portalLine = '\n🔐 Their portal access has been paused (re-adding them restores it).';
+                            } catch (e) {
+                                console.error('❌ va_removerep portal deactivate error:', e);
+                            }
+                        }
+                        return interaction.editReply(`✅ Removed <@${user.id}> from **${vaName}**. (They keep the shared VA Rep role in case they rep other VAs — remove it manually if needed.)${portalLine}`);
                     }
                 } catch (e) {
                     console.error('❌ va rep management error:', e);
