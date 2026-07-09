@@ -23,6 +23,8 @@ const {
 const {
     registerVaPortalRoutes,
     provisionOwnerAccount,
+    provisionRepAccount,
+    deactivateRepAccount,
     purgeVaData,
     VaSubmission,
 } = require('./vaPortal');
@@ -640,6 +642,9 @@ startDiscordBot(
     process.env.AWS_REGION,
     { DailyPilotStats, DailyPilotView, VirtualAirlineAd, Giveaway, VaTermsAcceptance,
       provisionVaPortalAccount: provisionOwnerAccount,
+      // Per-rep portal accounts, managed alongside /va_addrep and /va_removerep.
+      provisionVaPortalRepAccount: provisionRepAccount,
+      deactivateVaPortalRepAccount: deactivateRepAccount,
       // Full VA teardown: wipes portal accounts, submissions, events, embeds,
       // S3 images and the flight-events webhook for a VA. The bot handles the
       // Discord channel/role + the ad doc itself.
