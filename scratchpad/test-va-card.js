@@ -139,5 +139,32 @@ delete process.env.MAPBOX_STATIC_TOKEN;
 check(flightMapImageUrl(43.6777, -79.6248, true).includes('center=43.6777,-79.6248'), 'OSM center = lat,lon');
 check(flightMapImageUrl(NaN, 5, true) === null, 'no map for NaN coords');
 
+// 13. Isolation: one VA's customization must never bleed into another's card,
+// nor mutate the shared defaults. This is the "each embed doesn't take the
+// other's style" guarantee — every call resolves its own options object.
+console.log('• isolation between VAs / the shared defaults');
+const optsA = normalizeCardOptions({ accent: '#ff0000', title: 'VA A', fields: ['pilot'] });
+const optsB = normalizeCardOptions({ accent: '#0000ff', title: 'VA B', fields: ['server', 'ete'] });
+// Interleave builds; each must reflect ONLY its own options.
+const a1 = buildVaEventPayload(full, {}, optsA).embeds[0];
+const b1 = buildVaEventPayload(full, {}, optsB).embeds[0];
+const a2 = buildVaEventPayload(full, {}, optsA).embeds[0];
+check(a1.color === 0xff0000 && a1.title === 'VA A', 'VA A keeps its own accent/title');
+check(b1.color === 0x0000ff && b1.title === 'VA B', 'VA B keeps its own accent/title');
+check(JSON.stringify(a1) === JSON.stringify(a2), 'VA A card is identical before/after a B render (no bleed)');
+check(a1.fields.some(f => /Pilot/.test(f.name)) && !a1.fields.some(f => /Server/.test(f.name)), 'VA A shows only its fields');
+check(b1.fields.some(f => /Server/.test(f.name)) && !b1.fields.some(f => /Pilot/.test(f.name)), 'VA B shows only its fields');
+// A default render sitting between two custom ones (mirrors central feed +
+// partner) must stay default — proving customization can't leak onto it.
+const centralMid = buildVaEventPayload(full, {}, normalizeCardOptions({})).embeds[0];
+check(centralMid.color === 0x2ecc71, 'default (central-feed) card stays default amid custom renders');
+// normalizeCardOptions returns fresh, independent objects; the frozen default
+// is never handed out or mutated.
+const n1 = normalizeCardOptions({}), n2 = normalizeCardOptions({});
+check(n1 !== n2 && n1.fields !== n2.fields, 'each normalize call yields independent objects');
+try { n1.fields.push('server'); } catch (e) { /* ignore */ }
+check(normalizeCardOptions({}).fields.length === DEFAULT_CARD_FIELDS.length, 'mutating a result never affects future defaults');
+check(Object.isFrozen(require(path.join('..', 'vaEventCard.js')).DEFAULT_CARD_OPTIONS), 'DEFAULT_CARD_OPTIONS is frozen');
+
 console.log('\n=== ' + (failures === 0 ? 'ALL CHECKS PASSED ✅' : failures + ' CHECK(S) FAILED ❌') + ' ===');
 process.exit(failures === 0 ? 0 : 1);

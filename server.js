@@ -2456,7 +2456,7 @@ app.get('/api/va-ads/flight-events/by-code', requireAuth, async (req, res) => {
         if (!code) return res.status(400).json({ message: 'Pass ?code=…' });
         const bases = [...new Set([normalizeCallsignBase(code), callsignAirlineBase(code)].filter(Boolean))];
 
-        const sel = '+flightEventsWebhookUrl name callsign callsigns flightEventsEnabled flightEventsApproved flightEventsRequestedAt';
+        const sel = '+flightEventsWebhookUrl name callsign callsigns flightEventsEnabled flightEventsApproved flightEventsRequestedAt flightEventsCard';
         // Prefer a base-callsign match; fall back to an exact (case-insensitive)
         // name match so embeds linked by name still resolve.
         let ad = bases.length
@@ -2480,7 +2480,7 @@ app.get('/api/va-ads/flight-events/by-code', requireAuth, async (req, res) => {
 app.get('/api/va-ads/:id/flight-events', requireAuth, async (req, res) => {
     try {
         const ad = await VirtualAirlineAd.findById(req.params.id)
-            .select('+flightEventsWebhookUrl name callsign callsigns flightEventsEnabled flightEventsApproved flightEventsRequestedAt')
+            .select('+flightEventsWebhookUrl name callsign callsigns flightEventsEnabled flightEventsApproved flightEventsRequestedAt flightEventsCard')
             .lean();
         if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
         res.json({ data: flightEventsStatus(ad) });
