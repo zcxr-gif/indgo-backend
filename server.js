@@ -3462,6 +3462,7 @@ const STAFF_ONLY_PATHS = new Set([
     '/VA-ADMIN-MANUAL.md',
     '/embeds', '/embeds.html',
     '/EMBEDBACKEND.md',
+    '/webhooks', '/webhooks.html',
     '/graphic-designer', '/graphic-designer.html',
     '/va-submissions', '/va-submissions.html',
 ]);
@@ -3505,6 +3506,13 @@ app.get('/va-ads', (req, res) => {
 // Accessible via yoursite.com/embeds (staff-only — see guard above)
 app.get('/embeds', (req, res) => {
     res.sendFile(path.join(__dirname, 'embeds.html'));
+});
+
+// Specific route for the Webhooks Manager (per-VA flight-event webhook + card
+// appearance). Standalone so staff never have to open an embed to manage a
+// webhook. Accessible via yoursite.com/webhooks (staff-only — see guard above)
+app.get('/webhooks', (req, res) => {
+    res.sendFile(path.join(__dirname, 'webhooks.html'));
 });
 
 // Specific route for the VA Admin Manual (staff reference, rendered from Markdown)
