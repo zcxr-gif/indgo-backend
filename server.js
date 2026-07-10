@@ -281,6 +281,30 @@ VirtualAirlineAdSchema.pre('save', function (next) {
 const VirtualAirlineAd = mongoose.model('VirtualAirlineAd', VirtualAirlineAdSchema);
 
 /* =========================
+ * VA PILOT ROSTER
+ *
+ * The list of Infinite Flight usernames a VA gives us for their pilots. One row
+ * per (VA, username). Deliberately its OWN collection rather than an array on
+ * the VA listing: usernames are tiny text so this scales to thousands per VA
+ * without bloating the VA document, and it leaves room to hang per-pilot data
+ * off a row later (join date, stats link, verification). The username is stored
+ * both as typed (for display) and lowercased (usernameLower) as the match/de-dupe
+ * key, since IFC usernames are case-insensitive. Shared parse/normalize/DB
+ * helpers live in vaPilots.js so the staff API and the VA portal behave alike.
+ * ========================= */
+const VaPilotSchema = new mongoose.Schema({
+    vaAdId:        { type: mongoose.Schema.Types.ObjectId, ref: 'VirtualAirlineAd', required: true, index: true },
+    username:      { type: String, required: true, trim: true }, // as typed (display)
+    usernameLower: { type: String, required: true },             // lowercased match/de-dupe key
+    addedBy:       { type: String, default: '' },                // staff/owner who added it (audit)
+    addedAt:       { type: Date, default: Date.now },
+});
+// One username per VA (case-insensitive). Also the fast lookup path for a future
+// "attribute this flight to the VA whose roster the pilot is on".
+VaPilotSchema.index({ vaAdId: 1, usernameLower: 1 }, { unique: true });
+const VaPilot = mongoose.models.VaPilot || mongoose.model('VaPilot', VaPilotSchema);
+
+/* =========================
  * VA PARTNERSHIP TERMS ACCEPTANCE
  *
  * Written by the ticket bot when a user clicks "I accept" on the VA partnership
@@ -844,7 +868,7 @@ registerAuthRoutes(app);
 // sendVaTestEvent is defined further down (with the card renderer); wrap it in a
 // lambda so this call site doesn't touch it before it's initialised — the wrapper
 // only resolves it at request time, when the "send test" button is clicked.
-registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent: (ad) => sendVaTestEvent(ad), renderCardPreview: (ad, opts) => renderCardPreview(ad, opts) });
+registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent: (ad) => sendVaTestEvent(ad), renderCardPreview: (ad, opts) => renderCardPreview(ad, opts) });
 
 // Health Check — public, unauthenticated (for uptime/platform monitors).
 // NOTE: the site is staff-only, so the homepage ("/") is gated below; point any
@@ -2574,6 +2598,69 @@ app.post('/api/va-ads/:id/flight-events/preview', requireAuth, async (req, res) 
     }
 });
 
+// --- VA pilot roster (STAFF) -------------------------------------------------
+// A VA's list of Infinite Flight usernames, stored in the VaPilot collection.
+// Store-only for now (managed here + in the VA portal); a later change can use
+// it to attribute flights to a VA by pilot. All four routes are scoped to the
+// VA id in the path so one VA's roster can't touch another's.
+
+// GET: list a VA's roster (optional ?q= search, ?limit=/?skip= paging).
+app.get('/api/va-ads/:id/pilots', requireAuth, async (req, res) => {
+    try {
+        const ad = await VirtualAirlineAd.findById(req.params.id).select('_id').lean();
+        if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+        const out = await vaPilots.listPilots(VaPilot, ad._id, {
+            q: req.query.q, limit: req.query.limit, skip: req.query.skip,
+        });
+        res.json(out);
+    } catch (error) {
+        console.error('VA Ad pilots list error:', error);
+        res.status(500).json({ message: 'Server error while loading the pilot roster.' });
+    }
+});
+
+// POST: add one or many usernames. Body: { usernames } (array | CSV/blob | JSON
+// array string). Returns { added, skipped, total }.
+app.post('/api/va-ads/:id/pilots', requireAuth, async (req, res) => {
+    try {
+        const ad = await VirtualAirlineAd.findById(req.params.id).select('_id name').lean();
+        if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+        const input = (req.body && (req.body.usernames !== undefined ? req.body.usernames : req.body.username));
+        const who = (req.staff && (req.staff.displayName || req.staff.username)) || 'staff';
+        const out = await vaPilots.addPilots(VaPilot, ad._id, input, who);
+        res.json({ message: `Added ${out.added}, skipped ${out.skipped} duplicate${out.skipped === 1 ? '' : 's'}.`, ...out });
+    } catch (error) {
+        console.error('VA Ad pilots add error:', error);
+        res.status(500).json({ message: 'Server error while adding pilots.' });
+    }
+});
+
+// DELETE: remove one roster entry by its id.
+app.delete('/api/va-ads/:id/pilots/:pilotId', requireAuth, async (req, res) => {
+    try {
+        const ad = await VirtualAirlineAd.findById(req.params.id).select('_id').lean();
+        if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+        const out = await vaPilots.removePilot(VaPilot, ad._id, req.params.pilotId);
+        res.json({ message: out.removed ? 'Pilot removed.' : 'Pilot not found.', ...out });
+    } catch (error) {
+        console.error('VA Ad pilots remove error:', error);
+        res.status(500).json({ message: 'Server error while removing the pilot.' });
+    }
+});
+
+// DELETE: clear a VA's whole roster.
+app.delete('/api/va-ads/:id/pilots', requireAuth, async (req, res) => {
+    try {
+        const ad = await VirtualAirlineAd.findById(req.params.id).select('_id').lean();
+        if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+        const out = await vaPilots.clearPilots(VaPilot, ad._id);
+        res.json({ message: `Cleared ${out.removed} pilot${out.removed === 1 ? '' : 's'}.`, ...out, total: 0 });
+    } catch (error) {
+        console.error('VA Ad pilots clear error:', error);
+        res.status(500).json({ message: 'Server error while clearing the roster.' });
+    }
+});
+
 // POST: Track a click-through (e.g. on the join/apply link). Returns the target
 // URL so the frontend can redirect after recording the click.
 app.post('/api/va-ads/:id/click', async (req, res) => {
@@ -2732,6 +2819,10 @@ const {
     PUBLIC_BASE_URL: CARD_PUBLIC_BASE_URL,
 } = require('./vaEventCard');
 const { renderVaEventCard, renderVaRouteMapImage } = require('./vaEventCardImage');
+
+// Shared roster helpers (parse/normalize usernames + thin DB ops on the VaPilot
+// model). Same module backs the VA portal so both surfaces behave identically.
+const vaPilots = require('./vaPilots');
 
 // Pull a VA ad's saved card customization into a normalized options object. A
 // plain ad (or the central feed) yields the default look. Kept in one place so
