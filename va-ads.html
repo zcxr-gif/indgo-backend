@@ -277,6 +277,31 @@
     <!-- Toast -->
     <div id="toast" class="hidden fixed bottom-6 right-6 z-[60] px-5 py-3 rounded-xl shadow-2xl font-medium text-white animate-fade-in-up"></div>
 
+    <!-- ===================== ROSTER MODAL (read-only) ===================== -->
+    <!-- A VA's pilot roster is added/removed in the Webhooks Manager and the VA
+         portal; staff mostly live here in the Ads Manager, so this gives them a
+         read-only view of it per VA (the same list, without the webhook config). -->
+    <div id="rosterModal" class="hidden fixed inset-0 z-50 bg-zinc-900/60 backdrop-blur-sm flex items-start sm:items-center justify-center p-4 overflow-y-auto">
+        <div class="bg-white dark:bg-zinc-900 rounded-3xl w-full max-w-lg my-8 shadow-2xl border border-zinc-200 dark:border-zinc-800 animate-fade-in-up">
+            <div class="flex items-center justify-between gap-3 px-6 py-4 border-b border-zinc-200 dark:border-zinc-800 sticky top-0 bg-white dark:bg-zinc-900 rounded-t-3xl z-10">
+                <div class="min-w-0">
+                    <h3 class="text-lg font-bold flex items-center gap-2"><i class="fa-solid fa-users text-sky-500"></i> Pilot roster</h3>
+                    <p id="rosterVaName" class="text-xs text-zinc-500 dark:text-zinc-400 truncate"></p>
+                </div>
+                <button onclick="closeRoster()" class="p-2 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-full shrink-0"><i class="fa-solid fa-xmark text-lg"></i></button>
+            </div>
+            <div class="px-6 py-5 space-y-3">
+                <p class="text-xs text-zinc-400">The Infinite Flight usernames on this VA's roster. Read-only here — add or remove pilots in the Webhooks Manager. <span id="rosterCount" class="font-semibold text-zinc-500 dark:text-zinc-400"></span></p>
+                <input id="rosterSearch" type="text" placeholder="Search the roster…" class="w-full px-3 py-2 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none text-sm">
+                <div id="rosterList" class="max-h-80 overflow-y-auto rounded-xl border-2 border-zinc-100 dark:border-zinc-800 divide-y divide-zinc-100 dark:divide-zinc-800"></div>
+                <p id="rosterEmpty" class="hidden text-sm text-zinc-500 py-8 text-center"></p>
+                <div class="pt-1">
+                    <a id="rosterManageLink" href="#" class="text-xs font-semibold text-sky-600 dark:text-sky-400 hover:underline inline-flex items-center gap-1.5"><i class="fa-solid fa-bolt"></i> Manage in Webhooks Manager</a>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
         const API = "/api/va-ads";
         let debounceTimer;
@@ -388,6 +413,7 @@
                     </div>
                     <div class="flex items-center gap-2 mt-4 pt-3 border-t border-zinc-100 dark:border-zinc-800">
                         <button onclick='openModal(${JSON.stringify(ad).replace(/'/g, "&#39;")})' class="flex-1 text-sm font-medium py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"><i class="fa-solid fa-pen mr-1"></i>Edit</button>
+                        <button onclick="openRoster('${ad._id}','${esc(ad.name)}')" class="px-3 py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-sky-100 dark:hover:bg-sky-900/40 hover:text-sky-600 transition-colors" title="View pilot roster"><i class="fa-solid fa-users"></i></button>
                         <button onclick="toggleFeature('${ad._id}')" class="px-3 py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-amber-100 dark:hover:bg-amber-900/40 transition-colors" title="Toggle featured"><i class="fa-${ad.featured ? 'solid' : 'regular'} fa-star ${ad.featured ? 'text-amber-400' : ''}"></i></button>
                         <button onclick="removeAd('${ad._id}','${esc(ad.name)}')" class="px-3 py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-red-100 dark:hover:bg-red-900/40 hover:text-red-600 transition-colors" title="Delete"><i class="fa-solid fa-trash"></i></button>
                     </div>
@@ -520,8 +546,76 @@
             } catch (e) { toast(e.message || 'Failed to delete.', false); }
         }
 
+        // ---------- Pilot roster (read-only viewer) ----------
+        // Reuses the same staff API the Webhooks Manager writes through, so staff
+        // see an identical roster here without leaving the Ads Manager.
+        let rosterVaId = null;
+
+        function openRoster(id, name) {
+            rosterVaId = id;
+            document.getElementById('rosterVaName').textContent = name || '';
+            document.getElementById('rosterSearch').value = '';
+            document.getElementById('rosterCount').textContent = '';
+            document.getElementById('rosterManageLink').href = '/webhooks?va=' + encodeURIComponent(id);
+            document.getElementById('rosterList').innerHTML = '';
+            document.getElementById('rosterEmpty').classList.add('hidden');
+            document.getElementById('rosterModal').classList.remove('hidden');
+            document.body.style.overflow = 'hidden';
+            loadRoster('');
+        }
+
+        function closeRoster() {
+            document.getElementById('rosterModal').classList.add('hidden');
+            document.body.style.overflow = '';
+            rosterVaId = null;
+        }
+
+        async function loadRoster(q) {
+            const id = rosterVaId;
+            if (!id) return;
+            const list = document.getElementById('rosterList');
+            const empty = document.getElementById('rosterEmpty');
+            const count = document.getElementById('rosterCount');
+            list.innerHTML = '<p class="text-sm text-zinc-400 py-8 text-center">Loading…</p>';
+            empty.classList.add('hidden');
+            try {
+                const res = await fetch(`${API}/${id}/pilots?q=${encodeURIComponent(q || '')}&limit=2000`);
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.message || 'Could not load the roster.');
+                // A late response for a since-closed/changed roster mustn't clobber the UI.
+                if (rosterVaId !== id) return;
+                const rows = Array.isArray(data.pilots) ? data.pilots : [];
+                const rosterTotal = data.rosterTotal || 0;
+                count.textContent = rosterTotal ? `${rosterTotal} pilot${rosterTotal === 1 ? '' : 's'} total` : '';
+                if (!rows.length) {
+                    list.innerHTML = '';
+                    empty.textContent = rosterTotal ? 'No matches for that search.' : 'This VA has no pilots on its roster yet.';
+                    empty.classList.remove('hidden');
+                    return;
+                }
+                list.innerHTML = rows.map(p => `
+                    <div class="flex items-center justify-between gap-3 px-3 py-2">
+                        <span class="text-sm font-medium truncate">${esc(p.username)}</span>
+                        ${p.addedBy ? `<span class="text-[11px] text-zinc-400 shrink-0">added by ${esc(p.addedBy)}</span>` : ''}
+                    </div>`).join('');
+            } catch (e) {
+                if (rosterVaId !== id) return;
+                list.innerHTML = '';
+                empty.textContent = e.message || 'Could not load the roster.';
+                empty.classList.remove('hidden');
+            }
+        }
+
+        // Debounced search within the open roster.
+        let _rosterTimer = null;
+        document.getElementById('rosterSearch').addEventListener('input', (e) => {
+            clearTimeout(_rosterTimer);
+            const q = e.target.value;
+            _rosterTimer = setTimeout(() => loadRoster(q), 200);
+        });
+
         // ---------- Init ----------
-        document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+        document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeModal(); closeRoster(); } });
         loadAds();
     </script>
 </body>
