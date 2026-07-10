@@ -188,7 +188,7 @@
                     <label class="text-sm font-semibold flex items-center gap-2"><i class="fa-solid fa-users text-sky-500"></i> Pilot roster</label>
                     <span id="wh_pilotCount" class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-500">0 pilots</span>
                 </div>
-                <p class="text-xs text-zinc-400 -mt-1">The VA's Infinite Flight usernames. Paste a list (one per line, or comma-separated) or upload a .csv/.txt — duplicates are ignored. Stored for this VA only.</p>
+                <p class="text-xs text-zinc-400 -mt-1">The VA's Infinite Flight usernames. Flights by these pilots are attributed to this VA even when the callsign doesn't match its registered pattern (a fallback — it never overrides a callsign match). Paste a list (one per line, or comma-separated) or upload a .csv/.txt — duplicates are ignored.</p>
                 <textarea id="wh_pilotInput" rows="3" placeholder="e.g.&#10;Antony&#10;JohnDoe, Jane_Doe&#10;@another_pilot" class="w-full px-3 py-2 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none mono text-sm"></textarea>
                 <div class="flex items-center gap-2 flex-wrap">
                     <button type="button" id="wh_pilotAddBtn" onclick="addWhPilots()" class="bg-zinc-900 hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 text-white text-xs font-semibold px-3 py-2 rounded-lg active:scale-95 transition">Add pilots</button>

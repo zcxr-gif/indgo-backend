@@ -299,9 +299,14 @@ const VaPilotSchema = new mongoose.Schema({
     addedBy:       { type: String, default: '' },                // staff/owner who added it (audit)
     addedAt:       { type: Date, default: Date.now },
 });
-// One username per VA (case-insensitive). Also the fast lookup path for a future
-// "attribute this flight to the VA whose roster the pilot is on".
+// One username per VA (case-insensitive), and the fast "who's on this VA's
+// roster" path.
 VaPilotSchema.index({ vaAdId: 1, usernameLower: 1 }, { unique: true });
+// Reverse lookup: "which VAs is this pilot on the roster of?" — backs
+// roster-based flight-event attribution (resolveVaEventPartnerByRoster), which
+// queries by usernameLower ALONE (not prefixed by vaAdId), so it needs its own
+// index rather than riding the compound one above.
+VaPilotSchema.index({ usernameLower: 1 });
 const VaPilot = mongoose.models.VaPilot || mongoose.model('VaPilot', VaPilotSchema);
 
 /* =========================
@@ -3049,6 +3054,54 @@ const enrichEventMedia = async (e) => {
 // didn't fit "<base> ###VA" exactly, which is the "matching the VA to the
 // callsign every time" pain this removes. Returns the ad (with webhook URL) or
 // null; every gate that can't produce a target just resolves to null. Never throws.
+// Only an opted-in partner (staff-approved + enabled + a live webhook) can ever
+// receive an event; this is the shared gate every attribution path applies.
+const OPTED_IN_PARTNER_FILTER = {
+    flightEventsApproved: true,   // staff-granted; requests alone don't deliver
+    flightEventsEnabled: true,
+    flightEventsWebhookUrl: { $ne: null },
+};
+const PARTNER_SELECT = 'name callsigns logoUrl flightEventsCard +flightEventsWebhookUrl';
+
+// Attribute an event to an opted-in VA by PILOT ROSTER: the flight's pilot
+// (e.username) is on that VA's roster of Infinite Flight usernames. This is what
+// lets a VA say "these are our pilots" and catch their members' flights even
+// when the live callsign doesn't fit the VA's registered pattern. Used only as a
+// fallback (see resolveVaEventPartner) so it never redirects a flight away from
+// the VA the sender explicitly attributed it to. Returns an opted-in ad or null.
+const resolveVaEventPartnerByRoster = async (e) => {
+    const u = String(e.username || '').trim().toLowerCase();
+    if (!u) return null;
+    let vaIds;
+    try {
+        const rows = await VaPilot.find({ usernameLower: u }).select('vaAdId').lean();
+        vaIds = [...new Set(rows.map((r) => String(r.vaAdId)))];
+    } catch (err) {
+        console.error('[va-events] roster lookup failed:', err.message);
+        return null;
+    }
+    if (!vaIds.length) return null;
+
+    let ads;
+    try {
+        ads = await VirtualAirlineAd.find({ _id: { $in: vaIds }, ...OPTED_IN_PARTNER_FILTER })
+            .select(PARTNER_SELECT).sort({ name: 1 }).lean();
+    } catch (err) {
+        console.error('[va-events] roster partner lookup failed:', err.message);
+        return null;
+    }
+    const valid = ads.filter((a) => a.flightEventsWebhookUrl && isDiscordWebhookUrl(a.flightEventsWebhookUrl));
+    if (!valid.length) return null;
+    // A pilot on several opted-in rosters is ambiguous; pick deterministically
+    // (name-sorted) and log it so the overlap is visible rather than silent.
+    if (valid.length > 1) {
+        console.warn(`[va-events] pilot "${e.username}" is on ${valid.length} opted-in rosters — attributing to "${valid[0].name}"`);
+    } else {
+        console.log(`[va-events] attributed by roster: pilot "${e.username}" → "${valid[0].name}"`);
+    }
+    return valid[0];
+};
+
 const resolveVaEventPartner = async (e) => {
     // The event ALREADY arrives attributed to a VA — the ACARS sender resolved it
     // and set e.va.code / e.va.name. We're not re-identifying the flight here; we
@@ -3067,44 +3120,43 @@ const resolveVaEventPartner = async (e) => {
     const or = [];
     if (codeBases.length) or.push({ callsigns: { $in: callsignQueryVariants(codeBases) } });
     for (const n of names) or.push({ name: new RegExp('^' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
-    if (!or.length) return null;
 
-    let ad;
-    try {
-        ad = await VirtualAirlineAd.findOne({
-            $and: [
-                { $or: or },
-                { flightEventsApproved: true },   // staff-granted; requests alone don't deliver
-                { flightEventsEnabled: true },
-                { flightEventsWebhookUrl: { $ne: null } },
-            ],
-        }).select('name callsigns logoUrl flightEventsCard +flightEventsWebhookUrl').lean();
-    } catch (err) {
-        console.error('[va-events] partner lookup failed:', err.message);
-        return null;
-    }
-    // No opted-in VA — but log what we tried so a miss is diagnosable (almost
-    // always a gate that's off: not approved / disabled / no webhook saved —
-    // not a failure to identify the VA, which already happened on the sender).
-    if (!ad || !ad.flightEventsWebhookUrl) {
-        console.log(`[va-events] no opted-in partner for VA "${e.va?.name || e.va?.code || e.callsign}" — codes [${codeBases.join(', ')}] names [${names.join(', ')}]`);
-        return null;
+    let ad = null;
+    if (or.length) {
+        try {
+            ad = await VirtualAirlineAd.findOne({ $and: [{ $or: or }, OPTED_IN_PARTNER_FILTER] })
+                .select(PARTNER_SELECT).lean();
+        } catch (err) {
+            console.error('[va-events] partner lookup failed:', err.message);
+            ad = null;
+        }
     }
 
+    // Primary (sender/callsign) attribution found an opted-in partner. Deliver to
+    // it — but re-validate the URL at send time (a URL stored before validation
+    // tightened, or a host that should no longer be trusted, must not be posted
+    // to blindly). A bad URL here means SKIP, not roster-fallback: the sender was
+    // explicit about which VA this is, so we don't hand its flight to another.
+    //
     // NOTE: we deliberately DON'T re-check the live callsign against the VA's
-    // stored callsigns here. The sender already identified the VA by callsign;
-    // requiring the in-game callsign to also fit our strict "<base> ###VA" shape
-    // was a redundant second gate that dropped legitimate flights and made hooking
-    // a VA up feel unreliable. Trusting the sender's attribution is the fix.
-
-    // Re-validate at send time: a URL stored before validation tightened, or a
-    // VA host that should no longer be trusted, must not be posted to blindly.
-    if (!isDiscordWebhookUrl(ad.flightEventsWebhookUrl)) {
+    // stored callsigns — the sender already identified the VA; a second strict
+    // "<base> ###VA" gate used to drop legitimate flights.
+    if (ad && ad.flightEventsWebhookUrl) {
+        if (isDiscordWebhookUrl(ad.flightEventsWebhookUrl)) return ad;
         console.warn('[va-events] partner webhook not a valid Discord webhook, skipping:', ad.name);
         return null;
     }
 
-    return ad;
+    // No opted-in partner by callsign/name → try the PILOT ROSTER: is the pilot a
+    // known member of an opted-in VA? This is the path that makes a roster useful.
+    const rosterAd = await resolveVaEventPartnerByRoster(e);
+    if (rosterAd) return rosterAd;
+
+    // Still nothing — log what we tried so a miss is diagnosable (usually a gate
+    // that's off: not approved / disabled / no webhook — not a failure to
+    // identify the VA, which already happened on the sender).
+    console.log(`[va-events] no opted-in partner for VA "${e.va?.name || e.va?.code || e.callsign}" — codes [${codeBases.join(', ')}] names [${names.join(', ')}] pilot "${e.username || ''}"`);
+    return null;
 };
 
 // Slow-path handler, run after we've already acked the sender. Anything that
