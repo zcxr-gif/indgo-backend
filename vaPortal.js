@@ -30,6 +30,9 @@ const { PutObjectCommand } = require('@aws-sdk/client-s3');
 // Reuse the staff portal's auth so our oversight routes accept a staff session.
 const { requireAuth: requireStaffSession } = require('./staffAuth');
 const { normalizeCardOptions } = require('./vaEventCard');
+// Shared roster helpers — same module the staff API uses, so a VA managing its
+// own roster and staff managing it see identical parsing/de-dupe/limits.
+const vaPilots = require('./vaPilots');
 
 // Where the embed widget is hosted. The portal surfaces a VA's embed link as a
 // read-only, copyable URL; it never lets the VA change the underlying config.
@@ -639,7 +642,7 @@ async function uploadSubmissionFile(s3Client, file) {
  * @param {Function} [deps.uploadVaImage] (s3Client, file, ref, kind) => url
  * @param {Function} [deps.deleteVaImage] (s3Client, url) => Promise
  */
-function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent, renderCardPreview }) {
+function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent, renderCardPreview }) {
     // Webhook URLs are secrets, so the profile API never echoes one back in full.
     // Surface just enough for the owner to recognise what's saved: the trailing
     // chars of the webhook id. Defensive against malformed stored values.
@@ -1024,6 +1027,85 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, 
                     ? `Discord rejected the webhook (HTTP ${status}). The URL may be wrong, revoked or deleted.`
                     : 'Could not reach the webhook URL.',
             });
+        }
+    });
+
+    // --- Pilot roster (owner self-service) ----------------------------------
+    // A VA owner manages their own list of Infinite Flight usernames. Same shared
+    // helpers + VaPilot collection the staff API uses, always scoped to THIS
+    // account's VA so an owner can only ever touch their own roster. Guarded so a
+    // clear "roster is unavailable" beats a crash if the model wasn't wired in.
+    const rosterReady = (res) => {
+        if (!VaPilot) { res.status(500).json({ error: 'The pilot roster is unavailable right now.' }); return false; }
+        return true;
+    };
+
+    // GET: list the owner's roster (optional ?q= search + ?limit=/?skip= paging).
+    app.get('/api/va-portal/pilots', requirePortal, async (req, res) => {
+        try {
+            if (!rosterReady(res)) return;
+            if (!req.portal.vaAdId) return res.status(404).json({ error: 'No VA is linked to this account.' });
+            const out = await vaPilots.listPilots(VaPilot, req.portal.vaAdId, {
+                q: req.query.q, limit: req.query.limit, skip: req.query.skip,
+            });
+            res.json(out);
+        } catch (err) {
+            console.error('VA portal pilots list error:', err);
+            res.status(500).json({ error: 'Could not load your pilot roster.' });
+        }
+    });
+
+    // POST: add one or many usernames. Owner-only (managing the roster is an
+    // ownership action, like editing the profile). Body: { usernames }.
+    app.post('/api/va-portal/pilots', requirePortalOwner, async (req, res) => {
+        try {
+            if (!rosterReady(res)) return;
+            if (!req.portal.vaAdId) return res.status(404).json({ error: 'No VA is linked to this account.' });
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId).select('name').lean();
+            if (!ad) return res.status(404).json({ error: 'Your VA listing could not be found.' });
+            const input = (req.body && (req.body.usernames !== undefined ? req.body.usernames : req.body.username));
+            const who = req.portal.displayName || req.portal.username;
+            const out = await vaPilots.addPilots(VaPilot, req.portal.vaAdId, input, who);
+            logActivity({
+                vaAdId: ad._id, vaName: ad.name, actorName: who, actorRole: req.portal.role,
+                action: 'pilots.add', detail: `Added ${out.added} pilot${out.added === 1 ? '' : 's'} (skipped ${out.skipped})`,
+            });
+            res.json({ message: `Added ${out.added}, skipped ${out.skipped} duplicate${out.skipped === 1 ? '' : 's'}.`, ...out });
+        } catch (err) {
+            console.error('VA portal pilots add error:', err);
+            res.status(500).json({ error: 'Could not add pilots.' });
+        }
+    });
+
+    // DELETE: remove one roster entry by id (owner-only).
+    app.delete('/api/va-portal/pilots/:pilotId', requirePortalOwner, async (req, res) => {
+        try {
+            if (!rosterReady(res)) return;
+            if (!req.portal.vaAdId) return res.status(404).json({ error: 'No VA is linked to this account.' });
+            const out = await vaPilots.removePilot(VaPilot, req.portal.vaAdId, req.params.pilotId);
+            res.json({ message: out.removed ? 'Pilot removed.' : 'Pilot not found.', ...out });
+        } catch (err) {
+            console.error('VA portal pilots remove error:', err);
+            res.status(500).json({ error: 'Could not remove the pilot.' });
+        }
+    });
+
+    // DELETE: clear the whole roster (owner-only).
+    app.delete('/api/va-portal/pilots', requirePortalOwner, async (req, res) => {
+        try {
+            if (!rosterReady(res)) return;
+            if (!req.portal.vaAdId) return res.status(404).json({ error: 'No VA is linked to this account.' });
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId).select('name').lean();
+            const out = await vaPilots.clearPilots(VaPilot, req.portal.vaAdId);
+            if (ad) logActivity({
+                vaAdId: ad._id, vaName: ad.name,
+                actorName: req.portal.displayName || req.portal.username, actorRole: req.portal.role,
+                action: 'pilots.clear', detail: `Cleared ${out.removed} pilot${out.removed === 1 ? '' : 's'}`,
+            });
+            res.json({ message: `Cleared ${out.removed} pilot${out.removed === 1 ? '' : 's'}.`, ...out, total: 0 });
+        } catch (err) {
+            console.error('VA portal pilots clear error:', err);
+            res.status(500).json({ error: 'Could not clear the roster.' });
         }
     });
 

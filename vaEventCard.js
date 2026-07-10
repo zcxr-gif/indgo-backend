@@ -54,6 +54,12 @@ const DEFAULT_CARD_FIELDS = ['pilot', 'callsign', 'aircraft', 'server', 'altspee
 // 'compact' = the plain Discord embed only (no image upload), for VAs who want
 // a lighter post.
 const CARD_LAYOUTS = ['card', 'compact'];
+// How the rendered card/map images sit in the Discord message:
+//   'embed' = boxed inside the embed (Discord's default, constrained width);
+//   'large' = posted as standalone attachments so Discord shows them at full
+//             message width (bigger, and not framed by the embed container).
+// Only affects the 'card' layout — 'compact' has no image either way.
+const CARD_IMAGE_STYLES = ['embed', 'large'];
 // Which side of the card the aircraft photo sits on.
 const PHOTO_SIDES = ['right', 'left'];
 // Route-map basemap looks. The concrete colour palettes live in the image
@@ -96,6 +102,7 @@ const normalizeCardOptions = (raw = {}) => {
     return {
         accent: normalizeHex(o.accent),
         layout: CARD_LAYOUTS.includes(o.layout) ? o.layout : 'card',
+        imageStyle: CARD_IMAGE_STYLES.includes(o.imageStyle) ? o.imageStyle : 'embed',
         showMap: o.showMap === undefined ? true : !!o.showMap,
         showPhoto: o.showPhoto === undefined ? true : !!o.showPhoto,
         photoSide: PHOTO_SIDES.includes(o.photoSide) ? o.photoSide : 'right',
@@ -344,7 +351,7 @@ module.exports = {
     // Derived route figures (shared with the image renderer).
     routeDistanceNm, eteMinutes, formatDuration, eteTextFor,
     // Card customization vocabulary + helpers (shared with the API/UI/renderer).
-    CARD_FIELD_KEYS, DEFAULT_CARD_FIELDS, CARD_LAYOUTS, PHOTO_SIDES, MAP_STYLES,
+    CARD_FIELD_KEYS, DEFAULT_CARD_FIELDS, CARD_LAYOUTS, CARD_IMAGE_STYLES, PHOTO_SIDES, MAP_STYLES,
     DEFAULT_CARD_OPTIONS, normalizeCardOptions, resolveAccent, resolveMapLine,
     normalizeHex, normalizeColor,
 };

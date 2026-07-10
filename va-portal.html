@@ -290,6 +290,14 @@
                         </select>
                         <p class="text-[11px] text-zinc-400 mt-1" data-i18n="fe.card.layoutHelp">Compact skips the rendered image for a lighter post.</p>
                     </div>
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.card.imageStyle">Image size</label>
+                        <select id="pfCardImageStyle" class="field pf-edit">
+                            <option value="embed" data-i18n="fe.card.imageStyleEmbed">Standard (framed in embed)</option>
+                            <option value="large" data-i18n="fe.card.imageStyleLarge">Large (standalone image)</option>
+                        </select>
+                        <p class="text-[11px] text-zinc-400 mt-1" data-i18n="fe.card.imageStyleHelp">Large posts the card as a full-width standalone image, not boxed in the embed.</p>
+                    </div>
                 </div>
 
                 <div>
@@ -359,6 +367,30 @@
                     <button type="button" id="pfCardSaveBtn" class="btn pf-edit" data-i18n="fe.card.save">Save appearance</button>
                     <p id="pfCardMsg" class="hidden text-sm font-medium break-words"></p>
                 </div>
+            </div>
+
+            <!-- Pilot roster (owner) -->
+            <div id="pfPilotRoster" class="hidden surface rounded-2xl p-5 sm:p-6 space-y-4 mt-4">
+                <div>
+                    <div class="flex items-center justify-between">
+                        <h3 class="text-sm font-bold flex items-center gap-2"><i data-lucide="users" class="w-4 h-4 text-sky-500"></i> <span data-i18n="fe.roster.title">Pilot roster</span></h3>
+                        <span id="pfPilotCount" class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-500">0</span>
+                    </div>
+                    <p class="text-[11px] text-zinc-400 mt-1" data-i18n="fe.roster.help">Your pilots' Infinite Flight usernames. Paste a list (one per line or comma-separated) or upload a .csv/.txt — duplicates are ignored.</p>
+                </div>
+                <textarea id="pfPilotInput" rows="3" placeholder="Antony&#10;JohnDoe, Jane_Doe" class="field pf-edit mono"></textarea>
+                <div class="flex items-center gap-2 flex-wrap">
+                    <button type="button" id="pfPilotAddBtn" class="btn pf-edit" data-i18n="fe.roster.add">Add pilots</button>
+                    <label class="text-xs font-semibold px-3 py-2 rounded-lg border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 cursor-pointer pf-edit">
+                        <i data-lucide="upload" class="w-3.5 h-3.5 inline-block align-[-2px] mr-1"></i> <span data-i18n="fe.roster.upload">Upload CSV/TXT</span>
+                        <input id="pfPilotFile" type="file" accept=".csv,.txt,text/csv,text/plain" class="hidden pf-edit">
+                    </label>
+                    <button type="button" id="pfPilotClearBtn" class="text-xs font-semibold px-3 py-2 rounded-lg border border-red-200 dark:border-red-900/60 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 ml-auto pf-edit" data-i18n="fe.roster.clear">Clear all</button>
+                </div>
+                <input id="pfPilotSearch" type="text" class="field" data-i18n-ph="fe.roster.search" placeholder="Search the roster…">
+                <div id="pfPilotList" class="max-h-64 overflow-y-auto rounded-xl border border-zinc-200 dark:border-zinc-800 divide-y divide-zinc-100 dark:divide-zinc-800"></div>
+                <p id="pfPilotEmpty" class="hidden text-xs text-zinc-500 dark:text-zinc-400 py-6 text-center" data-i18n="fe.roster.empty">No pilots yet — add some above.</p>
+                <p id="pfPilotMsg" class="hidden text-sm font-medium break-words"></p>
             </div>
 
             <p id="flightReadonly" class="hidden text-xs text-zinc-400 mt-3 flex items-center gap-1.5"><i data-lucide="lock" class="w-3.5 h-3.5"></i> <span data-i18n="fe.readonly">Only the VA owner can manage flight notifications.</span></p>
@@ -955,6 +987,10 @@
         // Populate the customization panel from the VA's saved card config and
         // reveal it once a webhook is on file. Defaults keep the standard look.
         function fillCardForm(va, editable) {
+            // The roster is owner-managed but independent of webhook setup — a VA
+            // can build it any time — so it shows whenever the owner can edit.
+            $('pfPilotRoster').classList.toggle('hidden', !editable);
+            if (editable) loadPfPilots();
             const wrap = $('pfCardCustomize');
             const show = editable && (va.flightEventsConfigured || va.flightEventsRequested || va.flightEventsApproved);
             wrap.classList.toggle('hidden', !show);
@@ -964,6 +1000,7 @@
             $('pfCardAccent').value = accent;
             $('pfCardAccentPicker').value = /^#[0-9a-fA-F]{6}$/.test(accent) ? accent : '#2ecc71';
             $('pfCardLayout').value = c.layout === 'compact' ? 'compact' : 'card';
+            $('pfCardImageStyle').value = c.imageStyle === 'large' ? 'large' : 'embed';
             $('pfCardShowPhoto').checked = c.showPhoto !== false;
             $('pfCardShowMap').checked = c.showMap !== false;
             $('pfCardTitle').value = c.title || '';
@@ -982,6 +1019,7 @@
             return {
                 accent: $('pfCardAccent').value.trim(),
                 layout: $('pfCardLayout').value,
+                imageStyle: $('pfCardImageStyle').value,
                 showPhoto: $('pfCardShowPhoto').checked,
                 showMap: $('pfCardShowMap').checked,
                 photoSide: $('pfCardPhotoSide').value,
@@ -1054,6 +1092,88 @@
                 flash('pfCardMsg', t('fe.card.saved'), true);
             } catch (err) { flash('pfCardMsg', err.message, false); }
             finally { $('pfCardSaveBtn').disabled = false; }
+        });
+
+        // ---------- Pilot roster (owner) ----------
+        let pfPilotSearchTimer = null;
+        function renderPfPilots(data) {
+            const list = $('pfPilotList');
+            const empty = $('pfPilotEmpty');
+            const total = (data && data.rosterTotal) || 0;
+            $('pfPilotCount').textContent = total;
+            const rows = (data && data.pilots) || [];
+            if (!rows.length) {
+                list.innerHTML = '';
+                empty.textContent = total ? t('fe.roster.noMatch') : t('fe.roster.empty');
+                empty.classList.remove('hidden');
+                return;
+            }
+            empty.classList.add('hidden');
+            list.innerHTML = rows.map(p => `
+                <div class="flex items-center justify-between gap-2 px-3 py-2">
+                    <span class="text-sm mono truncate">${esc(p.username)}</span>
+                    <button type="button" data-pid="${esc(p.id)}" class="pf-pilot-del text-zinc-400 hover:text-red-500 shrink-0 px-1" title="${esc(t('fe.roster.remove'))}"><i data-lucide="x" class="w-4 h-4"></i></button>
+                </div>`).join('');
+            list.querySelectorAll('.pf-pilot-del').forEach(b => b.addEventListener('click', () => removePfPilot(b.getAttribute('data-pid'))));
+            drawIcons();
+        }
+        async function loadPfPilots() {
+            const q = $('pfPilotSearch').value.trim();
+            try {
+                const data = await api('/pilots?q=' + encodeURIComponent(q));
+                renderPfPilots(data);
+            } catch { /* leave the list as-is on a transient error */ }
+        }
+        async function addPfPilots() {
+            const ta = $('pfPilotInput');
+            const usernames = ta.value.trim();
+            if (!usernames) { flash('pfPilotMsg', t('fe.roster.pasteFirst'), false); return; }
+            $('pfPilotAddBtn').disabled = true;
+            try {
+                const data = await api('/pilots', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ usernames }),
+                });
+                ta.value = ''; $('pfPilotSearch').value = '';
+                flash('pfPilotMsg', t('fe.roster.added', { added: data.added, skipped: data.skipped }), true);
+                loadPfPilots();
+            } catch (err) { flash('pfPilotMsg', err.message, false); }
+            finally { $('pfPilotAddBtn').disabled = false; }
+        }
+        async function removePfPilot(pilotId) {
+            try {
+                await api('/pilots/' + encodeURIComponent(pilotId), { method: 'DELETE' });
+                loadPfPilots();
+            } catch (err) { flash('pfPilotMsg', err.message, false); }
+        }
+        async function clearPfPilots() {
+            if (!confirm(t('fe.roster.confirmClear'))) return;
+            try {
+                const data = await api('/pilots', { method: 'DELETE' });
+                $('pfPilotSearch').value = '';
+                flash('pfPilotMsg', t('fe.roster.cleared', { removed: data.removed }), true);
+                loadPfPilots();
+            } catch (err) { flash('pfPilotMsg', err.message, false); }
+        }
+        $('pfPilotAddBtn').addEventListener('click', addPfPilots);
+        $('pfPilotClearBtn').addEventListener('click', clearPfPilots);
+        $('pfPilotSearch').addEventListener('input', () => {
+            clearTimeout(pfPilotSearchTimer);
+            pfPilotSearchTimer = setTimeout(loadPfPilots, 250);
+        });
+        $('pfPilotFile').addEventListener('change', (e) => {
+            const file = e.target.files && e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = () => {
+                const lines = String(reader.result || '').split(/\r?\n/);
+                if (lines.length && /^\s*(username|user|pilot|ifc)\s*$/i.test(lines[0])) lines.shift();
+                const ta = $('pfPilotInput');
+                ta.value = (ta.value.trim() ? ta.value.trim() + '\n' : '') + lines.join('\n').trim();
+                flash('pfPilotMsg', t('fe.roster.csvLoaded'), true);
+            };
+            reader.readAsText(file);
+            e.target.value = '';
         });
 
         // ---------- Embed requests (owner only; embeds are staff-provisioned) ----------

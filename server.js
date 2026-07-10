@@ -224,12 +224,16 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // normalizeCardOptions() from vaEventCard.js. Only ever applied to THIS VA's
     // own webhook — the central feed always uses the default card.
     flightEventsCard: {
-        accent:    { type: String, trim: true, default: '' },      // '#rrggbb' or '' = event colour
-        layout:    { type: String, enum: ['card', 'compact'], default: 'card' },
-        showMap:   { type: Boolean, default: true },               // post the route-map image
-        showPhoto: { type: Boolean, default: true },               // aircraft photo on the card
-        title:     { type: String, trim: true, default: '' },      // custom embed title; '' = default
-        fields:    { type: [String], default: [] },                // ordered subset; [] = default set
+        accent:     { type: String, trim: true, default: '' },      // '#rrggbb' or '' = event colour
+        layout:     { type: String, enum: ['card', 'compact'], default: 'card' },
+        imageStyle: { type: String, enum: ['embed', 'large'], default: 'embed' }, // card/map framed in the embed vs. posted as full-width standalone attachments
+        showMap:    { type: Boolean, default: true },               // post the route-map image
+        showPhoto:  { type: Boolean, default: true },               // aircraft photo on the card
+        photoSide:  { type: String, enum: ['right', 'left'], default: 'right' },  // which side the aircraft photo sits on
+        mapStyle:   { type: String, enum: ['dark', 'midnight', 'light', 'mono'], default: 'dark' }, // route-map basemap palette
+        mapLine:    { type: String, trim: true, default: '' },      // route-line colour ('#rrggbb'/name) or '' = accent
+        title:      { type: String, trim: true, default: '' },      // custom embed title; '' = default
+        fields:     { type: [String], default: [] },                // ordered subset; [] = default set
     },
 
     // --- Analytics ---
@@ -275,6 +279,35 @@ VirtualAirlineAdSchema.pre('save', function (next) {
 });
 
 const VirtualAirlineAd = mongoose.model('VirtualAirlineAd', VirtualAirlineAdSchema);
+
+/* =========================
+ * VA PILOT ROSTER
+ *
+ * The list of Infinite Flight usernames a VA gives us for their pilots. One row
+ * per (VA, username). Deliberately its OWN collection rather than an array on
+ * the VA listing: usernames are tiny text so this scales to thousands per VA
+ * without bloating the VA document, and it leaves room to hang per-pilot data
+ * off a row later (join date, stats link, verification). The username is stored
+ * both as typed (for display) and lowercased (usernameLower) as the match/de-dupe
+ * key, since IFC usernames are case-insensitive. Shared parse/normalize/DB
+ * helpers live in vaPilots.js so the staff API and the VA portal behave alike.
+ * ========================= */
+const VaPilotSchema = new mongoose.Schema({
+    vaAdId:        { type: mongoose.Schema.Types.ObjectId, ref: 'VirtualAirlineAd', required: true, index: true },
+    username:      { type: String, required: true, trim: true }, // as typed (display)
+    usernameLower: { type: String, required: true },             // lowercased match/de-dupe key
+    addedBy:       { type: String, default: '' },                // staff/owner who added it (audit)
+    addedAt:       { type: Date, default: Date.now },
+});
+// One username per VA (case-insensitive), and the fast "who's on this VA's
+// roster" path.
+VaPilotSchema.index({ vaAdId: 1, usernameLower: 1 }, { unique: true });
+// Reverse lookup: "which VAs is this pilot on the roster of?" — backs
+// roster-based flight-event attribution (resolveVaEventPartnerByRoster), which
+// queries by usernameLower ALONE (not prefixed by vaAdId), so it needs its own
+// index rather than riding the compound one above.
+VaPilotSchema.index({ usernameLower: 1 });
+const VaPilot = mongoose.models.VaPilot || mongoose.model('VaPilot', VaPilotSchema);
 
 /* =========================
  * VA PARTNERSHIP TERMS ACCEPTANCE
@@ -644,8 +677,12 @@ const cloudWatchClient = new CloudWatchClient({
 
 // Configure Multer to store file in MEMORY temporarily
 const upload = multer({
-    dest: os.tmpdir(), 
-    limits: { fileSize: 100 * 1024 * 1024 } // 100MB limit
+    dest: os.tmpdir(),
+    // 15MB is comfortably above any logo/banner/aircraft image or gate CSV we
+    // accept, while cutting the old 100MB ceiling that let a single upload write
+    // a huge temp file — on some container hosts os.tmpdir() is RAM-backed
+    // (tmpfs), so an oversized upload could spike memory toward the cap.
+    limits: { fileSize: 15 * 1024 * 1024 } // 15MB limit
 });
 
 // --- START THE BOT ---
@@ -840,7 +877,7 @@ registerAuthRoutes(app);
 // sendVaTestEvent is defined further down (with the card renderer); wrap it in a
 // lambda so this call site doesn't touch it before it's initialised — the wrapper
 // only resolves it at request time, when the "send test" button is clicked.
-registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent: (ad) => sendVaTestEvent(ad), renderCardPreview: (ad, opts) => renderCardPreview(ad, opts) });
+registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent: (ad) => sendVaTestEvent(ad), renderCardPreview: (ad, opts) => renderCardPreview(ad, opts) });
 
 // Health Check — public, unauthenticated (for uptime/platform monitors).
 // NOTE: the site is staff-only, so the homepage ("/") is gated below; point any
@@ -2570,6 +2607,69 @@ app.post('/api/va-ads/:id/flight-events/preview', requireAuth, async (req, res) 
     }
 });
 
+// --- VA pilot roster (STAFF) -------------------------------------------------
+// A VA's list of Infinite Flight usernames, stored in the VaPilot collection.
+// Store-only for now (managed here + in the VA portal); a later change can use
+// it to attribute flights to a VA by pilot. All four routes are scoped to the
+// VA id in the path so one VA's roster can't touch another's.
+
+// GET: list a VA's roster (optional ?q= search, ?limit=/?skip= paging).
+app.get('/api/va-ads/:id/pilots', requireAuth, async (req, res) => {
+    try {
+        const ad = await VirtualAirlineAd.findById(req.params.id).select('_id').lean();
+        if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+        const out = await vaPilots.listPilots(VaPilot, ad._id, {
+            q: req.query.q, limit: req.query.limit, skip: req.query.skip,
+        });
+        res.json(out);
+    } catch (error) {
+        console.error('VA Ad pilots list error:', error);
+        res.status(500).json({ message: 'Server error while loading the pilot roster.' });
+    }
+});
+
+// POST: add one or many usernames. Body: { usernames } (array | CSV/blob | JSON
+// array string). Returns { added, skipped, total }.
+app.post('/api/va-ads/:id/pilots', requireAuth, async (req, res) => {
+    try {
+        const ad = await VirtualAirlineAd.findById(req.params.id).select('_id name').lean();
+        if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+        const input = (req.body && (req.body.usernames !== undefined ? req.body.usernames : req.body.username));
+        const who = (req.staff && (req.staff.displayName || req.staff.username)) || 'staff';
+        const out = await vaPilots.addPilots(VaPilot, ad._id, input, who);
+        res.json({ message: `Added ${out.added}, skipped ${out.skipped} duplicate${out.skipped === 1 ? '' : 's'}.`, ...out });
+    } catch (error) {
+        console.error('VA Ad pilots add error:', error);
+        res.status(500).json({ message: 'Server error while adding pilots.' });
+    }
+});
+
+// DELETE: remove one roster entry by its id.
+app.delete('/api/va-ads/:id/pilots/:pilotId', requireAuth, async (req, res) => {
+    try {
+        const ad = await VirtualAirlineAd.findById(req.params.id).select('_id').lean();
+        if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+        const out = await vaPilots.removePilot(VaPilot, ad._id, req.params.pilotId);
+        res.json({ message: out.removed ? 'Pilot removed.' : 'Pilot not found.', ...out });
+    } catch (error) {
+        console.error('VA Ad pilots remove error:', error);
+        res.status(500).json({ message: 'Server error while removing the pilot.' });
+    }
+});
+
+// DELETE: clear a VA's whole roster.
+app.delete('/api/va-ads/:id/pilots', requireAuth, async (req, res) => {
+    try {
+        const ad = await VirtualAirlineAd.findById(req.params.id).select('_id').lean();
+        if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+        const out = await vaPilots.clearPilots(VaPilot, ad._id);
+        res.json({ message: `Cleared ${out.removed} pilot${out.removed === 1 ? '' : 's'}.`, ...out, total: 0 });
+    } catch (error) {
+        console.error('VA Ad pilots clear error:', error);
+        res.status(500).json({ message: 'Server error while clearing the roster.' });
+    }
+});
+
 // POST: Track a click-through (e.g. on the join/apply link). Returns the target
 // URL so the frontend can redirect after recording the click.
 app.post('/api/va-ads/:id/click', async (req, res) => {
@@ -2729,6 +2829,10 @@ const {
 } = require('./vaEventCard');
 const { renderVaEventCard, renderVaRouteMapImage } = require('./vaEventCardImage');
 
+// Shared roster helpers (parse/normalize usernames + thin DB ops on the VaPilot
+// model). Same module backs the VA portal so both surfaces behave identically.
+const vaPilots = require('./vaPilots');
+
 // Pull a VA ad's saved card customization into a normalized options object. A
 // plain ad (or the central feed) yields the default look. Kept in one place so
 // every delivery path applies the VA's config identically.
@@ -2766,6 +2870,12 @@ const postVaEventCard = async (webhookUrl, e, media, prerendered, opts) => {
     const vaName = e.va?.name || e.va?.code || 'Virtual Airline';
     // The Inflight brand mark ALWAYS rides in the footer icon — not customizable.
     const brandIcon = `${CARD_PUBLIC_BASE_URL}/assets/brand/inflight-logo.png`;
+    // 'large' image style: leave the card/map files UNREFERENCED by any embed so
+    // Discord renders them as standalone attachments at full message width —
+    // bigger, and not boxed inside the embed container. The text embed (author,
+    // title, description, footer) still rides above them for context. Default
+    // 'embed' style frames the card inside the embed via attachment://card.png.
+    const largeImages = o.imageStyle === 'large';
     const embed = {
         color: accentInt,
         // The VA's own logo lives here, in the message (the card image carries our
@@ -2783,23 +2893,28 @@ const postVaEventCard = async (webhookUrl, e, media, prerendered, opts) => {
             `**${e.username || 'A pilot'}** ${isTakeoff ? 'departed' : 'landed'} on **${e.server || 'unknown'}**.`
             + (isHttpImageUrl(track) ? `\n[🔭 Track on Inflight](${track})` : ''),
             2048),
-        image: { url: 'attachment://card.png' },
+        ...(largeImages ? {} : { image: { url: 'attachment://card.png' } }),
         footer: {
             text: 'Powered by Inflight',
             ...(isHttpImageUrl(brandIcon) ? { icon_url: brandIcon } : {}),
         },
         timestamp: new Date(Number(e.timestamp) || Date.now()).toISOString(),
     };
-    // The route map rides as a SECOND embed whose only content is the map
-    // image — Discord stacks it full-width under the card. No map (unknown
-    // airports, render hiccup, or VA turned it off) just means a one-embed message.
+    // In the default 'embed' style the route map rides as a SECOND embed whose
+    // only content is the map image — Discord stacks it full-width under the card.
+    // In 'large' style there's no map embed: the map file is left unreferenced so
+    // it too shows as a big standalone attachment. Either way both files are still
+    // declared in `attachments` so Discord keeps them. No map (unknown airports,
+    // render hiccup, or VA turned it off) just means a card-only message.
     const embeds = [embed];
     const attachments = [{ id: 0, filename: 'card.png' }];
     if (mapPng) {
-        embeds.push({
-            color: accentInt,
-            image: { url: 'attachment://map.png' },
-        });
+        if (!largeImages) {
+            embeds.push({
+                color: accentInt,
+                image: { url: 'attachment://map.png' },
+            });
+        }
         attachments.push({ id: 1, filename: 'map.png' });
     }
 
@@ -2943,6 +3058,54 @@ const enrichEventMedia = async (e) => {
 // didn't fit "<base> ###VA" exactly, which is the "matching the VA to the
 // callsign every time" pain this removes. Returns the ad (with webhook URL) or
 // null; every gate that can't produce a target just resolves to null. Never throws.
+// Only an opted-in partner (staff-approved + enabled + a live webhook) can ever
+// receive an event; this is the shared gate every attribution path applies.
+const OPTED_IN_PARTNER_FILTER = {
+    flightEventsApproved: true,   // staff-granted; requests alone don't deliver
+    flightEventsEnabled: true,
+    flightEventsWebhookUrl: { $ne: null },
+};
+const PARTNER_SELECT = 'name callsigns logoUrl flightEventsCard +flightEventsWebhookUrl';
+
+// Attribute an event to an opted-in VA by PILOT ROSTER: the flight's pilot
+// (e.username) is on that VA's roster of Infinite Flight usernames. This is what
+// lets a VA say "these are our pilots" and catch their members' flights even
+// when the live callsign doesn't fit the VA's registered pattern. Used only as a
+// fallback (see resolveVaEventPartner) so it never redirects a flight away from
+// the VA the sender explicitly attributed it to. Returns an opted-in ad or null.
+const resolveVaEventPartnerByRoster = async (e) => {
+    const u = String(e.username || '').trim().toLowerCase();
+    if (!u) return null;
+    let vaIds;
+    try {
+        const rows = await VaPilot.find({ usernameLower: u }).select('vaAdId').lean();
+        vaIds = [...new Set(rows.map((r) => String(r.vaAdId)))];
+    } catch (err) {
+        console.error('[va-events] roster lookup failed:', err.message);
+        return null;
+    }
+    if (!vaIds.length) return null;
+
+    let ads;
+    try {
+        ads = await VirtualAirlineAd.find({ _id: { $in: vaIds }, ...OPTED_IN_PARTNER_FILTER })
+            .select(PARTNER_SELECT).sort({ name: 1 }).lean();
+    } catch (err) {
+        console.error('[va-events] roster partner lookup failed:', err.message);
+        return null;
+    }
+    const valid = ads.filter((a) => a.flightEventsWebhookUrl && isDiscordWebhookUrl(a.flightEventsWebhookUrl));
+    if (!valid.length) return null;
+    // A pilot on several opted-in rosters is ambiguous; pick deterministically
+    // (name-sorted) and log it so the overlap is visible rather than silent.
+    if (valid.length > 1) {
+        console.warn(`[va-events] pilot "${e.username}" is on ${valid.length} opted-in rosters — attributing to "${valid[0].name}"`);
+    } else {
+        console.log(`[va-events] attributed by roster: pilot "${e.username}" → "${valid[0].name}"`);
+    }
+    return valid[0];
+};
+
 const resolveVaEventPartner = async (e) => {
     // The event ALREADY arrives attributed to a VA — the ACARS sender resolved it
     // and set e.va.code / e.va.name. We're not re-identifying the flight here; we
@@ -2961,44 +3124,43 @@ const resolveVaEventPartner = async (e) => {
     const or = [];
     if (codeBases.length) or.push({ callsigns: { $in: callsignQueryVariants(codeBases) } });
     for (const n of names) or.push({ name: new RegExp('^' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
-    if (!or.length) return null;
 
-    let ad;
-    try {
-        ad = await VirtualAirlineAd.findOne({
-            $and: [
-                { $or: or },
-                { flightEventsApproved: true },   // staff-granted; requests alone don't deliver
-                { flightEventsEnabled: true },
-                { flightEventsWebhookUrl: { $ne: null } },
-            ],
-        }).select('name callsigns logoUrl flightEventsCard +flightEventsWebhookUrl').lean();
-    } catch (err) {
-        console.error('[va-events] partner lookup failed:', err.message);
-        return null;
-    }
-    // No opted-in VA — but log what we tried so a miss is diagnosable (almost
-    // always a gate that's off: not approved / disabled / no webhook saved —
-    // not a failure to identify the VA, which already happened on the sender).
-    if (!ad || !ad.flightEventsWebhookUrl) {
-        console.log(`[va-events] no opted-in partner for VA "${e.va?.name || e.va?.code || e.callsign}" — codes [${codeBases.join(', ')}] names [${names.join(', ')}]`);
-        return null;
+    let ad = null;
+    if (or.length) {
+        try {
+            ad = await VirtualAirlineAd.findOne({ $and: [{ $or: or }, OPTED_IN_PARTNER_FILTER] })
+                .select(PARTNER_SELECT).lean();
+        } catch (err) {
+            console.error('[va-events] partner lookup failed:', err.message);
+            ad = null;
+        }
     }
 
+    // Primary (sender/callsign) attribution found an opted-in partner. Deliver to
+    // it — but re-validate the URL at send time (a URL stored before validation
+    // tightened, or a host that should no longer be trusted, must not be posted
+    // to blindly). A bad URL here means SKIP, not roster-fallback: the sender was
+    // explicit about which VA this is, so we don't hand its flight to another.
+    //
     // NOTE: we deliberately DON'T re-check the live callsign against the VA's
-    // stored callsigns here. The sender already identified the VA by callsign;
-    // requiring the in-game callsign to also fit our strict "<base> ###VA" shape
-    // was a redundant second gate that dropped legitimate flights and made hooking
-    // a VA up feel unreliable. Trusting the sender's attribution is the fix.
-
-    // Re-validate at send time: a URL stored before validation tightened, or a
-    // VA host that should no longer be trusted, must not be posted to blindly.
-    if (!isDiscordWebhookUrl(ad.flightEventsWebhookUrl)) {
+    // stored callsigns — the sender already identified the VA; a second strict
+    // "<base> ###VA" gate used to drop legitimate flights.
+    if (ad && ad.flightEventsWebhookUrl) {
+        if (isDiscordWebhookUrl(ad.flightEventsWebhookUrl)) return ad;
         console.warn('[va-events] partner webhook not a valid Discord webhook, skipping:', ad.name);
         return null;
     }
 
-    return ad;
+    // No opted-in partner by callsign/name → try the PILOT ROSTER: is the pilot a
+    // known member of an opted-in VA? This is the path that makes a roster useful.
+    const rosterAd = await resolveVaEventPartnerByRoster(e);
+    if (rosterAd) return rosterAd;
+
+    // Still nothing — log what we tried so a miss is diagnosable (usually a gate
+    // that's off: not approved / disabled / no webhook — not a failure to
+    // identify the VA, which already happened on the sender).
+    console.log(`[va-events] no opted-in partner for VA "${e.va?.name || e.va?.code || e.callsign}" — codes [${codeBases.join(', ')}] names [${names.join(', ')}] pilot "${e.username || ''}"`);
+    return null;
 };
 
 // Slow-path handler, run after we've already acked the sender. Anything that
