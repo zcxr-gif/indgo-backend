@@ -346,7 +346,7 @@ const buildRouteMapSvg = (route, pos, lineColor, pal, MAP) => {
 // brand mark reads on any basemap style.
 const MAP_LOGO = { x: 20, y: 16, w: 150, h: 40 };
 
-const renderVaRouteMapImage = async (e = {}, opts) => {
+const renderVaRouteMapImageImpl = async (e = {}, opts) => {
     try {
         const o = normalizeCardOptions(opts || {});
         const route = extractRoute(e);
@@ -532,7 +532,7 @@ const buildBaseSvg = (e, route, has, opts) => {
 
 // Render the composite PNG for one event. Returns a Buffer, or null if rendering
 // failed (caller then falls back to the plain embed).
-const renderVaEventCard = async (e = {}, media = {}, opts) => {
+const renderVaEventCardImpl = async (e = {}, media = {}, opts) => {
     try {
         const o = normalizeCardOptions(opts || {});
         const route = extractRoute(e);
@@ -574,5 +574,32 @@ const renderVaEventCard = async (e = {}, media = {}, opts) => {
         return null;
     }
 };
+
+// --- Render serialization ----------------------------------------------------
+// sharp/libvips renders allocate large native buffers (the composite card, the
+// route-map banner, plus the fetched aircraft photo). Under a burst of
+// simultaneous flight events — or a live preview arriving while events land —
+// several pipelines could otherwise run at once and spike RSS toward the
+// container's memory cap, and on Linux glibc holds that freed native memory in
+// its arenas afterwards (the "RSS only drops on restart" effect). Funnel EVERY
+// render through a single-slot queue so at most one pipeline's buffers are alive
+// at a time. The cost is a few ms of queue wait per render — invisible next to a
+// webhook round-trip — and it changes nothing about the output.
+//
+// The queue is process-wide and outlives individual requests on purpose; it never
+// grows unbounded (it holds only the in-flight + waiting tasks) and the chain is
+// kept resolved past failures so one bad render can't stall the rest.
+let renderTail = Promise.resolve();
+const queueRender = (task) => {
+    const result = renderTail.then(task);
+    renderTail = result.then(() => {}, () => {});
+    return result;
+};
+
+// Public renderers: identical signatures/return values to the impls above, just
+// serialized. Callers (live delivery, staff/portal preview, test button) are
+// unaffected beyond ordering.
+const renderVaEventCard = (e = {}, media = {}, opts) => queueRender(() => renderVaEventCardImpl(e, media, opts));
+const renderVaRouteMapImage = (e = {}, opts) => queueRender(() => renderVaRouteMapImageImpl(e, opts));
 
 module.exports = { renderVaEventCard, renderVaRouteMapImage };

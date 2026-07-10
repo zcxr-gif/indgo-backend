@@ -677,8 +677,12 @@ const cloudWatchClient = new CloudWatchClient({
 
 // Configure Multer to store file in MEMORY temporarily
 const upload = multer({
-    dest: os.tmpdir(), 
-    limits: { fileSize: 100 * 1024 * 1024 } // 100MB limit
+    dest: os.tmpdir(),
+    // 15MB is comfortably above any logo/banner/aircraft image or gate CSV we
+    // accept, while cutting the old 100MB ceiling that let a single upload write
+    // a huge temp file — on some container hosts os.tmpdir() is RAM-backed
+    // (tmpfs), so an oversized upload could spike memory toward the cap.
+    limits: { fileSize: 15 * 1024 * 1024 } // 15MB limit
 });
 
 // --- START THE BOT ---
