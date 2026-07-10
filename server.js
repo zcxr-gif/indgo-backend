@@ -224,12 +224,16 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // normalizeCardOptions() from vaEventCard.js. Only ever applied to THIS VA's
     // own webhook — the central feed always uses the default card.
     flightEventsCard: {
-        accent:    { type: String, trim: true, default: '' },      // '#rrggbb' or '' = event colour
-        layout:    { type: String, enum: ['card', 'compact'], default: 'card' },
-        showMap:   { type: Boolean, default: true },               // post the route-map image
-        showPhoto: { type: Boolean, default: true },               // aircraft photo on the card
-        title:     { type: String, trim: true, default: '' },      // custom embed title; '' = default
-        fields:    { type: [String], default: [] },                // ordered subset; [] = default set
+        accent:     { type: String, trim: true, default: '' },      // '#rrggbb' or '' = event colour
+        layout:     { type: String, enum: ['card', 'compact'], default: 'card' },
+        imageStyle: { type: String, enum: ['embed', 'large'], default: 'embed' }, // card/map framed in the embed vs. posted as full-width standalone attachments
+        showMap:    { type: Boolean, default: true },               // post the route-map image
+        showPhoto:  { type: Boolean, default: true },               // aircraft photo on the card
+        photoSide:  { type: String, enum: ['right', 'left'], default: 'right' },  // which side the aircraft photo sits on
+        mapStyle:   { type: String, enum: ['dark', 'midnight', 'light', 'mono'], default: 'dark' }, // route-map basemap palette
+        mapLine:    { type: String, trim: true, default: '' },      // route-line colour ('#rrggbb'/name) or '' = accent
+        title:      { type: String, trim: true, default: '' },      // custom embed title; '' = default
+        fields:     { type: [String], default: [] },                // ordered subset; [] = default set
     },
 
     // --- Analytics ---
@@ -2766,6 +2770,12 @@ const postVaEventCard = async (webhookUrl, e, media, prerendered, opts) => {
     const vaName = e.va?.name || e.va?.code || 'Virtual Airline';
     // The Inflight brand mark ALWAYS rides in the footer icon — not customizable.
     const brandIcon = `${CARD_PUBLIC_BASE_URL}/assets/brand/inflight-logo.png`;
+    // 'large' image style: leave the card/map files UNREFERENCED by any embed so
+    // Discord renders them as standalone attachments at full message width —
+    // bigger, and not boxed inside the embed container. The text embed (author,
+    // title, description, footer) still rides above them for context. Default
+    // 'embed' style frames the card inside the embed via attachment://card.png.
+    const largeImages = o.imageStyle === 'large';
     const embed = {
         color: accentInt,
         // The VA's own logo lives here, in the message (the card image carries our
@@ -2783,23 +2793,28 @@ const postVaEventCard = async (webhookUrl, e, media, prerendered, opts) => {
             `**${e.username || 'A pilot'}** ${isTakeoff ? 'departed' : 'landed'} on **${e.server || 'unknown'}**.`
             + (isHttpImageUrl(track) ? `\n[🔭 Track on Inflight](${track})` : ''),
             2048),
-        image: { url: 'attachment://card.png' },
+        ...(largeImages ? {} : { image: { url: 'attachment://card.png' } }),
         footer: {
             text: 'Powered by Inflight',
             ...(isHttpImageUrl(brandIcon) ? { icon_url: brandIcon } : {}),
         },
         timestamp: new Date(Number(e.timestamp) || Date.now()).toISOString(),
     };
-    // The route map rides as a SECOND embed whose only content is the map
-    // image — Discord stacks it full-width under the card. No map (unknown
-    // airports, render hiccup, or VA turned it off) just means a one-embed message.
+    // In the default 'embed' style the route map rides as a SECOND embed whose
+    // only content is the map image — Discord stacks it full-width under the card.
+    // In 'large' style there's no map embed: the map file is left unreferenced so
+    // it too shows as a big standalone attachment. Either way both files are still
+    // declared in `attachments` so Discord keeps them. No map (unknown airports,
+    // render hiccup, or VA turned it off) just means a card-only message.
     const embeds = [embed];
     const attachments = [{ id: 0, filename: 'card.png' }];
     if (mapPng) {
-        embeds.push({
-            color: accentInt,
-            image: { url: 'attachment://map.png' },
-        });
+        if (!largeImages) {
+            embeds.push({
+                color: accentInt,
+                image: { url: 'attachment://map.png' },
+            });
+        }
         attachments.push({ id: 1, filename: 'map.png' });
     }
 

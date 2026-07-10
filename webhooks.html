@@ -112,6 +112,14 @@
                     </div>
                 </div>
                 <div>
+                    <label class="block text-xs font-semibold mb-1.5 text-zinc-500">Image size</label>
+                    <select id="wh_card_image_style" class="w-full px-3 py-2 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none text-sm">
+                        <option value="embed">Standard — framed inside the embed</option>
+                        <option value="large">Large — full-width standalone image</option>
+                    </select>
+                    <p class="text-xs text-zinc-400 mt-1.5">Large posts the card (and route map) as standalone attachments so Discord shows them bigger, not boxed in the embed container.</p>
+                </div>
+                <div>
                     <label class="block text-xs font-semibold mb-1.5 text-zinc-500">Custom title <span class="font-normal text-zinc-400">· optional</span></label>
                     <input id="wh_card_title" type="text" maxlength="240" placeholder="Leave blank for the default title" class="w-full px-3 py-2 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none text-sm">
                 </div>
@@ -293,6 +301,7 @@
             document.getElementById('wh_card_accent').value = accent;
             document.getElementById('wh_card_accentPicker').value = /^#[0-9a-fA-F]{6}$/.test(accent) ? accent : '#2ecc71';
             document.getElementById('wh_card_layout').value = c.layout === 'compact' ? 'compact' : 'card';
+            document.getElementById('wh_card_image_style').value = c.imageStyle === 'large' ? 'large' : 'embed';
             document.getElementById('wh_card_showPhoto').checked = c.showPhoto !== false;
             document.getElementById('wh_card_showMap').checked = c.showMap !== false;
             document.getElementById('wh_card_title').value = c.title || '';
@@ -351,6 +360,7 @@
             return {
                 accent: document.getElementById('wh_card_accent').value.trim(),
                 layout: document.getElementById('wh_card_layout').value,
+                imageStyle: document.getElementById('wh_card_image_style').value,
                 showPhoto: document.getElementById('wh_card_showPhoto').checked,
                 showMap: document.getElementById('wh_card_showMap').checked,
                 photoSide: document.getElementById('wh_card_photoSide').value,

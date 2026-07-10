@@ -290,6 +290,14 @@
                         </select>
                         <p class="text-[11px] text-zinc-400 mt-1" data-i18n="fe.card.layoutHelp">Compact skips the rendered image for a lighter post.</p>
                     </div>
+                    <div>
+                        <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.card.imageStyle">Image size</label>
+                        <select id="pfCardImageStyle" class="field pf-edit">
+                            <option value="embed" data-i18n="fe.card.imageStyleEmbed">Standard (framed in embed)</option>
+                            <option value="large" data-i18n="fe.card.imageStyleLarge">Large (standalone image)</option>
+                        </select>
+                        <p class="text-[11px] text-zinc-400 mt-1" data-i18n="fe.card.imageStyleHelp">Large posts the card as a full-width standalone image, not boxed in the embed.</p>
+                    </div>
                 </div>
 
                 <div>
@@ -964,6 +972,7 @@
             $('pfCardAccent').value = accent;
             $('pfCardAccentPicker').value = /^#[0-9a-fA-F]{6}$/.test(accent) ? accent : '#2ecc71';
             $('pfCardLayout').value = c.layout === 'compact' ? 'compact' : 'card';
+            $('pfCardImageStyle').value = c.imageStyle === 'large' ? 'large' : 'embed';
             $('pfCardShowPhoto').checked = c.showPhoto !== false;
             $('pfCardShowMap').checked = c.showMap !== false;
             $('pfCardTitle').value = c.title || '';
@@ -982,6 +991,7 @@
             return {
                 accent: $('pfCardAccent').value.trim(),
                 layout: $('pfCardLayout').value,
+                imageStyle: $('pfCardImageStyle').value,
                 showPhoto: $('pfCardShowPhoto').checked,
                 showMap: $('pfCardShowMap').checked,
                 photoSide: $('pfCardPhotoSide').value,
