@@ -93,6 +93,8 @@
                 <button type="submit" class="btn w-full" data-i18n="login.signin">Sign in</button>
             </form>
             <p class="text-center text-xs text-zinc-400 dark:text-zinc-600 mt-6">
+                <a href="/terms" target="_blank" rel="noopener" class="underline hover:text-zinc-600 dark:hover:text-zinc-300" data-i18n="comp.terms">Terms &amp; Conditions</a>
+                <span class="mx-1.5">·</span>
                 <span data-i18n="login.staffPrompt">Are you Inflight staff?</span> <a href="/staff" class="underline hover:text-zinc-600 dark:hover:text-zinc-300" data-i18n="login.staffHub">Staff hub</a>
             </p>
 
@@ -135,6 +137,8 @@
                     <!-- Top-right controls -->
                     <div class="absolute top-3 right-3 flex items-center gap-2">
                         <div id="dashLangPicker"></div>
+                        <a href="/terms" target="_blank" rel="noopener" data-i18n-title="comp.viewTerms" title="View Terms" class="w-9 h-9 grid place-items-center rounded-full bg-white/85 dark:bg-zinc-900/80 backdrop-blur text-zinc-700 dark:text-zinc-200 hover:scale-105 transition shadow"><i data-lucide="scroll-text" class="w-4 h-4"></i></a>
+                        <a href="/VA-Advertisement-Terms.pdf" target="_blank" rel="noopener" data-i18n-title="comp.downloadPdf" title="Download PDF" class="w-9 h-9 grid place-items-center rounded-full bg-white/85 dark:bg-zinc-900/80 backdrop-blur text-zinc-700 dark:text-zinc-200 hover:scale-105 transition shadow"><i data-lucide="file-down" class="w-4 h-4"></i></a>
                         <button onclick="toggleTheme()" data-i18n-title="common.theme" title="Toggle theme" class="w-9 h-9 grid place-items-center rounded-full bg-white/85 dark:bg-zinc-900/80 backdrop-blur text-zinc-700 dark:text-zinc-200 hover:scale-105 transition shadow"><span id="dashThemeIcon"></span></button>
                         <button onclick="logout()" data-i18n-title="common.signout" title="Sign out" class="w-9 h-9 grid place-items-center rounded-full bg-white/85 dark:bg-zinc-900/80 backdrop-blur text-zinc-700 dark:text-zinc-200 hover:scale-105 transition shadow"><i data-lucide="log-out" class="w-4 h-4"></i></button>
                     </div>
@@ -186,7 +190,7 @@
             <button class="tab" data-tab="flightevents" onclick="switchTab('flightevents')"><i data-lucide="plane-takeoff" class="w-4 h-4"></i> <span data-i18n="tab.flightevents">Flight events</span></button>
             <button class="tab" data-tab="profile" onclick="switchTab('profile')"><i data-lucide="building-2" class="w-4 h-4"></i> <span data-i18n="tab.profile">VA Profile</span></button>
             <button class="tab" data-tab="embed" onclick="switchTab('embed')"><i data-lucide="code-2" class="w-4 h-4"></i> <span data-i18n="tab.embed">Embed</span></button>
-            <button id="tabComplianceBtn" class="tab relative" data-tab="compliance" onclick="switchTab('compliance')"><i data-lucide="shield-check" class="w-4 h-4"></i> <span data-i18n="tab.compliance">Compliance</span><span id="complianceDot" class="hidden absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-rose-500 ring-2 ring-white dark:ring-zinc-900"></span></button>
+            <button id="tabComplianceBtn" class="tab relative" data-tab="compliance" onclick="switchTab('compliance')"><i data-lucide="shield-check" class="w-4 h-4"></i> <span data-i18n="tab.compliance">Terms &amp; standing</span><span id="complianceDot" class="hidden absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-rose-500 ring-2 ring-white dark:ring-zinc-900"></span></button>
             <button id="tabTeamBtn" class="tab hidden" data-tab="team" onclick="switchTab('team')"><i data-lucide="users" class="w-4 h-4"></i> <span data-i18n="tab.team">Team</span></button>
             <button class="tab" data-tab="account" onclick="switchTab('account')"><i data-lucide="user-cog" class="w-4 h-4"></i> <span data-i18n="tab.account">Account</span></button>
         </nav>

@@ -123,8 +123,9 @@
                     <p class="text-sm font-semibold flex items-center gap-2"><i data-lucide="scroll-text" class="w-4 h-4"></i> Terms of Service</p>
                     <p id="tosMetaStaff" class="text-xs text-zinc-500 dark:text-zinc-400 mt-1">—</p>
                 </div>
-                <div class="flex items-center gap-2">
+                <div class="flex items-center gap-2 flex-wrap">
                     <a href="/terms" target="_blank" rel="noopener" class="text-xs font-semibold px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 inline-flex items-center gap-1.5"><i data-lucide="external-link" class="w-3.5 h-3.5"></i> View Terms</a>
+                    <a href="/VA-Advertisement-Terms.pdf" target="_blank" rel="noopener" class="text-xs font-semibold px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 inline-flex items-center gap-1.5" title="The signed PDF sent to VAs in partnership tickets"><i data-lucide="file-down" class="w-3.5 h-3.5"></i> PDF</a>
                     <button onclick="announceTos()" id="tosAnnounceBtn" class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 inline-flex items-center gap-1.5" title="Post a Terms-update notice to every VA's Discord channel"><i data-lucide="megaphone" class="w-3.5 h-3.5"></i> Announce update</button>
                 </div>
             </div>
@@ -231,6 +232,16 @@
                 $('app').classList.remove('hidden');
                 lucide.createIcons();
                 loadSubmissions();
+                // Deep links (e.g. from the VA Ads Manager "Warn" button):
+                // ?tab=warnings&va=<id> opens the Warnings tab with the VA preselected.
+                const q = new URLSearchParams(location.search);
+                const va = q.get('va');
+                if (va) {
+                    ['fVa','evVa','wVa','fWarnVa'].forEach(id => { const el = $(id); if (el && [...el.options].some(o => o.value === va)) el.value = va; });
+                }
+                const tab = q.get('tab');
+                if (tab && ['submissions','events','warnings','accounts','activity'].includes(tab)) switchTab(tab);
+                if (va && tab === 'warnings') { const r = $('wReason'); if (r) r.focus(); }
             } catch (err) {
                 if (err.message !== 'auth') {
                     $('bootLoader').innerHTML = `<p class="text-sm text-rose-500">${esc(err.message)}</p>`;
