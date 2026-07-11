@@ -123,7 +123,7 @@
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
                     <div>
                         <label class="block text-sm font-semibold mb-1.5">VA code <span class="text-red-500">*</span></label>
-                        <input id="f_va_code" required placeholder="OCEAN" onchange="syncWebhookPanel()" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
+                        <input id="f_va_code" required placeholder="OCEAN" onchange="onVaCodeEdited()" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
                     </div>
                     <div class="sm:col-span-2">
                         <label class="block text-sm font-semibold mb-1.5">Display name</label>
@@ -626,6 +626,11 @@
         // Pulls the VA-Ads directory once, then filters client-side so picking a
         // VA pastes its callsign/name/logo straight into the form.
         let VA_DIRECTORY = null;
+        // The VA ad this embed is explicitly bound to (the "head"). Set when staff
+        // pick a VA or open an existing embed that already has the link; cleared
+        // when the code is hand-edited so a stale id never overrides the code.
+        let pickedVaId = null;
+        function onVaCodeEdited() { pickedVaId = null; syncWebhookPanel(); }
         let vaDirLoading = null;
 
         async function loadVaDirectory() {
@@ -694,6 +699,7 @@
                 : (v.callsign ? [v.callsign] : []))
                 .map(c => String(c).trim()).filter(Boolean);
             const code = (callsigns[0] || '').toUpperCase();
+            pickedVaId = v._id || null; // bind this embed to the picked VA head
             document.getElementById('f_va_code').value = code;
             document.getElementById('f_va_name').value = v.name || '';
             document.getElementById('f_va_logo').value = v.logoUrl || '';
@@ -942,6 +948,7 @@
         function openModal() {
             document.getElementById('form').reset();
             document.getElementById('f_id').value = '';
+            pickedVaId = null; // new embed — no VA bound until one is picked
             setAccent('');
             document.getElementById('formError').classList.add('hidden');
             resetVaConnector();
@@ -958,6 +965,7 @@
             document.getElementById('form').reset();
             resetVaConnector();
             document.getElementById('f_id').value = c._id;
+            pickedVaId = c.vaAdId || null; // preserve the existing VA link on edit
             document.getElementById('f_label').value = c.label || '';
             document.getElementById('f_va_code').value = (c.va && c.va.code) || '';
             document.getElementById('f_va_name').value = (c.va && c.va.name) || '';
@@ -1032,6 +1040,7 @@
             const v = (id) => document.getElementById(id).value.trim();
             return {
                 label: v('f_label'),
+                vaAdId: pickedVaId || undefined, // explicit link to the VA head
                 va: { code: v('f_va_code'), name: v('f_va_name'), logo: v('f_va_logo') },
                 callsignPrefixes: v('f_prefixes'),
                 callsignSuffixes: v('f_suffixes'),

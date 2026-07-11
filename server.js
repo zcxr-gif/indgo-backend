@@ -349,6 +349,13 @@ const EmbedConfigSchema = new mongoose.Schema({
     // Opaque token the VA embeds in their iframe URL. Generated on create.
     token: { type: String, required: true, unique: true, index: true },
 
+    // Hard link to the VA advertisement this embed belongs to — the "head".
+    // Embeds were historically matched to a VA only by va.code (callsign); this
+    // reference makes the trail explicit, so a VA's ad, roster, webhook and
+    // embed all point at one record. Backfilled from va.code for legacy embeds;
+    // kept in step with the ad's name/logo whenever either side changes.
+    vaAdId: { type: mongoose.Schema.Types.ObjectId, ref: 'VirtualAirlineAd', default: null, index: true },
+
     // Internal label so staff can tell entries apart in the manager (not exposed).
     label: { type: String, trim: true, default: '' },
 
@@ -655,6 +662,10 @@ mongoose.connection.once('open', async () => {
     };
     await dropLegacyIndex(DailyPilotView,  'date_1_pilotUserId_1_viewerHash_1');
     await dropLegacyIndex(DailyPilotStats, 'date_1_pilotUserId_1');
+
+    // Make sure every legacy embed is plugged into its VA (backfills vaAdId from
+    // callsign for embeds created before the link existed). Idempotent.
+    backfillEmbedVaLinks();
 });
 
 // 4. CONFIGURE AWS CLIENTS
@@ -2358,6 +2369,12 @@ app.put('/api/va-ads/:id', requireAuth, uploadVaImages, async (req, res) => {
         if (b.flightEventsApproved !== undefined) ad.flightEventsApproved = b.flightEventsApproved === true || b.flightEventsApproved === 'true';
 
         await ad.save();
+
+        // Keep linked embeds in sync with the head: push the ad's name/logo onto
+        // every embed that points at it (and adopt embeds newly matched by a
+        // just-edited callsign). Fire-and-forget — never block the ad save on it.
+        syncEmbedsToAd(ad).catch((e) => console.error('embed sync on ad update:', e.message));
+
         res.json({ message: 'VA advertisement updated.', data: ad });
     } catch (error) {
         cleanupTempFiles([bannerFile, logoFile].filter(Boolean));
@@ -3428,6 +3445,14 @@ app.get('/api/embed/resolve', async (req, res) => {
 const applyEmbedFields = (cfg, body) => {
     if (body.label !== undefined) cfg.label = String(body.label || '').trim();
 
+    // Explicit VA link (the embed manager sends this when a VA is picked). An
+    // empty/invalid value clears it; linkEmbedToVa() below can still re-derive
+    // it from va.code on save.
+    if (body.vaAdId !== undefined) {
+        cfg.vaAdId = (body.vaAdId && mongoose.Types.ObjectId.isValid(String(body.vaAdId)))
+            ? body.vaAdId : null;
+    }
+
     const va = body.va || {};
     if (va.code !== undefined) cfg.va.code = String(va.code || '').trim().toUpperCase();
     if (va.name !== undefined) cfg.va.name = String(va.name || '').trim();
@@ -3522,6 +3547,77 @@ const applyEmbedFields = (cfg, body) => {
     }
 };
 
+// Establish (or refresh) the trail from an embed to its VA "head". If the embed
+// already names a vaAdId, that VA wins; otherwise we find the single VA whose
+// callsigns include the embed's va.code. Once resolved, the link is stored and
+// the display snapshot (name/logo) is refreshed from the ad so the embed can't
+// drift out of sync. A no-op when nothing matches or the code is ambiguous (we
+// never guess between two VAs). Returns the linked ad, or null.
+const linkEmbedToVa = async (cfg) => {
+    try {
+        let ad = null;
+        if (cfg.vaAdId) {
+            ad = await VirtualAirlineAd.findById(cfg.vaAdId).select('name logoUrl').lean();
+            if (!ad) cfg.vaAdId = null; // stale reference — fall through to code match
+        }
+        if (!ad) {
+            const code = String((cfg.va && cfg.va.code) || '').trim().toUpperCase();
+            if (!code) return null;
+            const matches = await VirtualAirlineAd
+                .find({ callsigns: { $in: callsignQueryVariants([code]) } })
+                .select('name logoUrl').limit(2).lean();
+            if (matches.length !== 1) return null; // none or ambiguous → don't guess
+            ad = matches[0];
+            cfg.vaAdId = ad._id;
+        }
+        if (!cfg.va) cfg.va = {};
+        if (ad.name) cfg.va.name = ad.name;
+        if (ad.logoUrl) cfg.va.logo = ad.logoUrl;
+        return ad;
+    } catch (err) {
+        console.error('linkEmbedToVa error:', err.message);
+        return null;
+    }
+};
+
+// Backfill the vaAdId link for every legacy embed that predates it, matching by
+// callsign. Idempotent and cheap (skips already-linked embeds); runs once on
+// boot so "every embed leads to its VA" holds without a manual step.
+const backfillEmbedVaLinks = async () => {
+    try {
+        const orphans = await EmbedConfig.find({ $or: [{ vaAdId: null }, { vaAdId: { $exists: false } }] })
+            .select('va vaAdId');
+        let linked = 0;
+        for (const cfg of orphans) {
+            const ad = await linkEmbedToVa(cfg);
+            if (ad) { await cfg.save(); linked++; }
+        }
+        if (linked) console.log(`[embed-link] backfilled ${linked}/${orphans.length} embed(s) to their VA`);
+    } catch (err) {
+        console.error('backfillEmbedVaLinks error:', err.message);
+    }
+};
+
+// Push a VA ad's identity onto its embeds so they never drift from the head:
+//   1) refresh name/logo on every embed already linked by vaAdId, and
+//   2) adopt any still-unlinked embed whose va.code matches one of the ad's
+//      callsigns (e.g. after a callsign edit), stamping the vaAdId link on it.
+// Never steals an embed already linked to a different VA.
+const syncEmbedsToAd = async (ad) => {
+    if (!ad || !ad._id) return;
+    const snapshot = { 'va.name': ad.name || '', 'va.logo': ad.logoUrl || '', updatedAt: new Date() };
+    await EmbedConfig.updateMany({ vaAdId: ad._id }, { $set: snapshot });
+
+    const codes = (Array.isArray(ad.callsigns) && ad.callsigns.length ? ad.callsigns : [ad.callsign])
+        .filter(Boolean).map((c) => String(c).toUpperCase());
+    if (codes.length) {
+        await EmbedConfig.updateMany(
+            { 'va.code': { $in: codes }, $or: [{ vaAdId: null }, { vaAdId: { $exists: false } }] },
+            { $set: { ...snapshot, vaAdId: ad._id } },
+        );
+    }
+};
+
 // The cosmetic-only subset of the fields above — safe to hand to a VA editing
 // its OWN embed from the partner portal. It restyles the widget (mode, theme,
 // header, accent/gradient, corner radius, map-card colours) but deliberately
@@ -3602,6 +3698,7 @@ app.post('/api/embed/configs', requireAuth, async (req, res) => {
         }
         const cfg = new EmbedConfig({ token: 'tok_' + crypto.randomBytes(16).toString('hex'), va: {} });
         applyEmbedFields(cfg, body);
+        await linkEmbedToVa(cfg); // plug the new embed into its VA head
         await cfg.save();
         res.status(201).json(cfg.toObject());
     } catch (error) {
@@ -3617,6 +3714,7 @@ app.patch('/api/embed/configs/:id', requireAuth, async (req, res) => {
         if (!cfg) return res.status(404).json({ message: 'Embed config not found.' });
         applyEmbedFields(cfg, req.body || {});
         if (!cfg.va.code) return res.status(400).json({ message: 'va.code is required.' });
+        await linkEmbedToVa(cfg); // keep the VA link + name/logo snapshot current
         await cfg.save();
         res.json(cfg.toObject());
     } catch (error) {

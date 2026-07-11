@@ -370,6 +370,20 @@
         // ---------- Load list ----------
         function debouncedLoad() { clearTimeout(debounceTimer); debounceTimer = setTimeout(loadAds, 350); }
 
+        // Deep link: /va-ads?va=<id> opens that VA's roster straight away (e.g.
+        // the "Manage roster" link from the Webhooks Manager leads here). Runs
+        // once, after the first grid render, so we can resolve the VA's name.
+        let adsCache = [];
+        let _rosterDeepLinkDone = false;
+        function maybeOpenRosterFromUrl() {
+            if (_rosterDeepLinkDone) return;
+            const id = new URLSearchParams(location.search).get('va');
+            if (!id) return;
+            _rosterDeepLinkDone = true;
+            const ad = adsCache.find(a => String(a._id) === String(id));
+            if (ad) openRoster(ad._id, ad.name);
+        }
+
         async function loadAds() {
             const grid = document.getElementById('grid');
             const loading = document.getElementById('loadingState');
@@ -394,6 +408,8 @@
 
                 if (!ads.length) { grid.innerHTML = ''; empty.classList.remove('hidden'); return; }
                 grid.innerHTML = ads.map(cardHtml).join('');
+                adsCache = ads;
+                maybeOpenRosterFromUrl();
             } catch (e) {
                 loading.classList.add('hidden');
                 toast('Failed to load advertisements.', false);
