@@ -62,7 +62,7 @@
             'tab.embed': 'Embed',
             'tab.team': 'Team',
             'tab.account': 'Account',
-            'tab.compliance': 'Compliance',
+            'tab.compliance': 'Terms & standing',
             // ToS update banner + compliance tab
             'tos.updated': 'Our Terms & Conditions have been updated',
             'tos.updatedSub': 'Please review and acknowledge the new version to stay in good standing.',
@@ -797,7 +797,7 @@
             'tab.embed': 'Intégrer',
             'tab.team': 'Équipe',
             'tab.account': 'Compte',
-            'tab.compliance': 'Conformité',
+            'tab.compliance': 'Conditions et statut',
             'tos.updated': 'Nos Conditions Générales ont été mises à jour',
             'tos.updatedSub': 'Veuillez consulter et accepter la nouvelle version pour rester en règle.',
             'tos.review': 'Consulter et accepter',

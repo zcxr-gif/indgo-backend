@@ -231,6 +231,16 @@
                 $('app').classList.remove('hidden');
                 lucide.createIcons();
                 loadSubmissions();
+                // Deep links (e.g. from the VA Ads Manager "Warn" button):
+                // ?tab=warnings&va=<id> opens the Warnings tab with the VA preselected.
+                const q = new URLSearchParams(location.search);
+                const va = q.get('va');
+                if (va) {
+                    ['fVa','evVa','wVa','fWarnVa'].forEach(id => { const el = $(id); if (el && [...el.options].some(o => o.value === va)) el.value = va; });
+                }
+                const tab = q.get('tab');
+                if (tab && ['submissions','events','warnings','accounts','activity'].includes(tab)) switchTab(tab);
+                if (va && tab === 'warnings') { const r = $('wReason'); if (r) r.focus(); }
             } catch (err) {
                 if (err.message !== 'auth') {
                     $('bootLoader').innerHTML = `<p class="text-sm text-rose-500">${esc(err.message)}</p>`;
