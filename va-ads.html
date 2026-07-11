@@ -307,7 +307,7 @@
                             </label>
                             <button type="button" onclick="clearRosterPilots()" class="text-xs font-semibold px-3 py-2 rounded-lg border-2 border-red-200 dark:border-red-900/60 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 ml-auto">Clear all</button>
                         </div>
-                        <p class="text-[11px] text-zinc-400">Smart CSV: a header row and extra columns are ignored — the username column is picked automatically. Duplicates are skipped.</p>
+                        <p class="text-[11px] text-zinc-400">Formats handled automatically: a plain list, comma / semicolon / tab-separated, a CSV or spreadsheet export (header row and extra columns are ignored — the username column is picked for you), or a JSON array. Leading “@” and duplicates are stripped.</p>
                     </div>
                 </div>
 
@@ -645,38 +645,13 @@
         }
 
         // --- Bulk management (admin/staff) ----------------------------------
-        // Turn whatever staff paste or drop into a clean newline list, then POST
-        // it — the server de-dupes/normalizes, so this only extracts usernames.
-
-        // Smart CSV/text → newline-separated usernames. Handles a spreadsheet
-        // export (header row + several columns) by picking the username column;
-        // falls back to the raw text for a plain pasted list, which the server
-        // already parses on its own.
-        function extractRosterUsernames(text) {
-            const lines = String(text || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-            if (!lines.length) return '';
-            // Guess the delimiter from the first line: tab, then semicolon, then comma.
-            const first = lines[0];
-            const delim = first.includes('\t') ? '\t' : (first.includes(';') && !first.includes(',') ? ';' : ',');
-            const cells = (line) => line.split(delim).map(c => c.replace(/^\s*"(.*)"\s*$/, '$1').trim());
-            const header = cells(first);
-            const HDR = /^(user\s*names?|users?|pilots?|ifc|ifn|callsigns?|display\s*names?|names?)$/i;
-            // A real multi-column CSV with a recognizable header → keep just that column.
-            if (header.length > 1 && header.some(c => HDR.test(c))) {
-                const prefer = ['username', 'user', 'pilot', 'ifc', 'ifn'];
-                const norm = header.map(c => c.toLowerCase().replace(/\s+/g, ''));
-                let idx = -1;
-                for (const p of prefer) { idx = norm.indexOf(p); if (idx !== -1) break; }
-                if (idx === -1) idx = header.findIndex(c => HDR.test(c));
-                return lines.slice(1).map(l => (cells(l)[idx] || '')).filter(Boolean).join('\n');
-            }
-            // A lone header cell on its own line (e.g. "username") → drop it.
-            if (header.length === 1 && HDR.test(header[0])) lines.shift();
-            return lines.join('\n');
-        }
-
-        async function postRosterUsernames(usernames) {
+        // Whatever staff paste or drop is sent as-is; the shared server parser
+        // (vaPilots.parsePilotUsernames) is the single source of truth for format
+        // detection — plain lists, CSV/TSV/semicolon tables with headers, JSON,
+        // BOMs — and it de-dupes/normalizes. So the client just posts the text.
+        async function addRosterPilots() {
             const id = rosterVaId;
+            const usernames = document.getElementById('rosterInput').value;
             if (!id || !usernames.trim()) { toast('Paste or drop at least one username first.', false); return; }
             const btn = document.getElementById('rosterAddBtn');
             btn.disabled = true;
@@ -693,10 +668,6 @@
                 loadRoster('');
             } catch (e) { toast(e.message || 'Could not add pilots.', false); }
             finally { btn.disabled = false; }
-        }
-
-        function addRosterPilots() {
-            postRosterUsernames(extractRosterUsernames(document.getElementById('rosterInput').value));
         }
 
         async function removeRosterPilot(pilotId) {
@@ -723,15 +694,16 @@
             } catch (e) { toast(e.message || 'Could not clear the roster.', false); }
         }
 
-        // Read a chosen/dropped file into the textarea (smart-parsed), so it flows
-        // through the same review-then-Add path as a paste.
+        // Read a chosen/dropped file into the textarea so staff can review (and
+        // edit) before adding. The server parses the format on Add, so the raw
+        // contents go in as-is (minus a UTF-8 BOM, which would just be noise).
         function loadRosterFile(file) {
             if (!file) return;
             const reader = new FileReader();
             reader.onload = () => {
-                const cleaned = extractRosterUsernames(String(reader.result || ''));
+                const text = String(reader.result || '').replace(/^\uFEFF/, '').trim();
                 const ta = document.getElementById('rosterInput');
-                ta.value = (ta.value.trim() ? ta.value.trim() + '\n' : '') + cleaned;
+                ta.value = (ta.value.trim() ? ta.value.trim() + '\n' : '') + text;
                 toast('File loaded — review, then Add pilots.');
             };
             reader.readAsText(file);
