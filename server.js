@@ -2917,37 +2917,58 @@ const postVaEventCard = async (webhookUrl, e, media, prerendered, opts) => {
         },
         timestamp: new Date(Number(e.timestamp) || Date.now()).toISOString(),
     };
-    // In the default 'embed' style the route map rides as a SECOND embed whose
-    // only content is the map image — Discord stacks it full-width under the card.
-    // In 'large' style there's no map embed: the map file is left unreferenced so
-    // it too shows as a big standalone attachment. Either way both files are still
-    // declared in `attachments` so Discord keeps them. No map (unknown airports,
-    // render hiccup, or VA turned it off) just means a card-only message.
-    const embeds = [embed];
-    const attachments = [{ id: 0, filename: 'card.png' }];
-    if (mapPng) {
-        if (!largeImages) {
-            embeds.push({
-                color: accentInt,
-                image: { url: 'attachment://map.png' },
-            });
+    // Two delivery shapes below, chosen by image style. No map (unknown airports,
+    // a render hiccup, or the VA turned it off) simply means the map step is
+    // skipped in either shape.
+    //
+    // Default 'embed' style: ONE message — the card framed inside the text embed
+    // (attachment://card.png) and, when mapped, the route map as a second embed
+    // stacked full-width beneath it. The multipart upload can still fail (a
+    // transient Discord error, an oversize/edge-case attachment); on ANY upload
+    // error fall back to the plain JSON embed so the notification still goes out.
+    if (!largeImages) {
+        const embeds = [embed];
+        const attachments = [{ id: 0, filename: 'card.png' }];
+        if (mapPng) {
+            embeds.push({ color: accentInt, image: { url: 'attachment://map.png' } });
+            attachments.push({ id: 1, filename: 'map.png' });
         }
-        attachments.push({ id: 1, filename: 'map.png' });
+        try {
+            const form = new FormData();
+            form.append('payload_json', JSON.stringify({ embeds, attachments }));
+            form.append('files[0]', new Blob([png], { type: 'image/png' }), 'card.png');
+            if (mapPng) form.append('files[1]', new Blob([mapPng], { type: 'image/png' }), 'map.png');
+            return await axios.post(webhookUrl, form);
+        } catch (err) {
+            console.warn('[va-events] card upload failed, falling back to embed:', err.message);
+            return axios.post(webhookUrl, buildVaEventPayload(e, media));
+        }
     }
 
-    // The card rendered, but the multipart upload can still fail (a transient
-    // Discord error, an oversize/edge-case attachment). Don't let a render success
-    // become worse than a render failure: on ANY upload error fall back to the
-    // plain JSON embed so the notification still goes out.
-    try {
+    // 'large' style: the images are meant to stand on their own at full width.
+    // Packing the text embed and both standalone files into ONE message makes
+    // Discord squish them together and render out of order. Post them as SEPARATE
+    // messages instead — the card, then the route map, then the text embed — so
+    // each picture shows big on its own and the text sits by itself. Sent
+    // sequentially (awaited) so Discord preserves that order.
+    const postImageMessage = (buf, name) => {
         const form = new FormData();
-        form.append('payload_json', JSON.stringify({ embeds, attachments }));
-        form.append('files[0]', new Blob([png], { type: 'image/png' }), 'card.png');
-        if (mapPng) form.append('files[1]', new Blob([mapPng], { type: 'image/png' }), 'map.png');
-        return await axios.post(webhookUrl, form);
+        form.append('payload_json', JSON.stringify({ attachments: [{ id: 0, filename: name }] }));
+        form.append('files[0]', new Blob([buf], { type: 'image/png' }), name);
+        return axios.post(webhookUrl, form);
+    };
+    let last = null;
+    try {
+        last = await postImageMessage(png, 'card.png');
+        if (mapPng) last = await postImageMessage(mapPng, 'map.png');
+        last = await axios.post(webhookUrl, { embeds: [embed] }); // the text stuff, on its own
+        return last;
     } catch (err) {
-        console.warn('[va-events] card upload failed, falling back to embed:', err.message);
-        return axios.post(webhookUrl, buildVaEventPayload(e, media));
+        console.warn('[va-events] split card post failed:', err.message);
+        // Nothing landed yet → guarantee the notification with a plain embed. If
+        // some messages already went out, don't re-post (avoids a duplicate).
+        if (!last) return axios.post(webhookUrl, buildVaEventPayload(e, media));
+        return last;
     }
 };
 
