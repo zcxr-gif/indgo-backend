@@ -43,23 +43,117 @@ const normalizePilotUsername = (raw) => {
     return { username: s, usernameLower: s.toLowerCase() };
 };
 
-// Parse whatever a VA submits — an array, a JSON-array string, or a free blob
-// (textarea paste / CSV) separated by newlines, commas, semicolons or tabs —
-// into a de-duplicated list of normalized usernames in first-seen order.
+// Object keys we treat as "this field holds the username", best first — used
+// when a VA hands us an array of objects (JSON export, spreadsheet-as-JSON).
+const USERNAME_KEYS = ['username', 'user', 'ifc', 'ifn', 'ign', 'pilot', 'callsign', 'name'];
+
+// A column header (or object key) that marks the username column. Substring
+// match so "IFC Username", "Pilot Name", "Display name" all qualify.
+const HEADER_RE = /(user\s*name|username|\buser\b|\bifc\b|\bifn\b|\bign\b|pilot|callsign|display\s*name|\bname\b)/i;
+// Strict, whole-cell header — used only to drop a lone header line ("username"
+// on its own) from an otherwise plain single-column list.
+const LONE_HEADER_RE = /^(user\s*names?|usernames?|users?|pilots?|ifc|ifn|ign|callsigns?|display\s*names?|names?)$/i;
+
+// Pull the username out of one object (a row from a JSON/records export),
+// preferring the most username-y key. Keys are matched case/space/underscore-
+// insensitively so "IFC_Username" and "ifc username" both resolve.
+const pickFromObject = (obj) => {
+    if (!obj || typeof obj !== 'object') return '';
+    const norm = {};
+    for (const k of Object.keys(obj)) norm[k.toLowerCase().replace(/[\s_]+/g, '')] = obj[k];
+    for (const key of USERNAME_KEYS) {
+        if (norm[key] != null && String(norm[key]).trim()) return String(norm[key]);
+    }
+    for (const k of Object.keys(norm)) {
+        if (/(user|name|ifc|ifn|ign|callsign|pilot)/.test(k) && String(norm[k]).trim()) return String(norm[k]);
+    }
+    return '';
+};
+
+// Quote-aware split of one delimited line (handles "Doe, John" and "" escapes),
+// so a comma inside a quoted CSV field doesn't spawn a phantom column.
+const splitDelimited = (line, delim) => {
+    const out = [];
+    let cur = '';
+    let q = false;
+    for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (q) {
+            if (ch === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; }
+            else cur += ch;
+        } else if (ch === '"') { q = true; }
+        else if (ch === delim) { out.push(cur); cur = ''; }
+        else cur += ch;
+    }
+    out.push(cur);
+    return out.map((c) => c.trim());
+};
+
+// Turn a free-text blob (textarea paste / uploaded CSV/TSV) into a flat list of
+// raw username strings. A single line, or multi-line text with no recognizable
+// header, is treated as a plain list split on commas/semicolons/tabs — so
+// "JohnDoe, Jane_Doe" stays two pilots. Only a genuine multi-column table with
+// a header row (e.g. a spreadsheet export) is read column-wise, keeping just the
+// username column and dropping the header.
+const partsFromBlob = (raw) => {
+    const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    if (!lines.length) return [];
+    if (lines.length === 1) return lines[0].split(/[,;\t]+/);
+
+    const sample = lines.slice(0, 5).join('\n');
+    const delim = /\t/.test(sample) ? '\t' : (/;/.test(sample) && !/,/.test(sample) ? ';' : ',');
+    const rows = lines.map((l) => splitDelimited(l, delim));
+    const maxCols = rows.reduce((m, r) => Math.max(m, r.length), 0);
+
+    if (maxCols > 1 && rows[0].some((c) => HEADER_RE.test(c))) {
+        const header = rows[0];
+        const score = (c) => {
+            const s = c.toLowerCase().replace(/[\s_]+/g, '');
+            if (s.includes('username')) return 6;
+            if (s === 'ifc' || s === 'ifn' || s === 'ign') return 5;
+            if (s.includes('user')) return 4;
+            if (s.includes('pilot')) return 3;
+            if (s.includes('callsign')) return 2;
+            if (s.includes('name')) return 1;
+            return 0;
+        };
+        let idx = 0;
+        let best = -1;
+        header.forEach((c, i) => { const sc = score(c); if (sc > best) { best = sc; idx = i; } });
+        return rows.slice(1).map((r) => r[idx] || '');
+    }
+    // Not tabular — a plain list. Drop a lone header line ("username" on its own)
+    // before flattening the rest on commas/semicolons/tabs.
+    const list = LONE_HEADER_RE.test(lines[0]) ? lines.slice(1) : lines;
+    return list.flatMap((l) => l.split(/[,;\t]+/));
+};
+
+// Parse whatever a VA submits into a de-duplicated list of normalized usernames
+// in first-seen order. Accepts, in order of precedence:
+//   - an array (of strings, or of record objects like {username: "..."}),
+//   - a JSON string (array of strings/objects, or a single object),
+//   - a free blob: a plain list, or a CSV/TSV/semicolon table with a header.
+// A UTF-8 BOM (common on Excel exports) is stripped so it can't corrupt the
+// first username or header cell.
 const parsePilotUsernames = (value) => {
     let parts = [];
     if (Array.isArray(value)) {
-        parts = value.map((v) => String(v));
+        parts = value.map((v) => (v && typeof v === 'object') ? pickFromObject(v) : String(v));
     } else {
-        const raw = String(value == null ? '' : value).trim();
+        const raw = String(value == null ? '' : value).replace(/^\uFEFF/, '').trim();
         if (!raw) return [];
-        if (raw.startsWith('[')) {
+        if (raw[0] === '[' || raw[0] === '{') {
             try {
-                const arr = JSON.parse(raw);
-                if (Array.isArray(arr)) parts = arr.map((v) => String(v));
-            } catch { /* not JSON — fall through to delimiter split */ }
+                const data = JSON.parse(raw);
+                if (Array.isArray(data)) {
+                    parts = data.map((v) => (v && typeof v === 'object') ? pickFromObject(v) : String(v));
+                } else if (data && typeof data === 'object') {
+                    const u = pickFromObject(data);
+                    if (u) parts = [u];
+                }
+            } catch { /* not JSON — fall through to blob parsing */ }
         }
-        if (!parts.length) parts = raw.split(/[\n,;\t]+/);
+        if (!parts.length) parts = partsFromBlob(raw);
     }
     const seen = new Set();
     const out = [];

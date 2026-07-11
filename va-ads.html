@@ -277,6 +277,50 @@
     <!-- Toast -->
     <div id="toast" class="hidden fixed bottom-6 right-6 z-[60] px-5 py-3 rounded-xl shadow-2xl font-medium text-white animate-fade-in-up"></div>
 
+    <!-- ===================== ROSTER MODAL (read-only) ===================== -->
+    <!-- A VA's pilot roster (its Infinite Flight usernames). Everyone who reaches
+         this page can view it; admin/staff can also bulk-add (paste / smart CSV /
+         drag-drop), remove, and clear — the same management the Webhooks Manager
+         and the VA portal offer, surfaced where staff already work. -->
+    <div id="rosterModal" class="hidden fixed inset-0 z-50 bg-zinc-900/60 backdrop-blur-sm flex items-start sm:items-center justify-center p-4 overflow-y-auto">
+        <div class="bg-white dark:bg-zinc-900 rounded-3xl w-full max-w-lg my-8 shadow-2xl border border-zinc-200 dark:border-zinc-800 animate-fade-in-up">
+            <div class="flex items-center justify-between gap-3 px-6 py-4 border-b border-zinc-200 dark:border-zinc-800 sticky top-0 bg-white dark:bg-zinc-900 rounded-t-3xl z-10">
+                <div class="min-w-0">
+                    <h3 class="text-lg font-bold flex items-center gap-2"><i class="fa-solid fa-users text-sky-500"></i> Pilot roster</h3>
+                    <p id="rosterVaName" class="text-xs text-zinc-500 dark:text-zinc-400 truncate"></p>
+                </div>
+                <button onclick="closeRoster()" class="p-2 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-full shrink-0"><i class="fa-solid fa-xmark text-lg"></i></button>
+            </div>
+            <div class="px-6 py-5 space-y-3">
+                <p id="rosterIntro" class="text-xs text-zinc-400">The Infinite Flight usernames on this VA's roster. <span id="rosterCount" class="font-semibold text-zinc-500 dark:text-zinc-400"></span></p>
+
+                <!-- Bulk add (admin/staff only) — paste a list, drop a CSV/TXT, or
+                     click to browse. Everything funnels through one Add path. -->
+                <div id="rosterManage" class="hidden space-y-2">
+                    <div id="rosterDrop" class="rounded-xl border-2 border-dashed border-zinc-200 dark:border-zinc-800 p-3 space-y-2 transition-colors">
+                        <textarea id="rosterInput" rows="3" placeholder="Paste usernames — one per line or comma-separated — or drop a .csv / .txt here.&#10;e.g.&#10;Antony&#10;JohnDoe, Jane_Doe&#10;@another_pilot" class="w-full px-3 py-2 rounded-lg border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none text-sm font-mono"></textarea>
+                        <div class="flex items-center gap-2 flex-wrap">
+                            <button type="button" id="rosterAddBtn" onclick="addRosterPilots()" class="bg-zinc-900 hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 text-white text-xs font-semibold px-3 py-2 rounded-lg active:scale-95 transition">Add pilots</button>
+                            <label class="text-xs font-semibold px-3 py-2 rounded-lg border-2 border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 cursor-pointer">
+                                <i class="fa-solid fa-file-csv mr-1"></i> Upload CSV/TXT
+                                <input id="rosterFile" type="file" accept=".csv,.txt,text/csv,text/plain" class="hidden">
+                            </label>
+                            <button type="button" onclick="clearRosterPilots()" class="text-xs font-semibold px-3 py-2 rounded-lg border-2 border-red-200 dark:border-red-900/60 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 ml-auto">Clear all</button>
+                        </div>
+                        <p class="text-[11px] text-zinc-400">Formats handled automatically: a plain list, comma / semicolon / tab-separated, a CSV or spreadsheet export (header row and extra columns are ignored — the username column is picked for you), or a JSON array. Leading “@” and duplicates are stripped.</p>
+                    </div>
+                </div>
+
+                <input id="rosterSearch" type="text" placeholder="Search the roster…" class="w-full px-3 py-2 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none text-sm">
+                <div id="rosterList" class="max-h-80 overflow-y-auto rounded-xl border-2 border-zinc-100 dark:border-zinc-800 divide-y divide-zinc-100 dark:divide-zinc-800"></div>
+                <p id="rosterEmpty" class="hidden text-sm text-zinc-500 py-8 text-center"></p>
+                <div class="pt-1">
+                    <a id="rosterManageLink" href="#" class="text-xs font-semibold text-sky-600 dark:text-sky-400 hover:underline inline-flex items-center gap-1.5"><i class="fa-solid fa-bolt"></i> Open in Webhooks Manager</a>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
         const API = "/api/va-ads";
         let debounceTimer;
@@ -388,6 +432,7 @@
                     </div>
                     <div class="flex items-center gap-2 mt-4 pt-3 border-t border-zinc-100 dark:border-zinc-800">
                         <button onclick='openModal(${JSON.stringify(ad).replace(/'/g, "&#39;")})' class="flex-1 text-sm font-medium py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"><i class="fa-solid fa-pen mr-1"></i>Edit</button>
+                        <button onclick="openRoster('${ad._id}','${esc(ad.name)}')" class="px-3 py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-sky-100 dark:hover:bg-sky-900/40 hover:text-sky-600 transition-colors" title="View pilot roster"><i class="fa-solid fa-users"></i></button>
                         <button onclick="toggleFeature('${ad._id}')" class="px-3 py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-amber-100 dark:hover:bg-amber-900/40 transition-colors" title="Toggle featured"><i class="fa-${ad.featured ? 'solid' : 'regular'} fa-star ${ad.featured ? 'text-amber-400' : ''}"></i></button>
                         <button onclick="removeAd('${ad._id}','${esc(ad.name)}')" class="px-3 py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-red-100 dark:hover:bg-red-900/40 hover:text-red-600 transition-colors" title="Delete"><i class="fa-solid fa-trash"></i></button>
                     </div>
@@ -520,8 +565,179 @@
             } catch (e) { toast(e.message || 'Failed to delete.', false); }
         }
 
+        // ---------- Pilot roster viewer + bulk manager ----------
+        // Reuses the same staff API the Webhooks Manager writes through, so staff
+        // see an identical roster without leaving the Ads Manager. Adding/removing
+        // is gated to admin/staff — the same access level as the Webhooks Manager,
+        // the other place rosters are managed.
+        let rosterVaId = null;
+        let canManageRoster = false;
+
+        // Learn the current user's role once so we know whether to expose the
+        // add/remove controls. Read-only viewing works regardless of role.
+        (async () => {
+            try {
+                const res = await fetch('/api/auth/me');
+                const data = await res.json().catch(() => ({}));
+                canManageRoster = !!(data.user && ['admin', 'staff'].includes(data.user.role));
+            } catch { /* stay read-only if we can't tell */ }
+        })();
+
+        function openRoster(id, name) {
+            rosterVaId = id;
+            document.getElementById('rosterVaName').textContent = name || '';
+            document.getElementById('rosterSearch').value = '';
+            document.getElementById('rosterCount').textContent = '';
+            document.getElementById('rosterManageLink').href = '/webhooks?va=' + encodeURIComponent(id);
+            const manage = document.getElementById('rosterManage');
+            manage.classList.toggle('hidden', !canManageRoster);
+            if (canManageRoster) document.getElementById('rosterInput').value = '';
+            document.getElementById('rosterList').innerHTML = '';
+            document.getElementById('rosterEmpty').classList.add('hidden');
+            document.getElementById('rosterModal').classList.remove('hidden');
+            document.body.style.overflow = 'hidden';
+            loadRoster('');
+        }
+
+        function closeRoster() {
+            document.getElementById('rosterModal').classList.add('hidden');
+            document.body.style.overflow = '';
+            rosterVaId = null;
+        }
+
+        async function loadRoster(q) {
+            const id = rosterVaId;
+            if (!id) return;
+            const list = document.getElementById('rosterList');
+            const empty = document.getElementById('rosterEmpty');
+            const count = document.getElementById('rosterCount');
+            list.innerHTML = '<p class="text-sm text-zinc-400 py-8 text-center">Loading…</p>';
+            empty.classList.add('hidden');
+            try {
+                const res = await fetch(`${API}/${id}/pilots?q=${encodeURIComponent(q || '')}&limit=2000`);
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.message || 'Could not load the roster.');
+                // A late response for a since-closed/changed roster mustn't clobber the UI.
+                if (rosterVaId !== id) return;
+                const rows = Array.isArray(data.pilots) ? data.pilots : [];
+                const rosterTotal = data.rosterTotal || 0;
+                count.textContent = rosterTotal ? `${rosterTotal} pilot${rosterTotal === 1 ? '' : 's'} total` : '';
+                if (!rows.length) {
+                    list.innerHTML = '';
+                    empty.textContent = rosterTotal ? 'No matches for that search.' : 'This VA has no pilots on its roster yet.';
+                    empty.classList.remove('hidden');
+                    return;
+                }
+                list.innerHTML = rows.map(p => `
+                    <div class="flex items-center justify-between gap-3 px-3 py-2">
+                        <span class="text-sm font-medium truncate">${esc(p.username)}</span>
+                        <span class="flex items-center gap-2 shrink-0">
+                            ${p.addedBy ? `<span class="text-[11px] text-zinc-400">added by ${esc(p.addedBy)}</span>` : ''}
+                            ${canManageRoster ? `<button type="button" onclick="removeRosterPilot('${esc(p.id)}')" title="Remove" class="text-zinc-400 hover:text-red-500 px-1"><i class="fa-solid fa-xmark"></i></button>` : ''}
+                        </span>
+                    </div>`).join('');
+            } catch (e) {
+                if (rosterVaId !== id) return;
+                list.innerHTML = '';
+                empty.textContent = e.message || 'Could not load the roster.';
+                empty.classList.remove('hidden');
+            }
+        }
+
+        // --- Bulk management (admin/staff) ----------------------------------
+        // Whatever staff paste or drop is sent as-is; the shared server parser
+        // (vaPilots.parsePilotUsernames) is the single source of truth for format
+        // detection — plain lists, CSV/TSV/semicolon tables with headers, JSON,
+        // BOMs — and it de-dupes/normalizes. So the client just posts the text.
+        async function addRosterPilots() {
+            const id = rosterVaId;
+            const usernames = document.getElementById('rosterInput').value;
+            if (!id || !usernames.trim()) { toast('Paste or drop at least one username first.', false); return; }
+            const btn = document.getElementById('rosterAddBtn');
+            btn.disabled = true;
+            try {
+                const res = await fetch(`${API}/${id}/pilots`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ usernames }),
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.message || 'Could not add pilots.');
+                document.getElementById('rosterInput').value = '';
+                document.getElementById('rosterSearch').value = '';
+                toast(data.message || 'Pilots added.');
+                loadRoster('');
+            } catch (e) { toast(e.message || 'Could not add pilots.', false); }
+            finally { btn.disabled = false; }
+        }
+
+        async function removeRosterPilot(pilotId) {
+            const id = rosterVaId;
+            if (!id) return;
+            try {
+                const res = await fetch(`${API}/${id}/pilots/${pilotId}`, { method: 'DELETE' });
+                if (!res.ok) throw new Error();
+                loadRoster(document.getElementById('rosterSearch').value.trim());
+            } catch { toast('Could not remove the pilot.', false); }
+        }
+
+        async function clearRosterPilots() {
+            const id = rosterVaId;
+            if (!id) return;
+            if (!confirm('Remove ALL pilots from this VA\'s roster? This cannot be undone.')) return;
+            try {
+                const res = await fetch(`${API}/${id}/pilots`, { method: 'DELETE' });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.message || 'Could not clear the roster.');
+                document.getElementById('rosterSearch').value = '';
+                toast(data.message || 'Roster cleared.');
+                loadRoster('');
+            } catch (e) { toast(e.message || 'Could not clear the roster.', false); }
+        }
+
+        // Read a chosen/dropped file into the textarea so staff can review (and
+        // edit) before adding. The server parses the format on Add, so the raw
+        // contents go in as-is (minus a UTF-8 BOM, which would just be noise).
+        function loadRosterFile(file) {
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = () => {
+                const text = String(reader.result || '').replace(/^\uFEFF/, '').trim();
+                const ta = document.getElementById('rosterInput');
+                ta.value = (ta.value.trim() ? ta.value.trim() + '\n' : '') + text;
+                toast('File loaded — review, then Add pilots.');
+            };
+            reader.readAsText(file);
+        }
+
+        document.getElementById('rosterFile').addEventListener('change', (e) => {
+            loadRosterFile(e.target.files && e.target.files[0]);
+            e.target.value = '';
+        });
+
+        // Drag-and-drop a CSV/TXT onto the paste zone.
+        const rosterDrop = document.getElementById('rosterDrop');
+        const rosterDropHi = ['border-sky-400', 'bg-sky-50/50', 'dark:bg-sky-950/20'];
+        ['dragenter', 'dragover'].forEach(ev => rosterDrop.addEventListener(ev, (e) => {
+            e.preventDefault(); rosterDrop.classList.add(...rosterDropHi);
+        }));
+        ['dragleave', 'drop'].forEach(ev => rosterDrop.addEventListener(ev, (e) => {
+            e.preventDefault(); rosterDrop.classList.remove(...rosterDropHi);
+        }));
+        rosterDrop.addEventListener('drop', (e) => {
+            const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+            if (file) loadRosterFile(file);
+        });
+
+        // Debounced search within the open roster.
+        let _rosterTimer = null;
+        document.getElementById('rosterSearch').addEventListener('input', (e) => {
+            clearTimeout(_rosterTimer);
+            const q = e.target.value;
+            _rosterTimer = setTimeout(() => loadRoster(q), 200);
+        });
+
         // ---------- Init ----------
-        document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+        document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeModal(); closeRoster(); } });
         loadAds();
     </script>
 </body>

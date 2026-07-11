@@ -877,7 +877,7 @@ registerAuthRoutes(app);
 // sendVaTestEvent is defined further down (with the card renderer); wrap it in a
 // lambda so this call site doesn't touch it before it's initialised — the wrapper
 // only resolves it at request time, when the "send test" button is clicked.
-registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent: (ad) => sendVaTestEvent(ad), renderCardPreview: (ad, opts) => renderCardPreview(ad, opts) });
+registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent: (ad) => sendVaTestEvent(ad), renderCardPreview: (ad, opts) => renderCardPreview(ad, opts), applyEmbedAppearance: (cfg, body) => applyEmbedAppearance(cfg, body) });
 
 // Health Check — public, unauthenticated (for uptime/platform monitors).
 // NOTE: the site is staff-only, so the homepage ("/") is gated below; point any
@@ -3520,6 +3520,66 @@ const applyEmbedFields = (cfg, body) => {
         cfg.expiresAt = v ? new Date(v) : null;
         if (cfg.expiresAt && isNaN(cfg.expiresAt.getTime())) cfg.expiresAt = null;
     }
+};
+
+// The cosmetic-only subset of the fields above — safe to hand to a VA editing
+// its OWN embed from the partner portal. It restyles the widget (mode, theme,
+// header, accent/gradient, corner radius, map-card colours) but deliberately
+// touches NOTHING that changes what the embed tracks or who may host it:
+// no va identity/callsign matching, hubs, servers, provider/mapbox token,
+// allowedOrigins, revoked or expiry. Validation mirrors applyEmbedFields so the
+// portal and staff manager coerce values identically. Returns the config.
+const applyEmbedAppearance = (cfg, body = {}) => {
+    if (body.mode !== undefined) cfg.mode = EMBED_MODES.includes(body.mode) ? body.mode : cfg.mode;
+    if (body.theme !== undefined) cfg.theme = EMBED_THEMES.includes(body.theme) ? body.theme : cfg.theme;
+    if (body.freeStyle !== undefined) cfg.freeStyle = String(body.freeStyle || '').trim() || 'dark';
+
+    if (body.header !== undefined) {
+        cfg.header = (body.header === false || String(body.header).trim().toLowerCase() === 'off') ? 'off' : 'on';
+    }
+    if (body.headerPos !== undefined) {
+        cfg.headerPos = EMBED_HEADER_POSITIONS.includes(body.headerPos) ? body.headerPos : 'top';
+    }
+    if (body.accent !== undefined) {
+        cfg.accent = toStringList(body.accent).map(normalizeHexColor).filter(Boolean).slice(0, 3);
+    }
+    if (body.gradient !== undefined) {
+        cfg.gradient = (body.gradient === false || String(body.gradient).trim().toLowerCase() === 'off') ? 'off' : 'auto';
+    }
+    if (body.gradientAngle !== undefined) {
+        const n = Number(body.gradientAngle);
+        cfg.gradientAngle = (body.gradientAngle === '' || body.gradientAngle === null || !Number.isFinite(n))
+            ? 120 : ((Math.round(n) % 360) + 360) % 360;
+    }
+    if (body.compact !== undefined) {
+        cfg.compact = body.compact === true || body.compact === 1 || body.compact === '1' || body.compact === 'true';
+    }
+    if (body.radius !== undefined) {
+        const n = Number(body.radius);
+        cfg.radius = (body.radius === '' || body.radius === null || !Number.isFinite(n))
+            ? null : Math.min(32, Math.max(0, Math.round(n)));
+    }
+
+    if (!cfg.card) cfg.card = {};
+    const card = (body.card && typeof body.card === 'object') ? body.card : {};
+    const firstDefined = (...vals) => vals.find((x) => x !== undefined);
+    const cColor   = firstDefined(card.color,   body.cardColor,   body.cardBg);
+    const cText    = firstDefined(card.text,    body.cardText,    body.textColor);
+    const cOpacity = firstDefined(card.opacity, body.cardOpacity, body.opacity);
+    const cBlur    = firstDefined(card.blur,    body.cardBlur);
+    if (cColor !== undefined) cfg.card.color = normalizeCardColor(cColor);
+    if (cText !== undefined)  cfg.card.text  = normalizeCardColor(cText);
+    if (cOpacity !== undefined) {
+        const n = Number(cOpacity);
+        cfg.card.opacity = (cOpacity === '' || cOpacity === null || !Number.isFinite(n))
+            ? null : Math.min(100, Math.max(0, n));
+    }
+    if (cBlur !== undefined) {
+        const n = Number(cBlur);
+        cfg.card.blur = (cBlur === '' || cBlur === null || !Number.isFinite(n))
+            ? null : Math.min(40, Math.max(0, Math.round(n)));
+    }
+    return cfg;
 };
 
 // GET /api/embed/configs — STAFF. List every token config (newest first).
