@@ -1189,14 +1189,103 @@
             finally { $('embedRequestBtn').disabled = false; }
         });
 
-        // ---------- Embeds (read-only) ----------
+        // ---------- Embeds (copy links + owner appearance editor) ----------
         let embedsCache = [];
+        let embedEditable = false;
         function copyEmbedUrl(i) { const em = embedsCache[i]; if (em) copyText(em.url, t('embed.link')); }
         function copyEmbedIframe(i) { const em = embedsCache[i]; if (em) copyText(em.iframe, 'iframe'); }
+
+        // Small builders for the appearance form (owner only).
+        function emSelect(id, cur, opts) {
+            return `<select id="${id}" class="field py-2 text-sm mt-1">` +
+                opts.map(o => `<option value="${esc(o[0])}" ${o[0] === String(cur) ? 'selected' : ''}>${esc(o[1])}</option>`).join('') +
+                `</select>`;
+        }
+        function emField(label, inner) {
+            return `<label class="block"><span class="text-[11px] font-semibold uppercase tracking-wide text-zinc-400">${esc(label)}</span>${inner}</label>`;
+        }
+        function embedCustomizeHtml(em, i) {
+            const a = em.appearance || {};
+            const accent0 = (a.accent && a.accent[0]) || '';
+            const card = a.card || {};
+            return `
+            <details class="mt-4 border-t border-zinc-100 dark:border-zinc-800 pt-4" ontoggle="onEmbedToggle(${i}, this)">
+                <summary class="cursor-pointer text-sm font-semibold flex items-center gap-2 select-none"><i data-lucide="sliders-horizontal" class="w-4 h-4"></i> ${esc(t('embed.customize'))}</summary>
+                <div class="grid grid-cols-2 gap-3 mt-3">
+                    ${emField(t('embed.fld.mode'), emSelect(`emc_${i}_mode`, a.mode || 'roster', [['roster', t('embed.opt.roster')], ['map', t('embed.opt.map')]]))}
+                    ${emField(t('embed.fld.theme'), emSelect(`emc_${i}_theme`, a.theme || 'dark', [['dark', 'Dark'], ['light', 'Light']]))}
+                    ${emField(t('embed.fld.header'), emSelect(`emc_${i}_header`, a.header || 'on', [['on', t('embed.opt.on')], ['off', t('embed.opt.off')]]))}
+                    ${emField(t('embed.fld.headerPos'), emSelect(`emc_${i}_headerPos`, a.headerPos || 'top', [['top', t('embed.opt.top')], ['bottom', t('embed.opt.bottom')], ['left', t('embed.opt.left')], ['right', t('embed.opt.right')]]))}
+                    ${emField(t('embed.fld.accent'), `<div class="flex items-center gap-2 mt-1"><input type="color" id="emc_${i}_accent" value="${esc(accent0 || '#2563eb')}" class="w-9 h-9 rounded-lg border-2 border-zinc-200 dark:border-zinc-700 bg-transparent p-0.5 shrink-0"><label class="text-xs flex items-center gap-1.5 select-none"><input type="checkbox" id="emc_${i}_accentAuto" ${accent0 ? '' : 'checked'} class="w-4 h-4 rounded accent-emerald-500">${esc(t('embed.fld.accentAuto'))}</label></div>`)}
+                    ${emField(t('embed.fld.gradient'), `<div class="flex items-center gap-3 mt-1"><label class="text-xs flex items-center gap-1.5 select-none"><input type="checkbox" id="emc_${i}_gradient" ${(a.gradient || 'auto') !== 'off' ? 'checked' : ''} class="w-4 h-4 rounded accent-emerald-500">${esc(t('embed.opt.on'))}</label><input type="number" id="emc_${i}_angle" min="0" max="360" step="1" placeholder="120" value="${a.gradientAngle == null ? '' : esc(String(a.gradientAngle))}" title="${esc(t('embed.fld.angle'))}" class="field py-2 text-sm w-20"></div>`)}
+                    ${emField(t('embed.fld.radius'), `<input type="number" id="emc_${i}_radius" min="0" max="32" step="1" placeholder="default" value="${a.radius == null ? '' : esc(String(a.radius))}" class="field py-2 text-sm mt-1">`)}
+                    ${emField(t('embed.fld.compact'), `<label class="flex items-center gap-2 mt-2 text-sm select-none"><input type="checkbox" id="emc_${i}_compact" ${a.compact ? 'checked' : ''} class="w-4 h-4 rounded accent-emerald-500">${esc(t('embed.opt.on'))}</label>`)}
+                    ${emField(t('embed.fld.mapStyle'), emSelect(`emc_${i}_freeStyle`, a.freeStyle || 'dark', [['dark', 'dark'], ['liberty', 'liberty'], ['bright', 'bright'], ['positron', 'positron']]))}
+                </div>
+                <p class="text-[11px] font-semibold uppercase tracking-wide text-zinc-400 mt-4 mb-1">${esc(t('embed.fld.mapCard'))}</p>
+                <div class="grid grid-cols-2 gap-3">
+                    ${emField(t('embed.fld.cardColor'), `<input id="emc_${i}_cardColor" placeholder="#0b1220, navy" value="${esc(card.color || '')}" class="field py-2 text-sm mt-1">`)}
+                    ${emField(t('embed.fld.cardText'), `<input id="emc_${i}_cardText" placeholder="white, #fff" value="${esc(card.text || '')}" class="field py-2 text-sm mt-1">`)}
+                    ${emField(t('embed.fld.cardOpacity'), `<input type="number" id="emc_${i}_cardOpacity" min="0" max="100" step="0.05" placeholder="0.6 or 60" value="${card.opacity == null ? '' : esc(String(card.opacity))}" class="field py-2 text-sm mt-1">`)}
+                    ${emField(t('embed.fld.cardBlur'), `<input type="number" id="emc_${i}_cardBlur" min="0" max="40" step="1" placeholder="auto" value="${card.blur == null ? '' : esc(String(card.blur))}" class="field py-2 text-sm mt-1">`)}
+                </div>
+                <div class="flex items-center gap-2 mt-4 flex-wrap">
+                    <button type="button" onclick="saveEmbed(${i})" class="btn py-2 px-3 text-sm"><i data-lucide="check" class="w-3.5 h-3.5"></i> ${esc(t('embed.saveApply'))}</button>
+                    <button type="button" onclick="loadEmbeds()" class="text-xs font-medium px-3 py-2 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition">${esc(t('common.reset'))}</button>
+                    <span id="emc_${i}_msg" class="text-xs font-medium"></span>
+                </div>
+                <div class="mt-3">
+                    <p class="text-[11px] font-semibold uppercase tracking-wide text-zinc-400 mb-1">${esc(t('embed.preview'))}</p>
+                    <iframe id="emc_${i}_frame" data-src="${esc(em.url)}" style="width:100%;height:420px;border:0;border-radius:12px;overflow:hidden" loading="lazy" title="preview"></iframe>
+                    <p class="text-[11px] text-zinc-400 mt-1">${esc(t('embed.previewNote'))}</p>
+                </div>
+            </details>`;
+        }
+
+        // Lazily point the preview iframe at its src the first time the panel opens
+        // (avoids loading external widgets for every embed up front).
+        function onEmbedToggle(i, det) {
+            if (!det.open) return;
+            const f = $(`emc_${i}_frame`);
+            if (f && !f.src && f.dataset.src) f.src = f.dataset.src;
+        }
+
+        async function saveEmbed(i) {
+            const em = embedsCache[i];
+            if (!em) return;
+            const val = (id) => { const el = $(`emc_${i}_${id}`); return el ? el.value : undefined; };
+            const chk = (id) => { const el = $(`emc_${i}_${id}`); return el ? el.checked : false; };
+            const body = {
+                mode: val('mode'), theme: val('theme'), header: val('header'), headerPos: val('headerPos'),
+                accent: chk('accentAuto') ? [] : [val('accent')],
+                gradient: chk('gradient') ? 'auto' : 'off',
+                gradientAngle: val('angle'),
+                compact: chk('compact'),
+                radius: val('radius'),
+                freeStyle: val('freeStyle'),
+                card: { color: val('cardColor'), text: val('cardText'), opacity: val('cardOpacity'), blur: val('cardBlur') },
+            };
+            const msg = $(`emc_${i}_msg`);
+            try {
+                const res = await api(`/embeds/${encodeURIComponent(em.id)}`, {
+                    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                if (res && res.embed) embedsCache[i] = Object.assign(embedsCache[i], res.embed);
+                if (msg) { msg.textContent = t('embed.applied'); msg.className = 'text-xs font-medium text-emerald-600 dark:text-emerald-400'; }
+                // Re-resolve the live widget so the preview reflects the saved look.
+                const f = $(`emc_${i}_frame`);
+                if (f) f.src = em.url + (em.url.includes('?') ? '&' : '?') + '_=' + Date.now();
+            } catch (err) {
+                if (msg) { msg.textContent = err.message; msg.className = 'text-xs font-medium text-rose-500'; }
+            }
+        }
+
         async function loadEmbeds() {
             try {
-                const { embeds } = await api('/va');
+                const { embeds, editable } = await api('/va');
                 embedsCache = embeds || [];
+                embedEditable = !!editable;
                 const box = $('embedList');
                 if (!embeds || !embeds.length) {
                     box.innerHTML = `<div class="surface rounded-2xl p-8 text-center text-sm text-zinc-400">
@@ -1221,6 +1310,7 @@
                             <button onclick="copyEmbedIframe(${i})" class="text-xs font-medium px-3 py-2 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition inline-flex items-center gap-1.5"><i data-lucide="code" class="w-3.5 h-3.5"></i> ${esc(t('embed.copyIframe'))}</button>
                             <a href="${esc(em.url)}" target="_blank" rel="noopener" class="text-xs font-medium px-3 py-2 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition inline-flex items-center gap-1.5"><i data-lucide="external-link" class="w-3.5 h-3.5"></i> ${esc(t('embed.preview'))}</a>
                         </div>
+                        ${embedEditable ? embedCustomizeHtml(em, i) : ''}
                     </div>`).join('');
                 drawIcons();
             } catch (err) {

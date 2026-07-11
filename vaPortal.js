@@ -642,7 +642,7 @@ async function uploadSubmissionFile(s3Client, file) {
  * @param {Function} [deps.uploadVaImage] (s3Client, file, ref, kind) => url
  * @param {Function} [deps.deleteVaImage] (s3Client, url) => Promise
  */
-function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent, renderCardPreview }) {
+function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent, renderCardPreview, applyEmbedAppearance }) {
     // Webhook URLs are secrets, so the profile API never echoes one back in full.
     // Surface just enough for the owner to recognise what's saved: the trailing
     // chars of the webhook id. Defensive against malformed stored values.
@@ -713,23 +713,57 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
         };
     };
 
-    // Find this VA's embed links (read-only). Matched on the embed config's
-    // va.code against any of the VA's callsigns. Returns copyable URLs only;
-    // tokens/config are never editable from the portal.
+    // The VA's callsign code(s), uppercased — the key an embed is matched on.
+    // An embed "belongs to" this VA when its va.code is one of these, which is
+    // also the ownership check for editing (a VA can only restyle its own embeds).
+    const vaCallsignCodes = (ad) =>
+        ((Array.isArray(ad.callsigns) && ad.callsigns.length ? ad.callsigns : [ad && ad.callsign])
+            .filter(Boolean)).map((c) => String(c).toUpperCase());
+
+    // Shape one embed config for the portal: the copyable link/iframe plus the
+    // editable appearance (mirrors the cosmetic fields applyEmbedAppearance
+    // accepts). Identity, matching and access-control fields are never exposed.
+    const serializeEmbed = (c, ad) => {
+        const url = `${EMBED_BASE_URL}?token=${encodeURIComponent(c.token)}`;
+        const title = (c.va && c.va.name) || (ad && ad.name) || 'VA';
+        return {
+            id: String(c._id),
+            label: c.label || (c.va && c.va.name) || (ad && ad.name) || 'Embed',
+            mode: c.mode,
+            revoked: !!c.revoked,
+            url,
+            iframe: `<iframe src="${url}" style="width:100%;height:560px;border:0;border-radius:16px;overflow:hidden" loading="lazy" title="${title} live map"></iframe>`,
+            appearance: {
+                mode: c.mode || 'roster',
+                theme: c.theme || 'dark',
+                header: c.header || 'on',
+                headerPos: c.headerPos || 'top',
+                accent: Array.isArray(c.accent) ? c.accent : [],
+                gradient: c.gradient || 'auto',
+                gradientAngle: (c.gradientAngle == null ? 120 : c.gradientAngle),
+                compact: !!c.compact,
+                radius: (c.radius == null ? null : c.radius),
+                freeStyle: c.freeStyle || 'dark',
+                card: {
+                    color: (c.card && c.card.color) || '',
+                    text: (c.card && c.card.text) || '',
+                    opacity: (c.card && c.card.opacity != null) ? c.card.opacity : null,
+                    blur: (c.card && c.card.blur != null) ? c.card.blur : null,
+                },
+            },
+        };
+    };
+
+    // Find this VA's embeds. Matched on the embed config's va.code against any of
+    // the VA's callsigns. Read for everyone on the VA; editing is owner-gated at
+    // the route + re-checked against these codes before any write.
     async function embedLinksForVa(ad) {
         if (!EmbedConfig || !ad) return [];
-        const codes = ((Array.isArray(ad.callsigns) && ad.callsigns.length ? ad.callsigns : [ad.callsign])
-            .filter(Boolean)).map(c => String(c).toUpperCase());
+        const codes = vaCallsignCodes(ad);
         if (!codes.length) return [];
         try {
             const configs = await EmbedConfig.find({ 'va.code': { $in: codes } }).sort({ createdAt: -1 }).limit(20);
-            return configs.map(c => ({
-                label: c.label || c.va?.name || ad.name,
-                mode: c.mode,
-                revoked: !!c.revoked,
-                url: `${EMBED_BASE_URL}?token=${encodeURIComponent(c.token)}`,
-                iframe: `<iframe src="${EMBED_BASE_URL}?token=${encodeURIComponent(c.token)}" style="width:100%;height:560px;border:0;border-radius:16px;overflow:hidden" loading="lazy" title="${(c.va?.name || ad.name || 'VA')} live map"></iframe>`,
-            }));
+            return configs.map((c) => serializeEmbed(c, ad));
         } catch (err) {
             console.error('VA portal embed lookup error:', err.message);
             return [];
@@ -1134,6 +1168,44 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
         } catch (err) {
             console.error('VA portal embed request error:', err);
             res.status(500).json({ error: 'Could not submit your request.' });
+        }
+    });
+
+    // PATCH an embed's appearance — owner only. The VA can restyle its widget on
+    // demand (theme, header, accent/gradient, corner radius, map-card colours);
+    // the change is written to the shared EmbedConfig, so every place the embed
+    // is deployed (and this portal's preview) picks it up on next load. Scoped
+    // hard: the target embed's va.code must be one of THIS VA's callsigns, so an
+    // owner can never touch another VA's embed by guessing an id.
+    app.patch('/api/va-portal/embeds/:id', requirePortalOwner, async (req, res) => {
+        try {
+            if (!EmbedConfig || typeof applyEmbedAppearance !== 'function') {
+                return res.status(500).json({ error: 'Embed editing is unavailable right now.' });
+            }
+            if (!req.portal.vaAdId) return res.status(404).json({ error: 'No VA is linked to this account.' });
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId);
+            if (!ad) return res.status(404).json({ error: 'Your VA listing could not be found.' });
+
+            const codes = vaCallsignCodes(ad);
+            let cfg = null;
+            if (mongoose.Types.ObjectId.isValid(String(req.params.id || ''))) {
+                cfg = await EmbedConfig.findById(req.params.id);
+            }
+            if (!cfg || !codes.includes(String((cfg.va && cfg.va.code) || '').toUpperCase())) {
+                return res.status(404).json({ error: 'That embed was not found for your VA.' });
+            }
+
+            applyEmbedAppearance(cfg, req.body || {});
+            await cfg.save();
+            logActivity({
+                vaAdId: ad._id, vaName: ad.name,
+                actorName: req.portal.displayName || req.portal.username, actorRole: req.portal.role,
+                action: 'embed.style', detail: `Updated appearance of embed “${cfg.label || (cfg.va && cfg.va.name) || ad.name}”`,
+            });
+            res.json({ ok: true, embed: serializeEmbed(cfg, ad) });
+        } catch (err) {
+            console.error('VA portal embed update error:', err);
+            res.status(500).json({ error: 'Could not update the embed.' });
         }
     });
 
