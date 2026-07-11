@@ -161,6 +161,24 @@
             <p class="text-sm text-amber-700 dark:text-amber-300 flex items-center gap-2"><i data-lucide="alert-triangle" class="w-4 h-4 shrink-0"></i> <span><span data-i18n="pw.temp1">You're using a temporary password. Please set your own in</span> <button onclick="switchTab('account')" class="underline font-semibold" data-i18n="pw.tempAccount">Account</button>.</span></p>
         </div>
 
+        <!-- ToS update banner (shown when the current Terms version is unacknowledged) -->
+        <div id="tosBanner" class="hidden mb-5 surface rounded-2xl p-4 border-blue-300/60 bg-blue-50/60 dark:bg-blue-500/5 fade-in">
+            <div class="flex items-start gap-3">
+                <i data-lucide="file-text" class="w-5 h-5 shrink-0 text-blue-600 dark:text-blue-400 mt-0.5"></i>
+                <div class="flex-1 min-w-0">
+                    <p class="text-sm font-semibold text-blue-800 dark:text-blue-300"><span data-i18n="tos.updated">Our Terms &amp; Conditions have been updated</span> <span id="tosBannerVer" class="opacity-70"></span></p>
+                    <p class="text-xs text-blue-700/80 dark:text-blue-300/70 mt-0.5" data-i18n="tos.updatedSub">Please review and acknowledge the new version to stay in good standing.</p>
+                    <div class="flex flex-wrap items-center gap-2 mt-3">
+                        <button onclick="switchTab('compliance')" class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition" data-i18n="tos.review">Review &amp; acknowledge</button>
+                        <a href="/terms" target="_blank" rel="noopener" class="text-xs font-semibold px-3 py-1.5 rounded-lg border border-blue-300/60 text-blue-700 dark:text-blue-300 hover:bg-blue-100/50 dark:hover:bg-blue-500/10 transition" data-i18n="tos.viewPage">View Terms</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- High-severity standing banner (final warning / termination) -->
+        <div id="standingBanner" class="hidden mb-5 rounded-2xl p-4 fade-in"></div>
+
         <!-- Tab nav -->
         <nav class="surface rounded-2xl p-1.5 mb-6 flex items-center gap-1 overflow-x-auto fade-in">
             <button class="tab active" data-tab="submit" onclick="switchTab('submit')"><i data-lucide="send" class="w-4 h-4"></i> <span data-i18n="tab.submit">Submit</span></button>
@@ -168,6 +186,7 @@
             <button class="tab" data-tab="flightevents" onclick="switchTab('flightevents')"><i data-lucide="plane-takeoff" class="w-4 h-4"></i> <span data-i18n="tab.flightevents">Flight events</span></button>
             <button class="tab" data-tab="profile" onclick="switchTab('profile')"><i data-lucide="building-2" class="w-4 h-4"></i> <span data-i18n="tab.profile">VA Profile</span></button>
             <button class="tab" data-tab="embed" onclick="switchTab('embed')"><i data-lucide="code-2" class="w-4 h-4"></i> <span data-i18n="tab.embed">Embed</span></button>
+            <button id="tabComplianceBtn" class="tab relative" data-tab="compliance" onclick="switchTab('compliance')"><i data-lucide="shield-check" class="w-4 h-4"></i> <span data-i18n="tab.compliance">Compliance</span><span id="complianceDot" class="hidden absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-rose-500 ring-2 ring-white dark:ring-zinc-900"></span></button>
             <button id="tabTeamBtn" class="tab hidden" data-tab="team" onclick="switchTab('team')"><i data-lucide="users" class="w-4 h-4"></i> <span data-i18n="tab.team">Team</span></button>
             <button class="tab" data-tab="account" onclick="switchTab('account')"><i data-lucide="user-cog" class="w-4 h-4"></i> <span data-i18n="tab.account">Account</span></button>
         </nav>
@@ -549,6 +568,48 @@
             <div id="teamList" class="space-y-2"></div>
         </section>
 
+        <!-- ===== TAB: COMPLIANCE (Terms + Warnings) ===== -->
+        <section id="panel-compliance" class="tab-panel hidden">
+            <div class="mb-4">
+                <h2 class="text-base font-bold tracking-tight" data-i18n="comp.heading">Compliance &amp; standing</h2>
+                <p class="text-sm text-zinc-500 dark:text-zinc-400" data-i18n="comp.sub">Your VA's standing under our Terms, any warnings we've issued, and the Terms you agreed to.</p>
+            </div>
+
+            <!-- Standing summary -->
+            <div id="standingCard" class="surface rounded-2xl p-5 sm:p-6 mb-5 flex items-center gap-4">
+                <div id="standingIcon" class="w-11 h-11 rounded-xl grid place-items-center bg-emerald-100 text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-400 shrink-0"><i data-lucide="shield-check" class="w-5 h-5"></i></div>
+                <div class="min-w-0">
+                    <p id="standingTitle" class="text-sm font-bold" data-i18n="comp.standingGood">Good standing</p>
+                    <p id="standingDesc" class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5" data-i18n="comp.standingGoodSub">No active warnings. Keep it up!</p>
+                </div>
+            </div>
+
+            <!-- Terms & documents -->
+            <div class="surface rounded-2xl p-5 sm:p-6 mb-5">
+                <div class="flex items-start justify-between gap-4 flex-wrap">
+                    <div class="min-w-0">
+                        <p class="text-sm font-bold flex items-center gap-2"><i data-lucide="scroll-text" class="w-4 h-4"></i> <span data-i18n="comp.terms">Terms &amp; Conditions</span></p>
+                        <p id="tosMeta" class="text-xs text-zinc-500 dark:text-zinc-400 mt-1">—</p>
+                        <p id="tosAckState" class="text-xs mt-1"></p>
+                    </div>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <a id="tosPageLink" href="/terms" target="_blank" rel="noopener" class="text-xs font-semibold px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition inline-flex items-center gap-1.5"><i data-lucide="external-link" class="w-3.5 h-3.5"></i> <span data-i18n="comp.viewTerms">View Terms</span></a>
+                        <a id="tosPdfLink" href="/VA-Advertisement-Terms.pdf" target="_blank" rel="noopener" class="text-xs font-semibold px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition inline-flex items-center gap-1.5"><i data-lucide="file-down" class="w-3.5 h-3.5"></i> <span data-i18n="comp.downloadPdf">Download PDF</span></a>
+                        <button id="tosAckBtn" onclick="acknowledgeTos()" class="hidden text-xs font-semibold px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition inline-flex items-center gap-1.5"><i data-lucide="check" class="w-3.5 h-3.5"></i> <span data-i18n="comp.acceptTerms">I acknowledge the current Terms</span></button>
+                    </div>
+                </div>
+                <ul id="tosChangelog" class="hidden mt-4 pt-4 border-t border-zinc-100 dark:border-zinc-800 text-xs text-zinc-600 dark:text-zinc-300 space-y-1.5"></ul>
+            </div>
+
+            <!-- Warnings -->
+            <div class="flex items-center justify-between mb-3">
+                <h3 class="text-sm font-bold tracking-tight" data-i18n="comp.warnings">Warnings</h3>
+                <button onclick="loadCompliance()" data-i18n-title="common.refresh" title="Refresh" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500 transition"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+            </div>
+            <p class="text-xs text-zinc-500 dark:text-zinc-400 mb-3" data-i18n="comp.warningsSub">Notices are also delivered to your VA's Discord. Acknowledging confirms you received a notice — it isn't an admission. Questions? Contact our VA Rep.</p>
+            <div id="warnList" class="space-y-3"><div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400" data-i18n="submit.loading">Loading…</div></div>
+        </section>
+
         <!-- ===== TAB: ACCOUNT ===== -->
         <section id="panel-account" class="tab-panel hidden">
             <div class="mb-3">
@@ -682,7 +743,7 @@
             renderLangPickers();
             if (me) {
                 $('acctRole').textContent = t('role.' + me.role) || me.role;
-                loadSubmissions(); loadEvents(); loadEmbeds();
+                loadSubmissions(); loadEvents(); loadEmbeds(); loadCompliance();
                 if (vaProfile) { paintHero(); fillProfileForm(vaProfile, me.role === 'owner'); }
                 if (me.role === 'owner') loadTeam();
             }
@@ -783,6 +844,7 @@
             loadSubmissions();
             loadEvents();
             loadEmbeds();
+            loadCompliance();     // Terms banner + warnings + standing
             if (me.role === 'owner') loadTeam();
             setThemeIcons();
             drawIcons();
@@ -1411,6 +1473,164 @@
             if (!confirm(t('events.confirmRemove'))) return;
             try { await api('/events/' + id, { method: 'DELETE' }); loadEvents(); }
             catch (err) { alert(err.message); }
+        }
+
+        // ---------- Compliance: Terms + Warnings ----------
+        // Map a level palette (from vaTos.js) to Tailwind classes for badges,
+        // the standing card, and the high-severity banner.
+        const LEVEL_PALETTE = {
+            amber:         { badge: 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300', bar: 'border-l-amber-400', icon: 'bg-amber-100 text-amber-600 dark:bg-amber-500/15 dark:text-amber-400', banner: 'bg-amber-50 dark:bg-amber-500/10 text-amber-800 dark:text-amber-200 border border-amber-300/50' },
+            orange:        { badge: 'bg-orange-100 text-orange-700 dark:bg-orange-500/15 dark:text-orange-300', bar: 'border-l-orange-400', icon: 'bg-orange-100 text-orange-600 dark:bg-orange-500/15 dark:text-orange-400', banner: 'bg-orange-50 dark:bg-orange-500/10 text-orange-800 dark:text-orange-200 border border-orange-300/50' },
+            'deep-orange': { badge: 'bg-orange-200 text-orange-800 dark:bg-orange-600/20 dark:text-orange-300', bar: 'border-l-orange-500', icon: 'bg-orange-200 text-orange-700 dark:bg-orange-600/20 dark:text-orange-300', banner: 'bg-orange-100 dark:bg-orange-600/10 text-orange-900 dark:text-orange-200 border border-orange-400/50' },
+            red:           { badge: 'bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300', bar: 'border-l-rose-500', icon: 'bg-rose-100 text-rose-600 dark:bg-rose-500/15 dark:text-rose-400', banner: 'bg-rose-50 dark:bg-rose-500/10 text-rose-800 dark:text-rose-200 border border-rose-300/50' },
+            black:         { badge: 'bg-zinc-800 text-zinc-100 dark:bg-zinc-100 dark:text-zinc-900', bar: 'border-l-zinc-800 dark:border-l-zinc-200', icon: 'bg-zinc-800 text-white dark:bg-zinc-100 dark:text-zinc-900', banner: 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900 border border-zinc-700 dark:border-zinc-300' },
+        };
+        const paletteFor = (p) => LEVEL_PALETTE[p] || LEVEL_PALETTE.red;
+
+        let tosInfo = null;
+
+        function applyTosBanner(tos) {
+            tosInfo = tos;
+            if (!tos) return;
+            const outdated = !tos.acknowledged;
+            $('tosBanner').classList.toggle('hidden', !outdated);
+            $('tosBannerVer').textContent = '(' + tos.version + ')';
+            // Terms card meta + acknowledge button state.
+            $('tosMeta').textContent = t('comp.terms') + ' — ' + tos.version + ' • ' + (tos.effectiveDate || '');
+            if (tos.pdfUrl) $('tosPdfLink').href = tos.pdfUrl;
+            if (tos.pageUrl) $('tosPageLink').href = tos.pageUrl;
+            const ackBtn = $('tosAckBtn');
+            const ackState = $('tosAckState');
+            ackBtn.classList.toggle('hidden', tos.acknowledged);
+            if (tos.acknowledged) {
+                ackState.className = 'text-xs mt-1 text-emerald-600 dark:text-emerald-400';
+                ackState.textContent = '✓ ' + t('comp.termsCurrent');
+            } else {
+                ackState.className = 'text-xs mt-1 text-blue-600 dark:text-blue-400';
+                ackState.textContent = tos.acknowledgedVersion ? t('comp.termsOutdated') : t('comp.termsNever');
+            }
+            // Changelog for the current version.
+            const cl = (tos.changelog || []).find(c => c.version === tos.version);
+            const ul = $('tosChangelog');
+            if (cl && Array.isArray(cl.notes) && cl.notes.length) {
+                ul.innerHTML = '<li class="font-semibold text-zinc-700 dark:text-zinc-200 mb-1">' + esc(t('comp.whatChanged')) + '</li>' +
+                    cl.notes.map(n => '<li class="flex gap-2"><span class="text-blue-500">•</span><span>' + esc(n) + '</span></li>').join('');
+                ul.classList.remove('hidden');
+            } else { ul.classList.add('hidden'); }
+        }
+
+        function applyStanding(standing) {
+            const dot = $('complianceDot');
+            const topBanner = $('standingBanner');
+            const card = $('standingCard');
+            const icon = $('standingIcon');
+            const title = $('standingTitle');
+            const desc = $('standingDesc');
+            const hasIssue = standing && (standing.activeCount > 0 || standing.terminated);
+            // Nav dot: red when anything needs attention (active warning or unacked Terms).
+            const needsAttention = hasIssue || (tosInfo && !tosInfo.acknowledged);
+            dot.classList.toggle('hidden', !needsAttention);
+
+            if (!hasIssue) {
+                topBanner.classList.add('hidden');
+                icon.className = 'w-11 h-11 rounded-xl grid place-items-center bg-emerald-100 text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-400 shrink-0';
+                icon.innerHTML = '<i data-lucide="shield-check" class="w-5 h-5"></i>';
+                title.textContent = t('comp.standingGood');
+                desc.textContent = t('comp.standingGoodSub');
+                drawIcons();
+                return;
+            }
+            const pal = paletteFor(standing.peakPalette);
+            icon.className = 'w-11 h-11 rounded-xl grid place-items-center shrink-0 ' + pal.icon;
+            icon.innerHTML = '<i data-lucide="' + (standing.terminated ? 'ban' : 'alert-triangle') + '" class="w-5 h-5"></i>';
+            title.textContent = standing.peakLabel || t('comp.warnings');
+            const n = standing.activeCount;
+            desc.textContent = (standing.terminated
+                ? t('comp.terms')
+                : (n + ' ' + (n === 1 ? 'active warning' : 'active warnings'))) +
+                (standing.unacknowledged ? ' • ' + standing.unacknowledged + ' to acknowledge' : '');
+
+            // Show the high-severity top banner only for final warning / termination.
+            if (standing.peakLevel === 'final' || standing.terminated) {
+                topBanner.className = 'mb-5 rounded-2xl p-4 fade-in ' + pal.banner;
+                topBanner.innerHTML =
+                    '<div class="flex items-start gap-3">' +
+                        '<i data-lucide="' + (standing.terminated ? 'ban' : 'alert-octagon') + '" class="w-5 h-5 shrink-0 mt-0.5"></i>' +
+                        '<div class="flex-1 min-w-0">' +
+                            '<p class="text-sm font-bold">' + esc(standing.peakLabel) + '</p>' +
+                            '<p class="text-xs opacity-90 mt-0.5">' + esc(standing.terminated
+                                ? 'Your partnership has been terminated. See Compliance for details.'
+                                : 'This is your final warning. Please review it in Compliance immediately.') + '</p>' +
+                            '<button onclick="switchTab(\'compliance\')" class="mt-2 text-xs font-semibold underline">' + esc(t('tos.review')) + '</button>' +
+                        '</div>' +
+                    '</div>';
+                topBanner.classList.remove('hidden');
+            } else {
+                topBanner.classList.add('hidden');
+            }
+            drawIcons();
+        }
+
+        function renderWarnings(warnings, standing) {
+            const wrap = $('warnList');
+            if (!warnings || !warnings.length) {
+                wrap.innerHTML = '<div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400">' + esc(t('comp.noWarnings')) + '</div>';
+                return;
+            }
+            wrap.innerHTML = warnings.map(w => {
+                const pal = paletteFor(w.palette);
+                const rescinded = w.status === 'rescinded';
+                const acked = !!w.acknowledgedAt;
+                return '<div class="surface rounded-2xl p-4 sm:p-5 border-l-4 ' + pal.bar + (rescinded ? ' opacity-60' : '') + '">' +
+                    '<div class="flex items-start justify-between gap-3 flex-wrap">' +
+                        '<div class="flex items-center gap-2 flex-wrap">' +
+                            '<span class="text-[11px] font-bold px-2 py-0.5 rounded-full ' + pal.badge + '">' + esc(w.levelLabel) + '</span>' +
+                            (rescinded ? '<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400 line-through">' + esc(t('comp.rescinded')) + '</span>' : '') +
+                            (acked && !rescinded ? '<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300 inline-flex items-center gap-1"><i data-lucide="check" class="w-3 h-3"></i>' + esc(t('comp.acknowledged')) + '</span>' : '') +
+                        '</div>' +
+                        '<span class="text-[11px] text-zinc-400">' + esc(fmtDate(w.createdAt)) + '</span>' +
+                    '</div>' +
+                    '<p class="text-sm text-zinc-700 dark:text-zinc-200 mt-2.5 whitespace-pre-wrap">' + esc(w.reason) + '</p>' +
+                    '<div class="flex items-center justify-between gap-3 mt-3 flex-wrap">' +
+                        '<p class="text-[11px] text-zinc-400">' + esc(t('comp.issuedBy')) + ' ' + esc(w.issuedByName) +
+                            (w.discordDelivered ? ' • <span class="inline-flex items-center gap-1">' + esc(t('comp.deliveredDiscord')) + '</span>' : '') +
+                            (acked ? ' • ' + esc(t('comp.acknowledged')) + ' ' + esc(fmtDate(w.acknowledgedAt)) + (w.acknowledgedByName ? ' (' + esc(w.acknowledgedByName) + ')' : '') : '') + '</p>' +
+                        (!acked && !rescinded ? '<button onclick="acknowledgeWarning(\'' + w.id + '\')" class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 hover:opacity-90 transition inline-flex items-center gap-1.5"><i data-lucide="check" class="w-3.5 h-3.5"></i>' + esc(t('comp.acknowledge')) + '</button>' : '') +
+                    '</div>' +
+                '</div>';
+            }).join('');
+            drawIcons();
+        }
+
+        async function loadCompliance() {
+            try {
+                const [{ tos }, w] = await Promise.all([
+                    api('/tos'),
+                    api('/warnings'),
+                ]);
+                applyTosBanner(tos);
+                renderWarnings(w.warnings, w.standing);
+                applyStanding(w.standing);
+            } catch (err) {
+                $('warnList').innerHTML = '<div class="surface rounded-2xl p-6 text-center text-sm text-rose-500">' + esc(err.message) + '</div>';
+            }
+        }
+
+        async function acknowledgeTos() {
+            try {
+                const { tos } = await api('/tos/acknowledge', { method: 'POST' });
+                applyTosBanner(tos);
+                // Standing dot may clear once Terms are current.
+                loadCompliance();
+                toast(t('comp.termsCurrent'));
+            } catch (err) { alert(err.message); }
+        }
+
+        async function acknowledgeWarning(id) {
+            try {
+                await api('/warnings/' + id + '/acknowledge', { method: 'POST' });
+                loadCompliance();
+            } catch (err) { alert(err.message); }
         }
 
         // ---------- Team (owner) ----------

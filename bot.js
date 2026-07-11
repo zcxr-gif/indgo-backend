@@ -42,6 +42,8 @@ const { uploadAirportImage, getAirportInfo, deleteAirportImages } = require('./a
 // Import VA image helpers so the bot can accept banner/logo uploads in-channel
 // and push them to S3, exactly like the web dashboard does.
 const { uploadVaImage, deleteVaImage } = require('./vaAds');
+// Shared Terms version + enforcement config (source of truth for the portal too).
+const { TOS_VERSION: VA_TOS_VERSION, TOS_PAGE_PATH: VA_TOS_PAGE_PATH } = require('./vaTos');
 
 // Promisify pipeline for efficient stream handling
 const pipeline = util.promisify(stream.pipeline);
@@ -858,7 +860,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
     };
 
     // Version this so a future ToS revision can re-prompt previous accepters.
-    const VA_PARTNERSHIP_TOS_VERSION = 'v1';
+    // Mirrors the shared Terms version so the ticket, the portal and the PDF
+    // never disagree. Bumping TOS_VERSION in vaTos.js re-prompts prior accepters.
+    const VA_PARTNERSHIP_TOS_VERSION = VA_TOS_VERSION;
 
     // The official VA Advertisement Program Terms & Conditions, shipped as a PDF
     // in the repo and attached to the partnership ticket so VAs get the real
@@ -876,9 +880,11 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 "Please read our **Terms & Conditions** (attached as a PDF above) before continuing. " +
                 "By accepting, your VA agrees to the full contract. Key points:\n\n" +
                 "• **Free program** — a directory advertising your VA across our platform, subject to staff approval.\n" +
+                "• **Official tracking provider** — by joining, you accept Inflight as your VA's **official flight-tracking provider**. This does **not** require every pilot to use Inflight, but events you post or run are tracked with Inflight and credit Inflight as the tracker.\n" +
                 "• **Event tracking** — any event you announce or run **must be tracked using Inflight**, with a screenshot from our tracker.\n" +
                 "• **Accurate content** — listing info, logos and banners must be accurate, owned by you, and not offensive or infringing.\n" +
                 "• **Staff authority** — Inflight may review, edit, approve, decline, feature or remove any listing at our discretion.\n" +
+                "• **Enforcement** — breaches are handled through a warning ladder (**verbal → first → second → final**) and may end in **contract termination**. Warnings are delivered here and recorded in your VA Portal.\n" +
                 "• **iOS app** — VA listings are **not** shown in our iOS app for copyright-compliance reasons.\n" +
                 "• **Changes/suspension** — required changes not made within **7 days** of contact may lead to suspension.\n\n" +
                 "If you have **any questions**, please inquire our Inflight VA Rep <@&" + INFLIGHT_VA_REP_ROLE_ID + "> or our moderators <@&" + ADMIN_ROLE_ID + "> right here in this ticket.\n\n" +

@@ -3827,6 +3827,31 @@ app.get('/va-portal', (req, res) => {
     res.sendFile(path.join(__dirname, 'va-portal.html'));
 });
 
+// Public Terms & Conditions page (mirrors the signed PDF). Rendered client-side
+// from GET /api/va-terms so the page and the PDF share one source (vaTermsContent.js).
+app.get(['/terms', '/va-terms'], (req, res) => {
+    res.sendFile(path.join(__dirname, 'terms.html'));
+});
+
+// Structured Terms content + version/changelog for the Terms page and portal.
+// Public: the Terms are not secret.
+app.get('/api/va-terms', (req, res) => {
+    const terms = require('./vaTermsContent');
+    const { TOS_CHANGELOG, TOS_SUMMARY, WARNING_LEVELS, TOS_PDF_PATH } = require('./vaTos');
+    res.json({
+        title: terms.TITLE,
+        subtitle: terms.SUBTITLE,
+        version: terms.VERSION,
+        effectiveDate: terms.EFFECTIVE_DATE,
+        pdfUrl: TOS_PDF_PATH,
+        intro: terms.INTRO,
+        clauses: terms.CLAUSES,
+        changelog: TOS_CHANGELOG,
+        summary: TOS_SUMMARY,
+        warningLevels: WARNING_LEVELS.map(l => ({ key: l.key, label: l.label, meaning: l.meaning })),
+    });
+});
+
 // 1. Serve static files from the root directory
 // This allows the browser to find airports.js, images, and CSS
 app.use(express.static(__dirname));
