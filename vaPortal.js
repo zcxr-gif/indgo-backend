@@ -33,6 +33,12 @@ const { normalizeCardOptions } = require('./vaEventCard');
 // Shared roster helpers — same module the staff API uses, so a VA managing its
 // own roster and staff managing it see identical parsing/de-dupe/limits.
 const vaPilots = require('./vaPilots');
+// Single source of truth for the Terms version + the enforcement ladder, shared
+// with the Discord bot and the public Terms page so nothing drifts.
+const {
+    TOS_VERSION, TOS_EFFECTIVE_DATE, TOS_PDF_PATH, TOS_PAGE_PATH,
+    TOS_SUMMARY, TOS_CHANGELOG, WARNING_LEVELS, WARNING_LEVEL_KEYS, getWarningLevel,
+} = require('./vaTos');
 
 // Where the embed widget is hosted. The portal surfaces a VA's embed link as a
 // read-only, copyable URL; it never lets the VA change the underlying config.
@@ -89,6 +95,13 @@ const VaPortalAccountSchema = new mongoose.Schema({
     // them to set their own on first login.
     mustChangePassword: { type: Boolean, default: false },
     lastLoginAt: { type: Date, default: null },
+
+    // Which Terms version this account holder has acknowledged in the portal.
+    // The portal compares this to the current TOS_VERSION (vaTos.js) and shows a
+    // "Terms updated — please review" banner whenever it lags behind, satisfying
+    // "whenever we update the ToS, partners are updated on it in their portal".
+    tosAckVersion: { type: String, default: '' },
+    tosAckAt: { type: Date, default: null },
 }, { timestamps: true });
 
 const VaPortalAccount = mongoose.models.VaPortalAccount
@@ -167,6 +180,73 @@ function publicEvent(e) {
     };
 }
 
+/* =========================
+ * VA WARNINGS  (Terms enforcement ladder)
+ *
+ * A durable record of every warning Inflight issues to a VA for not following
+ * the Terms. The escalation levels (verbal → first → second → final →
+ * termination) live in vaTos.js so the portal, the Discord embed and the PDF
+ * all agree. Each warning is delivered to the VA's Discord channel AND shown in
+ * their portal, where any account on the VA can acknowledge receipt.
+ * ========================= */
+const VaWarningSchema = new mongoose.Schema({
+    vaAdId: { type: mongoose.Schema.Types.ObjectId, ref: 'VirtualAirlineAd', required: true, index: true },
+    vaName: { type: String, default: '' },
+    // One of vaTos WARNING_LEVEL_KEYS.
+    level: { type: String, enum: WARNING_LEVEL_KEYS, required: true },
+    reason: { type: String, required: true, trim: true, maxlength: 4000 },
+    // Which Terms version was in force when this was issued (for context).
+    termsVersion: { type: String, default: TOS_VERSION },
+
+    // Who issued it (an Inflight staff member).
+    issuedByName: { type: String, default: '' },
+    issuedByRole: { type: String, default: '' },
+
+    // active until an admin rescinds it (e.g. issued in error / resolved).
+    status: { type: String, enum: ['active', 'rescinded'], default: 'active', index: true },
+    rescindedByName: { type: String, default: '' },
+    rescindedAt: { type: Date, default: null },
+    rescindReason: { type: String, default: '' },
+
+    // The VA's acknowledgement of receipt (not agreement).
+    acknowledgedAt: { type: Date, default: null },
+    acknowledgedByName: { type: String, default: '' },
+
+    // Delivery bookkeeping so staff can see it reached Discord.
+    discordDelivered: { type: Boolean, default: false },
+    discordChannelId: { type: String, default: null },
+}, { timestamps: true });
+
+VaWarningSchema.index({ vaAdId: 1, createdAt: -1 });
+VaWarningSchema.index({ status: 1, createdAt: -1 });
+
+const VaWarning = mongoose.models.VaWarning || mongoose.model('VaWarning', VaWarningSchema);
+
+function publicWarning(w) {
+    if (!w) return null;
+    const lvl = getWarningLevel(w.level) || {};
+    return {
+        id: w._id,
+        vaAdId: w.vaAdId,
+        vaName: w.vaName,
+        level: w.level,
+        levelLabel: lvl.label || w.level,
+        levelShort: lvl.short || w.level,
+        palette: lvl.palette || 'red',
+        order: (typeof lvl.order === 'number') ? lvl.order : 0,
+        reason: w.reason,
+        termsVersion: w.termsVersion || '',
+        issuedByName: w.issuedByName || 'Inflight',
+        status: w.status,
+        rescindedByName: w.rescindedByName || '',
+        rescindedAt: w.rescindedAt || null,
+        acknowledgedAt: w.acknowledgedAt || null,
+        acknowledgedByName: w.acknowledgedByName || '',
+        discordDelivered: !!w.discordDelivered,
+        createdAt: w.createdAt,
+    };
+}
+
 // Lightweight audit trail so the Inflight side can "see whatever they do".
 const VaPortalActivitySchema = new mongoose.Schema({
     vaAdId: { type: mongoose.Schema.Types.ObjectId, ref: 'VirtualAirlineAd', default: null, index: true },
@@ -212,6 +292,83 @@ function logActivity({ vaAdId, vaName, actorName, actorRole, action, detail }) {
     }
 }
 
+// Deliver a warning to the VA's own Discord channel (their "thread"), so the
+// notice reaches the partner where they operate — not just in the portal.
+// Best-effort and fire-and-forget: returns the channel id we posted to, or null
+// if the VA has no Discord channel wired up. bot.js is required lazily.
+function deliverWarningToDiscord(ad, warning) {
+    try {
+        const channelId = ad && ad.discordChannelId;
+        if (!channelId) return null;
+        const { postToChannel } = require('./bot');
+        const lvl = getWarningLevel(warning.level) || {};
+        const isTermination = warning.level === 'termination';
+        const title = isTermination
+            ? `⛔ ${lvl.label || 'Contract Termination'}`
+            : `⚠️ ${lvl.label || 'Warning'}`;
+        const ladder = WARNING_LEVELS.map((l) =>
+            (l.key === warning.level ? `**➤ ${l.label}**` : l.label)).join('  →  ');
+        postToChannel(channelId, {
+            content: isTermination ? undefined : '@here',
+            embeds: [{
+                title,
+                description:
+                    `This is an official **${lvl.label || 'notice'}** issued to **${warning.vaName || ad.name}** ` +
+                    `regarding compliance with the Inflight VA Advertisement Program Terms.\n\n` +
+                    `**Reason**\n${String(warning.reason || '').slice(0, 1500)}\n\n` +
+                    (lvl.meaning ? `**What this means**\n${lvl.meaning}\n\n` : '') +
+                    `Please review and acknowledge this in your **VA Portal** › Compliance. ` +
+                    `Questions can be raised with our VA Rep.`,
+                color: (typeof lvl.color === 'number') ? lvl.color : 0xDC2626,
+                fields: [
+                    { name: 'Escalation stage', value: ladder, inline: false },
+                    { name: 'Issued by', value: String(warning.issuedByName || 'Inflight').slice(0, 256), inline: true },
+                    { name: 'Terms version', value: String(warning.termsVersion || TOS_VERSION), inline: true },
+                ],
+                footer: { text: 'Inflight VA Advertisement Program • Terms enforcement' },
+                timestamp: new Date().toISOString(),
+            }],
+        });
+        return channelId;
+    } catch (err) {
+        console.error('VA warning Discord delivery error:', err.message);
+        return null;
+    }
+}
+
+// Announce a Terms update to every VA that has a Discord channel, so partners
+// are prompted (in Discord + their portal) to review the new version. Returns
+// a { attempted } count. Best-effort per channel.
+async function announceTosUpdateToDiscord(VirtualAirlineAd) {
+    let attempted = 0;
+    try {
+        const { postToChannel } = require('./bot');
+        const ads = await VirtualAirlineAd
+            .find({ discordChannelId: { $ne: null }, status: { $ne: 'removed' } }, 'name discordChannelId')
+            .limit(2000);
+        for (const ad of ads) {
+            if (!ad.discordChannelId) continue;
+            attempted += 1;
+            postToChannel(ad.discordChannelId, {
+                embeds: [{
+                    title: '📄 Our Terms & Conditions have been updated',
+                    description:
+                        `The Inflight VA Advertisement Program **Terms & Conditions** have been updated to ` +
+                        `**${TOS_VERSION}** (effective ${TOS_EFFECTIVE_DATE}).\n\n` +
+                        `Please review them and acknowledge the new version in your **VA Portal** › Compliance. ` +
+                        `Continued participation constitutes acceptance of the revised Terms.`,
+                    color: 0x2563EB,
+                    footer: { text: 'Inflight VA Advertisement Program' },
+                    timestamp: new Date().toISOString(),
+                }],
+            });
+        }
+    } catch (err) {
+        console.error('VA ToS announce error:', err.message);
+    }
+    return { attempted };
+}
+
 // ---------------------------------------------------------------------------
 // Serialisers
 // ---------------------------------------------------------------------------
@@ -230,8 +387,33 @@ function publicAccount(a) {
         mustChangePassword: a.mustChangePassword,
         lastLoginAt: a.lastLoginAt,
         createdAt: a.createdAt,
+        tosAckVersion: a.tosAckVersion || '',
+        tosAckAt: a.tosAckAt || null,
     };
 }
+
+// The current Terms state, plus whether a given portal account has acknowledged
+// the live version. Shared by /auth/me and the dedicated /tos route so the
+// portal can render its "Terms updated" banner from either.
+function tosState(account) {
+    const acked = !!account && account.tosAckVersion === TOS_VERSION;
+    return {
+        version: TOS_VERSION,
+        effectiveDate: TOS_EFFECTIVE_DATE,
+        pdfUrl: TOS_PDF_PATH,
+        pageUrl: TOS_PAGE_PATH,
+        summary: TOS_SUMMARY,
+        changelog: TOS_CHANGELOG,
+        acknowledged: acked,
+        acknowledgedVersion: (account && account.tosAckVersion) || '',
+        acknowledgedAt: (account && account.tosAckAt) || null,
+    };
+}
+
+// The enforcement ladder shape the portal + staff UI render (no server-only bits).
+const warningLevelsPublic = () => WARNING_LEVELS.map((l) => ({
+    key: l.key, order: l.order, label: l.label, short: l.short, palette: l.palette, meaning: l.meaning,
+}));
 
 // Shape a submission for the VA-facing portal (hides internal staff notes).
 function publicSubmission(s) {
@@ -809,7 +991,7 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
     app.get('/api/va-portal/auth/me', async (req, res) => {
         const account = await resolveAccount(req);
         if (!account) return res.status(401).json({ error: 'Not authenticated.' });
-        res.json({ account: publicAccount(account) });
+        res.json({ account: publicAccount(account), tos: tosState(account) });
     });
 
     app.post('/api/va-portal/auth/change-password', requirePortal, async (req, res) => {
@@ -1366,6 +1548,90 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
     });
 
     // =====================================================================
+    // VA-FACING COMPLIANCE: TERMS + WARNINGS
+    // =====================================================================
+    // Current Terms state + this account's acknowledgement, plus the warning
+    // ladder definition (so the portal can render level meanings).
+    app.get('/api/va-portal/tos', requirePortal, async (req, res) => {
+        res.json({ tos: tosState(req.portal), levels: warningLevelsPublic() });
+    });
+
+    // Acknowledge the current Terms version. Records it against the account so
+    // the "Terms updated" banner clears. Any account on the VA may acknowledge.
+    app.post('/api/va-portal/tos/acknowledge', requirePortal, async (req, res) => {
+        try {
+            req.portal.tosAckVersion = TOS_VERSION;
+            req.portal.tosAckAt = new Date();
+            await req.portal.save();
+            logActivity({
+                vaAdId: req.portal.vaAdId, vaName: req.portal.vaName,
+                actorName: req.portal.displayName || req.portal.username, actorRole: req.portal.role,
+                action: 'tos.acknowledge', detail: `Acknowledged Terms ${TOS_VERSION}`,
+            });
+            res.json({ ok: true, tos: tosState(req.portal) });
+        } catch (err) {
+            console.error('VA portal tos ack error:', err);
+            res.status(500).json({ error: 'Could not record your acknowledgement.' });
+        }
+    });
+
+    // The VA's own warnings (active + history), newest first, plus a compact
+    // "standing" summary the portal renders at a glance.
+    app.get('/api/va-portal/warnings', requirePortal, async (req, res) => {
+        try {
+            if (!req.portal.vaAdId) return res.json({ warnings: [], standing: null, levels: warningLevelsPublic() });
+            const warnings = await VaWarning.find({ vaAdId: req.portal.vaAdId }).sort({ createdAt: -1 }).limit(200);
+            const active = warnings.filter(w => w.status === 'active');
+            const terminated = active.some(w => w.level === 'termination');
+            // Highest active escalation stage drives the standing badge.
+            let peak = null;
+            for (const w of active) {
+                const lvl = getWarningLevel(w.level);
+                if (lvl && (!peak || lvl.order > peak.order)) peak = lvl;
+            }
+            res.json({
+                warnings: warnings.map(publicWarning),
+                levels: warningLevelsPublic(),
+                standing: {
+                    activeCount: active.length,
+                    unacknowledged: active.filter(w => !w.acknowledgedAt).length,
+                    terminated,
+                    peakLevel: peak ? peak.key : null,
+                    peakLabel: peak ? peak.label : null,
+                    peakPalette: peak ? peak.palette : null,
+                },
+            });
+        } catch (err) {
+            console.error('VA portal warnings error:', err);
+            res.status(500).json({ error: 'Could not load your warnings.' });
+        }
+    });
+
+    // Acknowledge receipt of a warning (not agreement). Any account on the VA.
+    app.post('/api/va-portal/warnings/:id/acknowledge', requirePortal, async (req, res) => {
+        try {
+            const w = await VaWarning.findById(req.params.id);
+            if (!w || String(w.vaAdId) !== String(req.portal.vaAdId)) {
+                return res.status(404).json({ error: 'Warning not found.' });
+            }
+            if (!w.acknowledgedAt) {
+                w.acknowledgedAt = new Date();
+                w.acknowledgedByName = req.portal.displayName || req.portal.username;
+                await w.save();
+                logActivity({
+                    vaAdId: req.portal.vaAdId, vaName: req.portal.vaName,
+                    actorName: w.acknowledgedByName, actorRole: req.portal.role,
+                    action: 'warning.acknowledge', detail: `${(getWarningLevel(w.level) || {}).label || w.level} acknowledged`,
+                });
+            }
+            res.json({ ok: true, warning: publicWarning(w) });
+        } catch (err) {
+            console.error('VA portal warning ack error:', err);
+            res.status(500).json({ error: 'Could not acknowledge the warning.' });
+        }
+    });
+
+    // =====================================================================
     // VA-FACING TEAM MANAGEMENT (owner only)
     // =====================================================================
     app.get('/api/va-portal/team', requirePortal, async (req, res) => {
@@ -1656,6 +1922,126 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             })),
         });
     });
+
+    // =====================================================================
+    // STAFF OVERSIGHT: TERMS ENFORCEMENT (WARNINGS) + TERMS ANNOUNCE
+    // =====================================================================
+    // Warnings across all VAs, or filtered to one. Newest first.
+    app.get('/api/va-portal/admin/warnings', requireOversight, async (req, res) => {
+        try {
+            const filter = {};
+            if (req.query.vaAdId) filter.vaAdId = req.query.vaAdId;
+            if (req.query.status && ['active', 'rescinded'].includes(req.query.status)) filter.status = req.query.status;
+            const warnings = await VaWarning.find(filter).sort({ createdAt: -1 }).limit(500);
+            res.json({ warnings: warnings.map(publicWarning), levels: warningLevelsPublic() });
+        } catch (err) {
+            console.error('VA portal admin warnings error:', err);
+            res.status(500).json({ error: 'Could not load warnings.' });
+        }
+    });
+
+    // Issue a warning to a VA. Records it, delivers it to the VA's Discord
+    // channel, and logs it. `level` must be one of the enforcement-ladder keys.
+    app.post('/api/va-portal/admin/warnings', requireOversight, async (req, res) => {
+        try {
+            const { vaAdId, level, reason } = req.body || {};
+            if (!vaAdId || !level || !String(reason || '').trim()) {
+                return res.status(400).json({ error: 'A VA, a level, and a reason are all required.' });
+            }
+            if (!WARNING_LEVEL_KEYS.includes(level)) {
+                return res.status(400).json({ error: 'Unknown warning level.' });
+            }
+            const ad = await VirtualAirlineAd.findById(vaAdId);
+            if (!ad) return res.status(404).json({ error: 'VA not found.' });
+
+            const issuedByName = (req.staff && (req.staff.displayName || req.staff.username || req.staff.name)) || 'Inflight staff';
+            const warning = await VaWarning.create({
+                vaAdId: ad._id,
+                vaName: ad.name,
+                level,
+                reason: String(reason).trim().slice(0, 4000),
+                termsVersion: TOS_VERSION,
+                issuedByName,
+                issuedByRole: (req.staff && req.staff.role) || 'staff',
+            });
+
+            // Deliver to the VA's Discord channel (their thread) — best-effort.
+            const channelId = deliverWarningToDiscord(ad, warning);
+            if (channelId) {
+                warning.discordDelivered = true;
+                warning.discordChannelId = channelId;
+                await warning.save();
+            }
+
+            logActivity({
+                vaAdId: ad._id, vaName: ad.name,
+                actorName: issuedByName, actorRole: 'inflight-staff',
+                action: 'warning.issue',
+                detail: `${(getWarningLevel(level) || {}).label || level} issued${channelId ? ' (delivered to Discord)' : ''}: ${String(reason).slice(0, 200)}`,
+            });
+
+            res.status(201).json({ warning: publicWarning(warning), deliveredToDiscord: !!channelId });
+        } catch (err) {
+            console.error('VA portal issue warning error:', err);
+            res.status(500).json({ error: 'Could not issue the warning.' });
+        }
+    });
+
+    // Rescind a warning (issued in error / resolved). Kept for the audit trail.
+    app.patch('/api/va-portal/admin/warnings/:id', requireOversight, async (req, res) => {
+        try {
+            const w = await VaWarning.findById(req.params.id);
+            if (!w) return res.status(404).json({ error: 'Warning not found.' });
+            const { status, rescindReason } = req.body || {};
+            if (status && !['active', 'rescinded'].includes(status)) {
+                return res.status(400).json({ error: 'Invalid status.' });
+            }
+            const staffName = (req.staff && (req.staff.displayName || req.staff.username || req.staff.name)) || 'Inflight staff';
+            if (status === 'rescinded' && w.status !== 'rescinded') {
+                w.status = 'rescinded';
+                w.rescindedByName = staffName;
+                w.rescindedAt = new Date();
+                w.rescindReason = String(rescindReason || '').slice(0, 1000);
+            } else if (status === 'active' && w.status !== 'active') {
+                w.status = 'active';
+                w.rescindedByName = '';
+                w.rescindedAt = null;
+                w.rescindReason = '';
+            }
+            await w.save();
+            logActivity({
+                vaAdId: w.vaAdId, vaName: w.vaName,
+                actorName: staffName, actorRole: 'inflight-staff',
+                action: 'warning.update', detail: `${(getWarningLevel(w.level) || {}).label || w.level} → ${w.status}`,
+            });
+            res.json({ warning: publicWarning(w) });
+        } catch (err) {
+            console.error('VA portal update warning error:', err);
+            res.status(500).json({ error: 'Could not update the warning.' });
+        }
+    });
+
+    // Current Terms metadata for the staff console (version, date, level defs).
+    app.get('/api/va-portal/admin/tos', requireOversight, async (req, res) => {
+        res.json({ tos: tosState(null), levels: warningLevelsPublic() });
+    });
+
+    // Broadcast a "Terms updated" notice to every VA's Discord channel. The
+    // portal banner already nudges partners; this reaches them in Discord too.
+    app.post('/api/va-portal/admin/tos/announce', requireOversight, async (req, res) => {
+        try {
+            const result = await announceTosUpdateToDiscord(VirtualAirlineAd);
+            const staffName = (req.staff && (req.staff.displayName || req.staff.username || req.staff.name)) || 'Inflight staff';
+            logActivity({
+                actorName: staffName, actorRole: 'inflight-staff',
+                action: 'tos.announce', detail: `Announced Terms ${TOS_VERSION} to ${result.attempted} VA channel(s)`,
+            });
+            res.json({ ok: true, ...result, version: TOS_VERSION });
+        } catch (err) {
+            console.error('VA portal tos announce error:', err);
+            res.status(500).json({ error: 'Could not announce the Terms update.' });
+        }
+    });
 }
 
 module.exports = {
@@ -1663,6 +2049,7 @@ module.exports = {
     VaSubmission,
     VaEvent,
     VaPortalActivity,
+    VaWarning,
     registerVaPortalRoutes,
     provisionOwnerAccount,
     provisionRepAccount,

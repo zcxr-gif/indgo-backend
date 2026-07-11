@@ -58,6 +58,7 @@
         <div class="flex items-center gap-2 mb-6">
             <button class="tab active" data-tab="submissions" onclick="switchTab('submissions')">Submissions</button>
             <button class="tab" data-tab="events" onclick="switchTab('events')">Events</button>
+            <button class="tab" data-tab="warnings" onclick="switchTab('warnings')">Warnings</button>
             <button class="tab" data-tab="accounts" onclick="switchTab('accounts')">Accounts</button>
             <button class="tab" data-tab="activity" onclick="switchTab('activity')">Activity</button>
         </div>
@@ -94,6 +95,51 @@
                 <button onclick="loadEvents()" class="w-9 h-9 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500" title="Refresh"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
             </div>
             <div id="evList" class="space-y-2"></div>
+        </div>
+
+        <!-- ===== WARNINGS (Terms enforcement) ===== -->
+        <div id="tab-warnings" class="hidden">
+            <!-- Issue a warning -->
+            <div class="surface rounded-2xl p-6 mb-5">
+                <p class="text-sm font-semibold mb-1 flex items-center gap-2"><i data-lucide="shield-alert" class="w-4 h-4"></i> Issue a warning</p>
+                <p class="text-xs text-zinc-500 dark:text-zinc-400 mb-3">Escalation ladder: Verbal → First → Second → Final → Contract Termination. The notice is delivered to the VA's Discord channel and recorded in their portal.</p>
+                <form id="warnForm" class="space-y-3">
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <select id="wVa" class="field" required><option value="">Select VA…</option></select>
+                        <select id="wLevel" class="field" required></select>
+                    </div>
+                    <p id="wLevelHint" class="text-xs text-zinc-500 dark:text-zinc-400"></p>
+                    <textarea id="wReason" class="field" rows="3" placeholder="Reason — what happened, what needs to change, and any deadline. This is shown to the VA." required maxlength="4000"></textarea>
+                    <div class="flex items-center gap-3">
+                        <button type="submit" class="btn">Issue warning</button>
+                        <p id="warnMsg" class="hidden text-sm font-medium"></p>
+                    </div>
+                </form>
+            </div>
+
+            <!-- Terms version + broadcast -->
+            <div class="surface rounded-2xl p-5 mb-5 flex items-center justify-between gap-4 flex-wrap">
+                <div class="min-w-0">
+                    <p class="text-sm font-semibold flex items-center gap-2"><i data-lucide="scroll-text" class="w-4 h-4"></i> Terms of Service</p>
+                    <p id="tosMetaStaff" class="text-xs text-zinc-500 dark:text-zinc-400 mt-1">—</p>
+                </div>
+                <div class="flex items-center gap-2">
+                    <a href="/terms" target="_blank" rel="noopener" class="text-xs font-semibold px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 inline-flex items-center gap-1.5"><i data-lucide="external-link" class="w-3.5 h-3.5"></i> View Terms</a>
+                    <button onclick="announceTos()" id="tosAnnounceBtn" class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 inline-flex items-center gap-1.5" title="Post a Terms-update notice to every VA's Discord channel"><i data-lucide="megaphone" class="w-3.5 h-3.5"></i> Announce update</button>
+                </div>
+            </div>
+
+            <!-- Warning history -->
+            <div class="flex flex-wrap items-center gap-2 mb-4">
+                <select id="fWarnVa" class="field max-w-[14rem]" onchange="loadWarnings()"><option value="">All VAs</option></select>
+                <select id="fWarnStatus" class="field max-w-[10rem]" onchange="loadWarnings()">
+                    <option value="">Any status</option>
+                    <option value="active">Active</option>
+                    <option value="rescinded">Rescinded</option>
+                </select>
+                <button onclick="loadWarnings()" class="w-9 h-9 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500" title="Refresh"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+            </div>
+            <div id="warnList" class="space-y-3"></div>
         </div>
 
         <!-- ===== ACCOUNTS ===== -->
@@ -162,8 +208,9 @@
 
         function switchTab(name) {
             document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
-            ['submissions','events','accounts','activity'].forEach(n => $('tab-' + n).classList.toggle('hidden', n !== name));
+            ['submissions','events','warnings','accounts','activity'].forEach(n => $('tab-' + n).classList.toggle('hidden', n !== name));
             if (name === 'events') loadEvents();
+            if (name === 'warnings') loadWarnings();
             if (name === 'accounts') loadAccounts();
             if (name === 'activity') loadActivity();
         }
@@ -177,6 +224,9 @@
                 $('fVa').innerHTML = '<option value="">All VAs</option>' + opts;
                 $('evVa').innerHTML = '<option value="">All VAs</option>' + opts;
                 $('naVa').innerHTML = '<option value="">Select VA…</option>' + opts;
+                $('wVa').innerHTML = '<option value="">Select VA…</option>' + opts;
+                $('fWarnVa').innerHTML = '<option value="">All VAs</option>' + opts;
+                await loadTos();
                 $('bootLoader').classList.add('hidden');
                 $('app').classList.remove('hidden');
                 lucide.createIcons();
@@ -278,6 +328,107 @@
             } catch (err) {
                 if (err.message !== 'auth') $('evList').innerHTML = `<div class="surface rounded-2xl p-6 text-center text-sm text-rose-500">${esc(err.message)}</div>`;
             }
+        }
+
+        // ---------- Warnings (Terms enforcement) ----------
+        let warnLevels = [];
+        const WARN_PALETTE = {
+            amber: 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300',
+            orange: 'bg-orange-100 text-orange-700 dark:bg-orange-500/15 dark:text-orange-300',
+            'deep-orange': 'bg-orange-200 text-orange-800 dark:bg-orange-600/20 dark:text-orange-300',
+            red: 'bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300',
+            black: 'bg-zinc-800 text-zinc-100 dark:bg-zinc-100 dark:text-zinc-900',
+        };
+        const warnPalette = (p) => WARN_PALETTE[p] || WARN_PALETTE.red;
+
+        async function loadTos() {
+            try {
+                const { tos, levels } = await api('/tos');
+                warnLevels = levels || [];
+                $('wLevel').innerHTML = warnLevels.map(l => `<option value="${l.key}">${esc(l.label)}</option>`).join('');
+                updateLevelHint();
+                if (tos) $('tosMetaStaff').textContent = `Current version ${tos.version} · effective ${tos.effectiveDate}`;
+            } catch (err) { /* boot surfaces auth errors */ }
+        }
+
+        function updateLevelHint() {
+            const lvl = warnLevels.find(l => l.key === $('wLevel').value);
+            $('wLevelHint').textContent = lvl ? lvl.meaning : '';
+        }
+
+        async function loadWarnings() {
+            const params = new URLSearchParams();
+            if ($('fWarnVa').value) params.set('vaAdId', $('fWarnVa').value);
+            if ($('fWarnStatus').value) params.set('status', $('fWarnStatus').value);
+            $('warnList').innerHTML = '<div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400">Loading…</div>';
+            try {
+                const { warnings } = await api('/warnings?' + params.toString());
+                if (!warnings.length) { $('warnList').innerHTML = '<div class="surface rounded-2xl p-8 text-center text-sm text-zinc-400">No warnings on record.</div>'; return; }
+                $('warnList').innerHTML = warnings.map(renderWarn).join('');
+                lucide.createIcons();
+            } catch (err) {
+                if (err.message !== 'auth') $('warnList').innerHTML = `<div class="surface rounded-2xl p-6 text-center text-sm text-rose-500">${esc(err.message)}</div>`;
+            }
+        }
+
+        function renderWarn(w) {
+            const rescinded = w.status === 'rescinded';
+            const acked = !!w.acknowledgedAt;
+            return `<div class="surface rounded-2xl p-5 ${rescinded ? 'opacity-60' : ''}">
+                <div class="flex items-start justify-between gap-3 flex-wrap">
+                    <div class="flex items-center gap-2 flex-wrap">
+                        <span class="text-[11px] font-bold px-2 py-0.5 rounded-full ${warnPalette(w.palette)}">${esc(w.levelLabel)}</span>
+                        <span class="text-[11px] font-semibold text-zinc-400">${esc(w.vaName||'—')}</span>
+                        ${rescinded ? '<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400 line-through">Rescinded</span>' : ''}
+                        ${acked && !rescinded ? '<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300 inline-flex items-center gap-1"><i data-lucide="check" class="w-3 h-3"></i>Acknowledged</span>' : ''}
+                        ${w.discordDelivered ? '<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-300">Discord ✓</span>' : ''}
+                    </div>
+                    <span class="text-[11px] text-zinc-400 whitespace-nowrap">${fmtDate(w.createdAt)}</span>
+                </div>
+                <p class="text-sm text-zinc-700 dark:text-zinc-200 mt-2.5 whitespace-pre-wrap">${esc(w.reason)}</p>
+                <div class="flex items-center justify-between gap-3 mt-3 flex-wrap">
+                    <p class="text-[11px] text-zinc-400">by ${esc(w.issuedByName)} · Terms ${esc(w.termsVersion||'')}${acked ? ' · acknowledged ' + fmtDate(w.acknowledgedAt) + (w.acknowledgedByName ? ' (' + esc(w.acknowledgedByName) + ')' : '') : ''}</p>
+                    ${rescinded
+                        ? `<button onclick="setWarnStatus('${w.id}','active')" class="text-xs font-semibold px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800">Reinstate</button>`
+                        : `<button onclick="setWarnStatus('${w.id}','rescinded')" class="text-xs font-semibold px-3 py-1.5 rounded-lg border border-rose-200 dark:border-rose-500/30 text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-500/10">Rescind</button>`}
+                </div>
+            </div>`;
+        }
+
+        $('wLevel').addEventListener('change', updateLevelHint);
+
+        $('warnForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            $('warnMsg').classList.add('hidden');
+            const vaAdId = $('wVa').value, level = $('wLevel').value, reason = $('wReason').value.trim();
+            if (!vaAdId || !level || !reason) { flash('warnMsg', 'VA, level and reason are all required.', false); return; }
+            const label = (warnLevels.find(l => l.key === level) || {}).label || level;
+            if (!confirm(`Issue "${label}" to this VA? It will be delivered to their Discord and shown in their portal.`)) return;
+            try {
+                const { deliveredToDiscord } = await api('/warnings', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ vaAdId, level, reason }),
+                });
+                $('wReason').value = '';
+                flash('warnMsg', 'Warning issued' + (deliveredToDiscord ? ' and delivered to Discord.' : ' (no Discord channel on file).'), true);
+                if (!$('fWarnVa').value || $('fWarnVa').value === vaAdId) loadWarnings();
+            } catch (err) { if (err.message !== 'auth') flash('warnMsg', err.message, false); }
+        });
+
+        async function setWarnStatus(id, status) {
+            if (status === 'rescinded' && !confirm('Rescind this warning? It stays on record but is marked rescinded.')) return;
+            try { await api('/warnings/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status }) }); loadWarnings(); }
+            catch (err) { if (err.message !== 'auth') alert(err.message); }
+        }
+
+        async function announceTos() {
+            if (!confirm("Post a Terms-update notice to every VA's Discord channel? Partners are already prompted in their portal.")) return;
+            const btn = $('tosAnnounceBtn'); btn.disabled = true;
+            try {
+                const r = await api('/tos/announce', { method: 'POST' });
+                alert(`Announced Terms ${r.version} to ${r.attempted} VA channel(s).`);
+            } catch (err) { if (err.message !== 'auth') alert(err.message); }
+            finally { btn.disabled = false; }
         }
 
         // ---------- Accounts ----------

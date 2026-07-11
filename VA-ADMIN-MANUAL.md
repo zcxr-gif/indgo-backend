@@ -234,6 +234,52 @@ links):
   contact first where practical, start the §8 clock if a fix is possible, then
   archive if it stays dark.
 
+### 7.3 Warnings & the enforcement ladder (Terms §10)
+
+For breaches of the Terms we run a **staged, on-the-record warning ladder**. Each
+warning is **delivered to the VA's Discord channel** *and* **recorded in their VA
+Portal** (Compliance tab), where the VA can acknowledge receipt.
+
+**Where:** the **VA Partnership Portal** staff console (`yoursite.com/va-submissions`)
+→ **Warnings** tab. Pick the VA, choose a level, write the reason (this text is
+shown to the VA), and **Issue warning**. History is listed there and can be
+**Rescinded** if issued in error (it stays on record, marked rescinded).
+
+**The ladder (lightest → heaviest):**
+
+| Level | When to use |
+| --- | --- |
+| **Verbal Warning** | Informal, first-touch "please fix this". No penalty. |
+| **First Warning** | Formal, recorded — the issue is serious or was raised before. |
+| **Second Warning** | Repeated / continuing breach. Suspension is on the table. |
+| **Final Warning** | Last chance. A further breach means termination. |
+| **Contract Termination** | Partnership ended; remove the listing (see §7.1 / Delete). |
+
+- **Start where the breach warrants** — you may skip stages for serious or
+  repeated breaches; you don't have to begin at Verbal.
+- Acknowledgement is **receipt, not agreement**, and **failure to acknowledge
+  does not pause** the process.
+- A warning is a **record + notice**; it does not itself change listing status.
+  Pair **Final Warning / Termination** with the matching status action (Suspend /
+  Delete, §8.3–8.4) when you actually pull the listing.
+- **Log it** (Section 10) — the portal already writes an activity entry, but keep
+  your decision log consistent.
+
+### 7.4 Terms updates & re-acknowledgement (Terms §16)
+
+The Terms are versioned in `vaTos.js` (**current: see the footer of any warning /
+the portal Compliance tab**). When the Terms change:
+
+1. Edit the clauses in `vaTermsContent.js`, **bump `TOS_VERSION`** in `vaTos.js`,
+   then rebuild the signed PDF with `npm run build:terms`.
+2. Partners are **automatically re-prompted in their portal** (a "Terms updated"
+   banner + an **acknowledge** button) the next time they sign in.
+3. Optionally hit **Announce update** on the Warnings tab to also post a
+   Terms-update notice to **every VA's Discord channel**.
+
+Partners can always read the Terms at **`/terms`** (public page) or download the
+**[PDF](/VA-Advertisement-Terms.pdf)** — both are linked from their portal.
+
 ---
 
 ## 8. Day-to-Day Workflows (the tool: `/va-ads`)

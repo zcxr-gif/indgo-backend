@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Terms &amp; Conditions — Inflight VA Advertisement Program</title>
+    <meta name="description" content="The Terms & Conditions for participation in the Inflight VA Advertisement Program.">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script>tailwind.config = { darkMode: 'class', theme: { extend: { screens: { xs: '400px' } } } };</script>
+    <script>(function(){try{var t=localStorage.getItem('va_portal_theme');document.documentElement.classList.toggle('dark', t!=='light');}catch(e){document.documentElement.classList.add('dark');}})();</script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+        :root { color-scheme: light dark; }
+        body { font-family: 'Inter', sans-serif; -webkit-font-smoothing: antialiased; }
+        [data-lucide] { width: 1.15em; height: 1.15em; }
+        svg.lucide { stroke-width: 1.75; }
+        .surface { background: #fff; border: 1px solid rgba(0,0,0,.06); box-shadow: 0 1px 2px rgba(0,0,0,.03), 0 1px 1px rgba(0,0,0,.02); }
+        .dark .surface { background: #18181b; border-color: rgba(255,255,255,.07); box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+        .btn { background: #18181b; color: #fff; padding: .55rem .95rem; border-radius: .75rem; font-size: .8125rem; font-weight: 600; transition: .15s; display: inline-flex; align-items: center; gap: .45rem; }
+        .dark .btn { background: #fafafa; color: #18181b; }
+        .btn:hover { opacity: .9; } .btn:active { transform: scale(.98); }
+        .btn-ghost { background: transparent; color: #52525b; border: 1px solid rgba(0,0,0,.1); }
+        .dark .btn-ghost { color: #d4d4d8; border-color: rgba(255,255,255,.12); }
+        .fade-in { animation: fade .4s cubic-bezier(.2,.8,.2,1) forwards; }
+        @keyframes fade { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .clause p { margin-top: .5rem; line-height: 1.65; }
+        .clause ul { margin-top: .5rem; }
+        .clause li { position: relative; padding-left: 1.15rem; margin-top: .4rem; line-height: 1.6; }
+        .clause li::before { content: ''; position: absolute; left: .1rem; top: .62em; width: .32rem; height: .32rem; border-radius: 999px; background: #2563eb; }
+    </style>
+</head>
+<body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 antialiased min-h-screen transition-colors duration-300">
+    <div class="max-w-3xl mx-auto px-4 sm:px-6 py-8 sm:py-12">
+        <!-- Header -->
+        <header class="flex items-start justify-between gap-4 mb-6">
+            <div>
+                <a href="/va-portal" class="inline-flex items-center gap-1.5 text-xs font-semibold text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 transition mb-3"><i data-lucide="arrow-left" class="w-3.5 h-3.5"></i> VA Portal</a>
+                <h1 id="title" class="text-2xl sm:text-3xl font-extrabold tracking-tight">Inflight VA Advertisement Program</h1>
+                <p id="subtitle" class="text-blue-600 dark:text-blue-400 font-bold text-lg mt-0.5">Terms &amp; Conditions</p>
+                <p id="meta" class="text-xs text-zinc-500 dark:text-zinc-400 mt-2">Loading…</p>
+            </div>
+            <button onclick="toggleTheme()" title="Toggle theme" class="shrink-0 w-9 h-9 grid place-items-center rounded-full surface"><span id="themeIcon"></span></button>
+        </header>
+
+        <!-- Actions -->
+        <div class="flex flex-wrap items-center gap-2 mb-6">
+            <a id="pdfLink" href="/VA-Advertisement-Terms.pdf" target="_blank" rel="noopener" class="btn"><i data-lucide="file-down" class="w-4 h-4"></i> Download PDF</a>
+            <a href="/va-portal" class="btn btn-ghost"><i data-lucide="external-link" class="w-4 h-4"></i> Open VA Portal</a>
+        </div>
+
+        <!-- What changed -->
+        <section id="changelogWrap" class="hidden surface rounded-2xl p-5 mb-6 fade-in border-l-4 border-l-blue-500">
+            <h2 class="text-sm font-bold flex items-center gap-2 mb-2"><i data-lucide="sparkles" class="w-4 h-4 text-blue-500"></i> <span id="changelogTitle">What's new</span></h2>
+            <ul id="changelogList" class="text-sm text-zinc-600 dark:text-zinc-300 space-y-1.5"></ul>
+        </section>
+
+        <!-- Intro -->
+        <section id="introWrap" class="surface rounded-2xl p-5 sm:p-6 mb-6">
+            <p id="intro" class="text-sm text-zinc-600 dark:text-zinc-300 leading-relaxed"></p>
+        </section>
+
+        <!-- Clauses -->
+        <main id="clauses" class="surface rounded-2xl p-5 sm:p-7 space-y-6 text-sm text-zinc-600 dark:text-zinc-300"></main>
+
+        <footer class="mt-8 text-center text-xs text-zinc-400 dark:text-zinc-500">
+            <p id="footerMeta"></p>
+            <p class="mt-1">© <span id="year"></span> Inflight</p>
+        </footer>
+    </div>
+
+    <script>
+        const $ = (id) => document.getElementById(id);
+        const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+        const drawIcons = () => { if (window.lucide) lucide.createIcons(); };
+
+        function setThemeIcon() {
+            const dark = document.documentElement.classList.contains('dark');
+            $('themeIcon').innerHTML = `<i data-lucide="${dark ? 'sun' : 'moon'}" class="w-[18px] h-[18px]"></i>`;
+            drawIcons();
+        }
+        function toggleTheme() {
+            const dark = !document.documentElement.classList.contains('dark');
+            document.documentElement.classList.toggle('dark', dark);
+            try { localStorage.setItem('va_portal_theme', dark ? 'dark' : 'light'); } catch (e) {}
+            setThemeIcon();
+        }
+
+        function renderBlocks(blocks) {
+            return (blocks || []).map(b => {
+                if (b.p) return `<p>${esc(b.p)}</p>`;
+                if (Array.isArray(b.list)) return `<ul>${b.list.map(i => `<li>${esc(i)}</li>`).join('')}</ul>`;
+                return '';
+            }).join('');
+        }
+
+        async function load() {
+            setThemeIcon();
+            $('year').textContent = new Date().getFullYear();
+            try {
+                const res = await fetch('/api/va-terms', { credentials: 'include' });
+                const d = await res.json();
+                $('title').textContent = d.title;
+                $('subtitle').textContent = d.subtitle;
+                $('meta').textContent = `Version ${d.version} • Effective ${d.effectiveDate}`;
+                $('footerMeta').textContent = `Inflight VA Advertisement Program — Terms & Conditions ${d.version}. Effective ${d.effectiveDate}.`;
+                if (d.pdfUrl) $('pdfLink').href = d.pdfUrl;
+                $('intro').textContent = d.intro;
+
+                // Changelog for the current version.
+                const current = (d.changelog || []).find(c => c.version === d.version);
+                if (current && Array.isArray(current.notes) && current.notes.length) {
+                    $('changelogTitle').textContent = `What's new in ${d.version}`;
+                    $('changelogList').innerHTML = current.notes.map(n => `<li class="flex gap-2"><i data-lucide="check" class="w-4 h-4 text-blue-500 shrink-0 mt-0.5"></i><span>${esc(n)}</span></li>`).join('');
+                    $('changelogWrap').classList.remove('hidden');
+                }
+
+                $('clauses').innerHTML = (d.clauses || []).map(c =>
+                    `<section class="clause"><h2 class="text-[15px] font-bold text-zinc-900 dark:text-zinc-100">${esc(c.heading)}</h2>${renderBlocks(c.blocks)}</section>`
+                ).join('');
+                drawIcons();
+            } catch (err) {
+                $('clauses').innerHTML = `<p class="text-rose-500">Could not load the Terms. Please try the <a class="underline" href="/VA-Advertisement-Terms.pdf">PDF version</a>.</p>`;
+            }
+        }
+        load();
+    </script>
+</body>
+</html>
