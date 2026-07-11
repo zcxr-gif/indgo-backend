@@ -182,25 +182,14 @@
                 </div>
             </div>
 
-            <!-- Pilot roster ------------------------------------------------ -->
-            <div class="mt-2 pt-3 border-t-2 border-zinc-100 dark:border-zinc-800 space-y-3">
-                <div class="flex items-center justify-between">
-                    <label class="text-sm font-semibold flex items-center gap-2"><i class="fa-solid fa-users text-sky-500"></i> Pilot roster</label>
-                    <span id="wh_pilotCount" class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-500">0 pilots</span>
-                </div>
-                <p class="text-xs text-zinc-400 -mt-1">The VA's Infinite Flight usernames. Flights by these pilots are attributed to this VA even when the callsign doesn't match its registered pattern (a fallback — it never overrides a callsign match). Paste a list (one per line, or comma-separated) or upload a .csv/.txt — duplicates are ignored.</p>
-                <textarea id="wh_pilotInput" rows="3" placeholder="e.g.&#10;Antony&#10;JohnDoe, Jane_Doe&#10;@another_pilot" class="w-full px-3 py-2 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none mono text-sm"></textarea>
-                <div class="flex items-center gap-2 flex-wrap">
-                    <button type="button" id="wh_pilotAddBtn" onclick="addWhPilots()" class="bg-zinc-900 hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 text-white text-xs font-semibold px-3 py-2 rounded-lg active:scale-95 transition">Add pilots</button>
-                    <label class="text-xs font-semibold px-3 py-2 rounded-lg border-2 border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 cursor-pointer">
-                        <i class="fa-solid fa-file-csv mr-1"></i> Upload CSV/TXT
-                        <input id="wh_pilotFile" type="file" accept=".csv,.txt,text/csv,text/plain" class="hidden">
-                    </label>
-                    <button type="button" id="wh_pilotClearBtn" onclick="clearWhPilots()" class="text-xs font-semibold px-3 py-2 rounded-lg border-2 border-red-200 dark:border-red-900/60 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 ml-auto">Clear all</button>
-                </div>
-                <input id="wh_pilotSearch" type="text" placeholder="Search the roster…" class="w-full px-3 py-2 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none text-sm">
-                <div id="wh_pilotList" class="max-h-64 overflow-y-auto rounded-xl border-2 border-zinc-100 dark:border-zinc-800 divide-y divide-zinc-100 dark:divide-zinc-800"></div>
-                <p id="wh_pilotEmpty" class="hidden text-xs text-zinc-500 py-6 text-center">No pilots yet — add some above.</p>
+            <!-- Pilot roster moved out — it belongs to the VA, not the webhook.
+                 Manage it from the VA Ads Manager (the VA record is the single
+                 home for its roster, embed and webhook). -->
+            <div class="mt-2 pt-3 border-t-2 border-zinc-100 dark:border-zinc-800">
+                <a id="wh_rosterLink" href="/va-ads" class="flex items-center justify-between gap-2 text-sm font-semibold text-sky-600 dark:text-sky-400 hover:underline">
+                    <span class="flex items-center gap-2"><i class="fa-solid fa-users"></i> Pilot roster</span>
+                    <span class="text-xs font-normal text-zinc-400 inline-flex items-center gap-1">Manage in VA Ads Manager <i class="fa-solid fa-arrow-right"></i></span>
+                </a>
             </div>
         </div>
     </main>
@@ -283,7 +272,9 @@
                 empty.classList.add('hidden');
                 panel.classList.remove('hidden');
                 renderWebhookPanel();
-                loadWhPilots();
+                // Roster lives with the VA now — point the link at this VA.
+                const rl = document.getElementById('wh_rosterLink');
+                if (rl) rl.href = '/va-ads?va=' + encodeURIComponent(webhookAd.id);
             } catch { toast('Could not load this VA\'s webhook.'); }
         }
 
@@ -433,100 +424,6 @@
         ['wh_card_layout', 'wh_card_showPhoto', 'wh_card_showMap', 'wh_card_photoSide', 'wh_card_mapStyle', 'wh_card_title'].forEach(id => document.getElementById(id).addEventListener('change', updateWhCardPreview));
         document.getElementById('wh_card_title').addEventListener('input', updateWhCardPreview);
         document.querySelectorAll('.wh-field').forEach(el => el.addEventListener('change', updateWhCardPreview));
-
-        // ---- pilot roster ----
-        let whPilotSearchTimer = null;
-        function renderWhPilots(data) {
-            const list = document.getElementById('wh_pilotList');
-            const empty = document.getElementById('wh_pilotEmpty');
-            const count = document.getElementById('wh_pilotCount');
-            const total = (data && data.rosterTotal) || 0;
-            count.textContent = total + ' pilot' + (total === 1 ? '' : 's');
-            const rows = (data && data.pilots) || [];
-            if (!rows.length) {
-                list.innerHTML = '';
-                empty.textContent = total ? 'No matches for that search.' : 'No pilots yet — add some above.';
-                empty.classList.remove('hidden');
-                return;
-            }
-            empty.classList.add('hidden');
-            list.innerHTML = rows.map(p => `
-                <div class="flex items-center justify-between gap-2 px-3 py-2">
-                    <span class="text-sm mono truncate">${esc(p.username)}</span>
-                    <button type="button" onclick="removeWhPilot('${esc(p.id)}')" title="Remove" class="text-zinc-400 hover:text-red-500 shrink-0 px-1"><i class="fa-solid fa-xmark"></i></button>
-                </div>`).join('');
-        }
-        async function loadWhPilots() {
-            if (!webhookAd || !webhookAd.id) return;
-            const q = document.getElementById('wh_pilotSearch').value.trim();
-            try {
-                const res = await fetch(`/api/va-ads/${webhookAd.id}/pilots?q=${encodeURIComponent(q)}`);
-                const data = await res.json().catch(() => ({}));
-                if (res.ok) renderWhPilots(data);
-            } catch { /* leave the list as-is on a transient error */ }
-        }
-        async function addWhPilots() {
-            if (!webhookAd || !webhookAd.id) return;
-            const ta = document.getElementById('wh_pilotInput');
-            const usernames = ta.value.trim();
-            if (!usernames) { toast('Paste at least one username first.'); return; }
-            const btn = document.getElementById('wh_pilotAddBtn');
-            btn.disabled = true;
-            try {
-                const res = await fetch(`/api/va-ads/${webhookAd.id}/pilots`, {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ usernames }),
-                });
-                const data = await res.json().catch(() => ({}));
-                if (!res.ok) throw new Error(data.message || 'Add failed');
-                ta.value = '';
-                document.getElementById('wh_pilotSearch').value = '';
-                toast(data.message || 'Pilots added');
-                loadWhPilots();
-            } catch (err) { toast(err.message || 'Could not add pilots'); }
-            finally { btn.disabled = false; }
-        }
-        async function removeWhPilot(pilotId) {
-            if (!webhookAd || !webhookAd.id) return;
-            try {
-                const res = await fetch(`/api/va-ads/${webhookAd.id}/pilots/${pilotId}`, { method: 'DELETE' });
-                if (!res.ok) throw new Error();
-                loadWhPilots();
-            } catch { toast('Could not remove the pilot'); }
-        }
-        async function clearWhPilots() {
-            if (!webhookAd || !webhookAd.id) return;
-            if (!confirm('Remove ALL pilots from this VA\'s roster? This cannot be undone.')) return;
-            try {
-                const res = await fetch(`/api/va-ads/${webhookAd.id}/pilots`, { method: 'DELETE' });
-                const data = await res.json().catch(() => ({}));
-                if (!res.ok) throw new Error(data.message || 'Clear failed');
-                toast(data.message || 'Roster cleared');
-                document.getElementById('wh_pilotSearch').value = '';
-                loadWhPilots();
-            } catch (err) { toast(err.message || 'Could not clear the roster'); }
-        }
-        document.getElementById('wh_pilotSearch').addEventListener('input', () => {
-            clearTimeout(whPilotSearchTimer);
-            whPilotSearchTimer = setTimeout(loadWhPilots, 250);
-        });
-        // Read a chosen CSV/TXT into the textarea (strip a lone header row like
-        // "username"), so the file funnels through the same Add path as a paste.
-        document.getElementById('wh_pilotFile').addEventListener('change', (e) => {
-            const file = e.target.files && e.target.files[0];
-            if (!file) return;
-            const reader = new FileReader();
-            reader.onload = () => {
-                let text = String(reader.result || '');
-                const lines = text.split(/\r?\n/);
-                if (lines.length && /^\s*(username|user|pilot|ifc)\s*$/i.test(lines[0])) lines.shift();
-                const ta = document.getElementById('wh_pilotInput');
-                ta.value = (ta.value.trim() ? ta.value.trim() + '\n' : '') + lines.join('\n').trim();
-                toast('CSV loaded — review, then Add pilots.');
-            };
-            reader.readAsText(file);
-            e.target.value = '';
-        });
 
         loadVaList();
     </script>

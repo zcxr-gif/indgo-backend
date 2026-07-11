@@ -570,15 +570,15 @@ async function purgeVaData(ad, { EmbedConfig, deleteVaImage, s3Client, isDiscord
     try { counts.events      = (await VaEvent.deleteMany({ vaAdId })).deletedCount || 0; } catch (e) { console.error('purgeVaData events:', e.message); }
     try { counts.activity    = (await VaPortalActivity.deleteMany({ vaAdId })).deletedCount || 0; } catch (e) { console.error('purgeVaData activity:', e.message); }
 
-    // Embeds are linked to a VA by callsign (the same match the portal uses to
-    // list "your embeds"), not by vaAdId.
+    // Embeds are linked to a VA by the hard vaAdId reference (the "head"), with a
+    // legacy callsign match as a fallback — the same pair the portal lists on.
     if (EmbedConfig) {
         try {
             const codes = ((Array.isArray(ad.callsigns) && ad.callsigns.length ? ad.callsigns : [ad.callsign])
                 .filter(Boolean)).map(c => String(c).toUpperCase());
-            if (codes.length) {
-                counts.embeds = (await EmbedConfig.deleteMany({ 'va.code': { $in: codes } })).deletedCount || 0;
-            }
+            const or = [{ vaAdId }];
+            if (codes.length) or.push({ 'va.code': { $in: codes } });
+            counts.embeds = (await EmbedConfig.deleteMany({ $or: or })).deletedCount || 0;
         } catch (e) { console.error('purgeVaData embeds:', e.message); }
     }
 
@@ -760,9 +760,12 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
     async function embedLinksForVa(ad) {
         if (!EmbedConfig || !ad) return [];
         const codes = vaCallsignCodes(ad);
-        if (!codes.length) return [];
+        // Prefer the hard vaAdId link (the "trail to the head"); fall back to the
+        // legacy callsign match so embeds created before the link still show.
+        const or = [{ vaAdId: ad._id }];
+        if (codes.length) or.push({ 'va.code': { $in: codes } });
         try {
-            const configs = await EmbedConfig.find({ 'va.code': { $in: codes } }).sort({ createdAt: -1 }).limit(20);
+            const configs = await EmbedConfig.find({ $or: or }).sort({ createdAt: -1 }).limit(20);
             return configs.map((c) => serializeEmbed(c, ad));
         } catch (err) {
             console.error('VA portal embed lookup error:', err.message);
@@ -907,6 +910,13 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             // Keep the portal account's denormalized VA name in step (name is
             // not editable here, but this is cheap insurance).
             await ad.save();
+            // Keep this VA's embeds in step with the head (e.g. a new logo).
+            if (EmbedConfig) {
+                EmbedConfig.updateMany(
+                    { vaAdId: ad._id },
+                    { $set: { 'va.name': ad.name || '', 'va.logo': ad.logoUrl || '', updatedAt: new Date() } },
+                ).catch((e) => console.error('VA portal embed sync error:', e.message));
+            }
             logActivity({
                 vaAdId: ad._id, vaName: ad.name,
                 actorName: req.portal.displayName || req.portal.username, actorRole: 'owner',
