@@ -155,6 +155,22 @@ const LIVE_IMAGE_TTL_MS = Number(process.env.LIVE_IMAGE_TTL_MS) || 15 * 60 * 100
 // `x-upload-token` or body/query `token`). When unset, the endpoints are open.
 const LIVE_IMAGE_UPLOAD_TOKEN = process.env.LIVE_IMAGE_UPLOAD_TOKEN || '';
 
+// Outage safety. The per-flight expiry only means "flight ended" if the IF
+// backend is actually still polling us. If it stops calling entirely (crash,
+// restart, network blip), we must NOT read that as "every flight ended" and
+// wipe the photos. So we track the last time ANY image resolve came in, and:
+//   - if the poller has gone quiet for longer than LIVE_IMAGE_POLLER_STALE_MS,
+//     the sweeper HOLDS everything (assumes the backend is down, not the flights);
+//   - only genuinely abandoned uploads (older than LIVE_IMAGE_MAX_AGE_MS) are
+//     ever reaped during such an outage, so nothing lingers forever either.
+const LIVE_IMAGE_POLLER_STALE_MS = Number(process.env.LIVE_IMAGE_POLLER_STALE_MS) || 10 * 60 * 1000; // 10 min
+const LIVE_IMAGE_MAX_AGE_MS = Number(process.env.LIVE_IMAGE_MAX_AGE_MS) || 12 * 60 * 60 * 1000; // 12 h
+// Timestamp of the most recent image-resolve request (single or batch). Starts
+// at 0 so a freshly (re)started server holds live photos until the poller has
+// proven it's alive again — a restart must never nuke in-flight uploads.
+let lastImageResolveAt = 0;
+const noteImageActivity = () => { lastImageResolveAt = Date.now(); };
+
 /* =========================
  * NEW: GATES SCHEMA
  * ========================= */
@@ -1516,11 +1532,19 @@ const escapeRegex = (s) => String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'
 async function lookupLiveFlightImage(flightId) {
     const id = (flightId || '').trim();
     if (!id) return null;
-    const live = await LiveFlightImage.findOneAndUpdate(
-        { flightId: id },
-        { $set: { expiresAt: new Date(Date.now() + LIVE_IMAGE_TTL_MS) } },
-        { new: true }
-    ).lean();
+    let live;
+    try {
+        live = await LiveFlightImage.findOneAndUpdate(
+            { flightId: id },
+            { $set: { expiresAt: new Date(Date.now() + LIVE_IMAGE_TTL_MS) } },
+            { new: true }
+        ).lean();
+    } catch (err) {
+        // A DB hiccup on the live-photo lookup must not break image serving —
+        // fall through to the community/registry match instead of erroring.
+        console.error('Live image lookup failed (falling back to library):', err.message);
+        return null;
+    }
     if (!live || !live.imageUrl) return null;
     return {
         imageUrl: live.imageUrl,
@@ -1606,6 +1630,7 @@ async function resolveAircraftImage({ type, livery, tail, flightId }) {
 // Returns the single best image for one live flight.
 app.get('/api/aircraft/image', async (req, res) => {
     try {
+        noteImageActivity(); // proves the poller/front end is alive (outage guard)
         const { type, model, livery, liveryName, tail, registration, flightId, id } = req.query;
         const result = await resolveAircraftImage({
             type: type || model,
@@ -1629,6 +1654,7 @@ app.get('/api/aircraft/image', async (req, res) => {
 // in a single round-trip instead of one call per aircraft.
 app.post('/api/aircraft/images/batch', async (req, res) => {
     try {
+        noteImageActivity(); // proves the poller is alive (outage guard)
         const flights = Array.isArray(req.body && req.body.flights) ? req.body.flights : null;
         if (!flights) {
             return res.status(400).json({ ok: false, message: 'Body must be { flights: [...] }.' });
@@ -1796,19 +1822,40 @@ app.delete('/api/aircraft/live-image/:flightId', async (req, res) => {
     }
 });
 
-// Sweeper: delete live images whose flight has gone quiet (expiresAt passed).
-// Removes the S3 object first, then the row, so nothing is orphaned. Runs on an
-// interval plus once shortly after boot.
+// Sweeper: clean up live images once their flight has genuinely ended.
+// Removes the S3 object first, then the row, so nothing is orphaned.
+//
+// Crucially, it distinguishes a single ended flight from a poller outage:
+//   • Poller healthy (we've had a resolve within LIVE_IMAGE_POLLER_STALE_MS) →
+//     a lapsed expiresAt means THAT flight ended while others kept polling → reap it.
+//   • Poller quiet (the IF backend stopped calling us — crash/restart/network) →
+//     do NOT trust expiresAt (nothing is being bumped); HOLD all photos and only
+//     reap ones older than LIVE_IMAGE_MAX_AGE_MS, so a transient stop never wipes
+//     in-flight uploads, yet truly abandoned rows still can't live forever.
 const LIVE_IMAGE_SWEEP_MS = Number(process.env.LIVE_IMAGE_SWEEP_MS) || 5 * 60 * 1000; // 5 min
 const sweepExpiredLiveImages = async () => {
     try {
-        const expired = await LiveFlightImage.find({ expiresAt: { $lte: new Date() } }).lean();
-        if (!expired.length) return;
-        await Promise.all(expired.map(async (doc) => {
+        const now = Date.now();
+        const pollerHealthy = lastImageResolveAt > 0 && (now - lastImageResolveAt) < LIVE_IMAGE_POLLER_STALE_MS;
+
+        // While the poller is down we only touch clearly-abandoned uploads.
+        const query = pollerHealthy
+            ? { expiresAt: { $lte: new Date(now) } }
+            : { uploadedAt: { $lte: new Date(now - LIVE_IMAGE_MAX_AGE_MS) } };
+
+        const doomed = await LiveFlightImage.find(query).lean();
+        if (!doomed.length) return;
+
+        await Promise.all(doomed.map(async (doc) => {
             if (doc.imageUrl) await deleteS3Object(doc.imageUrl);
             await LiveFlightImage.deleteOne({ _id: doc._id });
         }));
-        console.log(`🧹 Swept ${expired.length} expired live flight image(s).`);
+
+        console.log(
+            pollerHealthy
+                ? `🧹 Swept ${doomed.length} ended live flight image(s).`
+                : `⏸️  Poller quiet — held live images, reaped ${doomed.length} abandoned (>${Math.round(LIVE_IMAGE_MAX_AGE_MS / 3600000)}h).`
+        );
     } catch (err) {
         console.error('Live image sweep error:', err);
     }

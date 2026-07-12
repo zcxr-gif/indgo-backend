@@ -160,6 +160,29 @@ Want it gone the instant the flight drops off your tracker? Call:
 DELETE /api/aircraft/live-image/:flightId      (same token rule as upload)
 ```
 
+### If your backend goes down (outage safety)
+
+The keepalive above only works while your backend is actually polling. If it
+**stops entirely** — crash, restart, network blip — that must NOT be read as
+"every flight ended at once". So the sweeper tracks the last time *any* image
+request came in:
+
+- **Your backend keeps polling** → a single flight's lapsed expiry means that
+  flight ended → its photo is reaped (normal behaviour).
+- **Your backend goes quiet** (no image calls for `LIVE_IMAGE_POLLER_STALE_MS`,
+  default 10 min) → the sweeper assumes *it* is down and **holds every photo**.
+  When your backend comes back and resumes polling, the photos are still there
+  and pick up their normal expiry again.
+- A hard cap (`LIVE_IMAGE_MAX_AGE_MS`, default 12 h) still reaps genuinely
+  abandoned uploads even during a long outage, so nothing lives forever.
+
+A **fresh restart of this backend** also holds all photos until your poller has
+proven it's alive again — a redeploy never wipes in-flight uploads.
+
+Serving is independent, too: this backend never calls yours to *serve* an image,
+and the live-photo lookup fails soft (a DB blip falls through to the library
+match), so a problem on your side can't lock up image delivery here.
+
 You can also fetch one flight's live photo directly (this also keeps it alive):
 
 ```
