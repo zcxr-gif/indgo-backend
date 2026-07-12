@@ -763,7 +763,10 @@ startDiscordBot(
       // Full VA teardown: wipes portal accounts, submissions, events, embeds,
       // S3 images and the flight-events webhook for a VA. The bot handles the
       // Discord channel/role + the ad doc itself.
-      purgeVaData: (ad) => purgeVaData(ad, { EmbedConfig, deleteVaImage, s3Client, isDiscordWebhookUrl }) }
+      purgeVaData: (ad) => purgeVaData(ad, { EmbedConfig, deleteVaImage, s3Client, isDiscordWebhookUrl }),
+      // Primary submission path for live flight photos. Hoisted function defined
+      // later in this file; the bot only calls it at command time.
+      registerLiveFlightImage }
 );
 // ---------------------
 
@@ -1726,8 +1729,9 @@ const liveImageAuthOk = (req) => {
 };
 
 // Optimize + upload a live-flight photo to the ephemeral S3 prefix.
-const processAndUploadLiveImage = async (file, flightId) => {
-    const optimizedBuffer = await sharp(file.path)
+// `input` is either a file path (from multer) or an image Buffer (from the bot).
+const uploadLiveImageAsset = async (input, flightId) => {
+    const optimizedBuffer = await sharp(input)
         .resize({ width: 1600, withoutEnlargement: true })
         .webp({ quality: 78 })
         .toBuffer();
@@ -1741,6 +1745,46 @@ const processAndUploadLiveImage = async (file, flightId) => {
     }));
     return `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileName}`;
 };
+
+// Register (or replace) the live photo for one flight. Shared by the HTTP
+// upload endpoint AND the Discord bot (which is the primary submission path).
+// `input` is a file path or an image Buffer. Declared as a hoisted function so
+// it can be passed into startDiscordBot (called earlier in this file) while its
+// body still closes over helpers defined further down.
+async function registerLiveFlightImage({
+    input, flightId, aircraftType = '', liveryName = '',
+    tailNumber = '', callsign = '', pilotName = '',
+}) {
+    const id = String(flightId || '').trim();
+    if (!id) throw new Error('flightId is required');
+    if (!input) throw new Error('image is required');
+
+    // Replace any prior photo for this flight (delete its S3 object after).
+    const prior = await LiveFlightImage.findOne({ flightId: id }).lean();
+    const imageUrl = await uploadLiveImageAsset(input, id);
+
+    const doc = await LiveFlightImage.findOneAndUpdate(
+        { flightId: id },
+        {
+            $set: {
+                imageUrl,
+                aircraftType: String(aircraftType || ''),
+                liveryName:   String(liveryName || ''),
+                tailNumber:   String(tailNumber || '').toUpperCase(),
+                callsign:     String(callsign || ''),
+                pilotName:    String(pilotName || ''),
+                uploadedAt:   new Date(),
+                expiresAt:    new Date(Date.now() + LIVE_IMAGE_TTL_MS),
+            },
+        },
+        { new: true, upsert: true }
+    );
+
+    if (prior && prior.imageUrl && prior.imageUrl !== imageUrl) {
+        deleteS3Object(prior.imageUrl); // fire-and-forget
+    }
+    return doc;
+}
 
 // POST /api/aircraft/live-image  (multipart/form-data)
 // Fields: flightId (required) + image file ('image'); optional aircraftType,
@@ -1756,33 +1800,17 @@ app.post('/api/aircraft/live-image', upload.single('image'), async (req, res) =>
         if (!flightId) return res.status(400).json({ ok: false, message: 'flightId is required.' });
         if (!req.file) return res.status(400).json({ ok: false, message: 'An image file is required.' });
 
-        // Replace any prior photo for this flight (delete its S3 object first).
-        const prior = await LiveFlightImage.findOne({ flightId }).lean();
+        const doc = await registerLiveFlightImage({
+            input: req.file.path,
+            flightId,
+            aircraftType: req.body && req.body.aircraftType,
+            liveryName:   req.body && req.body.liveryName,
+            tailNumber:   req.body && req.body.tailNumber,
+            callsign:     req.body && req.body.callsign,
+            pilotName:    req.body && req.body.pilotName,
+        });
 
-        const imageUrl = await processAndUploadLiveImage(req.file, flightId);
-
-        const doc = await LiveFlightImage.findOneAndUpdate(
-            { flightId },
-            {
-                $set: {
-                    imageUrl,
-                    aircraftType: String((req.body && req.body.aircraftType) || ''),
-                    liveryName:   String((req.body && req.body.liveryName) || ''),
-                    tailNumber:   String((req.body && req.body.tailNumber) || '').toUpperCase(),
-                    callsign:     String((req.body && req.body.callsign) || ''),
-                    pilotName:    String((req.body && req.body.pilotName) || ''),
-                    uploadedAt:   new Date(),
-                    expiresAt:    new Date(Date.now() + LIVE_IMAGE_TTL_MS),
-                },
-            },
-            { new: true, upsert: true }
-        );
-
-        if (prior && prior.imageUrl && prior.imageUrl !== imageUrl) {
-            deleteS3Object(prior.imageUrl); // fire-and-forget
-        }
-
-        res.json({ ok: true, flightId, imageUrl, expiresAt: doc.expiresAt });
+        res.json({ ok: true, flightId, imageUrl: doc.imageUrl, expiresAt: doc.expiresAt });
     } catch (error) {
         console.error('Error uploading live flight image:', error);
         res.status(500).json({ ok: false, message: 'Error uploading live flight image.' });

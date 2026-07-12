@@ -123,7 +123,26 @@ shows on that flight only, overrides the library match, and is deleted once the
 flight ends. Stored under the `live-flights/` S3 prefix, tracked in the
 `LiveFlightImage` collection.
 
-### Upload
+### Primary path: the Discord bot (`/liveimage`)
+
+The bot is the intended first point of contact. A pilot runs:
+
+```
+/liveimage  photo:<their screenshot>  pilot:<their IF username or callsign>
+```
+
+The bot looks that pilot up on the live tracker, finds their active flight
+(across all live sessions), and — because it runs in the same process as this
+backend — hands the image straight to `registerLiveFlightImage` (no HTTP hop, no
+token). It replies privately with a preview and drops a copy in the submissions
+channel for staff visibility. If the pilot isn't currently flying, it says so and
+does nothing. Everything downstream (override on the live board, auto-cleanup on
+flight end) is identical no matter how the photo was submitted.
+
+The HTTP endpoint below is the same capability for any other front end (a web
+uploader, etc.).
+
+### Upload (HTTP)
 
 ```
 POST /api/aircraft/live-image          (multipart/form-data)

@@ -424,7 +424,8 @@ async function postToChannel(channelId, payload) {
 const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, models = {}) => {
     const { DailyPilotStats, VirtualAirlineAd, Giveaway, VaTermsAcceptance,
             provisionVaPortalAccount, provisionVaPortalRepAccount,
-            deactivateVaPortalRepAccount, purgeVaData } = models;
+            deactivateVaPortalRepAccount, purgeVaData,
+            registerLiveFlightImage } = models;
 
     // NOTE: `Options.cacheEverything()` is the *opposite* of what we want — it
     // caches everything with no caps and silently ignores the limits passed to
@@ -1773,6 +1774,10 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 .addStringOption(o => o.setName('aircraft_type').setDescription('Type (Start typing to search)').setAutocomplete(true).setRequired(true))
                 .addStringOption(o => o.setName('livery').setDescription('Livery/airline').setAutocomplete(true).setRequired(true))
                 .addAttachmentOption(o => o.setName('photo').setDescription('Upload photo').setRequired(true)),
+
+            new SlashCommandBuilder().setName('liveimage').setDescription('Add a live photo to the flight you are flying RIGHT NOW (auto-removed when you land)')
+                .addAttachmentOption(o => o.setName('photo').setDescription('Photo of your aircraft').setRequired(true))
+                .addStringOption(o => o.setName('pilot').setDescription('Your exact IF username or callsign (so I can find your live flight)').setRequired(true)),
             new SlashCommandBuilder().setName('links').setDescription('Get helpful resource links (Tracker, Forum, Liveries)'),
             
             new SlashCommandBuilder()
@@ -3563,6 +3568,107 @@ client.on('interactionCreate', async (interaction) => {
             }
 
             await startSubmissionFlow(interaction, type, livery, tail, photo.url, interaction.user, interaction.channelId);
+        }
+
+        // --- LIVE FLIGHT PHOTO ---
+        // Pilot attaches a photo of the aircraft they're flying right now. We find
+        // their active flight on the live tracker, then hand the image to the
+        // images backend (registerLiveFlightImage), which shows it on that flight
+        // and auto-removes it once the flight ends.
+        if (interaction.commandName === 'liveimage') {
+            await interaction.deferReply({ ephemeral: true });
+
+            if (typeof registerLiveFlightImage !== 'function') {
+                return interaction.editReply('❌ Live photos aren’t enabled on this server right now.');
+            }
+
+            const photo = interaction.options.getAttachment('photo');
+            const query = (interaction.options.getString('pilot') || '').trim();
+
+            if (!photo || !photo.contentType || !photo.contentType.startsWith('image/')) {
+                return interaction.editReply('❌ Please attach a valid image file.');
+            }
+
+            // 1. Find the pilot's active flight across live sessions.
+            const LIVE_API_URL = 'https://site--acars-backend--6dmjph8ltlhv.code.run';
+            const q = query.toUpperCase();
+            let match = null;
+            try {
+                const sessionsRes = await axios.get(`${LIVE_API_URL}/if-sessions`);
+                const sessions = (sessionsRes.data && sessionsRes.data.sessions) || [];
+                for (const session of sessions) {
+                    const flightsRes = await axios.get(`${LIVE_API_URL}/flights/${session.id}`).catch(() => null);
+                    const flights = (flightsRes && flightsRes.data && flightsRes.data.flights) || [];
+                    match = flights.find(f =>
+                        (f.username && f.username.toUpperCase().includes(q)) ||
+                        (f.callsign && f.callsign.toUpperCase().includes(q))
+                    );
+                    if (match) { match._sessionName = session.name; break; }
+                }
+            } catch (e) {
+                return interaction.editReply('❌ Couldn’t reach the live tracker. Please try again in a moment.');
+            }
+
+            if (!match) {
+                return interaction.editReply(
+                    `❌ No active flight found for “**${query}**”. You can only add a live photo while you’re flying — ` +
+                    `double-check you used your exact IF username or callsign.`
+                );
+            }
+
+            const flightId = match.flightId || match.id;
+            if (!flightId) {
+                return interaction.editReply('❌ The tracker didn’t return an id for that flight, so I can’t attach a photo to it.');
+            }
+
+            const aircraftType = (match.aircraft && match.aircraft.aircraftName) || match.aircraftName || '';
+            const liveryName   = (match.aircraft && match.aircraft.liveryName) || match.livery || match.liveryName || '';
+            const tailNumber   = match.registration || (match.aircraft && match.aircraft.registration) || '';
+
+            // 2. Download the attachment and register it as this flight's live photo.
+            try {
+                const resp = await axios.get(photo.url, { responseType: 'arraybuffer' });
+                const doc = await registerLiveFlightImage({
+                    input: Buffer.from(resp.data),
+                    flightId: String(flightId),
+                    aircraftType,
+                    liveryName,
+                    tailNumber,
+                    callsign: match.callsign || '',
+                    pilotName: match.username || '',
+                });
+
+                const embed = new EmbedBuilder()
+                    .setTitle('📸 Live flight photo set!')
+                    .setColor(THEME.WHITE)
+                    .setDescription(`Your photo is now showing on **${match.callsign || match.username}** and will be removed automatically once your flight ends.`)
+                    .addFields(
+                        { name: 'Flight', value: match.callsign || match.username || 'Unknown', inline: true },
+                        { name: 'Aircraft', value: aircraftType || 'Unknown', inline: true },
+                        { name: 'Livery', value: liveryName || '—', inline: true },
+                    )
+                    .setImage(doc.imageUrl)
+                    .setFooter({ text: BRAND_FOOTER })
+                    .setTimestamp();
+                await interaction.editReply({ embeds: [embed] });
+
+                // Staff visibility (best-effort).
+                try {
+                    const logCh = await client.channels.fetch(SUBMISSION_CHANNEL_ID).catch(() => null);
+                    if (logCh) {
+                        await logCh.send({ embeds: [new EmbedBuilder()
+                            .setTitle('🛰️ Live flight photo')
+                            .setColor(THEME.WHITE)
+                            .setDescription(`<@${interaction.user.id}> set a live photo for **${match.callsign || match.username}** (${aircraftType || 'Unknown'} · ${liveryName || '—'}).`)
+                            .setImage(doc.imageUrl)
+                            .setTimestamp()] });
+                    }
+                } catch (_) { /* logging is non-critical */ }
+            } catch (e) {
+                console.error('liveimage error:', e && e.message ? e.message : e);
+                await interaction.editReply('❌ Failed to set your live photo. Please try again.');
+            }
+            return;
         }
 
         if (interaction.commandName === 'lookup') {
