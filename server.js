@@ -65,6 +65,9 @@ process.on('uncaughtException', (err) => {
 // IMPORT THE BOT
 const { startDiscordBot } = require('./bot');
 
+// Live aircraft image resolver (fuzzy match IF type/livery -> best photo).
+const aircraftImages = require('./aircraftImages');
+
 // 1. INITIALIZE APP
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -1395,8 +1398,30 @@ app.get('/api/aircraft/lookup', async (req, res) => {
 
         const results = await CommunityAircraft.find(query);
 
-        // 4. FIX: If no results found, return placeholder using the normalized 'finalTail'
+        // 4. If the community collection has nothing, fall back to the static
+        //    aircraft.json registry (1000+ curated photos) using fuzzy matching
+        //    before giving up with a placeholder. This is what lets live IF
+        //    flights get a real image even when nobody has uploaded one yet.
         if (results.length === 0) {
+            const reg = (finalType && finalLivery)
+                ? aircraftImages.matchRegistry(finalType, finalLivery)
+                : null;
+            if (reg) {
+                const r = aircraftImages.registryToResult(reg.entry, reg.score);
+                return res.json({
+                    contributorName: "Registry",
+                    aircraftType: r.aircraftType || finalType || "Unknown",
+                    liveryName: r.liveryName || finalLivery || "Standard",
+                    tailNumber: r.registration || finalTail || "N/A",
+                    imageUrl: r.imageUrl,
+                    imageUrls: r.imageUrls,
+                    source: 'registry',
+                    matchScore: r.matchScore,
+                    isPlaceholder: false,
+                    uploadedAt: new Date()
+                });
+            }
+
             return res.json({
                 contributorName: "System",
                 aircraftType: finalType || "Unknown",
@@ -1418,11 +1443,156 @@ app.get('/api/aircraft/lookup', async (req, res) => {
             if (exactMatch) return res.json(exactMatch);
         }
 
-        res.json(results[0]); 
+        res.json(results[0]);
 
     } catch (error) {
         console.error('Error looking up aircraft:', error);
         res.status(500).json({ message: 'Error performing lookup.' });
+    }
+});
+
+/* =====================================================================
+ * LIVE AIRCRAFT IMAGES
+ *
+ * The IF/ACARS backend holds the live flights; each flight has an aircraft
+ * `type` and `livery` (as they come out of Infinite Flight). These endpoints
+ * turn that pair into the best available photo, searching BOTH the
+ * community-uploaded collection and the static aircraft.json registry with the
+ * same fuzzy scoring the Discord bot uses.
+ *
+ *   GET  /api/aircraft/image            — one flight
+ *   POST /api/aircraft/images/batch     — a whole live board in one request
+ *
+ * Both are public GET/POST reads (global cors() already sends
+ * Access-Control-Allow-Origin: *), so the IF backend or a browser widget can
+ * call them cross-origin.
+ * ===================================================================== */
+
+const escapeRegex = (s) => String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Resolve the best image for a single (type, livery, tail) triple.
+ * Prefers, in order: an exact community tail hit, then whichever of the
+ * community / registry best-matches scores highest (community wins ties — it's
+ * the curated, human-uploaded source). Returns a normalized result object, or a
+ * placeholder when nothing clears the confidence floor.
+ */
+async function resolveAircraftImage({ type, livery, tail }) {
+    const finalType = (type || '').trim();
+    const finalLivery = (livery || '').trim();
+    const finalTail = (tail || '').toUpperCase().trim();
+
+    // 1. Exact registration hit in the community DB — strongest signal there is.
+    if (finalTail) {
+        const byTail = await CommunityAircraft.findOne({ tailNumber: finalTail }).lean();
+        if (byTail && (byTail.imageUrl || (byTail.imageUrls && byTail.imageUrls.length))) {
+            return aircraftImages.communityToResult(byTail, 100);
+        }
+    }
+
+    // 2. Fuzzy match needs both a type and a livery.
+    if (finalType && finalLivery) {
+        // Narrow the community candidate set before scoring in-memory. Match on
+        // either field loosely so we don't miss photos whose stored type/livery
+        // is spelled differently from IF's; cap the set to stay bounded.
+        const or = [
+            { aircraftType: { $regex: escapeRegex(finalType), $options: 'i' } },
+            { liveryName: { $regex: escapeRegex(finalLivery), $options: 'i' } },
+        ];
+        // Also try the first significant word of each (e.g. "Airbus", "Air"),
+        // which catches "A321" stored vs "Airbus A321neo" incoming.
+        const typeWord = finalType.split(/\s+/)[0];
+        const livWord = finalLivery.split(/\s+/)[0];
+        if (typeWord && typeWord.length > 2) or.push({ aircraftType: { $regex: escapeRegex(typeWord), $options: 'i' } });
+        if (livWord && livWord.length > 2) or.push({ liveryName: { $regex: escapeRegex(livWord), $options: 'i' } });
+
+        const docs = await CommunityAircraft.find({ $or: or }).limit(500).lean();
+
+        const community = aircraftImages.matchCommunity(docs, finalType, finalLivery);
+        const registry = aircraftImages.matchRegistry(finalType, finalLivery);
+
+        // Community wins ties (curated source); otherwise take the higher score.
+        if (community && (!registry || community.score >= registry.score)) {
+            return aircraftImages.communityToResult(community.doc, community.score);
+        }
+        if (registry) {
+            return aircraftImages.registryToResult(registry.entry, registry.score);
+        }
+    }
+
+    // 3. Nothing matched — return a self-describing placeholder.
+    return {
+        imageUrl: null,
+        imageUrls: [],
+        aircraftType: finalType || 'Unknown',
+        liveryName: finalLivery || 'Standard',
+        registration: finalTail || null,
+        source: 'none',
+        matchScore: 0,
+        isPlaceholder: true,
+    };
+}
+
+// GET /api/aircraft/image?type=A321&livery=Air%20Canada&tail=C-GITU
+// Returns the single best image for one live flight.
+app.get('/api/aircraft/image', async (req, res) => {
+    try {
+        const { type, model, livery, liveryName, tail, registration } = req.query;
+        const result = await resolveAircraftImage({
+            type: type || model,
+            livery: liveryName || livery,
+            tail: tail || registration,
+        });
+        // Cache successful matches briefly at the edge; live boards poll often.
+        res.set('Cache-Control', result.isPlaceholder ? 'no-store' : 'public, max-age=300');
+        res.json({ ok: true, found: !result.isPlaceholder, ...result });
+    } catch (error) {
+        console.error('Error resolving aircraft image:', error);
+        res.status(500).json({ ok: false, message: 'Error resolving aircraft image.' });
+    }
+});
+
+// POST /api/aircraft/images/batch
+// Body: { flights: [ { id?, type, livery, tail? }, ... ] }
+// Returns one image result per flight, keyed by the flight's id (or its array
+// index when no id is given). Lets the IF backend resolve a whole live server
+// in a single round-trip instead of one call per aircraft.
+app.post('/api/aircraft/images/batch', async (req, res) => {
+    try {
+        const flights = Array.isArray(req.body && req.body.flights) ? req.body.flights : null;
+        if (!flights) {
+            return res.status(400).json({ ok: false, message: 'Body must be { flights: [...] }.' });
+        }
+        // Guard against abusive payloads.
+        const MAX_BATCH = 500;
+        if (flights.length > MAX_BATCH) {
+            return res.status(413).json({ ok: false, message: `Too many flights (max ${MAX_BATCH}).` });
+        }
+
+        const results = {};
+        // De-dupe identical (type|livery|tail) triples so a full server of the
+        // same aircraft/livery only costs one lookup.
+        const cache = new Map();
+        await Promise.all(flights.map(async (f, i) => {
+            const key = String(f && f.id != null ? f.id : i);
+            const type = (f && (f.type || f.model || f.aircraftType)) || '';
+            const livery = (f && (f.livery || f.liveryName)) || '';
+            const tail = (f && (f.tail || f.registration || f.tailNumber)) || '';
+            const dedupeKey = `${type}|${livery}|${tail}`.toLowerCase();
+            if (cache.has(dedupeKey)) {
+                results[key] = cache.get(dedupeKey);
+                return;
+            }
+            const result = await resolveAircraftImage({ type, livery, tail });
+            cache.set(dedupeKey, result);
+            results[key] = result;
+        }));
+
+        res.set('Cache-Control', 'no-store');
+        res.json({ ok: true, count: Object.keys(results).length, results });
+    } catch (error) {
+        console.error('Error resolving aircraft image batch:', error);
+        res.status(500).json({ ok: false, message: 'Error resolving aircraft image batch.' });
     }
 });
 
