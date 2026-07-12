@@ -123,6 +123,39 @@ CommunityAircraftSchema.index({ uploadedAt: -1 });
 const CommunityAircraft = mongoose.model('CommunityAircraft', CommunityAircraftSchema);
 
 /* =========================
+ * LIVE FLIGHT IMAGE SCHEMA (ephemeral)
+ *
+ * A pilot's own photo of the aircraft they're flying RIGHT NOW. Unlike the
+ * community collection (permanent, shared, keyed by type+livery), each row here
+ * belongs to a single live flight and is short-lived: it stays alive only while
+ * the flight is still being polled and is swept away once the flight ends.
+ * ========================= */
+const LiveFlightImageSchema = new mongoose.Schema({
+    flightId:     { type: String, required: true, unique: true, index: true }, // IF flight id
+    imageUrl:     { type: String, required: true },
+    // Denormalized flight context (handy for the live board / moderation).
+    aircraftType: { type: String, default: '' },
+    liveryName:   { type: String, default: '' },
+    tailNumber:   { type: String, default: '' },
+    callsign:     { type: String, default: '' },
+    pilotName:    { type: String, default: '' },
+    uploadedAt:   { type: Date, default: Date.now },
+    // Bumped every time the flight is still being resolved; the sweeper deletes
+    // the row (and its S3 object) once this passes.
+    expiresAt:    { type: Date, required: true, index: true },
+});
+
+const LiveFlightImage = mongoose.model('LiveFlightImage', LiveFlightImageSchema);
+
+// How long a live image survives without being "seen" (re-resolved). While the
+// flight is live, the IF backend keeps polling it, which bumps expiresAt; once
+// the flight ends, polling stops and the sweeper removes it after this window.
+const LIVE_IMAGE_TTL_MS = Number(process.env.LIVE_IMAGE_TTL_MS) || 15 * 60 * 1000; // 15 min
+// Optional shared secret. When set, uploads/deletes must present it (header
+// `x-upload-token` or body/query `token`). When unset, the endpoints are open.
+const LIVE_IMAGE_UPLOAD_TOKEN = process.env.LIVE_IMAGE_UPLOAD_TOKEN || '';
+
+/* =========================
  * NEW: GATES SCHEMA
  * ========================= */
 const AirportGateSchema = new mongoose.Schema({
@@ -1477,10 +1510,46 @@ const escapeRegex = (s) => String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'
  * the curated, human-uploaded source). Returns a normalized result object, or a
  * placeholder when nothing clears the confidence floor.
  */
-async function resolveAircraftImage({ type, livery, tail }) {
+// The pilot's own live photo for a specific flight. Bumps the row's expiry so
+// it survives as long as the flight is still being polled, then returns it in
+// the shared result shape (or null when there's no live upload for this flight).
+async function lookupLiveFlightImage(flightId) {
+    const id = (flightId || '').trim();
+    if (!id) return null;
+    const live = await LiveFlightImage.findOneAndUpdate(
+        { flightId: id },
+        { $set: { expiresAt: new Date(Date.now() + LIVE_IMAGE_TTL_MS) } },
+        { new: true }
+    ).lean();
+    if (!live || !live.imageUrl) return null;
+    return {
+        imageUrl: live.imageUrl,
+        imageUrls: [live.imageUrl],
+        aircraftType: live.aircraftType || '',
+        liveryName: live.liveryName || '',
+        registration: live.tailNumber || null,
+        pilotName: live.pilotName || '',
+        source: 'live',
+        matchScore: 100,
+        isPlaceholder: false,
+    };
+}
+
+async function resolveAircraftImage({ type, livery, tail, flightId }) {
     const finalType = (type || '').trim();
     const finalLivery = (livery || '').trim();
     const finalTail = (tail || '').toUpperCase().trim();
+
+    // 0. The pilot's own live photo for THIS flight beats everything.
+    const live = await lookupLiveFlightImage(flightId);
+    if (live) {
+        return {
+            ...live,
+            aircraftType: live.aircraftType || finalType || '',
+            liveryName: live.liveryName || finalLivery || '',
+            registration: live.registration || finalTail || null,
+        };
+    }
 
     // 1. Exact registration hit in the community DB — strongest signal there is.
     if (finalTail) {
@@ -1537,11 +1606,12 @@ async function resolveAircraftImage({ type, livery, tail }) {
 // Returns the single best image for one live flight.
 app.get('/api/aircraft/image', async (req, res) => {
     try {
-        const { type, model, livery, liveryName, tail, registration } = req.query;
+        const { type, model, livery, liveryName, tail, registration, flightId, id } = req.query;
         const result = await resolveAircraftImage({
             type: type || model,
             livery: liveryName || livery,
             tail: tail || registration,
+            flightId: flightId || id,
         });
         // Cache successful matches briefly at the edge; live boards poll often.
         res.set('Cache-Control', result.isPlaceholder ? 'no-store' : 'public, max-age=300');
@@ -1570,14 +1640,30 @@ app.post('/api/aircraft/images/batch', async (req, res) => {
         }
 
         const results = {};
-        // De-dupe identical (type|livery|tail) triples so a full server of the
-        // same aircraft/livery only costs one lookup.
+        // De-dupe identical (type|livery|tail) library lookups so a full server
+        // of the same aircraft/livery only costs one DB+registry search. Live
+        // per-flight photos are checked separately (never de-duped) and win.
         const cache = new Map();
         await Promise.all(flights.map(async (f, i) => {
             const key = String(f && f.id != null ? f.id : i);
+            const flightId = (f && (f.id != null ? f.id : (f.flightId != null ? f.flightId : ''))) + '';
             const type = (f && (f.type || f.model || f.aircraftType)) || '';
             const livery = (f && (f.livery || f.liveryName)) || '';
             const tail = (f && (f.tail || f.registration || f.tailNumber)) || '';
+
+            // Pilot's own live upload for this flight wins outright.
+            const live = await lookupLiveFlightImage(flightId);
+            if (live) {
+                results[key] = {
+                    ...live,
+                    aircraftType: live.aircraftType || type || '',
+                    liveryName: live.liveryName || livery || '',
+                    registration: live.registration || (tail || '').toUpperCase() || null,
+                };
+                return;
+            }
+
+            // Otherwise fall back to the (de-duped) shared library lookup.
             const dedupeKey = `${type}|${livery}|${tail}`.toLowerCase();
             if (cache.has(dedupeKey)) {
                 results[key] = cache.get(dedupeKey);
@@ -1595,6 +1681,140 @@ app.post('/api/aircraft/images/batch', async (req, res) => {
         res.status(500).json({ ok: false, message: 'Error resolving aircraft image batch.' });
     }
 });
+
+/* ---------------------------------------------------------------------
+ * Live per-flight uploads (ephemeral)
+ *
+ * A pilot uploads a photo of the aircraft they're flying now; it shows on that
+ * flight only and is swept away once the flight ends (see the sweeper below).
+ * ------------------------------------------------------------------- */
+
+// Optional shared-secret gate. Returns true when the request may write.
+const liveImageAuthOk = (req) => {
+    if (!LIVE_IMAGE_UPLOAD_TOKEN) return true; // open when no token configured
+    const provided = req.get('x-upload-token')
+        || (req.body && req.body.token)
+        || (req.query && req.query.token)
+        || '';
+    return provided === LIVE_IMAGE_UPLOAD_TOKEN;
+};
+
+// Optimize + upload a live-flight photo to the ephemeral S3 prefix.
+const processAndUploadLiveImage = async (file, flightId) => {
+    const optimizedBuffer = await sharp(file.path)
+        .resize({ width: 1600, withoutEnlargement: true })
+        .webp({ quality: 78 })
+        .toBuffer();
+    const cleanId = String(flightId || 'flight').replace(/[^a-zA-Z0-9]/g, '');
+    const fileName = `live-flights/${cleanId}-${Date.now()}-${Math.round(Math.random() * 1e6)}.webp`;
+    await s3Client.send(new PutObjectCommand({
+        Bucket: process.env.AWS_S3_BUCKET_NAME,
+        Key: fileName,
+        Body: optimizedBuffer,
+        ContentType: 'image/webp',
+    }));
+    return `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileName}`;
+};
+
+// POST /api/aircraft/live-image  (multipart/form-data)
+// Fields: flightId (required) + image file ('image'); optional aircraftType,
+// liveryName, tailNumber, callsign, pilotName. Replaces any existing photo for
+// that flight. One image per flight.
+app.post('/api/aircraft/live-image', upload.single('image'), async (req, res) => {
+    const tempFiles = req.file ? [req.file] : [];
+    try {
+        if (!liveImageAuthOk(req)) {
+            return res.status(401).json({ ok: false, message: 'Invalid or missing upload token.' });
+        }
+        const flightId = String((req.body && req.body.flightId) || '').trim();
+        if (!flightId) return res.status(400).json({ ok: false, message: 'flightId is required.' });
+        if (!req.file) return res.status(400).json({ ok: false, message: 'An image file is required.' });
+
+        // Replace any prior photo for this flight (delete its S3 object first).
+        const prior = await LiveFlightImage.findOne({ flightId }).lean();
+
+        const imageUrl = await processAndUploadLiveImage(req.file, flightId);
+
+        const doc = await LiveFlightImage.findOneAndUpdate(
+            { flightId },
+            {
+                $set: {
+                    imageUrl,
+                    aircraftType: String((req.body && req.body.aircraftType) || ''),
+                    liveryName:   String((req.body && req.body.liveryName) || ''),
+                    tailNumber:   String((req.body && req.body.tailNumber) || '').toUpperCase(),
+                    callsign:     String((req.body && req.body.callsign) || ''),
+                    pilotName:    String((req.body && req.body.pilotName) || ''),
+                    uploadedAt:   new Date(),
+                    expiresAt:    new Date(Date.now() + LIVE_IMAGE_TTL_MS),
+                },
+            },
+            { new: true, upsert: true }
+        );
+
+        if (prior && prior.imageUrl && prior.imageUrl !== imageUrl) {
+            deleteS3Object(prior.imageUrl); // fire-and-forget
+        }
+
+        res.json({ ok: true, flightId, imageUrl, expiresAt: doc.expiresAt });
+    } catch (error) {
+        console.error('Error uploading live flight image:', error);
+        res.status(500).json({ ok: false, message: 'Error uploading live flight image.' });
+    } finally {
+        cleanupTempFiles(tempFiles);
+    }
+});
+
+// GET /api/aircraft/live-image/:flightId — fetch (and keep alive) one flight's
+// live photo, or 404 if none.
+app.get('/api/aircraft/live-image/:flightId', async (req, res) => {
+    try {
+        const live = await lookupLiveFlightImage(req.params.flightId);
+        if (!live) return res.status(404).json({ ok: false, found: false });
+        res.set('Cache-Control', 'no-store');
+        res.json({ ok: true, found: true, ...live });
+    } catch (error) {
+        console.error('Error fetching live flight image:', error);
+        res.status(500).json({ ok: false, message: 'Error fetching live flight image.' });
+    }
+});
+
+// DELETE /api/aircraft/live-image/:flightId — remove a flight's photo now
+// (e.g. the IF backend saw the flight end). Deletes the S3 object + the row.
+app.delete('/api/aircraft/live-image/:flightId', async (req, res) => {
+    try {
+        if (!liveImageAuthOk(req)) {
+            return res.status(401).json({ ok: false, message: 'Invalid or missing upload token.' });
+        }
+        const flightId = String(req.params.flightId || '').trim();
+        const doc = await LiveFlightImage.findOneAndDelete({ flightId });
+        if (doc && doc.imageUrl) await deleteS3Object(doc.imageUrl);
+        res.json({ ok: true, deleted: !!doc });
+    } catch (error) {
+        console.error('Error deleting live flight image:', error);
+        res.status(500).json({ ok: false, message: 'Error deleting live flight image.' });
+    }
+});
+
+// Sweeper: delete live images whose flight has gone quiet (expiresAt passed).
+// Removes the S3 object first, then the row, so nothing is orphaned. Runs on an
+// interval plus once shortly after boot.
+const LIVE_IMAGE_SWEEP_MS = Number(process.env.LIVE_IMAGE_SWEEP_MS) || 5 * 60 * 1000; // 5 min
+const sweepExpiredLiveImages = async () => {
+    try {
+        const expired = await LiveFlightImage.find({ expiresAt: { $lte: new Date() } }).lean();
+        if (!expired.length) return;
+        await Promise.all(expired.map(async (doc) => {
+            if (doc.imageUrl) await deleteS3Object(doc.imageUrl);
+            await LiveFlightImage.deleteOne({ _id: doc._id });
+        }));
+        console.log(`🧹 Swept ${expired.length} expired live flight image(s).`);
+    } catch (err) {
+        console.error('Live image sweep error:', err);
+    }
+};
+setInterval(sweepExpiredLiveImages, LIVE_IMAGE_SWEEP_MS).unref();
+setTimeout(sweepExpiredLiveImages, 30 * 1000).unref();
 
 // GET: Admin System Stats (S3 & DB stats) — public read, like the other GET
 // data endpoints (va-ads, airports). Consumed by external frontends; the
