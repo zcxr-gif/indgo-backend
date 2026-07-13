@@ -11,6 +11,9 @@
   "author": "Antony",
   "license": "ISC",
   "type": "commonjs",
+  "engines": {
+    "node": "24.x"
+  },
   "dependencies": {
     "@aws-sdk/client-cloudwatch": "^3.940.0",
     "@aws-sdk/client-dynamodb": "^3.893.0",
