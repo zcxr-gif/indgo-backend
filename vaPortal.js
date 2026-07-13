@@ -346,6 +346,12 @@ async function announceTosUpdateToDiscord(VirtualAirlineAd) {
         const ads = await VirtualAirlineAd
             .find({ discordChannelId: { $ne: null }, status: { $ne: 'removed' } }, 'name discordChannelId')
             .limit(2000);
+        // Surface the current version's changelog in the notice so partners see
+        // what actually changed without having to open the Terms page first.
+        const current = TOS_CHANGELOG.find((c) => c.version === TOS_VERSION);
+        const changed = current && current.notes && current.notes.length
+            ? current.notes.map((n) => `• ${n}`).join('\n').slice(0, 1024)
+            : '';
         for (const ad of ads) {
             if (!ad.discordChannelId) continue;
             attempted += 1;
@@ -358,6 +364,7 @@ async function announceTosUpdateToDiscord(VirtualAirlineAd) {
                         `Please review them and acknowledge the new version in your **VA Portal** › Compliance. ` +
                         `Continued participation constitutes acceptance of the revised Terms.`,
                     color: 0x2563EB,
+                    fields: changed ? [{ name: 'What changed', value: changed, inline: false }] : [],
                     footer: { text: 'Inflight VA Advertisement Program' },
                     timestamp: new Date().toISOString(),
                 }],

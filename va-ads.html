@@ -56,6 +56,7 @@
             <div class="flex items-center gap-3">
                 <a href="/terms" target="_blank" rel="noopener" title="View the VA Advertisement Program Terms" class="hidden sm:inline-flex items-center gap-1.5 text-sm font-medium text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white transition-colors"><i class="fa-solid fa-scroll"></i><span>Terms</span></a>
                 <a href="/VA-Advertisement-Terms.pdf" target="_blank" rel="noopener" title="Download the signed Terms PDF" class="hidden sm:inline-flex items-center gap-1.5 text-sm font-medium text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white transition-colors"><i class="fa-solid fa-file-pdf"></i><span>PDF</span></a>
+                <button onclick="announceTosUpdate()" id="tosAnnounceBtn" title="Post a Terms-update notice to every VA's Discord channel" class="inline-flex items-center gap-1.5 text-sm font-semibold px-3 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white transition-all active:scale-95 shadow-sm disabled:opacity-60 disabled:pointer-events-none"><i class="fa-solid fa-bullhorn text-xs"></i><span class="hidden sm:inline">Notify VAs: ToS updated</span></button>
                 <button onclick="toggleDarkMode()" class="p-2 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-full transition-colors">
                     <i id="themeIcon" class="fa-solid fa-moon text-zinc-600 dark:text-yellow-400 text-lg"></i>
                 </button>
@@ -582,6 +583,22 @@
                 toast('Advertisement deleted.');
                 loadAds();
             } catch (e) { toast(e.message || 'Failed to delete.', false); }
+        }
+
+        // Broadcast a "Terms updated" notice to every VA's own Discord channel.
+        // Same endpoint the VA Portal console uses; partners are also re-prompted
+        // in their portal automatically whenever the Terms version is bumped.
+        async function announceTosUpdate() {
+            if (!confirm("Notify every VA in their Discord channel that the Terms & Conditions have been updated?\n\nPartners are already re-prompted in their portal — this posts the notice to their Discord too.")) return;
+            const btn = document.getElementById('tosAnnounceBtn');
+            btn.disabled = true;
+            try {
+                const res = await fetch('/api/va-portal/admin/tos/announce', { method: 'POST' });
+                const json = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(json.error || 'Could not send the Terms notice.');
+                toast(`Terms ${json.version} notice sent to ${json.attempted} VA channel(s).`);
+            } catch (e) { toast(e.message || 'Could not send the Terms notice.', false); }
+            finally { btn.disabled = false; }
         }
 
         // ---------- Pilot roster viewer + bulk manager ----------
