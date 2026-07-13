@@ -5,6 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "build": "node scripts/build-va-terms-pdf.js",
     "build:terms": "node scripts/build-va-terms-pdf.js"
   },
   "keywords": [],

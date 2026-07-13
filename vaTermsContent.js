@@ -5,8 +5,10 @@
  *   • the signed PDF (scripts/build-va-terms-pdf.js), and
  *   • the public Terms page (/terms → GET /api/va-terms → terms.html).
  *
- * Edit the clauses here, then run `node scripts/build-va-terms-pdf.js` to
- * rebuild VA-Advertisement-Terms.pdf. Bump TOS_VERSION in vaTos.js when you do.
+ * Edit the clauses here and bump TOS_VERSION in vaTos.js — that's it. The PDF
+ * is rebuilt automatically on every deploy (the `build` script in package.json
+ * runs scripts/build-va-terms-pdf.js). To preview locally: `npm run build:terms`.
+ * Full step-by-step guide: TERMS-EDITING.md.
  *
  * Each clause is { heading, blocks }, where a block is either:
  *   { p: '…' }                 a paragraph, or
