@@ -33,6 +33,12 @@ const CLAUSES = [
         heading: '2. What We Offer in Return',
         blocks: [
             { p: 'In return for participation, we offer advertising of your VA across our platform. This may include placement in flight information windows, badges, airport information windows, and other surfaces, as well as additional placements a VA may request. All such placements are offered subject to our approval and are not guaranteed.' },
+            { p: 'In addition, every VA that participates in the Program is entitled, free of charge, to the following partner benefits:' },
+            { list: [
+                'A live embed — a widget you can place on your VA’s own website (as a simple iframe) that displays your VA’s live flights map and/or pilot roster in real time, powered by the Inflight tracker and styled to match your branding.',
+                'A flight-events webhook — a Discord webhook that automatically posts takeoff and landing cards for flights flown under your VA’s callsign directly into a channel in your own Discord server, so your community sees your operations live without leaving Discord.',
+            ] },
+            { p: 'These benefits are provided on request and configured together with our staff. They remain available for as long as your VA participates in the Program and are withdrawn if your participation ends.' },
         ],
     },
     {

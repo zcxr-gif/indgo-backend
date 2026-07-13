@@ -18,11 +18,11 @@
 
 // Bump this whenever the Terms text or the PDF changes. Previous accepters are
 // re-prompted in their portal (and can be re-notified in Discord) when it moves.
-const TOS_VERSION = 'v2';
+const TOS_VERSION = 'v3';
 
 // Human-readable effective date of the current version (shown on the Terms
 // page, the PDF, and the portal banner).
-const TOS_EFFECTIVE_DATE = '2026-07-11';
+const TOS_EFFECTIVE_DATE = '2026-07-13';
 
 // Where partners find the Terms. The PDF is served statically from the repo
 // root; the page is a public route (see server.js).
@@ -95,6 +95,7 @@ const getWarningLevel = (key) => WARNING_LEVEL_MAP[key] || null;
 // Terms page, and the portal. Kept short — the PDF holds the full contract.
 const TOS_SUMMARY = [
     'Free program — a directory advertising your VA across our platform, subject to staff approval.',
+    'Partner benefits — every participating VA is entitled to a free live embed (a widget for your own website showing your VA’s live flights and pilot roster) and a Discord flight-events webhook (automatic takeoff/landing cards posted to your own server).',
     'Official tracking provider — by joining, you accept Inflight as your VA’s official flight-tracking provider. This does not require every individual pilot to use Inflight, but whenever you post or run an event, it must be tracked with Inflight and Inflight is credited as the tracker.',
     'Event tracking — any event you announce or run must be tracked using Inflight, evidenced by a screenshot from our tracker.',
     'Accurate content — listing info, logos and banners must be accurate, owned by you, and not offensive or infringing.',
@@ -107,8 +108,16 @@ const TOS_SUMMARY = [
 // so partners can see why they are being asked to re-acknowledge.
 const TOS_CHANGELOG = [
     {
-        version: 'v2',
+        version: 'v3',
         date: TOS_EFFECTIVE_DATE,
+        notes: [
+            'Added: every VA participating in the Program is entitled to a free live embed — a widget for your VA’s own website showing your live flights map and pilot roster, powered by the Inflight tracker.',
+            'Added: every participating VA is also entitled to a Discord flight-events webhook — takeoff and landing cards for flights flown under your VA, posted automatically to a channel in your own Discord server.',
+        ],
+    },
+    {
+        version: 'v2',
+        date: '2026-07-11',
         notes: [
             'Added: Inflight is your VA’s official flight-tracking provider. Not every pilot must use Inflight, but events you post or run are tracked with Inflight and credit Inflight as the tracker.',
             'Added: a formal enforcement ladder — verbal, first, second and final warnings, then contract termination — for VAs that do not follow the Terms. Warnings are delivered to your Discord and recorded in your portal.',
