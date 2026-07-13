@@ -27,6 +27,7 @@ const {
     deactivateRepAccount,
     purgeVaData,
     VaSubmission,
+    VaEvent,
 } = require('./vaPortal');
 
 const express = require('express');
@@ -2684,6 +2685,70 @@ app.delete('/api/va-ads/:id/pilots', requireAuth, async (req, res) => {
     } catch (error) {
         console.error('VA Ad pilots clear error:', error);
         res.status(500).json({ message: 'Server error while clearing the roster.' });
+    }
+});
+
+// --- VA pilot roster + events (PUBLIC, read-only) ----------------------------
+// No auth: these back a VA's own website, called cross-origin (global cors()
+// sends Access-Control-Allow-Origin: *). The :id is the VA's ad id — the same
+// one the public GET /api/va-ads listing returns. Only display-safe fields go
+// out: the roster drops the addedBy audit trail and row ids, and both routes
+// 404 (not 500) on a malformed id.
+
+// GET /api/public/va/:id/pilots?q=&limit=&skip= — the VA's pilot roster.
+// Same search/paging as the staff route: q is a case-insensitive username
+// match, limit defaults to 500 (max 2000).
+app.get('/api/public/va/:id/pilots', async (req, res) => {
+    try {
+        if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+            return res.status(404).json({ message: 'VA not found.' });
+        }
+        const ad = await VirtualAirlineAd.findById(req.params.id).select('_id name').lean();
+        if (!ad) return res.status(404).json({ message: 'VA not found.' });
+        const out = await vaPilots.listPilots(VaPilot, ad._id, {
+            q: req.query.q, limit: req.query.limit, skip: req.query.skip,
+        });
+        res.set('Cache-Control', 'public, max-age=60');
+        res.json({
+            va: { id: String(ad._id), name: ad.name },
+            total: out.total,
+            rosterTotal: out.rosterTotal,
+            pilots: out.pilots.map(p => ({ username: p.username, addedAt: p.addedAt })),
+        });
+    } catch (error) {
+        console.error('Public VA pilots error:', error);
+        res.status(500).json({ message: 'Server error while loading the pilot roster.' });
+    }
+});
+
+// GET /api/public/va/:id/events — the VA's upcoming events (anything starting
+// later than 12h ago), soonest first. Mirrors the portal's window/limit so the
+// VA's site and the portal always agree on what "upcoming" means.
+app.get('/api/public/va/:id/events', async (req, res) => {
+    try {
+        if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+            return res.status(404).json({ message: 'VA not found.' });
+        }
+        const ad = await VirtualAirlineAd.findById(req.params.id).select('_id name').lean();
+        if (!ad) return res.status(404).json({ message: 'VA not found.' });
+        const since = new Date(Date.now() - 12 * 60 * 60 * 1000);
+        const events = await VaEvent.find({ vaAdId: ad._id, startsAt: { $gte: since } })
+            .sort({ startsAt: 1 }).limit(50).lean();
+        res.set('Cache-Control', 'public, max-age=60');
+        res.json({
+            va: { id: String(ad._id), name: ad.name },
+            events: events.map(e => ({
+                id: String(e._id),
+                title: e.title,
+                description: e.description || '',
+                link: e.link || '',
+                startsAt: e.startsAt,
+                createdAt: e.createdAt,
+            })),
+        });
+    } catch (error) {
+        console.error('Public VA events error:', error);
+        res.status(500).json({ message: 'Server error while loading events.' });
     }
 });
 
