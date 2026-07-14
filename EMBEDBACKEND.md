@@ -529,6 +529,12 @@ Customize → *Events + calendar*), or staff enable it in the embed manager.
 It also honours `theme`, `accent`/`color`, `gradient`, `angle`, `radius`,
 `header`, `compact`, `name`, `logo` exactly like the map widget.
 
+**Live preview / overrides:** in **token** mode these same params, when present
+on the URL, are layered *on top of* the resolved config. A distributed link
+(`?token=…` only) is unaffected, but the portal and staff embed managers append
+them so their in-editor preview reflects unsaved template/appearance edits
+without having to save first.
+
 ### Templates
 
 Ten presets vary size, layout, and which elements show (banners / logos /

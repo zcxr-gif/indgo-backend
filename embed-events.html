@@ -473,6 +473,25 @@
       });
   }
 
+  // Layer any explicit URL params over the current appearance/identity/template.
+  // In production the distributed iframe URL carries only ?token=, so nothing is
+  // overridden; the portal/staff PREVIEW appends these to show unsaved edits
+  // live without having to save first.
+  function applyOverrides() {
+    var ap = STATE.appearance;
+    if (qs.has("theme"))    ap.theme = qs.get("theme");
+    if (qs.has("accent"))   ap.accent = qs.get("accent");
+    else if (qs.has("color")) ap.accent = qs.get("color");
+    if (qs.has("gradient")) ap.gradient = qs.get("gradient");
+    if (qs.has("angle"))    ap.gradientAngle = qs.get("angle");
+    if (qs.has("radius"))   ap.radius = qs.get("radius");
+    if (qs.has("header"))   ap.header = qs.get("header");
+    if (qs.has("compact"))  ap.compact = (qs.get("compact") === "1" || qs.get("compact") === "true");
+    if (qs.has("name"))     STATE.va.name = qs.get("name");
+    if (qs.has("logo"))     STATE.va.logo = qs.get("logo");
+    if (qs.has("template")) STATE.tpl = templateById(qs.get("template"));
+  }
+
   function boot() {
     var token = (qs.get("token") || "").trim();
     var tplOverride = qs.get("template");
@@ -515,7 +534,7 @@
         });
 
     start
-      .then(function (vaAdId) { applyAppearance(STATE.appearance); return loadEvents(vaAdId); })
+      .then(function (vaAdId) { applyOverrides(); applyAppearance(STATE.appearance); return loadEvents(vaAdId); })
       .then(function () { render(); })
       .catch(function (err) { fail(err && err.message ? err.message : "Could not load this events embed."); });
   }
