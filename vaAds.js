@@ -22,16 +22,23 @@ const IMAGE_PROFILES = {
     event:  { width: 1600, height: 900, fit: 'inside' }
 };
 
-// Animated banners/logos are re-encoded as animated WebP, where file size is
-// (roughly) per-frame size × frame count. We keep EVERY frame and the full loop
-// — the animation runs as long as the source — but shrink each frame to hold the
-// total size down: a tighter dimension cap than the still profiles, plus more
-// aggressive WebP settings applied in uploadVaImage.
+// Animated banners/logos are re-encoded as animated WebP, keeping EVERY frame
+// and the full loop. Encoding cost is dominated by decoding + resizing every
+// frame, so the frame COUNT (not just resolution) drives how long the request
+// takes — a tight dimension cap keeps both the output small AND the encode fast
+// enough to finish inside the HTTP timeout.
 const ANIMATED_PROFILES = {
-    banner: { width: 1280, height: 480, fit: 'inside' },
-    logo:   { width: 384,  height: 384, fit: 'inside' },
-    event:  { width: 1280, height: 720, fit: 'inside' }
+    banner: { width: 720, height: 270, fit: 'inside' },
+    logo:   { width: 320, height: 320, fit: 'inside' },
+    event:  { width: 720, height: 405, fit: 'inside' }
 };
+
+// Hard ceiling on total source pixels to decode for an animated upload
+// (frames × width × height). Above this the synchronous encode would risk
+// exceeding the request timeout, so we reject fast with a clear message instead
+// of letting the request hang. ~120 MP ≈ a ~4s GIF at 720p, or a longer one at
+// lower resolution — comfortably covers normal banner GIFs.
+const MAX_ANIMATED_SOURCE_PIXELS = 120 * 1000 * 1000;
 
 // Build a clean, collision-resistant S3 key for a VA image.
 const buildKey = (vaRef, kind) => {
@@ -57,23 +64,40 @@ const uploadVaImage = async (s3Client, file, vaRef, kind = 'banner') => {
 
     const inputSource = file.path ? file.path : file.buffer;
 
-    // Probe for animation. metadata() only reads the header, so this is cheap;
-    // pages > 1 means a multi-frame (animated) source.
-    let animated = false;
-    try { animated = ((await sharp(inputSource).metadata()).pages || 1) > 1; }
-    catch { animated = false; }
+    // Probe the source. metadata() only reads the header, so this is cheap and
+    // tells us the frame count (pages) and per-frame dimensions up front.
+    let meta = {};
+    try { meta = await sharp(inputSource).metadata(); } catch { meta = {}; }
+    const frames = meta.pages || 1;
+    const animated = frames > 1;
+
+    // Fast-fail an animation that's too long/large to re-encode inside the
+    // request timeout (the encode decodes + resizes EVERY frame). Rejecting here
+    // — before the multi-second encode — turns a hung "saving…" into an instant,
+    // clear message. Tagged so the route can surface it as a 413.
+    if (animated) {
+        const sourcePixels = frames * (meta.width || 0) * (meta.height || 0);
+        if (sourcePixels > MAX_ANIMATED_SOURCE_PIXELS) {
+            const err = new Error(
+                'That animated banner is too long or too high-resolution to process. ' +
+                'Please use a shorter GIF, or one at a smaller resolution.'
+            );
+            err.status = 413;
+            if (file.path) fs.unlink(file.path, () => {});
+            throw err;
+        }
+    }
 
     const profile = (animated ? ANIMATED_PROFILES : IMAGE_PROFILES)[kind]
         || (animated ? ANIMATED_PROFILES : IMAGE_PROFILES).banner;
 
     // Animated path: keep every frame + the loop (full-length animation), but
-    // squeeze size hard — max encoder effort, lower quality, smart chroma
-    // subsampling, tighter dimensions. A long animation decodes to a lot of
-    // pixels (frames × w × h), so lift sharp's input-pixel guard; the 15MB
-    // upload cap still bounds the real work.
-    const readOpts = animated ? { animated: true, limitInputPixels: 500_000_000 } : {};
+    // squeeze size hard — lower quality, smart chroma subsampling and a tight
+    // dimension cap. effort:4 (not 6) keeps the encode fast; frame decode already
+    // dominates, so max effort buys little size but a lot of time.
+    const readOpts = animated ? { animated: true, limitInputPixels: 200_000_000 } : {};
     const webpOpts = animated
-        ? { quality: 55, effort: 6, smartSubsample: true }
+        ? { quality: 58, effort: 4, smartSubsample: true }
         : { quality: 82 };
 
     const optimizedBuffer = await sharp(inputSource, readOpts)
