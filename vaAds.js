@@ -22,6 +22,17 @@ const IMAGE_PROFILES = {
     event:  { width: 1600, height: 900, fit: 'inside' }
 };
 
+// Animated banners/logos are re-encoded as animated WebP, where file size is
+// (roughly) per-frame size × frame count. We keep EVERY frame and the full loop
+// — the animation runs as long as the source — but shrink each frame to hold the
+// total size down: a tighter dimension cap than the still profiles, plus more
+// aggressive WebP settings applied in uploadVaImage.
+const ANIMATED_PROFILES = {
+    banner: { width: 1280, height: 480, fit: 'inside' },
+    logo:   { width: 384,  height: 384, fit: 'inside' },
+    event:  { width: 1280, height: 720, fit: 'inside' }
+};
+
 // Build a clean, collision-resistant S3 key for a VA image.
 const buildKey = (vaRef, kind) => {
     const cleanRef = (vaRef || 'va').replace(/[^a-zA-Z0-9]/g, '').slice(0, 40) || 'va';
@@ -43,7 +54,6 @@ const buildKey = (vaRef, kind) => {
  */
 const uploadVaImage = async (s3Client, file, vaRef, kind = 'banner') => {
     const bucketName = process.env.AWS_S3_BUCKET_NAME;
-    const profile = IMAGE_PROFILES[kind] || IMAGE_PROFILES.banner;
 
     const inputSource = file.path ? file.path : file.buffer;
 
@@ -53,11 +63,22 @@ const uploadVaImage = async (s3Client, file, vaRef, kind = 'banner') => {
     try { animated = ((await sharp(inputSource).metadata()).pages || 1) > 1; }
     catch { animated = false; }
 
-    const optimizedBuffer = await sharp(inputSource, animated ? { animated: true } : {})
+    const profile = (animated ? ANIMATED_PROFILES : IMAGE_PROFILES)[kind]
+        || (animated ? ANIMATED_PROFILES : IMAGE_PROFILES).banner;
+
+    // Animated path: keep every frame + the loop (full-length animation), but
+    // squeeze size hard — max encoder effort, lower quality, smart chroma
+    // subsampling, tighter dimensions. A long animation decodes to a lot of
+    // pixels (frames × w × h), so lift sharp's input-pixel guard; the 15MB
+    // upload cap still bounds the real work.
+    const readOpts = animated ? { animated: true, limitInputPixels: 500_000_000 } : {};
+    const webpOpts = animated
+        ? { quality: 55, effort: 6, smartSubsample: true }
+        : { quality: 82 };
+
+    const optimizedBuffer = await sharp(inputSource, readOpts)
         .resize({ ...profile, withoutEnlargement: true })
-        // Animated WebP is far heavier frame-for-frame, so trade a little quality
-        // and encoder effort to keep a moving banner from ballooning on S3.
-        .webp(animated ? { quality: 70, effort: 4 } : { quality: 82 })
+        .webp(webpOpts)
         .toBuffer();
 
     const key = buildKey(vaRef, kind);
