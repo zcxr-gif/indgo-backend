@@ -483,12 +483,18 @@ and the aerial image itself are fully client-side (OSM + Esri imagery) and need
 
 ## 6. Events + Calendar companion widget
 
-Alongside the live map, a VA can surface an **Events + Calendar** widget hosted
-at:
+Alongside the live map, a VA can surface an **Events + Calendar** widget. Unlike
+the map embed (which is fronted by the Netlify site at `inflight.info`), this
+widget is served **directly by this backend**, so its URL points at the backend's
+own public origin (configurable via `EMBED_EVENTS_BASE_URL`):
 
 ```
-https://inflight.info/embed-events.html
+https://<backend-host>/embed-events.html
 ```
+
+Serving it from the backend means its relative `/api/embed/resolve`,
+`/api/public/va/:id/events` and `/assets/…` calls resolve straight to the
+backend — no Netlify forwarding rule needed for the new path.
 
 It renders the VA's upcoming events (a month calendar + an upcoming list) and
 styles itself with the **same** appearance the map embed uses (accent, theme,
@@ -504,7 +510,7 @@ Customize → *Events + calendar*), or staff enable it in the embed manager.
 
    ```html
    <iframe
-     src="https://inflight.info/embed-events.html?token=THE_SAME_TOKEN"
+     src="https://<backend-host>/embed-events.html?token=THE_SAME_TOKEN"
      style="width:100%;height:720px;border:0;border-radius:16px;overflow:hidden"
      loading="lazy" title="Ocean Virtual — Events & Calendar"></iframe>
    ```
@@ -564,4 +570,6 @@ GET /api/public/va/<vaAdId>/events
 
 Upcoming = anything starting later than 12h ago, soonest first (max 50),
 cacheable 60s. Events (with their optional banner + departure ICAO) are created
-by the VA in the portal's **Events** tab.
+by the VA in the portal's **Events** tab. `bannerUrl` is always a `.webp`;
+animated uploads (GIF / animated WebP) are preserved as **animated WebP**, so a
+banner may move — the widget renders it in a plain `<img>`, which plays it.

@@ -43,11 +43,13 @@ const {
 // Where the embed widget is hosted. The portal surfaces a VA's embed link as a
 // read-only, copyable URL; it never lets the VA change the underlying config.
 const EMBED_BASE_URL = process.env.EMBED_BASE_URL || 'https://inflight.info/embed.html';
-// The Events + Calendar companion widget lives beside the map widget. Defaults
-// to the same host as EMBED_BASE_URL (embed.html -> embed-events.html) so a
-// single EMBED_BASE_URL override moves both; can be pinned via its own env.
+// The Events + Calendar companion widget is served directly by THIS backend
+// (unlike the map embed, which is fronted by the Netlify site at inflight.info).
+// Point it at the backend's own public origin so its relative /api and /assets
+// calls resolve straight to the backend. Override with EMBED_EVENTS_BASE_URL if
+// the backend host ever changes.
 const EMBED_EVENTS_BASE_URL = process.env.EMBED_EVENTS_BASE_URL
-    || EMBED_BASE_URL.replace(/embed\.html(?=$|[?#])/, 'embed-events.html');
+    || 'https://site--indgo-backend--6dmjph8ltlhv.code.run/embed-events.html';
 
 const COOKIE_NAME = 'va_portal_token';
 const TOKEN_TYPE = 'va_portal';            // distinguishes these tokens from staff tokens
