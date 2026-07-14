@@ -496,7 +496,10 @@
 
     <script>
         const EMBED_BASE = 'https://inflight.info/embed.html';
-        const EMBED_EVENTS_BASE = 'https://inflight.info/embed-events.html';
+        // The events widget is served directly by the backend (not the Netlify
+        // front), so it points at the backend origin — its relative /api and
+        // /assets calls then resolve to the backend.
+        const EMBED_EVENTS_BASE = 'https://site--indgo-backend--6dmjph8ltlhv.code.run/embed-events.html';
         let CONFIGS = [];
 
         // ---- theme ----
