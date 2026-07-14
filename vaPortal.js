@@ -1156,6 +1156,9 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
         } catch (err) {
             cleanup();
             console.error('VA portal update profile error:', err);
+            // Surface a tagged image error (e.g. an oversized animated banner)
+            // with its own message; otherwise a generic failure.
+            if (err && err.status) return res.status(err.status).json({ error: err.message });
             res.status(500).json({ error: 'Could not save your VA profile.' });
         }
     });
@@ -1591,6 +1594,8 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
         } catch (err) {
             cleanup();
             console.error('VA portal create event error:', err);
+            // Surface a tagged image error (e.g. an oversized animated banner).
+            if (err && err.status) return res.status(err.status).json({ error: err.message });
             res.status(500).json({ error: 'Could not save the event.' });
         }
     });
