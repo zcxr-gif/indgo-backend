@@ -490,6 +490,7 @@
 
     <script>
         const EMBED_BASE = 'https://inflight.info/embed.html';
+        const EMBED_EVENTS_BASE = 'https://inflight.info/embed-events.html';
         let CONFIGS = [];
 
         // ---- theme ----
@@ -523,6 +524,15 @@
   loading="lazy"
   title="Live Flights">
 </iframe>`;
+        // Events + Calendar companion widget (shares the same token as the map).
+        const eventsUrlFor = (token) => `${EMBED_EVENTS_BASE}?token=${encodeURIComponent(token)}`;
+        const eventsIframeFor = (token) =>
+`<iframe
+  src="${eventsUrlFor(token)}"
+  style="width:100%;height:720px;border:0;border-radius:12px;overflow:hidden"
+  loading="lazy"
+  title="Events &amp; Calendar">
+</iframe>`;
 
         async function copyText(text, label) {
             try {
@@ -537,16 +547,18 @@
             }
         }
         window.copyIframe = (token) => copyText(iframeFor(token), 'iframe snippet');
+        window.copyEventsIframe = (token) => copyText(eventsIframeFor(token), 'events iframe snippet');
         window.copyToken = (token) => copyText(token, 'Token');
 
-        // ---- tester: open a live preview of the embed link ----
-        window.testEmbed = (token) => {
-            const url = urlFor(token);
+        // ---- tester: open a live preview of any embed link (map or events) ----
+        function openPreviewUrl(url) {
             document.getElementById('previewUrl').textContent = url;
             document.getElementById('previewOpen').href = url;
             document.getElementById('previewFrame').src = url;
             document.getElementById('previewModal').classList.remove('hidden');
-        };
+        }
+        window.testEmbed = (token) => openPreviewUrl(urlFor(token));
+        window.testEventsEmbed = (token) => openPreviewUrl(eventsUrlFor(token));
         window.copyPreviewUrl = () => copyText(document.getElementById('previewUrl').textContent, 'Embed URL');
         function reloadPreview() {
             const f = document.getElementById('previewFrame');
@@ -617,6 +629,7 @@
                         ${c.header === 'off' ? `<span class="px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 font-medium" title="Header hidden — Powered-by floats as a pill"><i class="fa-solid fa-eye-slash mr-1"></i>no header</span>` : ''}
                         ${(c.headerPos && c.headerPos !== 'top') ? `<span class="px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 font-medium" title="Header position"><i class="fa-solid fa-table-columns mr-1"></i>${esc(c.headerPos)}</span>` : ''}
                         ${c.compact ? `<span class="px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 font-medium" title="Compact header"><i class="fa-solid fa-compress mr-1"></i>compact</span>` : ''}
+                        ${c.events === 'on' ? `<span class="px-2 py-1 rounded-lg bg-sky-100 dark:bg-sky-500/15 text-sky-700 dark:text-sky-300 font-medium" title="Events + Calendar companion widget enabled (template ${esc(String(c.eventsTemplate || 1))})"><i class="fa-solid fa-calendar-days mr-1"></i>events · T${esc(String(c.eventsTemplate || 1))}</span>` : ''}
                     </div>
 
                     <div class="text-xs text-zinc-400 mb-1 truncate" title="${esc(origins)}"><i class="fa-solid fa-globe mr-1"></i>${esc(origins)}</div>
@@ -625,12 +638,18 @@
                     </div>
 
                     <div class="mt-auto grid grid-cols-2 gap-2">
-                        <button onclick="testEmbed('${c.token}')" class="col-span-2 bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-2 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition active:scale-95">
-                            <i class="fa-solid fa-flask"></i> Test embed
+                        <button onclick="testEmbed('${c.token}')" class="${c.events === 'on' ? '' : 'col-span-2'} bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-2 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition active:scale-95">
+                            <i class="fa-solid fa-flask"></i> Test${c.events === 'on' ? ' map' : ' embed'}
                         </button>
-                        <button onclick="copyIframe('${c.token}')" class="col-span-2 bg-zinc-900 hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 text-white px-3 py-2 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition active:scale-95">
-                            <i class="fa-solid fa-copy"></i> Copy iframe
+                        ${c.events === 'on' ? `<button onclick="testEventsEmbed('${c.token}')" class="bg-sky-600 hover:bg-sky-700 text-white px-3 py-2 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition active:scale-95">
+                            <i class="fa-solid fa-calendar-days"></i> Test events
+                        </button>` : ''}
+                        <button onclick="copyIframe('${c.token}')" class="${c.events === 'on' ? '' : 'col-span-2'} bg-zinc-900 hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 text-white px-3 py-2 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition active:scale-95">
+                            <i class="fa-solid fa-copy"></i> Copy${c.events === 'on' ? ' map' : ''} iframe
                         </button>
+                        ${c.events === 'on' ? `<button onclick="copyEventsIframe('${c.token}')" class="border-2 border-sky-200 dark:border-sky-900 text-sky-600 dark:text-sky-300 hover:bg-sky-50 dark:hover:bg-sky-500/10 px-3 py-2 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition active:scale-95">
+                            <i class="fa-solid fa-copy"></i> Copy events iframe
+                        </button>` : ''}
                         <button onclick="copyToken('${c.token}')" class="px-3 py-2 rounded-xl text-sm font-medium border-2 border-zinc-200 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition">Copy token</button>
                         <button onclick="edit('${c._id}')" class="px-3 py-2 rounded-xl text-sm font-medium border-2 border-zinc-200 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition">Edit</button>
                         <button onclick="rotate('${c._id}')" class="px-3 py-2 rounded-xl text-sm font-medium border-2 border-zinc-200 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition" title="Issue a new token (breaks the old iframe URL)">Rotate</button>
