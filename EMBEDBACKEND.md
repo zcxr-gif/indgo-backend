@@ -570,4 +570,6 @@ GET /api/public/va/<vaAdId>/events
 
 Upcoming = anything starting later than 12h ago, soonest first (max 50),
 cacheable 60s. Events (with their optional banner + departure ICAO) are created
-by the VA in the portal's **Events** tab.
+by the VA in the portal's **Events** tab. `bannerUrl` is always a `.webp`;
+animated uploads (GIF / animated WebP) are preserved as **animated WebP**, so a
+banner may move — the widget renders it in a plain `<img>`, which plays it.

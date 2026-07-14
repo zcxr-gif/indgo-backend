@@ -32,6 +32,13 @@ const buildKey = (vaRef, kind) => {
  * Optimize a single VA image (banner or logo) and upload it to S3.
  * Accepts both Multer disk files (file.path) and raw buffers (file.buffer),
  * so the same helper works from the web dashboard and from a bot/automation.
+ *
+ * Animation is preserved: an animated source (GIF or animated WebP) is
+ * re-encoded as ANIMATED WebP with every frame resized, so event banners can
+ * move. A still image takes the normal single-frame path. Output is always
+ * `.webp` at the same key/content-type, so the URL, the public API and the
+ * widget's <img> are identical whether or not the banner animates.
+ *
  * Returns the public URL.
  */
 const uploadVaImage = async (s3Client, file, vaRef, kind = 'banner') => {
@@ -40,9 +47,17 @@ const uploadVaImage = async (s3Client, file, vaRef, kind = 'banner') => {
 
     const inputSource = file.path ? file.path : file.buffer;
 
-    const optimizedBuffer = await sharp(inputSource)
+    // Probe for animation. metadata() only reads the header, so this is cheap;
+    // pages > 1 means a multi-frame (animated) source.
+    let animated = false;
+    try { animated = ((await sharp(inputSource).metadata()).pages || 1) > 1; }
+    catch { animated = false; }
+
+    const optimizedBuffer = await sharp(inputSource, animated ? { animated: true } : {})
         .resize({ ...profile, withoutEnlargement: true })
-        .webp({ quality: 82 })
+        // Animated WebP is far heavier frame-for-frame, so trade a little quality
+        // and encoder effort to keep a moving banner from ballooning on S3.
+        .webp(animated ? { quality: 70, effort: 4 } : { quality: 82 })
         .toBuffer();
 
     const key = buildKey(vaRef, kind);
