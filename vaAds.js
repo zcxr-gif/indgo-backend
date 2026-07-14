@@ -16,7 +16,10 @@ const fs = require('fs');
 // store a 4K upload; logos are fit inside a square box without enlarging.
 const IMAGE_PROFILES = {
     banner: { width: 1600, height: 600, fit: 'inside' },
-    logo:   { width: 512,  height: 512, fit: 'inside' }
+    logo:   { width: 512,  height: 512, fit: 'inside' },
+    // Event banners are the hero image on an event card. A wide 16:9-ish cap
+    // keeps them crisp on a big card without ever storing a full-res upload.
+    event:  { width: 1600, height: 900, fit: 'inside' }
 };
 
 // Build a clean, collision-resistant S3 key for a VA image.

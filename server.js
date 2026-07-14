@@ -2742,6 +2742,8 @@ app.get('/api/public/va/:id/events', async (req, res) => {
                 title: e.title,
                 description: e.description || '',
                 link: e.link || '',
+                departureIcao: e.departureIcao || '',
+                bannerUrl: e.bannerUrl || '',
                 startsAt: e.startsAt,
                 createdAt: e.createdAt,
             })),

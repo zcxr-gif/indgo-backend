@@ -242,8 +242,24 @@
                     <input id="evTitle" type="text" placeholder="Event title" data-i18n-ph="events.titlePh" required maxlength="120" class="field">
                     <input id="evWhen" type="datetime-local" required class="field">
                 </div>
-                <input id="evLink" type="text" placeholder="Link (sign-up, briefing… optional)" data-i18n-ph="events.linkPh" maxlength="300" class="field">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <input id="evIcao" type="text" placeholder="Departure ICAO (e.g. KLAX)" data-i18n-ph="events.icaoPh" maxlength="4" autocapitalize="characters" spellcheck="false" class="field uppercase">
+                    <input id="evLink" type="text" placeholder="Link (sign-up, briefing… optional)" data-i18n-ph="events.linkPh" maxlength="300" class="field">
+                </div>
                 <textarea id="evDesc" rows="2" placeholder="Details (optional)" data-i18n-ph="events.descPh" maxlength="1000" class="field"></textarea>
+                <!-- Optional hero banner. Clicking the tile opens the file picker; a thumbnail previews the pick. -->
+                <div>
+                    <input id="evBanner" type="file" accept="image/*" class="hidden">
+                    <button type="button" id="evBannerBtn" class="w-full flex items-center gap-3 rounded-xl border border-dashed border-zinc-300 dark:border-zinc-700 px-4 py-3 text-left hover:border-blue-400 hover:bg-blue-50/40 dark:hover:bg-blue-500/5 transition">
+                        <img id="evBannerPreview" class="hidden w-16 h-10 rounded-lg object-cover shrink-0 ring-1 ring-black/10" alt="">
+                        <span id="evBannerIcon" class="w-10 h-10 grid place-items-center rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-500 shrink-0"><i data-lucide="image-plus" class="w-5 h-5"></i></span>
+                        <span class="min-w-0">
+                            <span id="evBannerLabel" class="block text-sm font-medium text-zinc-700 dark:text-zinc-200" data-i18n="events.bannerCta">Add a banner image</span>
+                            <span class="block text-xs text-zinc-400" data-i18n="events.bannerHint">Wide image shown across the event — optional</span>
+                        </span>
+                        <span id="evBannerClear" class="hidden ml-auto text-xs text-rose-500 hover:underline shrink-0" data-i18n="events.bannerClear">Remove</span>
+                    </button>
+                </div>
                 <div class="flex items-center gap-3">
                     <button type="submit" class="btn" data-i18n="events.add">Add event</button>
                     <p id="evMsg" class="hidden text-sm font-medium"></p>
@@ -1436,6 +1452,23 @@
         // ---------- Events ----------
         const fmtEvent = (d) => new Date(d).toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 
+        // Human "time until" the event: "in 3d 4h", "in 2h", "in 15m", "starting
+        // now", or "started". Keeps the card feeling live without a ticking timer.
+        const fmtCountdown = (d) => {
+            const ms = new Date(d).getTime() - Date.now();
+            if (ms <= -60 * 1000) return t('events.started');
+            if (ms <= 60 * 1000) return t('events.now');
+            const mins = Math.round(ms / 60000);
+            const days = Math.floor(mins / 1440);
+            const hrs = Math.floor((mins % 1440) / 60);
+            const rem = mins % 60;
+            let span;
+            if (days > 0) span = days + 'd' + (hrs ? ' ' + hrs + 'h' : '');
+            else if (hrs > 0) span = hrs + 'h' + (rem ? ' ' + rem + 'm' : '');
+            else span = rem + 'm';
+            return t('events.inTime', { time: span });
+        };
+
         async function loadEvents() {
             try {
                 const { events } = await api('/events');
@@ -1443,31 +1476,80 @@
                     $('evList').innerHTML = `<div class="surface rounded-2xl p-6 text-center text-sm text-zinc-400">${esc(t('events.empty'))}</div>`;
                     return;
                 }
-                $('evList').innerHTML = events.map(e => `
-                    <div class="surface rounded-2xl p-4 flex items-start justify-between gap-3">
-                        <div class="min-w-0">
-                            <p class="font-semibold text-sm truncate">${esc(e.title)}</p>
-                            <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5 flex items-center gap-1.5"><i data-lucide="calendar-clock" class="w-3.5 h-3.5"></i>${fmtEvent(e.startsAt)}</p>
-                            ${e.description ? `<p class="text-sm text-zinc-600 dark:text-zinc-300 mt-1.5 whitespace-pre-wrap">${esc(e.description)}</p>` : ''}
-                            ${e.link ? `<a href="${esc(e.link)}" target="_blank" rel="noopener" class="text-xs text-blue-600 dark:text-blue-400 hover:underline inline-flex items-center gap-1 mt-1.5"><i data-lucide="link" class="w-3 h-3"></i>${esc(e.link.replace(/^https?:\/\//,'').slice(0,40))}</a>` : ''}
+                $('evList').innerHTML = events.map(e => {
+                    const soon = new Date(e.startsAt).getTime() - Date.now() < 24 * 60 * 60 * 1000;
+                    const banner = e.bannerUrl
+                        ? `<div class="relative h-36 sm:h-44 w-full overflow-hidden">
+                               <img src="${esc(e.bannerUrl)}" alt="" class="w-full h-full object-cover" loading="lazy" onerror="this.parentElement.style.display='none'">
+                               <div class="absolute inset-0 bg-gradient-to-t from-black/70 via-black/10 to-transparent"></div>
+                               <div class="absolute bottom-3 left-4 right-4 flex items-end justify-between gap-3">
+                                   <h3 class="text-white font-bold text-lg leading-tight drop-shadow truncate">${esc(e.title)}</h3>
+                                   ${e.departureIcao ? `<span class="shrink-0 inline-flex items-center gap-1 rounded-lg bg-white/90 dark:bg-zinc-900/90 px-2 py-1 text-xs font-bold tracking-wide text-zinc-800 dark:text-zinc-100 backdrop-blur"><i data-lucide="plane-takeoff" class="w-3.5 h-3.5"></i>${esc(e.departureIcao)}</span>` : ''}
+                               </div>
+                           </div>`
+                        : '';
+                    return `
+                    <div class="surface rounded-2xl overflow-hidden">
+                        ${banner}
+                        <div class="p-4 flex items-start justify-between gap-3">
+                            <div class="min-w-0">
+                                ${e.bannerUrl ? '' : `<p class="font-semibold text-sm truncate">${esc(e.title)}</p>`}
+                                <div class="flex flex-wrap items-center gap-2 ${e.bannerUrl ? '' : 'mt-0.5'}">
+                                    <span class="inline-flex items-center gap-1.5 text-xs text-zinc-500 dark:text-zinc-400"><i data-lucide="calendar-clock" class="w-3.5 h-3.5"></i>${fmtEvent(e.startsAt)}</span>
+                                    <span class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold ${soon ? 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300' : 'bg-blue-100 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300'}"><i data-lucide="clock" class="w-3 h-3"></i>${esc(fmtCountdown(e.startsAt))}</span>
+                                    ${(e.departureIcao && !e.bannerUrl) ? `<span class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300"><i data-lucide="plane-takeoff" class="w-3 h-3"></i>${esc(e.departureIcao)}</span>` : ''}
+                                </div>
+                                ${e.description ? `<p class="text-sm text-zinc-600 dark:text-zinc-300 mt-2 whitespace-pre-wrap">${esc(e.description)}</p>` : ''}
+                                ${e.link ? `<a href="${esc(e.link)}" target="_blank" rel="noopener" class="text-xs text-blue-600 dark:text-blue-400 hover:underline inline-flex items-center gap-1 mt-2"><i data-lucide="link" class="w-3 h-3"></i>${esc(e.link.replace(/^https?:\/\//,'').slice(0,40))}</a>` : ''}
+                            </div>
+                            <button onclick="deleteEvent('${e.id}')" title="${esc(t('common.remove'))}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-rose-50 dark:hover:bg-rose-500/10 text-rose-500 shrink-0"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
                         </div>
-                        <button onclick="deleteEvent('${e.id}')" title="${esc(t('common.remove'))}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-rose-50 dark:hover:bg-rose-500/10 text-rose-500 shrink-0"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
-                    </div>`).join('');
+                    </div>`;
+                }).join('');
                 drawIcons();
             } catch (err) {
                 $('evList').innerHTML = `<div class="surface rounded-2xl p-5 text-center text-sm text-rose-500">${esc(err.message)}</div>`;
             }
         }
 
+        // ---------- Event banner picker ----------
+        function resetEvBanner() {
+            $('evBanner').value = '';
+            $('evBannerPreview').classList.add('hidden');
+            $('evBannerPreview').removeAttribute('src');
+            $('evBannerIcon').classList.remove('hidden');
+            $('evBannerClear').classList.add('hidden');
+            $('evBannerLabel').textContent = t('events.bannerCta');
+        }
+        $('evBannerBtn').addEventListener('click', (e) => {
+            // The "Remove" affordance lives inside the button; treat it separately.
+            if (e.target.closest('#evBannerClear')) { e.preventDefault(); resetEvBanner(); return; }
+            $('evBanner').click();
+        });
+        $('evBanner').addEventListener('change', (e) => {
+            const f = e.target.files[0];
+            if (!f) { resetEvBanner(); return; }
+            $('evBannerPreview').src = URL.createObjectURL(f);
+            $('evBannerPreview').classList.remove('hidden');
+            $('evBannerIcon').classList.add('hidden');
+            $('evBannerClear').classList.remove('hidden');
+            $('evBannerLabel').textContent = f.name;
+        });
+
         $('evForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             hide('evMsg');
             try {
-                await api('/events', {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ title: $('evTitle').value, startsAt: $('evWhen').value, link: $('evLink').value, description: $('evDesc').value }),
-                });
+                const fd = new FormData();
+                fd.append('title', $('evTitle').value);
+                fd.append('startsAt', $('evWhen').value);
+                fd.append('departureIcao', $('evIcao').value.trim().toUpperCase());
+                fd.append('link', $('evLink').value);
+                fd.append('description', $('evDesc').value);
+                if ($('evBanner').files[0]) fd.append('banner', $('evBanner').files[0]);
+                await api('/events', { method: 'POST', body: fd });
                 $('evForm').reset();
+                resetEvBanner();
                 flash('evMsg', t('events.ok'), true);
                 loadEvents();
             } catch (err) { flash('evMsg', err.message, false); }

@@ -161,6 +161,11 @@ const VaEventSchema = new mongoose.Schema({
     title: { type: String, required: true, trim: true, maxlength: 120 },
     description: { type: String, default: '', maxlength: 1000 },
     link: { type: String, default: '', maxlength: 300 },
+    // Where the flight departs from, so pilots know where to spawn. Stored
+    // uppercase; validated as a 3–4 letter/number ICAO before it's saved.
+    departureIcao: { type: String, default: '', uppercase: true, trim: true, maxlength: 4 },
+    // Optional hero banner (S3 URL) shown large on the event card.
+    bannerUrl: { type: String, default: '' },
     startsAt: { type: Date, required: true },
     createdAt: { type: Date, default: Date.now },
 }, { minimize: true });
@@ -176,6 +181,7 @@ function publicEvent(e) {
     return {
         id: e._id, vaAdId: e.vaAdId, vaName: e.vaName,
         title: e.title, description: e.description || '', link: e.link || '',
+        departureIcao: e.departureIcao || '', bannerUrl: e.bannerUrl || '',
         startsAt: e.startsAt, createdByName: e.createdByName, createdAt: e.createdAt,
     };
 }
@@ -846,6 +852,23 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
         { name: 'logo', maxCount: 1 },
         { name: 'banner', maxCount: 1 },
     ]);
+    // multipart parser for the event editor (optional hero banner).
+    const uploadEventBanner = upload.single('banner');
+
+    // Validate + normalise a departure airport ICAO. ICAO codes are 4 chars
+    // (occasionally 3 for some codes we still accept), letters/digits only.
+    // Returns the uppercased code, or '' when blank; throws on a bad value so
+    // the route can bounce it with a clear message.
+    const normalizeIcao = (raw) => {
+        const s = String(raw == null ? '' : raw).trim().toUpperCase();
+        if (!s) return '';
+        if (!/^[A-Z0-9]{3,4}$/.test(s)) {
+            const err = new Error('Departure ICAO must be a 3–4 character airport code (e.g. KLAX).');
+            err.status = 400;
+            throw err;
+        }
+        return s;
+    };
 
     // Parse a field that may arrive as a JSON array, a CSV string, or an array.
     const parseList = (value) => {
@@ -1499,19 +1522,36 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
         }
     });
 
-    app.post('/api/va-portal/events', requirePortal, async (req, res) => {
+    // Accepts JSON or multipart (so an optional banner image can ride along).
+    app.post('/api/va-portal/events', requirePortal, uploadEventBanner, async (req, res) => {
+        const fs = require('fs');
+        const bannerFile = req.file;
+        const cleanup = () => { if (bannerFile && bannerFile.path) fs.unlink(bannerFile.path, () => {}); };
         try {
             const { title, description, link, startsAt } = req.body || {};
-            if (!title || !String(title).trim()) return res.status(400).json({ error: 'A title is required.' });
+            if (!title || !String(title).trim()) { cleanup(); return res.status(400).json({ error: 'A title is required.' }); }
             const when = new Date(startsAt);
-            if (isNaN(when.getTime())) return res.status(400).json({ error: 'A valid date & time is required.' });
+            if (isNaN(when.getTime())) { cleanup(); return res.status(400).json({ error: 'A valid date & time is required.' }); }
+
+            let departureIcao;
+            try { departureIcao = normalizeIcao(req.body && req.body.departureIcao); }
+            catch (e) { cleanup(); return res.status(e.status || 400).json({ error: e.message }); }
 
             // Soft cap so a VA can't balloon the (tiny) collection.
             const upcoming = await VaEvent.countDocuments({
                 vaAdId: req.portal.vaAdId, startsAt: { $gte: new Date() },
             });
             if (upcoming >= MAX_EVENTS_PER_VA) {
+                cleanup();
                 return res.status(400).json({ error: `You can have at most ${MAX_EVENTS_PER_VA} upcoming events.` });
+            }
+
+            // Optional hero banner → S3 (only if the helper was wired in).
+            let bannerUrl = '';
+            if (bannerFile && uploadVaImage) {
+                bannerUrl = await uploadVaImage(s3Client, bannerFile, req.portal.vaName || 'va', 'event');
+            } else {
+                cleanup();
             }
 
             const event = await VaEvent.create({
@@ -1521,6 +1561,8 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
                 title: String(title).trim().slice(0, 120),
                 description: String(description || '').slice(0, 1000),
                 link: String(link || '').trim().slice(0, 300),
+                departureIcao,
+                bannerUrl,
                 startsAt: when,
             });
             logActivity({
@@ -1530,6 +1572,7 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             });
             res.status(201).json({ event: publicEvent(event) });
         } catch (err) {
+            cleanup();
             console.error('VA portal create event error:', err);
             res.status(500).json({ error: 'Could not save the event.' });
         }
@@ -1540,6 +1583,10 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             const event = await VaEvent.findById(req.params.id);
             if (!event || String(event.vaAdId) !== String(req.portal.vaAdId)) {
                 return res.status(404).json({ error: 'Event not found.' });
+            }
+            // Best-effort: drop the event's banner from S3 so images don't leak.
+            if (event.bannerUrl && deleteVaImage) {
+                await deleteVaImage(s3Client, event.bannerUrl).catch(() => {});
             }
             await event.deleteOne();
             logActivity({
