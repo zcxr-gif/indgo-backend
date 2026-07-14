@@ -291,6 +291,8 @@
             'embed.fld.eventsTemplate': 'Template',
             'embed.fld.eventsHint': 'A separate copy-paste embed you can place next to your live map. It matches the colours & theme you set above.',
             'embed.eventsLink': 'Events + calendar embed',
+            'embed.eventsPreview': 'Events + calendar — live preview',
+            'embed.eventsPreviewNote': 'Updates as you change the template and appearance above. Save to make it live on your site.',
             'embed.tpl.1': '1 · Classic (calendar + list)',
             'embed.tpl.2': '2 · Compact list',
             'embed.tpl.3': '3 · Big banners',

@@ -376,6 +376,12 @@
                             </select>
                         </div>
                         <p class="text-xs text-zinc-400">Surfaces a second copy-paste embed (embed-events.html) that pulls this VA's upcoming events and matches the appearance above. The VA can also toggle this from their portal.</p>
+                        <div id="f_eventsPreviewWrap" class="hidden">
+                            <label class="block text-sm font-semibold mb-1.5"><i class="fa-solid fa-calendar-days text-sky-500 mr-1"></i> Live preview</label>
+                            <iframe id="f_eventsPreviewFrame" class="hidden" style="width:100%;height:520px;border:0;border-radius:12px;overflow:hidden" loading="lazy" title="Events preview"></iframe>
+                            <p id="f_eventsPreviewNote" class="hidden text-xs text-zinc-400">Connect a VA (top of the form) or save the token first to preview the events widget with live data.</p>
+                            <p class="text-xs text-zinc-400 mt-1">Updates as you change the template &amp; appearance. Reflects unsaved edits.</p>
+                        </div>
                     </div>
                 </div>
 
@@ -559,6 +565,67 @@
         }
         window.testEmbed = (token) => openPreviewUrl(urlFor(token));
         window.testEventsEmbed = (token) => openPreviewUrl(eventsUrlFor(token));
+
+        // ---- Live events preview inside the editor form ----
+        // Rebuilds the events widget URL from the CURRENT (unsaved) form values so
+        // staff see template/appearance changes immediately. Uses the config's
+        // token when editing, or ?va=<connected VA> for a not-yet-saved token.
+        let staffEvPreviewTimer = null;
+        function fVal(id) { const el = document.getElementById(id); return el ? el.value.trim() : ''; }
+        function fChk(id) { const el = document.getElementById(id); return el ? el.checked : false; }
+        function editingToken() {
+            const id = fVal('f_id');
+            if (!id) return '';
+            const c = CONFIGS.find(x => x._id === id);
+            return c ? c.token : '';
+        }
+        function buildStaffEventsPreviewUrl() {
+            const p = new URLSearchParams();
+            p.set('template', fVal('f_eventsTemplate') || '1');
+            p.set('theme', fVal('f_theme') || 'dark');
+            if (fVal('f_accent')) p.set('accent', fVal('f_accent'));
+            p.set('gradient', fVal('f_gradient') || 'auto');
+            if (fVal('f_gradientAngle')) p.set('angle', fVal('f_gradientAngle'));
+            if (fVal('f_radius')) p.set('radius', fVal('f_radius'));
+            p.set('header', fVal('f_header') || 'on');
+            p.set('compact', fChk('f_compact') ? '1' : '0');
+            p.set('_', Date.now());
+            const token = editingToken();
+            if (token) return `${EMBED_EVENTS_BASE}?token=${encodeURIComponent(token)}&${p.toString()}`;
+            if (pickedVaId) {
+                p.set('va', pickedVaId);
+                if (fVal('f_va_name')) p.set('name', fVal('f_va_name'));
+                if (fVal('f_va_logo')) p.set('logo', fVal('f_va_logo'));
+                return `${EMBED_EVENTS_BASE}?${p.toString()}`;
+            }
+            return ''; // no token and no VA connected yet
+        }
+        function refreshStaffEventsPreview() {
+            const wrap = document.getElementById('f_eventsPreviewWrap');
+            const frame = document.getElementById('f_eventsPreviewFrame');
+            const note = document.getElementById('f_eventsPreviewNote');
+            if (!wrap || !frame) return;
+            const on = fChk('f_events');
+            wrap.classList.toggle('hidden', !on);
+            if (!on) return;
+            const url = buildStaffEventsPreviewUrl();
+            if (url) { frame.classList.remove('hidden'); note.classList.add('hidden'); frame.src = url; }
+            else { frame.classList.add('hidden'); note.classList.remove('hidden'); }
+        }
+        function scheduleStaffEventsPreview() {
+            clearTimeout(staffEvPreviewTimer);
+            staffEvPreviewTimer = setTimeout(refreshStaffEventsPreview, 250);
+        }
+        function wireStaffEventsPreview() {
+            ['f_theme', 'f_accent', 'f_header', 'f_headerPos', 'f_gradient', 'f_gradientAngle',
+             'f_radius', 'f_compact', 'f_events', 'f_eventsTemplate', 'f_va_name', 'f_va_logo']
+                .forEach(id => {
+                    const el = document.getElementById(id);
+                    if (!el) return;
+                    el.addEventListener('input', scheduleStaffEventsPreview);
+                    el.addEventListener('change', scheduleStaffEventsPreview);
+                });
+        }
         window.copyPreviewUrl = () => copyText(document.getElementById('previewUrl').textContent, 'Embed URL');
         function reloadPreview() {
             const f = document.getElementById('previewFrame');
@@ -670,7 +737,7 @@
         // pick a VA or open an existing embed that already has the link; cleared
         // when the code is hand-edited so a stale id never overrides the code.
         let pickedVaId = null;
-        function onVaCodeEdited() { pickedVaId = null; syncWebhookPanel(); }
+        function onVaCodeEdited() { pickedVaId = null; syncWebhookPanel(); refreshStaffEventsPreview(); }
         let vaDirLoading = null;
 
         async function loadVaDirectory() {
@@ -760,6 +827,7 @@
             // The picked record carries its VA-ad _id + flight-event flags, so we
             // can light up the webhook panel without another lookup.
             syncWebhookPanel(v);
+            refreshStaffEventsPreview(); // a connected VA enables the ?va= preview
         }
 
         // Hide the results dropdown when clicking away from the connector.
@@ -996,6 +1064,7 @@
             document.getElementById('saveLabel').textContent = 'Create token';
             syncWebhookPanel();
             document.getElementById('modal').classList.remove('hidden');
+            refreshStaffEventsPreview();
         }
         function closeModal() { document.getElementById('modal').classList.add('hidden'); }
 
@@ -1044,6 +1113,7 @@
             document.getElementById('saveLabel').textContent = 'Save changes';
             syncWebhookPanel();
             document.getElementById('modal').classList.remove('hidden');
+            refreshStaffEventsPreview();
         }
 
         function toLocalInput(iso) {
@@ -1076,6 +1146,7 @@
             const first = ((csv || '').split(',')[0] || '').trim();
             picker.value = /^#?[0-9a-fA-F]{6}$/.test(first)
                 ? '#' + first.replace(/^#/, '') : '#1d4ed8';
+            scheduleStaffEventsPreview();
         }
 
         function collect() {
@@ -1165,6 +1236,7 @@
             if (res.ok) { toast('Deleted'); await load(); }
         }
 
+        wireStaffEventsPreview();
         load();
     </script>
 </body>
