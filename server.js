@@ -2319,6 +2319,9 @@ app.post('/api/va-ads', requireAuth, uploadVaImages, async (req, res) => {
         if (error.code === 11000) {
             return res.status(409).json({ message: 'A VA with that name already exists.' });
         }
+        if (error && error.status) {
+            return res.status(error.status).json({ message: error.message });
+        }
         console.error('VA Ad Create Error:', error);
         res.status(500).json({ message: 'Server error while creating VA advertisement.' });
     }
@@ -2398,6 +2401,9 @@ app.put('/api/va-ads/:id', requireAuth, uploadVaImages, async (req, res) => {
         cleanupTempFiles([bannerFile, logoFile].filter(Boolean));
         if (error.code === 11000) {
             return res.status(409).json({ message: 'A VA with that name already exists.' });
+        }
+        if (error && error.status) {
+            return res.status(error.status).json({ message: error.message });
         }
         console.error('VA Ad Update Error:', error);
         res.status(500).json({ message: 'Server error while updating VA advertisement.' });
