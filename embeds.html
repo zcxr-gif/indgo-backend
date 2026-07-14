@@ -356,6 +356,27 @@
                         </div>
                     </div>
                     <p class="text-xs text-zinc-400">Compact = slimmer header (smaller logo, tighter padding). Radius 0 = square corners; blank = the widget's default.</p>
+                    <div class="pt-3 mt-1 border-t border-zinc-200 dark:border-zinc-800 space-y-3">
+                        <label class="flex items-center gap-2 text-sm font-semibold cursor-pointer">
+                            <input type="checkbox" id="f_events" class="w-4 h-4 rounded accent-sky-500"> Offer an Events + Calendar companion embed
+                        </label>
+                        <div>
+                            <label class="block text-sm font-semibold mb-1.5">Events template</label>
+                            <select id="f_eventsTemplate" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                                <option value="1">1 · Classic (calendar + list)</option>
+                                <option value="2">2 · Compact list</option>
+                                <option value="3">3 · Big banners</option>
+                                <option value="4">4 · Calendar focus</option>
+                                <option value="5">5 · Minimal</option>
+                                <option value="6">6 · Card grid</option>
+                                <option value="7">7 · Rail</option>
+                                <option value="8">8 · Wide board</option>
+                                <option value="9">9 · Flags &amp; logos</option>
+                                <option value="10">10 · Poster</option>
+                            </select>
+                        </div>
+                        <p class="text-xs text-zinc-400">Surfaces a second copy-paste embed (embed-events.html) that pulls this VA's upcoming events and matches the appearance above. The VA can also toggle this from their portal.</p>
+                    </div>
                 </div>
 
                 <!-- Flight card (map mode) — cosmetic styling of the tap/detail
@@ -986,6 +1007,8 @@
             document.getElementById('f_gradientAngle').value = (c.gradientAngle == null) ? '' : c.gradientAngle;
             document.getElementById('f_compact').checked = !!c.compact;
             document.getElementById('f_radius').value = (c.radius == null) ? '' : c.radius;
+            document.getElementById('f_events').checked = c.events === 'on';
+            document.getElementById('f_eventsTemplate').value = String(c.eventsTemplate || 1);
             const card = c.card || {};
             document.getElementById('f_cardColor').value = card.color || '';
             document.getElementById('f_cardText').value = card.text || '';
@@ -1058,6 +1081,8 @@
                 gradientAngle: v('f_gradientAngle'),
                 compact: document.getElementById('f_compact').checked,
                 radius: v('f_radius'),
+                events: document.getElementById('f_events').checked ? 'on' : 'off',
+                eventsTemplate: v('f_eventsTemplate'),
                 card: {
                     color: v('f_cardColor'),
                     text: v('f_cardText'),

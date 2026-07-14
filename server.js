@@ -345,6 +345,15 @@ const EMBED_MODES = ['roster', 'map'];
 const EMBED_PROVIDERS = ['mapbox', 'free'];
 const EMBED_THEMES = ['dark', 'light'];
 const EMBED_HEADER_POSITIONS = ['top', 'bottom', 'left', 'right'];
+// The Events + Calendar companion widget (embed-events.html) ships 10 layout
+// presets; the VA picks one. Kept here so schema, resolve and validation agree.
+const EMBED_EVENT_TEMPLATE_MAX = 10;
+const normalizeEventsFlag = (v) =>
+    (v === true || v === 1 || v === '1' || v === 'on' || v === 'true') ? 'on' : 'off';
+const normalizeEventsTemplate = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.min(EMBED_EVENT_TEMPLATE_MAX, Math.max(1, Math.round(n))) : 1;
+};
 
 const EmbedConfigSchema = new mongoose.Schema({
     // Opaque token the VA embeds in their iframe URL. Generated on create.
@@ -406,6 +415,14 @@ const EmbedConfigSchema = new mongoose.Schema({
     gradientAngle: { type: Number, default: 120 },                    // degrees
     compact: { type: Boolean, default: false },                       // slimmer header
     radius: { type: Number, default: null },                          // widget corner radius px 0–32; null = widget default
+
+    // --- Events + calendar companion widget (embed-events.html) ---
+    // The VA's choice: 'on' surfaces an Events+Calendar embed that pulls this
+    // VA's upcoming events and styles itself with the same accent/theme/radius
+    // as the map embed. 'off' (default) means the VA hasn't opted in.
+    events: { type: String, enum: ['on', 'off'], default: 'off' },
+    // One of 10 layout presets (size / banners / logos / flags mix), 1-based.
+    eventsTemplate: { type: Number, default: 1, min: 1, max: EMBED_EVENT_TEMPLATE_MAX },
 
     // --- Flight-card customization (map mode) — see EMBEDBACKEND.md §1 ---
     // Purely cosmetic; the widget turns these into CSS on the tap/detail card.
@@ -3456,6 +3473,9 @@ const normalizeCardColor = (raw) => {
 // widget needs, with the same defaults documented in EMBEDBACKEND.md.
 const toResolvePayload = (cfg) => ({
     ok: true,
+    // Which VA ad this embed is tied to — lets the Events+Calendar companion
+    // widget fetch this VA's events via GET /api/public/va/:id/events.
+    vaAdId: cfg.vaAdId ? String(cfg.vaAdId) : '',
     va: { code: cfg.va.code, name: cfg.va.name || cfg.va.code, logo: cfg.va.logo || '' },
     callsignPrefixes: (cfg.callsignPrefixes && cfg.callsignPrefixes.length) ? cfg.callsignPrefixes : [cfg.va.code],
     callsignSuffixes: cfg.callsignSuffixes || [],
@@ -3479,6 +3499,9 @@ const toResolvePayload = (cfg) => ({
     gradientAngle: (cfg.gradientAngle == null) ? 120 : cfg.gradientAngle,
     compact: !!cfg.compact,
     ...(cfg.radius == null ? {} : { radius: cfg.radius }), // omit => widget default
+    // Events + calendar companion widget opt-in + chosen layout preset.
+    events: cfg.events || 'off',
+    eventsTemplate: cfg.eventsTemplate || 1,
     // Flight-card customization (map mode). Served as a nested object, only when
     // at least one field is set, so the widget keeps its defaults otherwise.
     ...(() => {
@@ -3600,6 +3623,10 @@ const applyEmbedFields = (cfg, body) => {
         cfg.radius = (body.radius === '' || body.radius === null || !Number.isFinite(n))
             ? null : Math.min(32, Math.max(0, Math.round(n)));
     }
+
+    // --- Events + calendar companion widget ---
+    if (body.events !== undefined) cfg.events = normalizeEventsFlag(body.events);
+    if (body.eventsTemplate !== undefined) cfg.eventsTemplate = normalizeEventsTemplate(body.eventsTemplate);
 
     // --- Flight-card customization (map mode). Accepts a nested `card` object
     // or the flat aliases cardColor/cardBg, cardText/textColor,
@@ -3763,6 +3790,10 @@ const applyEmbedAppearance = (cfg, body = {}) => {
         cfg.card.blur = (cBlur === '' || cBlur === null || !Number.isFinite(n))
             ? null : Math.min(40, Math.max(0, Math.round(n)));
     }
+
+    // Events + calendar companion widget (the VA's choice + chosen layout).
+    if (body.events !== undefined) cfg.events = normalizeEventsFlag(body.events);
+    if (body.eventsTemplate !== undefined) cfg.eventsTemplate = normalizeEventsTemplate(body.eventsTemplate);
     return cfg;
 };
 

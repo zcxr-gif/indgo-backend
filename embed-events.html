@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Events &amp; Calendar — Inflight embed</title>
+<!--
+  Inflight — Events + Calendar companion widget.
+
+  A self-contained, dependency-free embed a VA drops next to its live-map
+  embed. It resolves the VA + appearance the same way embed.html does, pulls
+  the VA's upcoming events from the PUBLIC read-only API, and renders a month
+  calendar + upcoming list, styled to match the map embed (accent / theme /
+  radius). Ten layout presets ("templates") vary size, banners, logos and
+  flags — the VA picks one in the portal.
+
+  Two ways to drive it (mirrors embed.html):
+    1. Token   : ?token=…            → GET /api/embed/resolve (appearance + vaAdId + template)
+    2. Preview : ?va=<adId>&…        → everything from the URL, no backend token
+  A ?template=1..10 query always overrides the resolved preset (for previews).
+-->
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; }
+  :root {
+    --accent: #2563eb;
+    --accent2: #3b82f6;
+    --angle: 120deg;
+    --radius: 16px;
+    --bg: #0b0f19;
+    --surface: #131a2a;
+    --surface2: #1b2436;
+    --text: #e5e7eb;
+    --muted: #94a3b8;
+    --border: rgba(255,255,255,.09);
+    --shadow: 0 10px 30px rgba(0,0,0,.35);
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  }
+  body[data-theme="light"] {
+    --bg: #f4f6fb;
+    --surface: #ffffff;
+    --surface2: #f1f5f9;
+    --text: #0f172a;
+    --muted: #64748b;
+    --border: rgba(15,23,42,.10);
+    --shadow: 0 10px 30px rgba(15,23,42,.10);
+  }
+  body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.45;
+  }
+  .wrap {
+    min-height: 100%;
+    display: flex;
+    flex-direction: column;
+    max-width: var(--maxw, 860px);
+    margin: 0 auto;
+    padding: 14px;
+    gap: 14px;
+  }
+  a { color: inherit; }
+
+  /* ---- Header ---- */
+  .ev-header {
+    display: flex; align-items: center; gap: 12px;
+    background: linear-gradient(var(--angle), var(--accent), var(--accent2));
+    color: #fff;
+    padding: 14px 16px;
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+  }
+  .ev-header.compact { padding: 9px 13px; }
+  .ev-header img.logo { height: 38px; width: 38px; border-radius: 9px; object-fit: cover; background: rgba(255,255,255,.15); flex: 0 0 auto; }
+  .ev-header.compact img.logo { height: 28px; width: 28px; }
+  .ev-header .h-title { font-weight: 800; font-size: 17px; letter-spacing: -.01em; text-shadow: 0 1px 2px rgba(0,0,0,.25); }
+  .ev-header .h-sub { font-size: 12px; opacity: .9; font-weight: 600; }
+  .ev-header .h-badge { margin-left: auto; background: rgba(255,255,255,.18); backdrop-filter: blur(4px); border-radius: 999px; padding: 4px 11px; font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; gap: 6px; }
+
+  /* ---- Sections & panels ---- */
+  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
+  .content { display: grid; gap: 14px; }
+  .content.side { grid-template-columns: minmax(0, 1fr); }
+  @media (min-width: 720px) { .content.side { grid-template-columns: 320px minmax(0,1fr); align-items: start; } }
+  .section-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+  .section-title h2 { margin: 0; font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+
+  /* ---- Calendar ---- */
+  .cal-nav { display: inline-flex; align-items: center; gap: 4px; }
+  .cal-nav button { background: var(--surface2); border: 1px solid var(--border); color: var(--text); width: 28px; height: 28px; border-radius: 8px; cursor: pointer; font-size: 15px; line-height: 1; display: grid; place-items: center; transition: .15s; }
+  .cal-nav button:hover { border-color: var(--accent); color: var(--accent); }
+  .cal-nav .cal-month { font-weight: 700; font-size: 13px; min-width: 128px; text-align: center; }
+  .cal-grid { padding: 10px; }
+  .cal-dow, .cal-days { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+  .cal-dow span { text-align: center; font-size: 10px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; padding-bottom: 4px; }
+  .cal-cell { position: relative; aspect-ratio: 1 / 1; border-radius: 9px; display: flex; flex-direction: column; align-items: center; justify-content: center; font-size: 13px; font-weight: 600; color: var(--text); background: transparent; border: 1px solid transparent; cursor: default; transition: .12s; }
+  .cal-cell.pad { color: transparent; }
+  .cal-cell.today { border-color: var(--accent); }
+  .cal-cell.has { cursor: pointer; background: var(--surface2); }
+  .cal-cell.has:hover, .cal-cell.sel { background: linear-gradient(var(--angle), var(--accent), var(--accent2)); color: #fff; }
+  .cal-cell .dots { display: flex; gap: 3px; margin-top: 3px; height: 5px; }
+  .cal-cell .dots i { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
+  .cal-cell.has:hover .dots i, .cal-cell.sel .dots i { background: #fff; }
+  .cal-daypanel { padding: 0 12px 12px; }
+
+  /* ---- Event list / cards ---- */
+  .ev-list { display: grid; gap: 10px; padding: 12px; }
+  .ev-list.grid { grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
+  .ev-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; display: flex; flex-direction: column; }
+  .ev-list:not(.grid) .ev-card { box-shadow: none; }
+  .ev-banner { position: relative; width: 100%; aspect-ratio: 16 / 6; overflow: hidden; background: var(--surface2); }
+  .ev-list.grid .ev-banner, .poster .ev-banner { aspect-ratio: 16 / 9; }
+  .ev-banner img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .ev-banner .grad { position: absolute; inset: 0; background: linear-gradient(to top, rgba(0,0,0,.72), rgba(0,0,0,.05) 55%, transparent); }
+  .ev-banner .b-title { position: absolute; left: 12px; right: 12px; bottom: 9px; color: #fff; font-weight: 800; font-size: 16px; line-height: 1.15; text-shadow: 0 1px 3px rgba(0,0,0,.5); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ev-banner .b-icao { position: absolute; top: 10px; right: 10px; background: rgba(255,255,255,.92); color: #0f172a; font-weight: 800; font-size: 11px; letter-spacing: .03em; padding: 3px 8px; border-radius: 8px; display: inline-flex; align-items: center; gap: 5px; backdrop-filter: blur(3px); }
+  .ev-body { padding: 12px 13px; display: flex; gap: 11px; align-items: flex-start; }
+  .ev-date { flex: 0 0 auto; width: 48px; text-align: center; background: linear-gradient(var(--angle), var(--accent), var(--accent2)); color: #fff; border-radius: 11px; padding: 7px 0; box-shadow: var(--shadow); }
+  .ev-date .d-mon { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em; opacity: .95; }
+  .ev-date .d-day { font-size: 20px; font-weight: 800; line-height: 1; }
+  .ev-main { min-width: 0; flex: 1; }
+  .ev-title { font-weight: 700; font-size: 14.5px; letter-spacing: -.01em; margin: 0 0 3px; }
+  .ev-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 2px 0 0; }
+  .chip { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; background: var(--surface2); color: var(--muted); border: 1px solid var(--border); }
+  .chip.time { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .chip.soon { color: #b45309; background: rgba(245,158,11,.14); border-color: rgba(245,158,11,.4); }
+  body[data-theme="dark"] .chip.soon { color: #fbbf24; }
+  .chip.icao { color: #047857; background: rgba(16,185,129,.14); border-color: rgba(16,185,129,.4); }
+  body[data-theme="dark"] .chip.icao { color: #34d399; }
+  .ev-desc { font-size: 13px; color: var(--muted); margin: 7px 0 0; white-space: pre-wrap; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+  .ev-link { display: inline-flex; align-items: center; gap: 5px; margin-top: 8px; font-size: 12px; font-weight: 700; color: var(--accent); text-decoration: none; }
+  .ev-link:hover { text-decoration: underline; }
+
+  /* Poster: featured next event */
+  .poster-hero { border-radius: var(--radius); overflow: hidden; position: relative; box-shadow: var(--shadow); }
+  .poster-hero .ev-banner { aspect-ratio: 16 / 7; }
+  .poster-hero .fallback { padding: 26px 20px; background: linear-gradient(var(--angle), var(--accent), var(--accent2)); color: #fff; }
+  .poster-hero .fallback h1 { margin: 0 0 6px; font-size: 24px; font-weight: 800; }
+
+  /* States */
+  .state { padding: 34px 18px; text-align: center; color: var(--muted); font-size: 14px; }
+  .state .emoji { font-size: 30px; display: block; margin-bottom: 8px; }
+  .spinner { width: 26px; height: 26px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; margin: 0 auto 10px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Powered-by footer */
+  .powered { margin-top: auto; display: flex; align-items: center; justify-content: center; gap: 7px; padding: 4px 0 2px; font-size: 11px; color: var(--muted); text-decoration: none; opacity: .85; }
+  .powered:hover { opacity: 1; }
+  .powered img { height: 14px; width: auto; }
+
+  /* Size presets */
+  body[data-size="sm"] .wrap { --maxw: 440px; }
+  body[data-size="md"] .wrap { --maxw: 860px; }
+  body[data-size="lg"] .wrap { --maxw: 1120px; }
+</style>
+</head>
+<body>
+  <div class="wrap" id="wrap">
+    <div class="state" id="boot"><div class="spinner"></div>Loading events…</div>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+  var $ = function (sel, el) { return (el || document).querySelector(sel); };
+  var wrap = $("#wrap");
+  var qs = new URLSearchParams(location.search);
+
+  // -------- 10 layout presets. A ?template= query overrides the resolved one. --------
+  var TEMPLATES = [
+    { id: 1,  name: "Classic",        size: "md", layout: "both",     banners: true,  logo: true,  flags: false },
+    { id: 2,  name: "Compact list",   size: "sm", layout: "list",     banners: false, logo: true,  flags: false },
+    { id: 3,  name: "Big banners",    size: "lg", layout: "list",     banners: true,  logo: true,  flags: true  },
+    { id: 4,  name: "Calendar focus", size: "lg", layout: "calendar", banners: false, logo: true,  flags: true  },
+    { id: 5,  name: "Minimal",        size: "sm", layout: "list",     banners: false, logo: false, flags: false },
+    { id: 6,  name: "Card grid",      size: "md", layout: "grid",     banners: true,  logo: true,  flags: true  },
+    { id: 7,  name: "Rail",           size: "sm", layout: "list",     banners: false, logo: true,  flags: true  },
+    { id: 8,  name: "Wide board",     size: "lg", layout: "side",     banners: true,  logo: true,  flags: true  },
+    { id: 9,  name: "Flags & logos",  size: "md", layout: "both",     banners: false, logo: true,  flags: true  },
+    { id: 10, name: "Poster",         size: "lg", layout: "poster",   banners: true,  logo: true,  flags: true  }
+  ];
+  var templateById = function (n) {
+    n = Math.min(10, Math.max(1, parseInt(n, 10) || 1));
+    return TEMPLATES[n - 1];
+  };
+
+  // -------- Colour helpers (single accent -> companion gradient stop) --------
+  function clampHex(c) {
+    c = String(c || "").trim();
+    if (/^#?[0-9a-fA-F]{3}$/.test(c)) { c = c.replace("#",""); c = "#" + c[0]+c[0]+c[1]+c[1]+c[2]+c[2]; }
+    return /^#[0-9a-fA-F]{6}$/.test(c) ? c.toLowerCase() : "";
+  }
+  function shade(hex, pct) {
+    var n = parseInt(hex.slice(1), 16);
+    var r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+    var t = pct < 0 ? 0 : 255, p = Math.abs(pct);
+    r = Math.round((t - r) * p + r); g = Math.round((t - g) * p + g); b = Math.round((t - b) * p + b);
+    return "#" + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
+  }
+
+  // -------- ICAO prefix -> country flag emoji (best-effort, generic fallback) --------
+  var ICAO_ISO = {
+    K:"US", PH:"US", PA:"US", PG:"US", C:"CA", MM:"MX", MG:"GT", MB:"BS", MK:"JM", MD:"DO", MT:"HT", MU:"CU", MP:"PA", MR:"CR", MZ:"BZ", MS:"SV", MH:"HN", MN:"NI",
+    SA:"AR", SB:"BR", SC:"CL", SK:"CO", SE:"EC", SG:"PY", SL:"BO", SP:"PE", SU:"UY", SV:"VE", SO:"GF", SM:"SR", SY:"GY",
+    EG:"GB", EI:"IE", EH:"NL", EB:"BE", EL:"LU", ED:"DE", ET:"DE", EK:"DK", EN:"NO", ES:"SE", EF:"FI", EP:"PL", EV:"LV", EE:"EE", EY:"LT",
+    LF:"FR", LE:"ES", LP:"PT", LI:"IT", LG:"GR", LT:"TR", LO:"AT", LK:"CZ", LH:"HU", LR:"RO", LB:"BG", LY:"RS", LC:"CY", LM:"MT", LD:"HR", LJ:"SI", LZ:"SK", LA:"AL", LU:"MD", LQ:"BA", LW:"MK", LS:"CH",
+    UU:"RU", UL:"RU", UW:"RU", UE:"RU", UH:"RU", UK:"UA", UM:"BY", UB:"AZ", UD:"AM", UG:"GE", UA:"KZ", UT:"UZ", UC:"KG",
+    OM:"AE", OO:"OM", OB:"BH", OK:"KW", OT:"QA", OE:"SA", OJ:"JO", OL:"LB", OS:"SY", OI:"IR", OR:"IQ", OP:"PK", OA:"AF", OY:"YE",
+    HE:"EG", HL:"LY", HA:"ET", HK:"KE", HT:"TZ", HU:"UG", HR:"RW", HS:"SD", HH:"ER", HC:"SO", HD:"DJ",
+    DA:"DZ", DT:"TN", DR:"NE", DN:"NG", DG:"GH", DI:"CI", DX:"TG", DB:"BJ", DF:"BF", GM:"MA", GO:"SN", GA:"ML", GU:"GN", GV:"CV", GF:"SL", GL:"LR", GG:"GW",
+    FA:"ZA", FB:"BW", FV:"ZW", FL:"ZM", FW:"MW", FM:"MG", FQ:"MZ", FS:"SC", FN:"AO", FZ:"CD", FG:"GQ", FK:"CM", FO:"GA", FC:"CG", FT:"TD", FE:"CF",
+    VA:"IN", VE:"IN", VI:"IN", VO:"IN", VG:"BD", VN:"NP", VC:"LK", VR:"MV", VY:"MM", VT:"TH", VL:"LA", VD:"KH", VV:"VN",
+    ZB:"CN", ZG:"CN", ZH:"CN", ZL:"CN", ZP:"CN", ZS:"CN", ZU:"CN", ZW:"CN", ZY:"CN", ZK:"KP", ZM:"MN",
+    RJ:"JP", RO:"JP", RK:"KR", RC:"TW", RP:"PH", VH:"HK", VM:"MO",
+    WM:"MY", WB:"BN", WS:"SG", WI:"ID", WA:"ID", WR:"ID", WP:"TL",
+    YM:"AU", YB:"AU", YP:"AU", YS:"AU", NZ:"NZ", NF:"FJ", NV:"VU", NW:"NC", NC:"CK", NT:"PF", NG:"KI", AY:"PG", AN:"NR",
+    BI:"IS", BG:"GL", TX:"BM", TJ:"PR", TI:"VI", TB:"BB", TT:"TT", TV:"VC", TG:"GD", TL:"LC", TA:"AG", TK:"KN", TD:"DM"
+  };
+  function flagFor(icao) {
+    if (!icao) return "";
+    var c = String(icao).toUpperCase();
+    var iso = ICAO_ISO[c.slice(0,2)] || ICAO_ISO[c.slice(0,1)];
+    if (!iso || iso.length !== 2) return "";
+    return String.fromCodePoint(0x1F1E6 + (iso.charCodeAt(0) - 65)) + String.fromCodePoint(0x1F1E6 + (iso.charCodeAt(1) - 65));
+  }
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (m) {
+      return { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[m];
+    });
+  }
+  function safeUrl(u) {
+    u = String(u || "").trim();
+    return /^https?:\/\//i.test(u) ? u : "";
+  }
+
+  // -------- Date helpers --------
+  var MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  var DOW = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+  function fmtDateTime(d) {
+    try { return new Date(d).toLocaleString(undefined, { weekday:"short", month:"short", day:"numeric", hour:"numeric", minute:"2-digit" }); }
+    catch (e) { return new Date(d).toString(); }
+  }
+  function countdown(d) {
+    var ms = new Date(d).getTime() - Date.now();
+    if (ms <= -60000) return "started";
+    if (ms <= 60000) return "starting now";
+    var mins = Math.round(ms / 60000), days = Math.floor(mins/1440), hrs = Math.floor((mins%1440)/60), rem = mins%60;
+    if (days > 0) return "in " + days + "d" + (hrs ? " " + hrs + "h" : "");
+    if (hrs > 0)  return "in " + hrs + "h" + (rem ? " " + rem + "m" : "");
+    return "in " + rem + "m";
+  }
+  var ONE_DAY = 86400000;
+
+  // -------- App state --------
+  var STATE = { tpl: templateById(1), events: [], appearance: {}, va: {}, calMonth: null };
+
+  // ==== Rendering ====
+  function eventDateKey(d) { var x = new Date(d); return x.getFullYear() + "-" + x.getMonth() + "-" + x.getDate(); }
+
+  function renderEventCard(e, tpl) {
+    var banner = safeUrl(e.bannerUrl);
+    var showBanner = tpl.banners && banner;
+    var flag = tpl.flags ? flagFor(e.departureIcao) : "";
+    var start = new Date(e.startsAt);
+    var soon = start.getTime() - Date.now() < ONE_DAY;
+    var link = safeUrl(e.link);
+    var icaoInner = (flag ? flag + " " : "") + esc(e.departureIcao || "");
+
+    var head = showBanner
+      ? '<div class="ev-banner"><img src="' + esc(banner) + '" alt="" loading="lazy" onerror="this.closest(\'.ev-banner\').style.display=\'none\'">' +
+          '<div class="grad"></div>' +
+          '<div class="b-title">' + esc(e.title) + '</div>' +
+          (e.departureIcao ? '<span class="b-icao">🛫 ' + icaoInner + '</span>' : '') +
+        '</div>'
+      : '';
+
+    var dateBadge = '<div class="ev-date"><div class="d-mon">' + MON[start.getMonth()] + '</div><div class="d-day">' + start.getDate() + '</div></div>';
+
+    var meta =
+      '<div class="ev-meta">' +
+        '<span class="chip time">🕑 ' + esc(fmtDateTime(e.startsAt)) + '</span>' +
+        '<span class="chip ' + (soon ? "soon" : "time") + '">⏳ ' + esc(countdown(e.startsAt)) + '</span>' +
+        (!showBanner && e.departureIcao ? '<span class="chip icao">🛫 ' + icaoInner + '</span>' : '') +
+      '</div>';
+
+    var body =
+      '<div class="ev-body">' +
+        dateBadge +
+        '<div class="ev-main">' +
+          (showBanner ? '' : '<h3 class="ev-title">' + esc(e.title) + '</h3>') +
+          meta +
+          (e.description ? '<p class="ev-desc">' + esc(e.description) + '</p>' : '') +
+          (link ? '<a class="ev-link" href="' + esc(link) + '" target="_blank" rel="noopener">🔗 ' + esc(link.replace(/^https?:\/\//,"").slice(0,42)) + '</a>' : '') +
+        '</div>' +
+      '</div>';
+
+    return '<div class="ev-card">' + head + body + '</div>';
+  }
+
+  function renderList(events, tpl, cls) {
+    if (!events.length) return '<div class="state"><span class="emoji">🗓️</span>No upcoming events right now.</div>';
+    return '<div class="ev-list ' + (cls || "") + '">' + events.map(function (e) { return renderEventCard(e, tpl); }).join("") + '</div>';
+  }
+
+  function renderCalendar(tpl) {
+    var base = STATE.calMonth || new Date();
+    var year = base.getFullYear(), month = base.getMonth();
+    var first = new Date(year, month, 1);
+    var startPad = first.getDay();
+    var daysInMonth = new Date(year, month + 1, 0).getDate();
+    var byDay = {};
+    STATE.events.forEach(function (e) {
+      var d = new Date(e.startsAt);
+      if (d.getFullYear() === year && d.getMonth() === month) {
+        (byDay[d.getDate()] = byDay[d.getDate()] || []).push(e);
+      }
+    });
+    var today = new Date();
+    var isThisMonth = today.getFullYear() === year && today.getMonth() === month;
+
+    var cells = "";
+    for (var p = 0; p < startPad; p++) cells += '<div class="cal-cell pad"></div>';
+    for (var day = 1; day <= daysInMonth; day++) {
+      var evs = byDay[day];
+      var classes = "cal-cell" + (evs ? " has" : "") + (isThisMonth && today.getDate() === day ? " today" : "");
+      var dots = evs ? '<div class="dots">' + evs.slice(0,3).map(function(){return "<i></i>";}).join("") + '</div>' : '<div class="dots"></div>';
+      cells += '<div class="' + classes + '" data-day="' + day + '">' + day + dots + '</div>';
+    }
+
+    var dow = DOW.map(function (d) { return "<span>" + d + "</span>"; }).join("");
+    return '' +
+      '<div class="section-title">' +
+        '<h2>Calendar</h2>' +
+        '<div class="cal-nav">' +
+          '<button data-nav="-1" aria-label="Previous month">‹</button>' +
+          '<span class="cal-month">' + MON[month] + " " + year + '</span>' +
+          '<button data-nav="1" aria-label="Next month">›</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="cal-grid"><div class="cal-dow">' + dow + '</div><div class="cal-days">' + cells + '</div></div>' +
+      '<div class="cal-daypanel" id="calDayPanel"></div>';
+  }
+
+  function wireCalendar(tpl, container) {
+    container.querySelectorAll('.cal-nav button[data-nav]').forEach(function (b) {
+      b.addEventListener("click", function () {
+        var base = STATE.calMonth || new Date();
+        STATE.calMonth = new Date(base.getFullYear(), base.getMonth() + parseInt(b.getAttribute("data-nav"), 10), 1);
+        render();
+      });
+    });
+    container.querySelectorAll('.cal-cell.has').forEach(function (c) {
+      c.addEventListener("click", function () {
+        container.querySelectorAll(".cal-cell.sel").forEach(function (x) { x.classList.remove("sel"); });
+        c.classList.add("sel");
+        var day = parseInt(c.getAttribute("data-day"), 10);
+        var base = STATE.calMonth || new Date();
+        var evs = STATE.events.filter(function (e) {
+          var d = new Date(e.startsAt);
+          return d.getFullYear() === base.getFullYear() && d.getMonth() === base.getMonth() && d.getDate() === day;
+        });
+        var panel = $("#calDayPanel", container);
+        if (panel) panel.innerHTML = renderList(evs, tpl, "");
+      });
+    });
+  }
+
+  function render() {
+    var tpl = STATE.tpl, ap = STATE.appearance, va = STATE.va;
+    document.body.setAttribute("data-size", tpl.size);
+
+    // Header
+    var headerHtml = "";
+    if (ap.header !== "off") {
+      var logo = (tpl.logo && va.logo) ? '<img class="logo" src="' + esc(va.logo) + '" alt="" onerror="this.remove()">' : "";
+      headerHtml =
+        '<div class="ev-header ' + (ap.compact ? "compact" : "") + '">' +
+          logo +
+          '<div><div class="h-title">' + esc(va.name || "Events") + '</div><div class="h-sub">Upcoming events &amp; calendar</div></div>' +
+          '<span class="h-badge">🗓️ ' + STATE.events.length + '</span>' +
+        '</div>';
+    }
+
+    // Body by layout
+    var body = "";
+    var upcoming = STATE.events;
+    if (tpl.layout === "calendar") {
+      body = '<div class="panel">' + renderCalendar(tpl) + '</div>';
+    } else if (tpl.layout === "list") {
+      body = '<div class="panel"><div class="section-title"><h2>Upcoming</h2></div>' + renderList(upcoming, tpl, "") + '</div>';
+    } else if (tpl.layout === "grid") {
+      body = '<div class="panel"><div class="section-title"><h2>Upcoming</h2></div>' + renderList(upcoming, tpl, "grid") + '</div>';
+    } else if (tpl.layout === "side") {
+      body = '<div class="content side">' +
+        '<div class="panel">' + renderCalendar(tpl) + '</div>' +
+        '<div class="panel"><div class="section-title"><h2>Upcoming</h2></div>' + renderList(upcoming, tpl, "") + '</div>' +
+      '</div>';
+    } else if (tpl.layout === "poster") {
+      var next = upcoming[0];
+      var hero;
+      if (next) {
+        var b = safeUrl(next.bannerUrl);
+        hero = b
+          ? '<div class="poster-hero"><div class="ev-banner"><img src="' + esc(b) + '" alt=""><div class="grad"></div>' +
+              '<div class="b-title" style="font-size:22px;white-space:normal">' + esc(next.title) + '</div>' +
+              (next.departureIcao ? '<span class="b-icao">🛫 ' + (tpl.flags && flagFor(next.departureIcao) ? flagFor(next.departureIcao) + " " : "") + esc(next.departureIcao) + '</span>' : '') +
+            '</div><div class="ev-body" style="border-top:1px solid var(--border)"><div class="ev-main">' +
+              '<div class="ev-meta"><span class="chip time">🕑 ' + esc(fmtDateTime(next.startsAt)) + '</span><span class="chip soon">⏳ ' + esc(countdown(next.startsAt)) + '</span></div>' +
+              (next.description ? '<p class="ev-desc">' + esc(next.description) + '</p>' : '') +
+            '</div></div></div>'
+          : '<div class="poster-hero"><div class="fallback"><h1>' + esc(next.title) + '</h1><div>' + esc(fmtDateTime(next.startsAt)) + ' · ' + esc(countdown(next.startsAt)) + '</div></div></div>';
+      } else {
+        hero = '<div class="panel"><div class="state"><span class="emoji">🗓️</span>No upcoming events right now.</div></div>';
+      }
+      var rest = upcoming.slice(1);
+      body = hero + (rest.length ? '<div class="panel"><div class="section-title"><h2>Also coming up</h2></div>' + renderList(rest, tpl, "") + '</div>' : "");
+    } else { // "both" (default)
+      body =
+        '<div class="panel">' + renderCalendar(tpl) + '</div>' +
+        '<div class="panel"><div class="section-title"><h2>Upcoming</h2></div>' + renderList(upcoming, tpl, "") + '</div>';
+    }
+
+    var powered =
+      '<a class="powered" href="https://inflight.info" target="_blank" rel="noopener">' +
+        'Powered by <img src="/assets/brand/inflight-logo.png" alt="Inflight" onerror="this.replaceWith(document.createTextNode(\'Inflight\'))">' +
+      '</a>';
+
+    wrap.innerHTML = headerHtml + body + powered;
+
+    if (tpl.layout === "calendar" || tpl.layout === "both" || tpl.layout === "side") {
+      wireCalendar(tpl, wrap);
+    }
+  }
+
+  // ==== Appearance -> CSS variables ====
+  function applyAppearance(ap) {
+    var body = document.body;
+    body.setAttribute("data-theme", ap.theme === "light" ? "light" : "dark");
+
+    var stops = [];
+    if (Array.isArray(ap.accent)) stops = ap.accent.map(clampHex).filter(Boolean);
+    else if (typeof ap.accent === "string" && ap.accent) stops = ap.accent.split(",").map(clampHex).filter(Boolean);
+    var a1 = stops[0] || "#2563eb";
+    var a2;
+    if (ap.gradient === "off") { a2 = a1; }
+    else if (stops[1]) { a2 = stops[1]; }
+    else { a2 = shade(a1, 0.22); }
+
+    var root = document.documentElement.style;
+    root.setProperty("--accent", a1);
+    root.setProperty("--accent2", a2);
+    root.setProperty("--angle", (Number.isFinite(+ap.gradientAngle) ? +ap.gradientAngle : 120) + "deg");
+    if (ap.radius != null && ap.radius !== "" && Number.isFinite(+ap.radius)) {
+      root.setProperty("--radius", Math.min(32, Math.max(0, +ap.radius)) + "px");
+    }
+  }
+
+  function fail(msg) {
+    document.body.setAttribute("data-theme", "dark");
+    wrap.innerHTML = '<div class="state"><span class="emoji">⚠️</span>' + esc(msg) + '</div>';
+  }
+
+  // ==== Data loading ====
+  function loadEvents(vaAdId) {
+    return fetch("/api/public/va/" + encodeURIComponent(vaAdId) + "/events", { credentials: "omit" })
+      .then(function (r) { if (!r.ok) throw new Error("events " + r.status); return r.json(); })
+      .then(function (data) {
+        STATE.events = (data.events || []).slice().sort(function (a, b) { return new Date(a.startsAt) - new Date(b.startsAt); });
+        if (!STATE.va.name) STATE.va.name = (data.va && data.va.name) || STATE.va.name || "Events";
+      });
+  }
+
+  function boot() {
+    var token = (qs.get("token") || "").trim();
+    var tplOverride = qs.get("template");
+
+    // The token may be origin-locked to the VA's own site. This widget runs in
+    // an iframe served from OUR host, so its own location.origin is useless for
+    // that check — report the EMBEDDING page's origin (from the referrer)
+    // instead. If the referrer is stripped we send nothing, and the resolver
+    // only enforces the lock when an origin is actually present.
+    var parentOrigin = "";
+    try { if (document.referrer) parentOrigin = new URL(document.referrer).origin; } catch (e) {}
+
+    var start = token
+      ? fetch("/api/embed/resolve?token=" + encodeURIComponent(token) + (parentOrigin ? "&origin=" + encodeURIComponent(parentOrigin) : ""), { credentials: "omit" })
+          .then(function (r) { if (!r.ok) throw new Error("This embed link is not valid or has been revoked."); return r.json(); })
+          .then(function (cfg) {
+            if (!cfg || cfg.ok === false) throw new Error("This embed link is not valid or has been revoked.");
+            STATE.appearance = cfg;
+            STATE.va = { name: cfg.va && cfg.va.name, logo: cfg.va && cfg.va.logo };
+            STATE.tpl = templateById(tplOverride != null ? tplOverride : cfg.eventsTemplate);
+            if (!cfg.vaAdId) throw new Error("This VA has no events source linked yet.");
+            return cfg.vaAdId;
+          })
+      : Promise.resolve().then(function () {
+          // Preview mode: everything from the URL.
+          var vaAdId = (qs.get("va") || qs.get("vaAdId") || "").trim();
+          if (!vaAdId) throw new Error("Missing embed token. Add ?token=… (or ?va=<id> for a preview).");
+          STATE.appearance = {
+            theme: qs.get("theme") || "dark",
+            accent: qs.get("accent") || qs.get("color") || "",
+            gradient: qs.get("gradient") || "auto",
+            gradientAngle: qs.get("angle"),
+            header: qs.get("header") || "on",
+            compact: qs.get("compact") === "1" || qs.get("compact") === "true",
+            radius: qs.get("radius")
+          };
+          STATE.va = { name: qs.get("name") || "", logo: qs.get("logo") || "" };
+          STATE.tpl = templateById(tplOverride != null ? tplOverride : (qs.get("template") || 1));
+          return vaAdId;
+        });
+
+    start
+      .then(function (vaAdId) { applyAppearance(STATE.appearance); return loadEvents(vaAdId); })
+      .then(function () { render(); })
+      .catch(function (err) { fail(err && err.message ? err.message : "Could not load this events embed."); });
+  }
+
+  boot();
+})();
+</script>
+</body>
+</html>

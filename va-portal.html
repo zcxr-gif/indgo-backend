@@ -1276,6 +1276,8 @@
         let embedEditable = false;
         function copyEmbedUrl(i) { const em = embedsCache[i]; if (em) copyText(em.url, t('embed.link')); }
         function copyEmbedIframe(i) { const em = embedsCache[i]; if (em) copyText(em.iframe, 'iframe'); }
+        function copyEventsUrl(i) { const em = embedsCache[i]; if (em) copyText(em.eventsUrl, t('embed.eventsLink')); }
+        function copyEventsIframe(i) { const em = embedsCache[i]; if (em) copyText(em.eventsIframe, 'iframe'); }
 
         // Small builders for the appearance form (owner only).
         function emSelect(id, cur, opts) {
@@ -1311,6 +1313,12 @@
                     ${emField(t('embed.fld.cardOpacity'), `<input type="number" id="emc_${i}_cardOpacity" min="0" max="100" step="0.05" placeholder="0.6 or 60" value="${card.opacity == null ? '' : esc(String(card.opacity))}" class="field py-2 text-sm mt-1">`)}
                     ${emField(t('embed.fld.cardBlur'), `<input type="number" id="emc_${i}_cardBlur" min="0" max="40" step="1" placeholder="auto" value="${card.blur == null ? '' : esc(String(card.blur))}" class="field py-2 text-sm mt-1">`)}
                 </div>
+                <p class="text-[11px] font-semibold uppercase tracking-wide text-zinc-400 mt-4 mb-1">${esc(t('embed.fld.eventsGroup'))}</p>
+                <label class="flex items-center gap-2 text-sm select-none mb-2"><input type="checkbox" id="emc_${i}_events" ${a.events === 'on' ? 'checked' : ''} class="w-4 h-4 rounded accent-emerald-500">${esc(t('embed.fld.eventsOn'))}</label>
+                <div class="grid grid-cols-2 gap-3">
+                    ${emField(t('embed.fld.eventsTemplate'), emSelect(`emc_${i}_eventsTemplate`, String(a.eventsTemplate || 1), [['1', t('embed.tpl.1')], ['2', t('embed.tpl.2')], ['3', t('embed.tpl.3')], ['4', t('embed.tpl.4')], ['5', t('embed.tpl.5')], ['6', t('embed.tpl.6')], ['7', t('embed.tpl.7')], ['8', t('embed.tpl.8')], ['9', t('embed.tpl.9')], ['10', t('embed.tpl.10')]]))}
+                </div>
+                <p class="text-[11px] text-zinc-400 mt-1">${esc(t('embed.fld.eventsHint'))}</p>
                 <div class="flex items-center gap-2 mt-4 flex-wrap">
                     <button type="button" onclick="saveEmbed(${i})" class="btn py-2 px-3 text-sm"><i data-lucide="check" class="w-3.5 h-3.5"></i> ${esc(t('embed.saveApply'))}</button>
                     <button type="button" onclick="loadEmbeds()" class="text-xs font-medium px-3 py-2 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition">${esc(t('common.reset'))}</button>
@@ -1345,6 +1353,8 @@
                 compact: chk('compact'),
                 radius: val('radius'),
                 freeStyle: val('freeStyle'),
+                events: chk('events') ? 'on' : 'off',
+                eventsTemplate: val('eventsTemplate'),
                 card: { color: val('cardColor'), text: val('cardText'), opacity: val('cardOpacity'), blur: val('cardBlur') },
             };
             const msg = $(`emc_${i}_msg`);
@@ -1355,6 +1365,9 @@
                 });
                 if (res && res.embed) embedsCache[i] = Object.assign(embedsCache[i], res.embed);
                 if (msg) { msg.textContent = t('embed.applied'); msg.className = 'text-xs font-medium text-emerald-600 dark:text-emerald-400'; }
+                // Reflect the events-embed opt-in row without collapsing this panel.
+                const evRow = $(`emb_events_${i}`);
+                if (evRow) evRow.classList.toggle('hidden', !chk('events'));
                 // Re-resolve the live widget so the preview reflects the saved look.
                 const f = $(`emc_${i}_frame`);
                 if (f) f.src = em.url + (em.url.includes('?') ? '&' : '?') + '_=' + Date.now();
@@ -1391,6 +1404,17 @@
                         <div class="flex items-center gap-2">
                             <button onclick="copyEmbedIframe(${i})" class="text-xs font-medium px-3 py-2 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition inline-flex items-center gap-1.5"><i data-lucide="code" class="w-3.5 h-3.5"></i> ${esc(t('embed.copyIframe'))}</button>
                             <a href="${esc(em.url)}" target="_blank" rel="noopener" class="text-xs font-medium px-3 py-2 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition inline-flex items-center gap-1.5"><i data-lucide="external-link" class="w-3.5 h-3.5"></i> ${esc(t('embed.preview'))}</a>
+                        </div>
+                        <div id="emb_events_${i}" class="mt-4 pt-4 border-t border-zinc-100 dark:border-zinc-800 ${em.eventsEnabled ? '' : 'hidden'}">
+                            <label class="text-[11px] font-semibold uppercase tracking-wide text-zinc-400 flex items-center gap-1.5"><i data-lucide="calendar-days" class="w-3.5 h-3.5"></i> ${esc(t('embed.eventsLink'))}</label>
+                            <div class="flex items-center gap-2 mt-1 mb-2">
+                                <code class="flex-1 min-w-0 truncate text-xs px-3 py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-500">${esc(em.eventsUrl)}</code>
+                                <button onclick="copyEventsUrl(${i})" class="btn shrink-0 py-2 px-3 text-xs"><i data-lucide="copy" class="w-3.5 h-3.5"></i></button>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <button onclick="copyEventsIframe(${i})" class="text-xs font-medium px-3 py-2 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition inline-flex items-center gap-1.5"><i data-lucide="code" class="w-3.5 h-3.5"></i> ${esc(t('embed.copyIframe'))}</button>
+                                <a href="${esc(em.eventsUrl)}" target="_blank" rel="noopener" class="text-xs font-medium px-3 py-2 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition inline-flex items-center gap-1.5"><i data-lucide="external-link" class="w-3.5 h-3.5"></i> ${esc(t('embed.preview'))}</a>
+                            </div>
                         </div>
                         ${embedEditable ? embedCustomizeHtml(em, i) : ''}
                     </div>`).join('');

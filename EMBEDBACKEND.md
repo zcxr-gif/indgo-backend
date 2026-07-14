@@ -260,6 +260,10 @@ so you can lock a token to one or more domains.
   "compact": true,
   "radius": 14,                // corner radius px 0–32; omit = widget default
 
+  "vaAdId": "5f…a001",         // the VA-Ads id — lets the events widget fetch events (see §6)
+  "events": "on",             // "on" if the VA opted into the events companion widget
+  "eventsTemplate": 1,         // 1–10 layout preset for the events widget (see §6)
+
   "card": {                    // flight-card styling (map mode) — see §1.2
     "opacity": 0.6,            //   0–1 or 0–100; <0.9 auto-frosts the map
     "color": "#0b1220",        //   hex, rgb(), or a colour name
@@ -474,3 +478,84 @@ and the aerial image itself are fully client-side (OSM + Esri imagery) and need
 4. (Optional) Lock the token to their domain via `allowedOrigins`.
 5. To turn a VA off, set `revoked: true` (or delete the entry) — the widget
    immediately shows "expired or revoked".
+
+---
+
+## 6. Events + Calendar companion widget
+
+Alongside the live map, a VA can surface an **Events + Calendar** widget hosted
+at:
+
+```
+https://inflight.info/embed-events.html
+```
+
+It renders the VA's upcoming events (a month calendar + an upcoming list) and
+styles itself with the **same** appearance the map embed uses (accent, theme,
+gradient, radius, header) so the two sit together and match. It's the VA's
+choice — off by default; the VA turns it on from their portal (Embed tab →
+Customize → *Events + calendar*), or staff enable it in the embed manager.
+
+### Driving it (same two ways as the map widget)
+
+1. **Token** — `?token=…`. The widget calls `/api/embed/resolve`, reads the
+   appearance, the chosen template, and `vaAdId`, then fetches the events from
+   the public endpoint below. This is what you distribute:
+
+   ```html
+   <iframe
+     src="https://inflight.info/embed-events.html?token=THE_SAME_TOKEN"
+     style="width:100%;height:720px;border:0;border-radius:16px;overflow:hidden"
+     loading="lazy" title="Ocean Virtual — Events & Calendar"></iframe>
+   ```
+
+   The events widget reuses the **same token** as the map embed — one token
+   drives both.
+
+2. **Preview** — no token. Pass everything on the URL:
+
+   ```
+   embed-events.html?va=<vaAdId>&template=3&theme=dark&accent=%230ea5e9,%238b5cf6&name=Ocean%20Virtual&logo=…
+   ```
+
+### Extra URL / resolve fields
+
+| Param / field    | Example        | Notes |
+|------------------|----------------|-------|
+| `va` / `vaAdId`  | `5f…a001`      | **Required in preview.** The VA-Ads id (the same id `GET /api/va-ads` returns). Token mode gets it from `resolve`. |
+| `template`       | `1`–`10`       | Layout preset (see below). A `?template=` query always overrides the resolved `eventsTemplate`. |
+| `events`         | `on` / `off`   | Resolve-only: whether the VA opted in. |
+
+It also honours `theme`, `accent`/`color`, `gradient`, `angle`, `radius`,
+`header`, `compact`, `name`, `logo` exactly like the map widget.
+
+### Templates
+
+Ten presets vary size, layout, and which elements show (banners / logos /
+country flags derived from the departure ICAO):
+
+| # | Name | Size | Layout | Banners | Logo | Flags |
+|---|------|------|--------|---------|------|-------|
+| 1 | Classic | md | calendar + list | ✅ | ✅ | — |
+| 2 | Compact list | sm | list | — | ✅ | — |
+| 3 | Big banners | lg | list | ✅ | ✅ | ✅ |
+| 4 | Calendar focus | lg | calendar | — | ✅ | ✅ |
+| 5 | Minimal | sm | list | — | — | — |
+| 6 | Card grid | md | grid | ✅ | ✅ | ✅ |
+| 7 | Rail | sm | list | — | ✅ | ✅ |
+| 8 | Wide board | lg | calendar + list side-by-side | ✅ | ✅ | ✅ |
+| 9 | Flags & logos | md | calendar + list | — | ✅ | ✅ |
+| 10 | Poster | lg | featured hero + list | ✅ | ✅ | ✅ |
+
+### Events data source (public, no auth)
+
+The widget reads events from the existing public endpoint:
+
+```
+GET /api/public/va/<vaAdId>/events
+→ { va:{id,name}, events:[ { id, title, description, link, departureIcao, bannerUrl, startsAt, createdAt } ] }
+```
+
+Upcoming = anything starting later than 12h ago, soonest first (max 50),
+cacheable 60s. Events (with their optional banner + departure ICAO) are created
+by the VA in the portal's **Events** tab.

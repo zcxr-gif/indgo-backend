@@ -43,6 +43,11 @@ const {
 // Where the embed widget is hosted. The portal surfaces a VA's embed link as a
 // read-only, copyable URL; it never lets the VA change the underlying config.
 const EMBED_BASE_URL = process.env.EMBED_BASE_URL || 'https://inflight.info/embed.html';
+// The Events + Calendar companion widget lives beside the map widget. Defaults
+// to the same host as EMBED_BASE_URL (embed.html -> embed-events.html) so a
+// single EMBED_BASE_URL override moves both; can be pinned via its own env.
+const EMBED_EVENTS_BASE_URL = process.env.EMBED_EVENTS_BASE_URL
+    || EMBED_BASE_URL.replace(/embed\.html(?=$|[?#])/, 'embed-events.html');
 
 const COOKIE_NAME = 'va_portal_token';
 const TOKEN_TYPE = 'va_portal';            // distinguishes these tokens from staff tokens
@@ -938,6 +943,10 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
     const serializeEmbed = (c, ad) => {
         const url = `${EMBED_BASE_URL}?token=${encodeURIComponent(c.token)}`;
         const title = (c.va && c.va.name) || (ad && ad.name) || 'VA';
+        // The Events + Calendar companion embed shares the same token (the widget
+        // resolves it for appearance, the VA link and the chosen template).
+        const eventsUrl = `${EMBED_EVENTS_BASE_URL}?token=${encodeURIComponent(c.token)}`;
+        const eventsEnabled = c.events === 'on';
         return {
             id: String(c._id),
             label: c.label || (c.va && c.va.name) || (ad && ad.name) || 'Embed',
@@ -945,6 +954,10 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             revoked: !!c.revoked,
             url,
             iframe: `<iframe src="${url}" style="width:100%;height:560px;border:0;border-radius:16px;overflow:hidden" loading="lazy" title="${title} live map"></iframe>`,
+            // Events + calendar companion widget (only meaningful when enabled).
+            eventsEnabled,
+            eventsUrl,
+            eventsIframe: `<iframe src="${eventsUrl}" style="width:100%;height:720px;border:0;border-radius:16px;overflow:hidden" loading="lazy" title="${title} events & calendar"></iframe>`,
             appearance: {
                 mode: c.mode || 'roster',
                 theme: c.theme || 'dark',
@@ -956,6 +969,8 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
                 compact: !!c.compact,
                 radius: (c.radius == null ? null : c.radius),
                 freeStyle: c.freeStyle || 'dark',
+                events: eventsEnabled ? 'on' : 'off',
+                eventsTemplate: (c.eventsTemplate == null ? 1 : c.eventsTemplate),
                 card: {
                     color: (c.card && c.card.color) || '',
                     text: (c.card && c.card.text) || '',
