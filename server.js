@@ -299,6 +299,11 @@ const VaPilotSchema = new mongoose.Schema({
     usernameLower: { type: String, required: true },             // lowercased match/de-dupe key
     addedBy:       { type: String, default: '' },                // staff/owner who added it (audit)
     addedAt:       { type: Date, default: Date.now },
+    // Optional display metadata a VA can attach via its feed (bare-username adds
+    // leave these empty; isNew defaults to null = "derive from joinedAt at read").
+    rank:          { type: String, default: '' },
+    joinedAt:      { type: Date, default: null },
+    isNew:         { type: Boolean, default: null },
 });
 // One username per VA (case-insensitive), and the fast "who's on this VA's
 // roster" path.
@@ -2692,8 +2697,74 @@ app.delete('/api/va-ads/:id/pilots', requireAuth, async (req, res) => {
 // No auth: these back a VA's own website, called cross-origin (global cors()
 // sends Access-Control-Allow-Origin: *). The :id is the VA's ad id — the same
 // one the public GET /api/va-ads listing returns. Only display-safe fields go
-// out: the roster drops the addedBy audit trail and row ids, and both routes
-// 404 (not 500) on a malformed id.
+// out: the roster drops the addedBy audit trail and row ids, and every route
+// 404s (not 500) on a malformed id.
+
+// The public shape of one upcoming event (drops internal audit fields like
+// vaAdId/vaName/createdByName). One source of truth for both the /events route
+// and the combined /va/:id document.
+const publicVaEvent = (e) => ({
+    id: String(e._id),
+    title: e.title,
+    description: e.description || '',
+    link: e.link || '',
+    startsAt: e.startsAt,
+    endsAt: e.endsAt || null,
+    type: e.type || 'other',
+    route: e.route || '',
+    server: e.server || '',
+    createdAt: e.createdAt,
+});
+// The public shape of one roster pilot (drops the addedBy audit trail; isNew is
+// already resolved by vaPilots.listPilots).
+const publicVaPilot = (p) => ({
+    username: p.username,
+    rank: p.rank || '',
+    joinedAt: p.joinedAt || null,
+    isNew: !!p.isNew,
+    addedAt: p.addedAt,
+});
+// "Upcoming" = anything starting later than 12h ago, soonest first — the same
+// window the portal + public list agree on. Shared by both read paths.
+const loadPublicVaEvents = async (vaAdId) => {
+    const since = new Date(Date.now() - 12 * 60 * 60 * 1000);
+    const events = await VaEvent.find({ vaAdId, startsAt: { $gte: since } })
+        .sort({ startsAt: 1 }).limit(50).lean();
+    return events.map(publicVaEvent);
+};
+
+// GET /api/public/va/:id — the whole public VA document in one call: the ad's
+// display fields plus its upcoming `events` and pilot `pilots`, wrapped in
+// `data` so a VA site can render everything from a single fetch.
+app.get('/api/public/va/:id', async (req, res) => {
+    try {
+        if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+            return res.status(404).json({ message: 'VA not found.' });
+        }
+        const ad = await VirtualAirlineAd.findById(req.params.id).lean();
+        if (!ad) return res.status(404).json({ message: 'VA not found.' });
+
+        const [events, roster] = await Promise.all([
+            loadPublicVaEvents(ad._id),
+            vaPilots.listPilots(VaPilot, ad._id, { q: req.query.q, limit: req.query.limit, skip: req.query.skip }),
+        ]);
+
+        res.set('Cache-Control', 'public, max-age=60');
+        res.json({
+            data: {
+                ...ad,
+                id: String(ad._id),
+                callsign: ad.callsign || '',
+                rosterTotal: roster.rosterTotal,
+                events,
+                pilots: roster.pilots.map(publicVaPilot),
+            },
+        });
+    } catch (error) {
+        console.error('Public VA document error:', error);
+        res.status(500).json({ message: 'Server error while loading the VA.' });
+    }
+});
 
 // GET /api/public/va/:id/pilots?q=&limit=&skip= — the VA's pilot roster.
 // Same search/paging as the staff route: q is a case-insensitive username
@@ -2713,7 +2784,7 @@ app.get('/api/public/va/:id/pilots', async (req, res) => {
             va: { id: String(ad._id), name: ad.name },
             total: out.total,
             rosterTotal: out.rosterTotal,
-            pilots: out.pilots.map(p => ({ username: p.username, addedAt: p.addedAt })),
+            pilots: out.pilots.map(publicVaPilot),
         });
     } catch (error) {
         console.error('Public VA pilots error:', error);
@@ -2731,20 +2802,10 @@ app.get('/api/public/va/:id/events', async (req, res) => {
         }
         const ad = await VirtualAirlineAd.findById(req.params.id).select('_id name').lean();
         if (!ad) return res.status(404).json({ message: 'VA not found.' });
-        const since = new Date(Date.now() - 12 * 60 * 60 * 1000);
-        const events = await VaEvent.find({ vaAdId: ad._id, startsAt: { $gte: since } })
-            .sort({ startsAt: 1 }).limit(50).lean();
         res.set('Cache-Control', 'public, max-age=60');
         res.json({
             va: { id: String(ad._id), name: ad.name },
-            events: events.map(e => ({
-                id: String(e._id),
-                title: e.title,
-                description: e.description || '',
-                link: e.link || '',
-                startsAt: e.startsAt,
-                createdAt: e.createdAt,
-            })),
+            events: await loadPublicVaEvents(ad._id),
         });
     } catch (error) {
         console.error('Public VA events error:', error);

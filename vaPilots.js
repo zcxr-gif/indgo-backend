@@ -167,6 +167,21 @@ const parsePilotUsernames = (value) => {
     return out;
 };
 
+// A pilot counts as "new" for this long after they joined, when the VA didn't
+// send an explicit isNew flag. Derived at read time (not stored) so a pilot
+// silently ages out of "new" without needing a write.
+const NEW_PILOT_WINDOW_MS = 21 * 24 * 60 * 60 * 1000; // 21 days
+
+// Resolve a roster row's isNew: an explicit boolean the VA sent always wins;
+// otherwise derive it from joinedAt against the 21-day window (no joinedAt =>
+// not new). Kept here so every read path (staff, portal, public) agrees.
+const resolvePilotIsNew = (row, now = Date.now()) => {
+    if (typeof row.isNew === 'boolean') return row.isNew;
+    if (!row.joinedAt) return false;
+    const t = new Date(row.joinedAt).getTime();
+    return Number.isNaN(t) ? false : (now - t) <= NEW_PILOT_WINDOW_MS;
+};
+
 // --- DB helpers (VaPilot model passed in) -----------------------------------
 // Each takes the mongoose model first so this module never touches the app's DB
 // connection directly. vaAdId is always an ObjectId (or a value mongoose can
@@ -188,10 +203,11 @@ const listPilots = async (VaPilot, vaAdId, { q = '', limit = 500, skip = 0 } = {
     const sk = Math.max(0, Number(skip) || 0);
     const [rows, total, rosterTotal] = await Promise.all([
         VaPilot.find(filter).sort({ addedAt: -1, _id: -1 }).skip(sk).limit(lim)
-            .select('username addedAt addedBy').lean(),
+            .select('username addedAt addedBy rank joinedAt isNew').lean(),
         VaPilot.countDocuments(filter),
         VaPilot.countDocuments({ vaAdId }),
     ]);
+    const now = Date.now();
     return {
         total,                       // matches for the current search
         rosterTotal,                 // whole roster, ignoring search
@@ -200,6 +216,9 @@ const listPilots = async (VaPilot, vaAdId, { q = '', limit = 500, skip = 0 } = {
             username: r.username,
             addedAt: r.addedAt,
             addedBy: r.addedBy || '',
+            rank: r.rank || '',
+            joinedAt: r.joinedAt || null,
+            isNew: resolvePilotIsNew(r, now),
         })),
     };
 };
@@ -239,6 +258,53 @@ const addPilots = async (VaPilot, vaAdId, rawUsernames, addedBy = '') => {
     };
 };
 
+// Upsert roster rows that carry feed metadata (rank / joinedAt / isNew), keyed
+// on (vaAdId, usernameLower). Unlike addPilots (which only ever inserts bare
+// usernames and skips anything already present), a re-posted feed here REFRESHES
+// an existing pilot's rank/joinedAt/isNew, so the roster tracks the VA's latest
+// post. `entries` are pre-normalized rows from ingestVaFeed.normalizePilots:
+//   { username, usernameLower, rank, joinedAt: Date|null, isNew: bool|null }
+// Returns { added, updated, total }.
+const upsertPilots = async (VaPilot, vaAdId, entries, addedBy = '') => {
+    const rows = (Array.isArray(entries) ? entries : [])
+        .filter((e) => e && e.usernameLower)
+        .slice(0, MAX_BULK);
+    if (!rows.length) return { added: 0, updated: 0, total: await countPilots(VaPilot, vaAdId) };
+
+    const who = String(addedBy || '').slice(0, 120);
+    const ops = rows.map((e) => {
+        // Only send metadata fields the feed actually provided, so a re-post that
+        // omits (say) rank doesn't blank an existing value.
+        const set = { username: e.username };
+        if (e.rank) set.rank = e.rank;
+        if (e.joinedAt) set.joinedAt = e.joinedAt;
+        if (typeof e.isNew === 'boolean') set.isNew = e.isNew;
+        return {
+            updateOne: {
+                filter: { vaAdId, usernameLower: e.usernameLower },
+                update: {
+                    $set: set,
+                    $setOnInsert: { vaAdId, usernameLower: e.usernameLower, addedBy: who },
+                },
+                upsert: true,
+            },
+        };
+    });
+
+    let added = 0;
+    let updated = 0;
+    try {
+        const r = await VaPilot.bulkWrite(ops, { ordered: false });
+        added = (r.upsertedCount != null ? r.upsertedCount : (r.nUpserted || 0));
+        updated = (r.modifiedCount != null ? r.modifiedCount : (r.nModified || 0));
+    } catch (err) {
+        // A concurrent upsert can trip the unique index (E11000); that's benign —
+        // the row exists. Re-throw anything else.
+        if (!(err && (err.code === 11000 || err.writeErrors))) throw err;
+    }
+    return { added, updated, total: await countPilots(VaPilot, vaAdId) };
+};
+
 // Remove one roster entry by its id, scoped to the VA so one VA can't delete
 // another's pilot. Returns { removed, total }.
 const removePilot = async (VaPilot, vaAdId, pilotId) => {
@@ -256,7 +322,7 @@ const clearPilots = async (VaPilot, vaAdId) => {
 };
 
 module.exports = {
-    normalizePilotUsername, parsePilotUsernames,
-    countPilots, listPilots, addPilots, removePilot, clearPilots,
-    MAX_USERNAME_LEN, MAX_BULK,
+    normalizePilotUsername, parsePilotUsernames, resolvePilotIsNew,
+    countPilots, listPilots, addPilots, upsertPilots, removePilot, clearPilots,
+    MAX_USERNAME_LEN, MAX_BULK, NEW_PILOT_WINDOW_MS,
 };

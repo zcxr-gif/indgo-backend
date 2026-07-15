@@ -33,6 +33,10 @@ const { normalizeCardOptions } = require('./vaEventCard');
 // Shared roster helpers — same module the staff API uses, so a VA managing its
 // own roster and staff managing it see identical parsing/de-dupe/limits.
 const vaPilots = require('./vaPilots');
+// Feed normalizers + the event-type vocabulary (single source of truth shared
+// with the VaEvent schema enum below), so a VA's posted events/pilots are
+// coerced identically wherever they enter.
+const { EVENT_TYPES, normalizeEvents, normalizePilots } = require('./ingestVaFeed');
 // Single source of truth for the Terms version + the enforcement ladder, shared
 // with the Discord bot and the public Terms page so nothing drifts.
 const {
@@ -162,6 +166,10 @@ const VaEventSchema = new mongoose.Schema({
     description: { type: String, default: '', maxlength: 1000 },
     link: { type: String, default: '', maxlength: 300 },
     startsAt: { type: Date, required: true },
+    endsAt: { type: Date, default: null },
+    type: { type: String, enum: EVENT_TYPES, default: 'other' },
+    route: { type: String, default: '', maxlength: 120 },
+    server: { type: String, default: '', maxlength: 60 },
     createdAt: { type: Date, default: Date.now },
 }, { minimize: true });
 
@@ -176,7 +184,9 @@ function publicEvent(e) {
     return {
         id: e._id, vaAdId: e.vaAdId, vaName: e.vaName,
         title: e.title, description: e.description || '', link: e.link || '',
-        startsAt: e.startsAt, createdByName: e.createdByName, createdAt: e.createdAt,
+        startsAt: e.startsAt, endsAt: e.endsAt || null,
+        type: e.type || 'other', route: e.route || '', server: e.server || '',
+        createdByName: e.createdByName, createdAt: e.createdAt,
     };
 }
 
@@ -1501,7 +1511,7 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
 
     app.post('/api/va-portal/events', requirePortal, async (req, res) => {
         try {
-            const { title, description, link, startsAt } = req.body || {};
+            const { title, startsAt } = req.body || {};
             if (!title || !String(title).trim()) return res.status(400).json({ error: 'A title is required.' });
             const when = new Date(startsAt);
             if (isNaN(when.getTime())) return res.status(400).json({ error: 'A valid date & time is required.' });
@@ -1514,14 +1524,22 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
                 return res.status(400).json({ error: `You can have at most ${MAX_EVENTS_PER_VA} upcoming events.` });
             }
 
+            // Run the single submission through the same normalizer the feed uses
+            // so the optional fields (endsAt/type/route/server) are coerced/clipped
+            // identically no matter how the event was created.
+            const [norm] = normalizeEvents({ events: [req.body || {}] });
             const event = await VaEvent.create({
                 vaAdId: req.portal.vaAdId,
                 vaName: req.portal.vaName,
                 createdByName: req.portal.displayName || req.portal.username,
-                title: String(title).trim().slice(0, 120),
-                description: String(description || '').slice(0, 1000),
-                link: String(link || '').trim().slice(0, 300),
+                title: (norm && norm.title) || String(title).trim().slice(0, 120),
+                description: norm ? norm.description : '',
+                link: norm ? norm.link : '',
                 startsAt: when,
+                endsAt: norm ? norm.endsAt : null,
+                type: norm ? norm.type : 'other',
+                route: norm ? norm.route : '',
+                server: norm ? norm.server : '',
             });
             logActivity({
                 vaAdId: req.portal.vaAdId, vaName: req.portal.vaName,
@@ -1551,6 +1569,76 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
         } catch (err) {
             console.error('VA portal delete event error:', err);
             res.status(500).json({ error: 'Could not delete the event.' });
+        }
+    });
+
+    // POST: bulk feed — a VA pushes its events + roster in one payload so its own
+    // website (or an automation) can keep Inflight in sync. Owner-only, scoped to
+    // this account's VA. Body: { data: { events:[…], pilots:[…] } } (the wrapper
+    // is optional — a bare { events, pilots } is also accepted). All the aliases
+    // and coercion documented in ingestVaFeed apply. Idempotent: re-posting the
+    // same events updates them in place (keyed on title+startsAt) and re-posting
+    // a pilot refreshes their rank/joinedAt rather than duplicating.
+    app.post('/api/va-portal/feed', requirePortalOwner, async (req, res) => {
+        try {
+            if (!req.portal.vaAdId) return res.status(404).json({ error: 'No VA is linked to this account.' });
+            const vaAdId = req.portal.vaAdId;
+            const who = req.portal.displayName || req.portal.username;
+            // Accept { data: {…} } or a bare {…}.
+            const body = (req.body && typeof req.body.data === 'object' && req.body.data) ? req.body.data : (req.body || {});
+
+            // --- Events: only keep still-relevant ones (the same 12h window the
+            // portal + public list use), then upsert on (title, startsAt) so a
+            // re-post edits in place. New inserts respect the per-VA soft cap.
+            const since = Date.now() - 12 * 60 * 60 * 1000;
+            const events = normalizeEvents(body).filter((e) => e.startsAt.getTime() >= since);
+            let upcomingCount = await VaEvent.countDocuments({ vaAdId, startsAt: { $gte: new Date() } });
+            let eventsAdded = 0;
+            let eventsUpdated = 0;
+            let eventsSkipped = 0;
+            for (const ev of events) {
+                const existing = await VaEvent.findOne({ vaAdId, title: ev.title, startsAt: ev.startsAt }).select('_id');
+                if (existing) {
+                    await VaEvent.updateOne({ _id: existing._id }, { $set: {
+                        endsAt: ev.endsAt, type: ev.type, route: ev.route,
+                        server: ev.server, description: ev.description, link: ev.link,
+                    } });
+                    eventsUpdated++;
+                } else if (upcomingCount >= MAX_EVENTS_PER_VA) {
+                    eventsSkipped++; // over the cap — leave existing events untouched
+                } else {
+                    await VaEvent.create({
+                        vaAdId, vaName: req.portal.vaName, createdByName: who,
+                        title: ev.title, description: ev.description, link: ev.link,
+                        startsAt: ev.startsAt, endsAt: ev.endsAt, type: ev.type,
+                        route: ev.route, server: ev.server,
+                    });
+                    eventsAdded++;
+                    if (ev.startsAt.getTime() >= Date.now()) upcomingCount++;
+                }
+            }
+
+            // --- Pilots: upsert usernames + optional rank/joinedAt/isNew.
+            const pilotRows = normalizePilots(body);
+            let pilots = { added: 0, updated: 0 };
+            if (pilotRows.length) {
+                if (!VaPilot) return res.status(500).json({ error: 'The pilot roster is unavailable right now.' });
+                pilots = await vaPilots.upsertPilots(VaPilot, vaAdId, pilotRows, who);
+            }
+
+            logActivity({
+                vaAdId, vaName: req.portal.vaName, actorName: who, actorRole: req.portal.role,
+                action: 'feed.ingest',
+                detail: `Feed: events +${eventsAdded}/~${eventsUpdated} (skipped ${eventsSkipped}), pilots +${pilots.added}/~${pilots.updated}`,
+            });
+            res.json({
+                ok: true,
+                events: { added: eventsAdded, updated: eventsUpdated, skipped: eventsSkipped },
+                pilots: { added: pilots.added, updated: pilots.updated, total: pilots.total },
+            });
+        } catch (err) {
+            console.error('VA portal feed ingest error:', err);
+            res.status(500).json({ error: 'Could not ingest the feed.' });
         }
     });
 
