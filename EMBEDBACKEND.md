@@ -594,11 +594,14 @@ Content-Type: multipart/form-data
 
 CORS is open (`Access-Control-Allow-Origin: *`), so the site can call it directly
 from the browser. Access is gated by the request's **Origin** — no shared secret:
-the allow-list is `COMMUNITY_SUBMIT_ORIGINS` (comma-separated, defaults to
-`https://inflight.info` plus `PUBLIC_BASE_URL`; `*` accepts any origin). A request
-whose Origin/Referer isn't allow-listed gets `403`. Because a browser sets the
-Origin header and page JS can't forge it, this trusts submissions from our own
-site without a token.
+the allow-list is `COMMUNITY_SUBMIT_ORIGINS` (comma-separated). Entries may use
+`*` as a wildcard matching one host segment, so
+`https://deploy-preview-*--indgo-va.netlify.app` matches **every numbered Netlify
+deploy preview**; a lone `*` accepts any origin. When unset the default covers
+`https://inflight.info`, the Netlify production host, its deploy-preview +
+branch-deploy hosts, and `PUBLIC_BASE_URL`. A request whose Origin/Referer isn't
+allow-listed gets `403`. Because a browser sets the Origin header and page JS
+can't forge it, this trusts submissions from our own sites without a token.
 
 ### Fields (multipart form)
 

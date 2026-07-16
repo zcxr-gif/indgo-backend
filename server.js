@@ -1578,25 +1578,43 @@ app.post('/api/aircraft', requireAuth, uploadAircraftImages, async (req, res) =>
 
 // Origins allowed to submit community aircraft photos. The submitting site is
 // trusted by its Origin (the browser sets it and page JS can't forge it) rather
-// than a shared secret. Defaults to our own site + PUBLIC_BASE_URL; override with
-// a comma-separated COMMUNITY_SUBMIT_ORIGINS list. An entry of `*` disables the
-// check (accept any origin).
+// than a shared secret. Override with a comma-separated COMMUNITY_SUBMIT_ORIGINS
+// list; the default covers the live site plus the Netlify production + preview
+// hosts. Entries may contain `*` as a wildcard that matches one host segment
+// (no dots) — so `deploy-preview-*--indgo-va.netlify.app` matches EVERY numbered
+// deploy preview. A lone `*` entry disables the check (accept any origin).
 const COMMUNITY_SUBMIT_ORIGINS = (() => {
-    const raw = process.env.COMMUNITY_SUBMIT_ORIGINS
-        || `https://inflight.info,${process.env.PUBLIC_BASE_URL || ''}`;
+    const raw = process.env.COMMUNITY_SUBMIT_ORIGINS || [
+        'https://inflight.info',
+        'https://indgo-va.netlify.app',
+        'https://deploy-preview-*--indgo-va.netlify.app',
+        'https://*--indgo-va.netlify.app', // branch deploys
+        process.env.PUBLIC_BASE_URL || '',
+    ].join(',');
     return raw.split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean);
 })();
+
+// Precompile each allow-list entry into a matcher. Plain entries match exactly;
+// entries containing `*` become an anchored regex where `*` matches one host
+// segment ([^.]*), so the deploy-preview NUMBER varies freely without matching a
+// different domain (the `$` anchor stops any suffix like `.attacker.com`).
+const COMMUNITY_SUBMIT_MATCHERS = COMMUNITY_SUBMIT_ORIGINS.map((entry) => {
+    if (entry === '*') return () => true;
+    if (!entry.includes('*')) return (o) => o === entry;
+    const rx = new RegExp('^' + entry.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '[^.]*') + '$');
+    return (o) => rx.test(o);
+});
 
 // Is this request coming from an allowed origin? Uses the Origin header, falling
 // back to the Referer's origin (some clients send only Referer).
 const isAllowedSubmitOrigin = (req) => {
-    if (COMMUNITY_SUBMIT_ORIGINS.includes('*')) return true;
     let origin = (req.get('origin') || '').trim().replace(/\/+$/, '');
     if (!origin) {
         const ref = req.get('referer') || '';
         try { origin = new URL(ref).origin; } catch (_) { origin = ''; }
     }
-    return !!origin && COMMUNITY_SUBMIT_ORIGINS.includes(origin);
+    if (!origin) return false;
+    return COMMUNITY_SUBMIT_MATCHERS.some((match) => match(origin));
 };
 
 // POST /api/community/aircraft/submit — PUBLIC endpoint that lets our front-end
