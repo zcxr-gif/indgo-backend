@@ -578,24 +578,27 @@ banner may move — the widget renders it in a plain `<img>`, which plays it.
 
 ## Partner aircraft submission API
 
-An external partner site can submit community aircraft photos without a staff
-session. Submissions do **not** write to the database directly — each photo is
-optimized, stored in S3, and posted into the **same Discord admin review flow**
-that pilot DM submissions use. Staff approve or reject it there with the existing
+Our front-end site can submit community aircraft photos without a staff session.
+Submissions do **not** write to the database directly — each photo is optimized,
+stored in S3, and posted into the **same Discord admin review flow** that pilot
+DM submissions use. Staff approve or reject it there with the existing
 Approve / Replace / Reject buttons, and only an **approval** creates the record.
+A **rejection** deletes the stored S3 object so nothing is orphaned.
 
 ### Endpoint
 
 ```
 POST /api/community/aircraft/submit
 Content-Type: multipart/form-data
-Authorization: Bearer <COMMUNITY_SUBMIT_TOKEN>   (or header  X-Submit-Token: <token>)
 ```
 
-CORS is open (`Access-Control-Allow-Origin: *`), so the partner site can call it
-directly from the browser. Gate access with `COMMUNITY_SUBMIT_TOKEN` (see
-`.env.example`). When the token is unset the endpoint accepts unauthenticated
-posts — only safe behind a trusted network.
+CORS is open (`Access-Control-Allow-Origin: *`), so the site can call it directly
+from the browser. Access is gated by the request's **Origin** — no shared secret:
+the allow-list is `COMMUNITY_SUBMIT_ORIGINS` (comma-separated, defaults to
+`https://inflight.info` plus `PUBLIC_BASE_URL`; `*` accepts any origin). A request
+whose Origin/Referer isn't allow-listed gets `403`. Because a browser sets the
+Origin header and page JS can't forge it, this trusts submissions from our own
+site without a token.
 
 ### Fields (multipart form)
 
@@ -619,14 +622,14 @@ otherwise pass `collaboratorName`.
 |--------|---------|
 | `202 Accepted` | `{ message, images }` — routed to review. |
 | `400` | Missing image or required type/livery. |
-| `401` | Bad/missing token (only when `COMMUNITY_SUBMIT_TOKEN` is set). |
+| `403` | Origin not on the `COMMUNITY_SUBMIT_ORIGINS` allow-list. |
 | `503` | Discord bot not ready — retry shortly. |
 
 ### Example
 
 ```bash
 curl -X POST https://<backend>/api/community/aircraft/submit \
-  -H "Authorization: Bearer $COMMUNITY_SUBMIT_TOKEN" \
+  -H "Origin: https://inflight.info" \
   -F "aircraftType=A320neo" \
   -F "liveryName=IndiGo" \
   -F "tailNumber=VT-IZA" \

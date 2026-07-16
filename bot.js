@@ -2961,6 +2961,16 @@ client.on('interactionCreate', async (interaction) => {
                         await channel.send(payload).catch(() => {});
                     }
                 }
+
+                // Web submissions upload straight to our bucket BEFORE review, so a
+                // rejection would otherwise orphan that object forever. Delete it now
+                // (only own-bucket URLs — DM submissions embed a Discord attachment,
+                // never an S3 object, so there's nothing of ours to remove). This runs
+                // after the notify above, which for web submissions is a no-op anyway
+                // (no submitter DM channel).
+                if (isOwnCommunityS3Url(rejectedImageUrl)) {
+                    await deleteImageFromS3(rejectedImageUrl);
+                }
                 return;
             }
 

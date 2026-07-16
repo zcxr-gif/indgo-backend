@@ -1576,17 +1576,35 @@ app.post('/api/aircraft', requireAuth, uploadAircraftImages, async (req, res) =>
     }
 });
 
-// Shared secret gating the public partner-submission endpoint. When set, every
-// request must present it as `Authorization: Bearer <token>` (or an
-// `X-Submit-Token` header). Leave blank only behind a trusted network.
-const COMMUNITY_SUBMIT_TOKEN = process.env.COMMUNITY_SUBMIT_TOKEN || null;
+// Origins allowed to submit community aircraft photos. The submitting site is
+// trusted by its Origin (the browser sets it and page JS can't forge it) rather
+// than a shared secret. Defaults to our own site + PUBLIC_BASE_URL; override with
+// a comma-separated COMMUNITY_SUBMIT_ORIGINS list. An entry of `*` disables the
+// check (accept any origin).
+const COMMUNITY_SUBMIT_ORIGINS = (() => {
+    const raw = process.env.COMMUNITY_SUBMIT_ORIGINS
+        || `https://inflight.info,${process.env.PUBLIC_BASE_URL || ''}`;
+    return raw.split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean);
+})();
 
-// POST /api/community/aircraft/submit — PUBLIC (token-gated) endpoint that lets an
-// external partner site submit aircraft photos. It differs from POST /api/aircraft
-// (staff-auth, which writes straight to the database) in two important ways:
-//   • it is called cross-origin by another site — the global cors() already sends
-//     Access-Control-Allow-Origin: *, and access is gated by COMMUNITY_SUBMIT_TOKEN
-//     rather than a staff session; and
+// Is this request coming from an allowed origin? Uses the Origin header, falling
+// back to the Referer's origin (some clients send only Referer).
+const isAllowedSubmitOrigin = (req) => {
+    if (COMMUNITY_SUBMIT_ORIGINS.includes('*')) return true;
+    let origin = (req.get('origin') || '').trim().replace(/\/+$/, '');
+    if (!origin) {
+        const ref = req.get('referer') || '';
+        try { origin = new URL(ref).origin; } catch (_) { origin = ''; }
+    }
+    return !!origin && COMMUNITY_SUBMIT_ORIGINS.includes(origin);
+};
+
+// POST /api/community/aircraft/submit — PUBLIC endpoint that lets our front-end
+// site submit aircraft photos. It differs from POST /api/aircraft (staff-auth,
+// which writes straight to the database) in two important ways:
+//   • it is called cross-origin from the browser — the global cors() already
+//     sends Access-Control-Allow-Origin: *, and access is gated by the request's
+//     Origin (see COMMUNITY_SUBMIT_ORIGINS) rather than a staff session; and
 //   • nothing is written to the database here. Each image is optimized, uploaded
 //     to S3, and handed to the SAME Discord admin review flow as DM submissions —
 //     staff approve/reject with the existing buttons, and only an approval writes
@@ -1595,13 +1613,9 @@ const COMMUNITY_SUBMIT_TOKEN = process.env.COMMUNITY_SUBMIT_TOKEN || null;
 app.post('/api/community/aircraft/submit', uploadAircraftImages, async (req, res) => {
     const files = collectUploadedImages(req);
     try {
-        if (COMMUNITY_SUBMIT_TOKEN) {
-            const auth = req.get('authorization') || '';
-            const provided = auth.startsWith('Bearer ') ? auth.slice(7).trim() : (req.get('x-submit-token') || '').trim();
-            if (provided !== COMMUNITY_SUBMIT_TOKEN) {
-                cleanupTempFiles(files);
-                return res.status(401).json({ message: 'Invalid or missing submission token.' });
-            }
+        if (!isAllowedSubmitOrigin(req)) {
+            cleanupTempFiles(files);
+            return res.status(403).json({ message: 'Origin not allowed to submit.' });
         }
 
         if (files.length === 0) {
