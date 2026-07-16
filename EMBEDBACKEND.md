@@ -573,3 +573,71 @@ cacheable 60s. Events (with their optional banner + departure ICAO) are created
 by the VA in the portal's **Events** tab. `bannerUrl` is always a `.webp`;
 animated uploads (GIF / animated WebP) are preserved as **animated WebP**, so a
 banner may move — the widget renders it in a plain `<img>`, which plays it.
+
+---
+
+## Partner aircraft submission API
+
+Our front-end site can submit community aircraft photos without a staff session.
+Submissions do **not** write to the database directly — each photo is optimized,
+stored in S3, and posted into the **same Discord admin review flow** that pilot
+DM submissions use. Staff approve or reject it there with the existing
+Approve / Replace / Reject buttons, and only an **approval** creates the record.
+A **rejection** deletes the stored S3 object so nothing is orphaned.
+
+### Endpoint
+
+```
+POST /api/community/aircraft/submit
+Content-Type: multipart/form-data
+```
+
+CORS is open (`Access-Control-Allow-Origin: *`), so the site can call it directly
+from the browser. Access is gated by the request's **Origin** — no shared secret:
+the allow-list is `COMMUNITY_SUBMIT_ORIGINS` (comma-separated). Entries may use
+`*` as a wildcard matching one host segment, so
+`https://deploy-preview-*--indgo-va.netlify.app` matches **every numbered Netlify
+deploy preview**; a lone `*` accepts any origin. When unset the default covers
+`https://inflight.info`, the Netlify production host, its deploy-preview +
+branch-deploy hosts, and `PUBLIC_BASE_URL`. A request whose Origin/Referer isn't
+allow-listed gets `403`. Because a browser sets the Origin header and page JS
+can't forge it, this trusts submissions from our own sites without a token.
+
+### Fields (multipart form)
+
+| Field | Required | Notes |
+|-------|----------|-------|
+| `images` | ✅ (1–3) | The photo file(s). A single legacy `image` field is also accepted. |
+| `aircraftType` *(or `model`)* | ✅ | e.g. `A320neo`. |
+| `liveryName` *(or `livery`)* | ✅ | e.g. `IndiGo`. |
+| `tailNumber` *(or `registration`)* | — | Optional; staff can set it during review. |
+| `collaboratorId` | — | The collaborator's **Discord user id** if the partner site has a linked account. When present, credit + the contributor role + the leaderboard all work natively. |
+| `collaboratorName` *(or `collaborator`)* | — | Display name to credit when there's no linked Discord id. Defaults to `Anonymous`. |
+| `sourceSite` | — | Free-text label for where the submission came from (shown on the review card). Falls back to the request `Origin`. |
+
+The **collaborator** is taken from the submitting site's identity rather than a
+Discord DM author: pass `collaboratorId` when the user has linked Discord,
+otherwise pass `collaboratorName`.
+
+### Responses
+
+| Status | Meaning |
+|--------|---------|
+| `202 Accepted` | `{ message, images }` — routed to review. |
+| `400` | Missing image or required type/livery. |
+| `403` | Origin not on the `COMMUNITY_SUBMIT_ORIGINS` allow-list. |
+| `503` | Discord bot not ready — retry shortly. |
+
+### Example
+
+```bash
+curl -X POST https://<backend>/api/community/aircraft/submit \
+  -H "Origin: https://inflight.info" \
+  -F "aircraftType=A320neo" \
+  -F "liveryName=IndiGo" \
+  -F "tailNumber=VT-IZA" \
+  -F "collaboratorId=123456789012345678" \
+  -F "collaboratorName=SkySpotter" \
+  -F "sourceSite=partner-gallery" \
+  -F "images=@/path/to/photo.jpg"
+```

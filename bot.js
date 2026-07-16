@@ -401,6 +401,25 @@ const normalizeData = async (rawType, rawLivery) => {
 // post to a channel by ID without holding its own bot connection.
 let botClient = null;
 
+// Assigned inside startDiscordBot. Lets the HTTP layer (server.js) hand an
+// aircraft photo submitted from an EXTERNAL partner site into the exact same
+// admin review + public-feed flow that Discord DM submissions use, so staff
+// approve/reject them with the identical buttons. Kept as a stable exported
+// wrapper (see submitWebAircraftReview) over this reassignable impl so a
+// destructured `require('./bot')` import always sees the live function.
+let _submitWebAircraftReviewImpl = null;
+
+// Public entry: post an aircraft photo (already uploaded to our S3 bucket) to the
+// admin review channel + public feed. Throws if the bot isn't ready so the caller
+// can surface a clear error to the submitting site. See the impl inside
+// startDiscordBot for the accepted fields.
+async function submitWebAircraftReview(payload) {
+    if (typeof _submitWebAircraftReviewImpl !== 'function') {
+        throw new Error('Discord bot not ready — cannot post aircraft review');
+    }
+    return _submitWebAircraftReviewImpl(payload);
+}
+
 // Post a message/embed to a Discord channel by ID using the running bot client.
 // Fire-and-forget: a no-op (logged) if the client isn't ready or the channel
 // can't be reached, so callers never have to guard against startup races.
@@ -1212,6 +1231,20 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         } catch (err) {
             console.error('S3 delete error:', err.message);
         }
+    };
+
+    // True when the URL already points at a processed object in OUR community
+    // bucket. Web submissions upload straight to S3 before review, so on approval
+    // we can reuse the URL as-is instead of re-fetching + re-running it through a
+    // full sharp pipeline — that saves a native image allocation per approval
+    // (helps under memory pressure) and avoids orphaning the object we stored.
+    const isOwnCommunityS3Url = (url) => {
+        if (!url) return false;
+        try {
+            const u = new URL(url);
+            return u.hostname === `${bucketName}.s3.${region}.amazonaws.com`
+                && u.pathname.startsWith('/community-aircraft/');
+        } catch (_) { return false; }
     };
 
     // Normalize a record's images into an ordered array (handles legacy single-image docs).
@@ -2225,12 +2258,35 @@ client.on('interactionCreate', async (interaction) => {
                     if (!tailField || !typeField || !liveryField) throw new Error("Missing required aircraft embed fields.");
 
                     let imageUrl = receivedEmbed.image?.url || interaction.message.attachments.first()?.url;
-                    const publicMsgId = (receivedEmbed.footer?.text || '').match(/Msg: (\d+)/)?.[1];
-                    const originChannelId = (receivedEmbed.footer?.text || '').match(/Ch: (\d+)/)?.[1];
+                    const footerText = receivedEmbed.footer?.text || '';
+                    const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
+                    const originChannelId = footerText.match(/Ch: (\d+)/)?.[1];
 
-                    const permanentUrl = await uploadImageToS3(imageUrl, tailField);
-                    const member = await interaction.guild.members.fetch(targetUserId).catch(() => null);
-                    const contributorName = member ? member.displayName : (await client.users.fetch(targetUserId)).username;
+                    // Web submissions arrive already stored in our bucket — reuse
+                    // that object rather than re-processing it through sharp.
+                    const permanentUrl = isOwnCommunityS3Url(imageUrl)
+                        ? imageUrl
+                        : await uploadImageToS3(imageUrl, tailField);
+
+                    // Resolve the collaborator. A numeric token is a Discord id
+                    // (DM submissions, or a web submission from a Discord-linked
+                    // account) — fetch the member/user for their name and grant the
+                    // contributor role. A non-numeric token ('web') means the
+                    // submitting site had no linked Discord identity, so credit the
+                    // display name carried in the footer with no Discord id.
+                    const isDiscordId = /^\d{5,}$/.test(String(targetUserId));
+                    const footerCollab = footerText.match(/Collab: ([^|]+?)\s*(?:\||$)/)?.[1]?.trim();
+                    let member = null;
+                    let contributorName = null;
+                    let contributorId = null;
+                    if (isDiscordId) {
+                        member = await interaction.guild.members.fetch(targetUserId).catch(() => null);
+                        contributorName = member
+                            ? member.displayName
+                            : await client.users.fetch(targetUserId).then(u => u.username).catch(() => null);
+                        contributorId = targetUserId;
+                    }
+                    if (!contributorName) contributorName = footerCollab || 'Anonymous';
 
                     // Find the existing record (if any) so we can place the new photo into
                     // the admin-chosen slot without disturbing the other images.
@@ -2282,7 +2338,7 @@ client.on('interactionCreate', async (interaction) => {
                     // The person who submitted this photo is the contributor of THIS
                     // slot only — adding/replacing photo 2 or 3 must not overwrite the
                     // contributor(s) of the other images.
-                    const slotContributor = { name: contributorName, id: targetUserId };
+                    const slotContributor = { name: contributorName, id: contributorId };
 
                     let replacedUrl = null;
                     if (isReplace && slotIndex < images.length) {
@@ -2904,6 +2960,16 @@ client.on('interactionCreate', async (interaction) => {
                         }
                         await channel.send(payload).catch(() => {});
                     }
+                }
+
+                // Web submissions upload straight to our bucket BEFORE review, so a
+                // rejection would otherwise orphan that object forever. Delete it now
+                // (only own-bucket URLs — DM submissions embed a Discord attachment,
+                // never an S3 object, so there's nothing of ours to remove). This runs
+                // after the notify above, which for web submissions is a no-op anyway
+                // (no submitter DM channel).
+                if (isOwnCommunityS3Url(rejectedImageUrl)) {
+                    await deleteImageFromS3(rejectedImageUrl);
                 }
                 return;
             }
@@ -3882,6 +3948,99 @@ client.on('interactionCreate', async (interaction) => {
     // Expose the client module-wide so postToChannel() can reach it.
     botClient = client;
 
+    // Web-submitted aircraft photos (from an external partner site via
+    // POST /api/community/aircraft/submit) are routed through the SAME admin
+    // review flow as Discord DM submissions: a pending card in the public feed +
+    // a review card in the admin channel with the existing approve/reject/edit
+    // buttons. The only differences from the DM path are:
+    //   • the image is already a permanent object in our S3 bucket, so we embed
+    //     it by URL instead of uploading a temp Discord attachment (the approval
+    //     handler detects an own-bucket URL and skips re-processing); and
+    //   • the collaborator identity comes from the submitting site, not a DM
+    //     author — a linked Discord id when the site has one (so credit, the
+    //     contributor role and the leaderboard all work natively), otherwise a
+    //     display name carried in the footer for the approval handler to use.
+    _submitWebAircraftReviewImpl = async ({
+        aircraftType, liveryName, tailNumber,
+        imageUrl, collaboratorId, collaboratorName, sourceSite,
+    }) => {
+        if (!client || !client.isReady || !client.isReady()) {
+            throw new Error('Discord bot not ready');
+        }
+
+        const type = String(aircraftType || '').trim();
+        const livery = String(liveryName || '').trim();
+        const tail = String(tailNumber || 'UNKNOWN').trim().toUpperCase() || 'UNKNOWN';
+        if (!type || !livery || !imageUrl) {
+            throw new Error('aircraftType, liveryName and imageUrl are required');
+        }
+
+        // A linked Discord id is the strongest identity — thread it through the
+        // buttons/footer exactly like the DM path's user id. Otherwise use a
+        // non-numeric 'web' token and carry the display name in the footer.
+        const hasDiscordId = /^\d{5,}$/.test(String(collaboratorId || ''));
+        const buttonToken = hasDiscordId ? String(collaboratorId) : 'web';
+        // Sanitize the display name so it can't break footer parsing (we split on
+        // '|') or overflow Discord's field limits.
+        const safeName = String(collaboratorName || 'Anonymous')
+            .replace(/[|\r\n]+/g, ' ').trim().slice(0, 60) || 'Anonymous';
+        const safeSource = String(sourceSite || '')
+            .replace(/[|\r\n]+/g, ' ').trim().slice(0, 40);
+
+        const adminChannel = await client.channels.fetch(ADMIN_CHANNEL_ID);
+        const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
+
+        const contributorDisplay = hasDiscordId ? `<@${buttonToken}>` : safeName;
+
+        // 1. Public feed — pending. S3 URLs are permanent, so embed by URL.
+        const publicEmbed = themedEmbed(SUB_STATE.PENDING.color)
+            .setTitle('📸 New Aircraft Spotted')
+            .setDescription(`**Status:** ${SUB_STATE.PENDING.badge}\nA new photo has been submitted${safeSource ? ` via **${safeSource}**` : ''} and is awaiting admin review.`)
+            .addFields(
+                { name: 'Aircraft', value: type, inline: true },
+                { name: 'Livery', value: livery, inline: true },
+                { name: 'Tail Number', value: tail, inline: true },
+                { name: 'Submitted By', value: contributorDisplay, inline: false }
+            )
+            .setImage(imageUrl)
+            .setTimestamp();
+        const publicMsg = await feedChannel.send({ embeds: [publicEmbed] });
+
+        // 2. Admin review card — identical field layout to the DM path so the
+        //    approve/reject handlers read it unchanged.
+        const finalEmbed = new EmbedBuilder()
+            .addFields(
+                { name: 'Contributor', value: contributorDisplay, inline: true },
+                { name: 'Tail Number', value: tail, inline: true },
+                { name: 'Aircraft Type', value: type, inline: true },
+                { name: 'Livery', value: livery, inline: true },
+            )
+            .setImage(imageUrl)
+            .setTimestamp();
+
+        let existingEntry = null;
+        try {
+            existingEntry = await CommunityAircraftModel.findOne({
+                aircraftType: { $regex: new RegExp(`^${escapeRegex(type)}$`, 'i') },
+                liveryName: { $regex: new RegExp(`^${escapeRegex(livery)}$`, 'i') }
+            });
+        } catch (e) { console.error('Web submission duplicate check failed:', e.message); }
+
+        const { components: adminComponents, extraEmbeds } = buildAircraftReview(finalEmbed, existingEntry, buttonToken);
+
+        // Footer carries the same Msg pointer the approval/reject handlers parse.
+        // No `Ch:` (there's no submitter DM channel to notify). For the id-less
+        // case we append `Collab:` so approval can credit the external identity.
+        let footer = `Pending | User: ${buttonToken} | Msg: ${publicMsg.id}`;
+        if (!hasDiscordId) footer += ` | Collab: ${safeName}`;
+        if (safeSource) footer += ` | Src: ${safeSource}`;
+        finalEmbed.setFooter({ text: footer });
+
+        await adminChannel.send({ embeds: [finalEmbed, ...extraEmbeds], components: adminComponents });
+
+        return { ok: true, feedMessageId: publicMsg.id };
+    };
+
     if (process.env.DISCORD_BOT_TOKEN) {
         client.login(process.env.DISCORD_BOT_TOKEN).catch((err) => {
             console.error('🤖 Discord login failed (continuing without bot):', err && err.message ? err.message : err);
@@ -3891,4 +4050,4 @@ client.on('interactionCreate', async (interaction) => {
     }
 };
 
-module.exports = { startDiscordBot, postToChannel };
+module.exports = { startDiscordBot, postToChannel, submitWebAircraftReview };

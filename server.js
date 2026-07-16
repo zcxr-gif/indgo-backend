@@ -64,7 +64,7 @@ process.on('uncaughtException', (err) => {
 });
 
 // IMPORT THE BOT
-const { startDiscordBot } = require('./bot');
+const { startDiscordBot, submitWebAircraftReview } = require('./bot');
 
 // 1. INITIALIZE APP
 const app = express();
@@ -769,8 +769,23 @@ const collectUploadedImages = (req) => {
     return files.slice(0, MAX_AIRCRAFT_IMAGES);
 };
 
+// Serialize aircraft-image sharp pipelines. Each resize decodes a full-res image
+// into a large native (libvips) buffer; a burst of uploads — now reachable from
+// the public partner-submission endpoint, not just staff — could otherwise run
+// several at once and spike RSS toward the container cap (and on glibc that freed
+// native memory lingers in the allocator's arenas, the "RSS only drops on
+// restart" effect). A single-slot queue keeps at most one pipeline's buffers
+// alive at a time. This mirrors the render queue in vaEventCardImage.js. The cost
+// is a few ms of ordering per image, invisible next to the S3 round-trip.
+let aircraftImageTail = Promise.resolve();
+const queueAircraftImage = (task) => {
+    const result = aircraftImageTail.then(task);
+    aircraftImageTail = result.then(() => {}, () => {});
+    return result;
+};
+
 // Helper: Optimize a single image file and upload it to S3, returning the public URL.
-const processAndUploadAircraftImage = async (file, tailRef) => {
+const processAndUploadAircraftImage = (file, tailRef) => queueAircraftImage(async () => {
     const optimizedBuffer = await sharp(file.path)
         .resize({ width: 1920, withoutEnlargement: true })
         .webp({ quality: 80 })
@@ -788,7 +803,7 @@ const processAndUploadAircraftImage = async (file, tailRef) => {
     }));
 
     return `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileName}`;
-};
+});
 
 // Helper: Delete every image associated with an aircraft entry (primary + gallery).
 const deleteAircraftImages = async (entry) => {
@@ -1558,6 +1573,127 @@ app.post('/api/aircraft', requireAuth, uploadAircraftImages, async (req, res) =>
 
         console.error('Upload Error:', error);
         res.status(500).json({ message: 'Server error during upload.' });
+    }
+});
+
+// Origins allowed to submit community aircraft photos. The submitting site is
+// trusted by its Origin (the browser sets it and page JS can't forge it) rather
+// than a shared secret. Override with a comma-separated COMMUNITY_SUBMIT_ORIGINS
+// list; the default covers the live site plus the Netlify production + preview
+// hosts. Entries may contain `*` as a wildcard that matches one host segment
+// (no dots) — so `deploy-preview-*--indgo-va.netlify.app` matches EVERY numbered
+// deploy preview. A lone `*` entry disables the check (accept any origin).
+const COMMUNITY_SUBMIT_ORIGINS = (() => {
+    const raw = process.env.COMMUNITY_SUBMIT_ORIGINS || [
+        'https://inflight.info',
+        'https://indgo-va.netlify.app',
+        'https://deploy-preview-*--indgo-va.netlify.app',
+        'https://*--indgo-va.netlify.app', // branch deploys
+        process.env.PUBLIC_BASE_URL || '',
+    ].join(',');
+    return raw.split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean);
+})();
+
+// Precompile each allow-list entry into a matcher. Plain entries match exactly;
+// entries containing `*` become an anchored regex where `*` matches one host
+// segment ([^.]*), so the deploy-preview NUMBER varies freely without matching a
+// different domain (the `$` anchor stops any suffix like `.attacker.com`).
+const COMMUNITY_SUBMIT_MATCHERS = COMMUNITY_SUBMIT_ORIGINS.map((entry) => {
+    if (entry === '*') return () => true;
+    if (!entry.includes('*')) return (o) => o === entry;
+    const rx = new RegExp('^' + entry.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '[^.]*') + '$');
+    return (o) => rx.test(o);
+});
+
+// Is this request coming from an allowed origin? Uses the Origin header, falling
+// back to the Referer's origin (some clients send only Referer).
+const isAllowedSubmitOrigin = (req) => {
+    let origin = (req.get('origin') || '').trim().replace(/\/+$/, '');
+    if (!origin) {
+        const ref = req.get('referer') || '';
+        try { origin = new URL(ref).origin; } catch (_) { origin = ''; }
+    }
+    if (!origin) return false;
+    return COMMUNITY_SUBMIT_MATCHERS.some((match) => match(origin));
+};
+
+// POST /api/community/aircraft/submit — PUBLIC endpoint that lets our front-end
+// site submit aircraft photos. It differs from POST /api/aircraft (staff-auth,
+// which writes straight to the database) in two important ways:
+//   • it is called cross-origin from the browser — the global cors() already
+//     sends Access-Control-Allow-Origin: *, and access is gated by the request's
+//     Origin (see COMMUNITY_SUBMIT_ORIGINS) rather than a staff session; and
+//   • nothing is written to the database here. Each image is optimized, uploaded
+//     to S3, and handed to the SAME Discord admin review flow as DM submissions —
+//     staff approve/reject with the existing buttons, and only an approval writes
+//     the record. The collaborator to credit comes from the submitting site's
+//     identity (a linked Discord id when it has one, else a display name).
+app.post('/api/community/aircraft/submit', uploadAircraftImages, async (req, res) => {
+    const files = collectUploadedImages(req);
+    try {
+        if (!isAllowedSubmitOrigin(req)) {
+            cleanupTempFiles(files);
+            return res.status(403).json({ message: 'Origin not allowed to submit.' });
+        }
+
+        if (files.length === 0) {
+            return res.status(400).json({ message: 'At least one image file is required.' });
+        }
+
+        const {
+            aircraftType, model,
+            liveryName, livery,
+            tailNumber, registration,
+            collaboratorId,
+            collaboratorName, collaborator,
+            sourceSite,
+        } = req.body;
+
+        const finalType = (aircraftType || model || '').trim();
+        const finalLivery = (liveryName || livery || '').trim();
+        // Tail is optional for partner submissions — staff can fill it in during
+        // review (the approval flow already tolerates an UNKNOWN tail).
+        const finalTail = (tailNumber || registration || 'UNKNOWN').toUpperCase();
+
+        if (!finalType || !finalLivery) {
+            cleanupTempFiles(files);
+            return res.status(400).json({ message: 'aircraftType (or model) and liveryName (or livery) are required.' });
+        }
+
+        // Collaborator identity supplied by the submitting site. A numeric id is
+        // treated as a linked Discord account; the name is the human-readable
+        // credit shown/used when there is no linked id.
+        const collabId = /^\d{5,}$/.test(String(collaboratorId || '')) ? String(collaboratorId) : null;
+        const collabName = (collaboratorName || collaborator || '').trim().slice(0, 60) || 'Anonymous';
+        const site = (sourceSite || req.get('origin') || '').toString().trim().slice(0, 80) || null;
+
+        // Process images sequentially (the sharp queue serializes them anyway) and
+        // route each into the admin review flow.
+        let routed = 0;
+        for (const file of files) {
+            const url = await processAndUploadAircraftImage(file, finalTail);
+            await submitWebAircraftReview({
+                aircraftType: finalType,
+                liveryName: finalLivery,
+                tailNumber: finalTail,
+                imageUrl: url,
+                collaboratorId: collabId,
+                collaboratorName: collabName,
+                sourceSite: site,
+            });
+            routed++;
+        }
+
+        cleanupTempFiles(files);
+        return res.status(202).json({ message: 'Submitted for review.', images: routed });
+    } catch (error) {
+        cleanupTempFiles(files);
+        if (error && /bot not ready/i.test(error.message || '')) {
+            console.error('Community submission rejected — Discord bot not ready.');
+            return res.status(503).json({ message: 'Review service temporarily unavailable. Please retry shortly.' });
+        }
+        console.error('Community submission error:', error);
+        return res.status(500).json({ message: 'Server error during submission.' });
     }
 });
 
@@ -4016,6 +4152,25 @@ app.get(/(.*)/, requireAuthPage, (req, res) => {
 });
 
 // 5. START SERVER
+// Memory diagnostics. The container OOM-kills the process with no application log
+// ("just crashes"), so we periodically log RSS/heap and, when RSS crosses a share
+// of the configured cap, emit a loud WARN — turning a silent kill into a visible
+// pre-crash trail that points at what was growing. Set MEMORY_LIMIT_MB to the
+// container's memory cap to enable the threshold warning (logging runs regardless).
+const MEMORY_LIMIT_MB = parseInt(process.env.MEMORY_LIMIT_MB, 10) || 0;
+const MEMORY_WARN_RATIO = 0.85;
+const mb = (bytes) => Math.round(bytes / 1024 / 1024);
+setInterval(() => {
+    const m = process.memoryUsage();
+    const rssMb = mb(m.rss);
+    const line = `[mem] rss=${rssMb}MB heapUsed=${mb(m.heapUsed)}MB heapTotal=${mb(m.heapTotal)}MB external=${mb(m.external)}MB`;
+    if (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_WARN_RATIO) {
+        console.warn(`⚠️  ${line} — near ${MEMORY_LIMIT_MB}MB cap (${Math.round((rssMb / MEMORY_LIMIT_MB) * 100)}%)`);
+    } else {
+        console.log(line);
+    }
+}, 5 * 60 * 1000).unref();
+
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
 });
