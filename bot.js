@@ -4015,10 +4015,12 @@ client.on('interactionCreate', async (interaction) => {
         const attachmentName = 'aircraft.webp';
         const makeAttachment = () => ({ attachment: imageBuffer, name: attachmentName });
 
-        // 1. Public feed — pending.
+        // 1. Public feed — pending. NOTE: the source/origin (which may be a private
+        // test/preview URL) is deliberately NOT shown here — this channel is public.
+        // It's recorded only in the admin card footer below (staff-only channel).
         const publicEmbed = themedEmbed(SUB_STATE.PENDING.color)
             .setTitle('📸 New Aircraft Spotted')
-            .setDescription(`**Status:** ${SUB_STATE.PENDING.badge}\nA new photo has been submitted${safeSource ? ` via **${safeSource}**` : ''} and is awaiting admin review.`)
+            .setDescription(`**Status:** ${SUB_STATE.PENDING.badge}\nA new photo has been submitted and is awaiting admin review.`)
             .addFields(
                 { name: 'Aircraft', value: type, inline: true },
                 { name: 'Livery', value: livery, inline: true },

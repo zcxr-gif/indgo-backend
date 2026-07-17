@@ -620,7 +620,7 @@ can't forge it, this trusts submissions from our own sites without a token.
 | `tailNumber` *(or `registration`)* | — | Optional; staff can set it during review. |
 | `collaboratorId` | — | The collaborator's **Discord user id** if the partner site has a linked account. When present, credit + the contributor role + the leaderboard all work natively. |
 | `collaboratorName` *(or `collaborator`)* | — | Display name to credit when there's no linked Discord id. Defaults to `Anonymous`. |
-| `sourceSite` | — | Free-text label for where the submission came from (shown on the review card). Falls back to the request `Origin`. |
+| `sourceSite` | — | Free-text label for where the submission came from. Falls back to the request `Origin`. Recorded **only on the staff review card** (admin channel) — it is never shown in the public feed, so a private test/preview URL is not exposed. |
 
 The **collaborator** is taken from the submitting site's identity rather than a
 Discord DM author: pass `collaboratorId` when the user has linked Discord,
