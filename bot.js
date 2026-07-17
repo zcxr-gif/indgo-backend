@@ -398,11 +398,19 @@ const normalizeData = async (rawType, rawLivery) => {
 
 // Auto-match a submission the same way the Discord DM flow does: normalize the
 // type/livery against the known aircraft/livery catalog, then auto-fill the tail
-// from the registration lookup when none was given. Safe before the bot is ready
-// (the catalogs are loaded independently; missing data just yields the raw input).
-// Shared by the web submission endpoint so partner submissions get identical
-// tidy-up to DM ones.
+// from the registration lookup when none was given. Shared by the web submission
+// endpoint so web submissions get IDENTICAL matching to DM ones — the site just
+// hands us the photo + details instead of a Discord DM.
+//
+// Critically, normalizeData() reads `cachedAircraftData`, which starts EMPTY and
+// is only populated by fetchAircraftMetadata(). The DM flow warms that cache
+// earlier in its path before matching; the web path has no such prior step, so we
+// must warm it here first. Without this the normalize silently no-ops — the plane
+// doesn't match AND (because the type/livery stay un-normalized) the "does this
+// aircraft already exist?" lookup misses too. fetchAircraftMetadata() self-caches
+// for an hour, so this is a cheap no-op after the first call.
 async function resolveAircraftMatch(rawType, rawLivery, rawTail) {
+    try { await fetchAircraftMetadata(); } catch (e) { console.error('resolveAircraftMatch: metadata warm failed:', e.message); }
     const { type, livery } = await normalizeData(String(rawType || ''), String(rawLivery || ''));
     let tail = String(rawTail || '').trim().toUpperCase();
     if (!tail || tail === 'UNKNOWN') {
