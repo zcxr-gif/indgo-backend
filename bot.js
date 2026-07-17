@@ -412,12 +412,14 @@ const normalizeData = async (rawType, rawLivery) => {
 async function resolveAircraftMatch(rawType, rawLivery, rawTail) {
     try { await fetchAircraftMetadata(); } catch (e) { console.error('resolveAircraftMatch: metadata warm failed:', e.message); }
     const { type, livery } = await normalizeData(String(rawType || ''), String(rawLivery || ''));
-    let tail = String(rawTail || '').trim().toUpperCase();
-    if (!tail || tail === 'UNKNOWN') {
-        const auto = lookupRegistration(type, livery);
-        if (auto) tail = String(auto).toUpperCase();
-    }
-    return { type: type.trim(), livery: livery.trim(), tail: tail || 'UNKNOWN' };
+    // Registration priority, matching the DM flow's auto-lookup as the source of
+    // truth: use the registration we have on file for this aircraft. If we DON'T
+    // have one, keep whatever registration the submitter sent rather than dropping
+    // it to UNKNOWN — the web submitter actually provides one, unlike a DM.
+    const sentTail = String(rawTail || '').trim().toUpperCase();
+    const auto = lookupRegistration(type, livery);
+    const tail = (auto ? String(auto).toUpperCase() : sentTail) || 'UNKNOWN';
+    return { type: type.trim(), livery: livery.trim(), tail };
 }
 
 // Module-level handle to the logged-in Discord client, set inside
