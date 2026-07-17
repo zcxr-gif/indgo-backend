@@ -396,6 +396,22 @@ const normalizeData = async (rawType, rawLivery) => {
     return { type: finalType, livery: finalLivery };
 };
 
+// Auto-match a submission the same way the Discord DM flow does: normalize the
+// type/livery against the known aircraft/livery catalog, then auto-fill the tail
+// from the registration lookup when none was given. Safe before the bot is ready
+// (the catalogs are loaded independently; missing data just yields the raw input).
+// Shared by the web submission endpoint so partner submissions get identical
+// tidy-up to DM ones.
+async function resolveAircraftMatch(rawType, rawLivery, rawTail) {
+    const { type, livery } = await normalizeData(String(rawType || ''), String(rawLivery || ''));
+    let tail = String(rawTail || '').trim().toUpperCase();
+    if (!tail || tail === 'UNKNOWN') {
+        const auto = lookupRegistration(type, livery);
+        if (auto) tail = String(auto).toUpperCase();
+    }
+    return { type: type.trim(), livery: livery.trim(), tail: tail || 'UNKNOWN' };
+}
+
 // Module-level handle to the logged-in Discord client, set inside
 // startDiscordBot. Lets server-side code (e.g. the VA portal's activity logging)
 // post to a channel by ID without holding its own bot connection.
@@ -1234,10 +1250,11 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
     };
 
     // True when the URL already points at a processed object in OUR community
-    // bucket. Web submissions upload straight to S3 before review, so on approval
-    // we can reuse the URL as-is instead of re-fetching + re-running it through a
-    // full sharp pipeline — that saves a native image allocation per approval
-    // (helps under memory pressure) and avoids orphaning the object we stored.
+    // bucket. Both DM and web submissions carry a Discord-hosted attachment into
+    // review (so it always renders), which approval moves to S3. This guard is
+    // defensive: if an image that's already in our bucket is ever (re-)approved,
+    // reuse the URL as-is instead of re-fetching + re-running a full sharp
+    // pipeline — saving a native image allocation and avoiding a duplicate object.
     const isOwnCommunityS3Url = (url) => {
         if (!url) return false;
         try {
@@ -2262,8 +2279,9 @@ client.on('interactionCreate', async (interaction) => {
                     const publicMsgId = footerText.match(/Msg: (\d+)/)?.[1];
                     const originChannelId = footerText.match(/Ch: (\d+)/)?.[1];
 
-                    // Web submissions arrive already stored in our bucket — reuse
-                    // that object rather than re-processing it through sharp.
+                    // Both DM and web submissions carry a Discord-hosted attachment,
+                    // so this moves it to S3. (If the image is somehow already in our
+                    // bucket, reuse it instead of re-running the sharp pipeline.)
                     const permanentUrl = isOwnCommunityS3Url(imageUrl)
                         ? imageUrl
                         : await uploadImageToS3(imageUrl, tailField);
@@ -2962,12 +2980,10 @@ client.on('interactionCreate', async (interaction) => {
                     }
                 }
 
-                // Web submissions upload straight to our bucket BEFORE review, so a
-                // rejection would otherwise orphan that object forever. Delete it now
-                // (only own-bucket URLs — DM submissions embed a Discord attachment,
-                // never an S3 object, so there's nothing of ours to remove). This runs
-                // after the notify above, which for web submissions is a no-op anyway
-                // (no submitter DM channel).
+                // Defensive: submissions carry a Discord-hosted attachment into
+                // review (nothing of ours in S3 until approval), so normally there's
+                // nothing to clean here. But if a rejected image is ever already in
+                // our bucket, remove it so a decline can't orphan a stored object.
                 if (isOwnCommunityS3Url(rejectedImageUrl)) {
                     await deleteImageFromS3(rejectedImageUrl);
                 }
@@ -3948,21 +3964,23 @@ client.on('interactionCreate', async (interaction) => {
     // Expose the client module-wide so postToChannel() can reach it.
     botClient = client;
 
-    // Web-submitted aircraft photos (from an external partner site via
+    // Web-submitted aircraft photos (from our front-end via
     // POST /api/community/aircraft/submit) are routed through the SAME admin
     // review flow as Discord DM submissions: a pending card in the public feed +
     // a review card in the admin channel with the existing approve/reject/edit
-    // buttons. The only differences from the DM path are:
-    //   • the image is already a permanent object in our S3 bucket, so we embed
-    //     it by URL instead of uploading a temp Discord attachment (the approval
-    //     handler detects an own-bucket URL and skips re-processing); and
+    // buttons. To match the DM path exactly, the photo is sent as a Discord
+    // ATTACHMENT (Discord hosts it, so it always renders in the embed) rather than
+    // as an external image URL; on approval the existing handler moves it to S3,
+    // just as it does for a DM submission's attachment. The only real differences:
+    //   • the type/livery/tail are already auto-matched by the caller (same
+    //     normalize + registration lookup the DM flow runs); and
     //   • the collaborator identity comes from the submitting site, not a DM
     //     author — a linked Discord id when the site has one (so credit, the
     //     contributor role and the leaderboard all work natively), otherwise a
     //     display name carried in the footer for the approval handler to use.
     _submitWebAircraftReviewImpl = async ({
         aircraftType, liveryName, tailNumber,
-        imageUrl, collaboratorId, collaboratorName, sourceSite,
+        imageBuffer, collaboratorId, collaboratorName, sourceSite,
     }) => {
         if (!client || !client.isReady || !client.isReady()) {
             throw new Error('Discord bot not ready');
@@ -3971,8 +3989,8 @@ client.on('interactionCreate', async (interaction) => {
         const type = String(aircraftType || '').trim();
         const livery = String(liveryName || '').trim();
         const tail = String(tailNumber || 'UNKNOWN').trim().toUpperCase() || 'UNKNOWN';
-        if (!type || !livery || !imageUrl) {
-            throw new Error('aircraftType, liveryName and imageUrl are required');
+        if (!type || !livery || !Buffer.isBuffer(imageBuffer) || imageBuffer.length === 0) {
+            throw new Error('aircraftType, liveryName and a non-empty image are required');
         }
 
         // A linked Discord id is the strongest identity — thread it through the
@@ -3991,20 +4009,27 @@ client.on('interactionCreate', async (interaction) => {
         const feedChannel = await client.channels.fetch(PUBLIC_FEED_CHANNEL_ID);
 
         const contributorDisplay = hasDiscordId ? `<@${buttonToken}>` : safeName;
+        // The same optimized webp is attached to both the feed and admin messages
+        // and rendered inside each embed via attachment://. Discord hosts it, so it
+        // shows immediately regardless of the S3 bucket's public policy.
+        const attachmentName = 'aircraft.webp';
+        const makeAttachment = () => ({ attachment: imageBuffer, name: attachmentName });
 
-        // 1. Public feed — pending. S3 URLs are permanent, so embed by URL.
+        // 1. Public feed — pending. NOTE: the source/origin (which may be a private
+        // test/preview URL) is deliberately NOT shown here — this channel is public.
+        // It's recorded only in the admin card footer below (staff-only channel).
         const publicEmbed = themedEmbed(SUB_STATE.PENDING.color)
             .setTitle('📸 New Aircraft Spotted')
-            .setDescription(`**Status:** ${SUB_STATE.PENDING.badge}\nA new photo has been submitted${safeSource ? ` via **${safeSource}**` : ''} and is awaiting admin review.`)
+            .setDescription(`**Status:** ${SUB_STATE.PENDING.badge}\nA new photo has been submitted and is awaiting admin review.`)
             .addFields(
                 { name: 'Aircraft', value: type, inline: true },
                 { name: 'Livery', value: livery, inline: true },
                 { name: 'Tail Number', value: tail, inline: true },
                 { name: 'Submitted By', value: contributorDisplay, inline: false }
             )
-            .setImage(imageUrl)
+            .setImage(`attachment://${attachmentName}`)
             .setTimestamp();
-        const publicMsg = await feedChannel.send({ embeds: [publicEmbed] });
+        const publicMsg = await feedChannel.send({ embeds: [publicEmbed], files: [makeAttachment()] });
 
         // 2. Admin review card — identical field layout to the DM path so the
         //    approve/reject handlers read it unchanged.
@@ -4015,7 +4040,7 @@ client.on('interactionCreate', async (interaction) => {
                 { name: 'Aircraft Type', value: type, inline: true },
                 { name: 'Livery', value: livery, inline: true },
             )
-            .setImage(imageUrl)
+            .setImage(`attachment://${attachmentName}`)
             .setTimestamp();
 
         let existingEntry = null;
@@ -4036,7 +4061,7 @@ client.on('interactionCreate', async (interaction) => {
         if (safeSource) footer += ` | Src: ${safeSource}`;
         finalEmbed.setFooter({ text: footer });
 
-        await adminChannel.send({ embeds: [finalEmbed, ...extraEmbeds], components: adminComponents });
+        await adminChannel.send({ embeds: [finalEmbed, ...extraEmbeds], components: adminComponents, files: [makeAttachment()] });
 
         return { ok: true, feedMessageId: publicMsg.id };
     };
@@ -4050,4 +4075,4 @@ client.on('interactionCreate', async (interaction) => {
     }
 };
 
-module.exports = { startDiscordBot, postToChannel, submitWebAircraftReview };
+module.exports = { startDiscordBot, postToChannel, submitWebAircraftReview, resolveAircraftMatch };
