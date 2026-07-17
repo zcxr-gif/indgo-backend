@@ -630,10 +630,15 @@ otherwise pass `collaboratorName`.
 
 | Status | Meaning |
 |--------|---------|
-| `202 Accepted` | `{ message, images, matched: { aircraftType, liveryName, tailNumber } }` — routed to review; `matched` shows the auto-matched values. |
-| `400` | Missing image or required type/livery. |
+| `202 Accepted` | `{ message, images, failed, matched: { aircraftType, liveryName, tailNumber } }` — `images` were routed to review, `failed` is how many were skipped (e.g. a corrupt file); `matched` shows the auto-matched values. |
+| `400` | Missing image / required type/livery, **too many images (max 3)**, or a file over 15MB. |
 | `403` | Origin not on the `COMMUNITY_SUBMIT_ORIGINS` allow-list. |
+| `422` | None of the submitted images could be processed. |
 | `503` | Discord bot not ready — retry shortly. |
+
+Up to 3 images per request; each becomes its own review card. Images are processed
+independently — a single unreadable file is skipped (counted in `failed`) rather
+than failing the whole batch.
 
 ### Example
 

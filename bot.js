@@ -1388,7 +1388,11 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 if (!t || !l) continue;
                 if (t.toLowerCase() !== typeField.toLowerCase() || l.toLowerCase() !== liveryField.toLowerCase()) continue;
 
-                const submitterId = (embed.footer?.text || '').match(/User: (\d+)/)?.[1];
+                // The token is a numeric Discord id (DM / linked web submissions) or
+                // the literal 'web' (id-less web submissions) — match both, so a batch
+                // of web photos for the same aircraft still re-renders its sibling
+                // pending cards (Add Photo 2 / Replace Photo 1 …) after each approval.
+                const submitterId = (embed.footer?.text || '').match(/User: (\w+)/)?.[1];
                 if (!submitterId) continue;
                 const refreshed = EmbedBuilder.from(embed);
                 const review = buildAircraftReview(refreshed, updatedEntry, submitterId);

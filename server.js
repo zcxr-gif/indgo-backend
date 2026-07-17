@@ -1644,7 +1644,28 @@ const isAllowedSubmitOrigin = (req) => {
 //     submitting site's identity (a linked Discord id when it has one, else a name).
 // Up to MAX_AIRCRAFT_IMAGES photos are accepted; each gets its own review card so
 // staff can slot them into the aircraft's up-to-3 gallery individually.
-app.post('/api/community/aircraft/submit', uploadAircraftImages, async (req, res) => {
+
+// Wrap the shared multer middleware so upload-level errors (too many files, a
+// file over the size limit, an unexpected field) return clean JSON instead of the
+// default Express HTML 500 — a public caller sending 4 photos or a 20MB file
+// should get a helpful 400, not a crash-looking page.
+const uploadCommunityImages = (req, res, next) => {
+    uploadAircraftImages(req, res, (err) => {
+        if (!err) return next();
+        if (err instanceof multer.MulterError) {
+            const messages = {
+                LIMIT_FILE_SIZE: 'Each image must be 15MB or smaller.',
+                LIMIT_FILE_COUNT: `Too many images — send at most ${MAX_AIRCRAFT_IMAGES}.`,
+                LIMIT_UNEXPECTED_FILE: `Too many images — send at most ${MAX_AIRCRAFT_IMAGES}.`,
+            };
+            return res.status(400).json({ message: messages[err.code] || 'Image upload rejected.' });
+        }
+        console.error('Community submission upload error:', err.message);
+        return res.status(400).json({ message: 'Image upload failed.' });
+    });
+};
+
+app.post('/api/community/aircraft/submit', uploadCommunityImages, async (req, res) => {
     const files = collectUploadedImages(req);
     try {
         if (!isAllowedSubmitOrigin(req)) {
@@ -1687,25 +1708,41 @@ app.post('/api/community/aircraft/submit', uploadAircraftImages, async (req, res
 
         // Optimize + route each image one at a time — the sharp queue serializes
         // the decode, and processing sequentially keeps only one image buffer alive.
+        // Each image is independent: one that fails to decode (corrupt/unsupported)
+        // is skipped so it can't take the rest of the batch (or the whole request)
+        // down. A "bot not ready" error is different — it fails every image the same
+        // way and is retryable, so we abort the batch and surface a 503.
         let routed = 0;
+        let failed = 0;
         for (const file of files) {
-            const imageBuffer = await optimizeAircraftImageBuffer(file);
-            await submitWebAircraftReview({
-                aircraftType: matched.type,
-                liveryName: matched.livery,
-                tailNumber: matched.tail,
-                imageBuffer,
-                collaboratorId: collabId,
-                collaboratorName: collabName,
-                sourceSite: site,
-            });
-            routed++;
+            try {
+                const imageBuffer = await optimizeAircraftImageBuffer(file);
+                await submitWebAircraftReview({
+                    aircraftType: matched.type,
+                    liveryName: matched.livery,
+                    tailNumber: matched.tail,
+                    imageBuffer,
+                    collaboratorId: collabId,
+                    collaboratorName: collabName,
+                    sourceSite: site,
+                });
+                routed++;
+            } catch (err) {
+                if (err && /bot not ready/i.test(err.message || '')) throw err;
+                failed++;
+                console.error('Community submission: image skipped:', err && err.message);
+            }
         }
 
         cleanupTempFiles(files);
+
+        if (routed === 0) {
+            return res.status(422).json({ message: 'None of the images could be processed.', images: 0, failed });
+        }
         return res.status(202).json({
-            message: 'Submitted for review.',
+            message: failed ? `Submitted ${routed} for review; ${failed} could not be processed.` : 'Submitted for review.',
             images: routed,
+            failed,
             matched: { aircraftType: matched.type, liveryName: matched.livery, tailNumber: matched.tail },
         });
     } catch (error) {
