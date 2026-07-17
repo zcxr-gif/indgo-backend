@@ -579,11 +579,18 @@ banner may move — the widget renders it in a plain `<img>`, which plays it.
 ## Partner aircraft submission API
 
 Our front-end site can submit community aircraft photos without a staff session.
-Submissions do **not** write to the database directly — each photo is optimized,
-stored in S3, and posted into the **same Discord admin review flow** that pilot
-DM submissions use. Staff approve or reject it there with the existing
-Approve / Replace / Reject buttons, and only an **approval** creates the record.
-A **rejection** deletes the stored S3 object so nothing is orphaned.
+Submissions do **not** write to the database directly — each photo is optimized
+and posted into the **same Discord admin review flow** that pilot DM submissions
+use. The photo is **attached to the Discord review message** (Discord hosts it, so
+it renders immediately — the same as a DM submission); only an **approval** moves
+it to S3 and creates the record, and a rejection leaves nothing behind. Staff act
+with the existing Approve / Replace / Reject buttons.
+
+The type/livery are **auto-matched** against the aircraft/livery catalog and the
+tail number is **auto-filled** from the registration lookup when omitted — exactly
+the normalization a Discord DM submission gets. The response echoes the matched
+values. Submit up to **3 photos** in one request; each becomes its own review card
+so staff slot them into the aircraft's gallery individually.
 
 ### Endpoint
 
@@ -623,7 +630,7 @@ otherwise pass `collaboratorName`.
 
 | Status | Meaning |
 |--------|---------|
-| `202 Accepted` | `{ message, images }` — routed to review. |
+| `202 Accepted` | `{ message, images, matched: { aircraftType, liveryName, tailNumber } }` — routed to review; `matched` shows the auto-matched values. |
 | `400` | Missing image or required type/livery. |
 | `403` | Origin not on the `COMMUNITY_SUBMIT_ORIGINS` allow-list. |
 | `503` | Discord bot not ready — retry shortly. |

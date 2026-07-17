@@ -64,7 +64,7 @@ process.on('uncaughtException', (err) => {
 });
 
 // IMPORT THE BOT
-const { startDiscordBot, submitWebAircraftReview } = require('./bot');
+const { startDiscordBot, submitWebAircraftReview, resolveAircraftMatch } = require('./bot');
 
 // 1. INITIALIZE APP
 const app = express();
@@ -804,6 +804,18 @@ const processAndUploadAircraftImage = (file, tailRef) => queueAircraftImage(asyn
 
     return `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileName}`;
 });
+
+// Helper: Optimize a single image to a webp buffer (no upload). Used by the web
+// submission endpoint, which hands the buffer to the bot to attach to the Discord
+// review message — the image lives on Discord until a staff approval moves it to
+// S3 (mirroring the DM flow). Runs through the same single-slot sharp queue so it
+// can't stack native image buffers with other uploads.
+const optimizeAircraftImageBuffer = (file) => queueAircraftImage(() =>
+    sharp(file.path)
+        .resize({ width: 1920, withoutEnlargement: true })
+        .webp({ quality: 80 })
+        .toBuffer()
+);
 
 // Helper: Delete every image associated with an aircraft entry (primary + gallery).
 const deleteAircraftImages = async (entry) => {
@@ -1619,15 +1631,19 @@ const isAllowedSubmitOrigin = (req) => {
 
 // POST /api/community/aircraft/submit — PUBLIC endpoint that lets our front-end
 // site submit aircraft photos. It differs from POST /api/aircraft (staff-auth,
-// which writes straight to the database) in two important ways:
+// which writes straight to the database) in these ways:
 //   • it is called cross-origin from the browser — the global cors() already
 //     sends Access-Control-Allow-Origin: *, and access is gated by the request's
-//     Origin (see COMMUNITY_SUBMIT_ORIGINS) rather than a staff session; and
-//   • nothing is written to the database here. Each image is optimized, uploaded
-//     to S3, and handed to the SAME Discord admin review flow as DM submissions —
-//     staff approve/reject with the existing buttons, and only an approval writes
-//     the record. The collaborator to credit comes from the submitting site's
-//     identity (a linked Discord id when it has one, else a display name).
+//     Origin (see COMMUNITY_SUBMIT_ORIGINS) rather than a staff session;
+//   • the type/livery/tail are auto-matched exactly like a Discord DM submission
+//     (normalize against the catalog + registration lookup for a missing tail); and
+//   • nothing is written to the database here. Each image is optimized and handed
+//     to the SAME Discord admin review flow as DM submissions — attached to the
+//     review message (so it renders immediately), and only a staff approval moves
+//     it to S3 and writes the record. The collaborator to credit comes from the
+//     submitting site's identity (a linked Discord id when it has one, else a name).
+// Up to MAX_AIRCRAFT_IMAGES photos are accepted; each gets its own review card so
+// staff can slot them into the aircraft's up-to-3 gallery individually.
 app.post('/api/community/aircraft/submit', uploadAircraftImages, async (req, res) => {
     const files = collectUploadedImages(req);
     try {
@@ -1649,16 +1665,18 @@ app.post('/api/community/aircraft/submit', uploadAircraftImages, async (req, res
             sourceSite,
         } = req.body;
 
-        const finalType = (aircraftType || model || '').trim();
-        const finalLivery = (liveryName || livery || '').trim();
-        // Tail is optional for partner submissions — staff can fill it in during
-        // review (the approval flow already tolerates an UNKNOWN tail).
-        const finalTail = (tailNumber || registration || 'UNKNOWN').toUpperCase();
+        const rawType = (aircraftType || model || '').trim();
+        const rawLivery = (liveryName || livery || '').trim();
+        const rawTail = (tailNumber || registration || '').trim();
 
-        if (!finalType || !finalLivery) {
+        if (!rawType || !rawLivery) {
             cleanupTempFiles(files);
             return res.status(400).json({ message: 'aircraftType (or model) and liveryName (or livery) are required.' });
         }
+
+        // Auto-match once for the whole submission (all its images share the same
+        // aircraft): normalize the type/livery and auto-fill the tail if missing.
+        const matched = await resolveAircraftMatch(rawType, rawLivery, rawTail);
 
         // Collaborator identity supplied by the submitting site. A numeric id is
         // treated as a linked Discord account; the name is the human-readable
@@ -1667,16 +1685,16 @@ app.post('/api/community/aircraft/submit', uploadAircraftImages, async (req, res
         const collabName = (collaboratorName || collaborator || '').trim().slice(0, 60) || 'Anonymous';
         const site = (sourceSite || req.get('origin') || '').toString().trim().slice(0, 80) || null;
 
-        // Process images sequentially (the sharp queue serializes them anyway) and
-        // route each into the admin review flow.
+        // Optimize + route each image one at a time — the sharp queue serializes
+        // the decode, and processing sequentially keeps only one image buffer alive.
         let routed = 0;
         for (const file of files) {
-            const url = await processAndUploadAircraftImage(file, finalTail);
+            const imageBuffer = await optimizeAircraftImageBuffer(file);
             await submitWebAircraftReview({
-                aircraftType: finalType,
-                liveryName: finalLivery,
-                tailNumber: finalTail,
-                imageUrl: url,
+                aircraftType: matched.type,
+                liveryName: matched.livery,
+                tailNumber: matched.tail,
+                imageBuffer,
                 collaboratorId: collabId,
                 collaboratorName: collabName,
                 sourceSite: site,
@@ -1685,7 +1703,11 @@ app.post('/api/community/aircraft/submit', uploadAircraftImages, async (req, res
         }
 
         cleanupTempFiles(files);
-        return res.status(202).json({ message: 'Submitted for review.', images: routed });
+        return res.status(202).json({
+            message: 'Submitted for review.',
+            images: routed,
+            matched: { aircraftType: matched.type, liveryName: matched.livery, tailNumber: matched.tail },
+        });
     } catch (error) {
         cleanupTempFiles(files);
         if (error && /bot not ready/i.test(error.message || '')) {
