@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>backend :: diagnostics</title>
+<style>
+  :root{
+    --bg:#080d0b; --panel:#0d1512; --line:#173025; --dim:#4c6b5c;
+    --fg:#b8f5d0; --green:#39ff88; --amber:#ffcc44; --red:#ff5566;
+    --cyan:#4fe6e6; --mag:#c98bff;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+    font-size:13px;line-height:1.45}
+  a{color:var(--cyan)}
+  .wrap{max-width:1220px;margin:0 auto;padding:14px}
+  header{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 18px;
+    border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:12px}
+  header h1{font-size:15px;margin:0;color:var(--green);letter-spacing:.5px}
+  header h1::before{content:"▍";color:var(--green);animation:blink 1.1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
+  .meta{color:var(--dim)}
+  .meta b{color:var(--fg);font-weight:600}
+  .status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;
+    background:var(--dim);margin-right:5px;vertical-align:middle}
+  .status-dot.ok{background:var(--green);box-shadow:0 0 6px var(--green)}
+  .status-dot.bad{background:var(--red);box-shadow:0 0 6px var(--red)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:12px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:11px 12px}
+  .panel h2{margin:0 0 9px;font-size:11px;text-transform:uppercase;letter-spacing:1.5px;
+    color:var(--dim);font-weight:600;display:flex;justify-content:space-between;align-items:center}
+  .row{display:flex;justify-content:space-between;gap:10px;padding:2px 0}
+  .row .k{color:var(--dim)}
+  .row .v{color:var(--fg);font-variant-numeric:tabular-nums;text-align:right}
+  .big{font-size:24px;color:var(--green);font-variant-numeric:tabular-nums;letter-spacing:.5px}
+  .unit{font-size:12px;color:var(--dim)}
+  canvas{width:100%;height:42px;display:block;margin:6px 0 2px;image-rendering:pixelated}
+  .bar{height:6px;background:#0a1a13;border-radius:3px;overflow:hidden;margin-top:6px}
+  .bar > i{display:block;height:100%;background:var(--green);transition:width .4s,background .4s}
+  .anoms{margin-bottom:12px}
+  .anom{border-left:3px solid var(--dim);background:var(--panel);padding:7px 11px;margin:6px 0;border-radius:0 4px 4px 0}
+  .anom .sig{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--dim)}
+  .anom.critical{border-color:var(--red)} .anom.critical .sig{color:var(--red)}
+  .anom.warn{border-color:var(--amber)} .anom.warn .sig{color:var(--amber)}
+  .anom.info{border-color:var(--cyan)} .anom.info .sig{color:var(--cyan)}
+  .ok-banner{color:var(--green);background:var(--panel);border:1px solid var(--line);
+    border-radius:6px;padding:9px 12px;margin-bottom:12px}
+  table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+  th,td{text-align:right;padding:4px 8px;border-bottom:1px solid #0f1f18;white-space:nowrap}
+  th{color:var(--dim);font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.5px;position:sticky;top:0;background:var(--panel)}
+  td.route,th.route{text-align:left;color:var(--cyan);max-width:340px;overflow:hidden;text-overflow:ellipsis}
+  .full{grid-column:1/-1}
+  .scroll{max-height:340px;overflow:auto}
+  .warnv{color:var(--amber)} .badv{color:var(--red)} .goodv{color:var(--green)}
+  .foot{color:var(--dim);margin-top:14px;font-size:11px;border-top:1px solid var(--line);padding-top:8px;
+    display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
+  .err{color:var(--red);padding:40px 12px;text-align:center}
+  .err h2{color:var(--red)}
+  button{background:transparent;color:var(--fg);border:1px solid var(--line);
+    border-radius:4px;padding:3px 9px;font-family:inherit;font-size:12px;cursor:pointer}
+  button:hover{border-color:var(--green);color:var(--green)}
+  .legend{font-size:10px;color:var(--dim)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>backend&nbsp;diagnostics</h1>
+    <span class="meta" id="hdr-proc">connecting…</span>
+    <span class="meta" style="margin-left:auto" id="hdr-poll"></span>
+    <button id="pauseBtn">pause</button>
+  </header>
+
+  <div id="content" style="display:none">
+    <div class="anoms" id="anoms"></div>
+    <div class="grid" id="grid"></div>
+
+    <div class="panel full" style="margin-top:12px">
+      <h2>routes — ranked by total time cost (count × avg) <span class="legend">the biggest CPU/latency consumers first</span></h2>
+      <div class="scroll">
+        <table id="routes">
+          <thead><tr>
+            <th class="route">method · path</th><th>count</th><th>avg ms</th>
+            <th>p95 ms</th><th>max ms</th><th>5xx</th><th>last</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="foot">
+      <span id="foot-left"></span>
+      <span id="foot-right"></span>
+    </div>
+  </div>
+
+  <div class="err" id="err" style="display:none"></div>
+</div>
+
+<script>
+const POLL_MS = 3000;
+let paused = false, timer = null, lastErr = null;
+
+const el = (id) => document.getElementById(id);
+const fmtAge = (ms) => {
+  if (!ms) return '—';
+  const s = Math.round((Date.now()-ms)/1000);
+  if (s < 60) return s+'s ago';
+  if (s < 3600) return Math.round(s/60)+'m ago';
+  return Math.round(s/3600)+'h ago';
+};
+const fmtUptime = (sec) => {
+  const d=Math.floor(sec/86400), h=Math.floor(sec%86400/3600), m=Math.floor(sec%3600/60);
+  return (d?d+'d ':'')+(h?h+'h ':'')+m+'m';
+};
+
+// tiny canvas sparkline
+function spark(canvas, values, color, opts={}){
+  if(!canvas) return;
+  const dpr = window.devicePixelRatio||1;
+  const w = canvas.clientWidth||280, h = canvas.clientHeight||42;
+  canvas.width = w*dpr; canvas.height = h*dpr;
+  const ctx = canvas.getContext('2d'); ctx.scale(dpr,dpr);
+  ctx.clearRect(0,0,w,h);
+  if(!values.length) return;
+  const max = opts.max || Math.max(...values, 1);
+  const min = opts.min || 0;
+  const rng = (max-min)||1;
+  const x = (i)=> values.length<2 ? 0 : (i/(values.length-1))*(w-2)+1;
+  const y = (v)=> h-2 - ((Math.max(min,Math.min(max,v))-min)/rng)*(h-4);
+  // fill
+  ctx.beginPath(); ctx.moveTo(x(0),h);
+  values.forEach((v,i)=>ctx.lineTo(x(i),y(v)));
+  ctx.lineTo(x(values.length-1),h); ctx.closePath();
+  ctx.fillStyle = color+'22'; ctx.fill();
+  // line
+  ctx.beginPath();
+  values.forEach((v,i)=> i?ctx.lineTo(x(i),y(v)):ctx.moveTo(x(i),y(v)));
+  ctx.strokeStyle = color; ctx.lineWidth = 1.4; ctx.stroke();
+  // last dot
+  ctx.beginPath(); ctx.arc(x(values.length-1),y(values[values.length-1]),2.2,0,7);
+  ctx.fillStyle = color; ctx.fill();
+}
+
+function panel(title, bodyHtml, extra=''){
+  return `<div class="panel"><h2>${title}${extra?`<span class="legend">${extra}</span>`:''}</h2>${bodyHtml}</div>`;
+}
+function rowH(k,v,cls=''){ return `<div class="row"><span class="k">${k}</span><span class="v ${cls}">${v}</span></div>`; }
+
+function render(d){
+  el('content').style.display='';
+  el('err').style.display='none';
+  const p = d.process;
+
+  // header
+  const disc = d.sources && d.sources.discord;
+  const db = d.sources && d.sources.mongo;
+  el('hdr-proc').innerHTML =
+    `pid <b>${p.pid}</b> · node <b>${p.node}</b> · up <b>${fmtUptime(p.uptimeSec)}</b> · `+
+    `<b>${p.reqLastMin}</b> req/min · gc.exposed <b>${p.gcExposed?'yes':'<span class="badv">no</span>'}</b>`;
+
+  // anomalies
+  const anoms = d.anomalies||[];
+  if(!anoms.length){
+    el('anoms').innerHTML = `<div class="ok-banner">▲ no anomalies detected — memory, event-loop, handles and routes all within thresholds.</div>`;
+  } else {
+    el('anoms').innerHTML = anoms.map(a=>
+      `<div class="anom ${a.level}"><div class="sig">${a.level} · ${a.signal}</div>${a.msg}</div>`).join('');
+  }
+
+  const g = [];
+
+  // --- MEMORY
+  const m = d.memory.current||{};
+  const cap = p.memoryLimitMb;
+  const pct = cap ? Math.round((m.rss/cap)*100) : 0;
+  const memCls = cap ? (pct>=85?'badv':pct>=70?'warnv':'goodv') : '';
+  g.push(panel('memory',
+    `<div class="big">${m.rss||0}<span class="unit"> MB rss</span></div>`+
+    `<canvas id="c-mem"></canvas>`+
+    rowH('heap used', (m.heapUsed||0)+' MB')+
+    rowH('heap total', (m.heapTotal||0)+' MB')+
+    rowH('external', (m.external||0)+' MB')+
+    rowH('arrayBuffers', (m.arrayBuffers||0)+' MB')+
+    rowH('peak rss', p.peakRssMb+' MB')+
+    (cap? rowH('of '+cap+'MB cap', pct+'%', memCls)+`<div class="bar"><i style="width:${Math.min(100,pct)}%;background:${pct>=85?'var(--red)':pct>=70?'var(--amber)':'var(--green)'}"></i></div>`
+        : rowH('cap', 'MEMORY_LIMIT_MB unset','warnv')),
+    'rss = real footprint'));
+
+  // --- EVENT LOOP (irregular rhythm)
+  const lp = d.eventLoop.current||{};
+  const lpCls = lp.p99>=100?'badv':lp.p99>=50?'warnv':'goodv';
+  g.push(panel('event loop delay',
+    `<div class="big ${lpCls}">${lp.p99!=null?lp.p99:'—'}<span class="unit"> ms p99</span></div>`+
+    `<canvas id="c-loop"></canvas>`+
+    rowH('mean', (lp.mean!=null?lp.mean:'—')+' ms')+
+    rowH('p50', (lp.p50!=null?lp.p50:'—')+' ms')+
+    rowH('p99', (lp.p99!=null?lp.p99:'—')+' ms', lpCls)+
+    rowH('max', (lp.max!=null?lp.max:'—')+' ms', lp.max>=200?'badv':''),
+    'spikes = blocking / GC'));
+
+  // --- CPU
+  const cp = d.cpu.current||{};
+  const cpCls = cp.pct>=90?'badv':cp.pct>=60?'warnv':'goodv';
+  g.push(panel('cpu (share of 1 core)',
+    `<div class="big ${cpCls}">${cp.pct!=null?cp.pct:'—'}<span class="unit"> %</span></div>`+
+    `<canvas id="c-cpu"></canvas>`+
+    rowH('sampled every', '5s')+
+    rowH('note', '&gt;100% = multi-core','')+'',
+    'user+system time'));
+
+  // --- HANDLES (leak detection)
+  const h = d.handles.current||{};
+  const hHist = d.handles.history||[];
+  const hTrend = hHist.length>=2 ? h.handles-hHist[0].handles : 0;
+  g.push(panel('active handles / requests',
+    `<div class="big ${h.handles>=200?'badv':h.handles>=100?'warnv':'goodv'}">${h.handles!=null?h.handles:'—'}<span class="unit"> handles</span></div>`+
+    `<canvas id="c-handles"></canvas>`+
+    rowH('active requests', h.requests!=null?h.requests:'—')+
+    rowH('trend (window)', (hTrend>=0?'+':'')+hTrend, hTrend>=50?'badv':hTrend>=20?'warnv':'')+
+    rowH('reads as', hTrend>=50?'climbing — leak?':'stable',''),
+    'climbing = leak'));
+
+  // --- GC
+  const gc = d.gc||{count:0};
+  const byKind = Object.entries(gc.byKind||{}).map(([k,v])=>rowH(k, v.count+' · '+Math.round(v.ms)+'ms')).join('');
+  g.push(panel('garbage collection',
+    `<div class="big">${gc.count}<span class="unit"> collections</span></div>`+
+    rowH('total pause', Math.round(gc.totalPauseMs||0)+' ms')+
+    rowH('max pause', Math.round((gc.maxPauseMs||0)*10)/10+' ms', gc.maxPauseMs>=100?'warnv':'')+
+    (byKind||rowH('detail','—')),
+    'since boot'));
+
+  // --- DISCORD
+  if(disc){
+    const c = disc.caches||{}, mem = disc.inMemory||{};
+    g.push(panel('discord gateway',
+      `<div class="row"><span class="k"><span class="status-dot ${disc.ready?'ok':'bad'}"></span>${disc.ready?'ready':'not ready'}</span>`+
+      `<span class="v">${disc.wsPingMs!=null?disc.wsPingMs+' ms ping':''}</span></div>`+
+      rowH('bot uptime', fmtUptime(disc.uptimeSec||0))+
+      `<h2 style="margin-top:9px">caches</h2>`+
+      rowH('guilds', c.guilds)+rowH('users', c.users, c.users>=100?'warnv':'')+
+      rowH('members', c.members, c.members>=200?'warnv':'')+rowH('channels', c.channels)+
+      `<h2 style="margin-top:9px">in-memory maps</h2>`+
+      rowH('userSessions', mem.userSessions)+rowH('activeGiveaways', mem.activeGiveaways)+
+      rowH('cachedLiveries', mem.cachedLiveries)+rowH('vaBannerCooldown', mem.vaBannerCooldown),
+      'bounded caches'));
+  }
+
+  // --- MONGO
+  if(db){
+    g.push(panel('mongodb',
+      `<div class="row"><span class="k"><span class="status-dot ${db.state==='connected'?'ok':'bad'}"></span>${db.state}</span></div>`+
+      rowH('host', db.host||'—')+rowH('database', db.name||'—')+rowH('models', db.models),
+      'connection'));
+  }
+
+  el('grid').innerHTML = g.join('');
+
+  // draw sparklines after DOM insert
+  spark(el('c-mem'), d.memory.history.map(x=>x.rss), '#39ff88', cap?{max:cap}:{});
+  spark(el('c-loop'), d.eventLoop.history.map(x=>x.p99), '#ffcc44');
+  spark(el('c-cpu'), d.cpu.history.map(x=>x.pct), '#4fe6e6', {max:100});
+  spark(el('c-handles'), d.handles.history.map(x=>x.handles), '#c98bff');
+
+  // routes
+  const tb = el('routes').querySelector('tbody');
+  tb.innerHTML = (d.routes||[]).map(r=>{
+    const p95cls = r.p95>=1000?'badv':r.p95>=300?'warnv':'';
+    return `<tr>
+      <td class="route" title="${r.key}">${r.key}</td>
+      <td>${r.count}</td><td>${r.avgMs}</td>
+      <td class="${p95cls}">${r.p95}</td><td>${r.maxMs}</td>
+      <td class="${r.errors?'badv':''}">${r.errors||''}</td>
+      <td class="k">${fmtAge(r.lastAt)}</td></tr>`;
+  }).join('') || `<tr><td class="route" colspan="7" style="color:var(--dim)">no requests observed yet</td></tr>`;
+
+  el('foot-left').textContent = `sampled every 5s · last update ${new Date(d.now).toLocaleTimeString()}`;
+  el('foot-right').textContent = `${(d.routes||[]).length} route(s) tracked`;
+}
+
+async function tick(){
+  try{
+    const r = await fetch('/api/admin/diagnostics', {credentials:'include', cache:'no-store'});
+    if(r.status===401||r.status===403){
+      showErr('access denied', 'This terminal is admin-only. Sign in to the staff hub as an admin, then reload.<br><a href="/staff">→ /staff</a>');
+      return;
+    }
+    if(!r.ok){ throw new Error('HTTP '+r.status); }
+    const d = await r.json();
+    lastErr=null;
+    render(d);
+  }catch(e){
+    lastErr = e;
+    el('hdr-poll').innerHTML = `<span class="badv">● poll failed: ${e.message}</span>`;
+  }
+}
+function showErr(title, msg){
+  el('content').style.display='none';
+  el('err').style.display='';
+  el('err').innerHTML = `<h2>${title}</h2><p>${msg}</p>`;
+}
+function loop(){
+  if(paused) return;
+  tick().finally(()=>{ if(!lastErr) el('hdr-poll').innerHTML = `<span class="goodv">● live</span> · every ${POLL_MS/1000}s`; });
+}
+el('pauseBtn').onclick = ()=>{
+  paused = !paused;
+  el('pauseBtn').textContent = paused?'resume':'pause';
+  el('hdr-poll').innerHTML = paused?'<span class="warnv">● paused</span>':'';
+  if(!paused) loop();
+};
+loop();
+timer = setInterval(loop, POLL_MS);
+window.addEventListener('resize', ()=>{ if(!paused && !lastErr) tick(); });
+</script>
+</body>
+</html>
