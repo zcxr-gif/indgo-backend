@@ -1796,6 +1796,19 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 }
             });
 
+            // vaBannerCooldown gains an entry per user who posts in the partnership
+            // channel and is otherwise never cleared — a slow unbounded leak. Once
+            // an entry is older than the cooldown window it can't gate anything, so
+            // drop it. (Declared later in startDiscordBot's scope; this interval
+            // fires long after that runs, so the reference is always resolved.)
+            if (typeof vaBannerCooldown !== 'undefined') {
+                vaBannerCooldown.forEach((ts, key) => {
+                    if (now - ts > VA_BANNER_COOLDOWN_MS) {
+                        vaBannerCooldown.delete(key);
+                    }
+                });
+            }
+
             if (global.gc) {
                 global.gc();
             }

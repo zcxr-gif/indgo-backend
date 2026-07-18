@@ -1409,7 +1409,11 @@ app.post('/api/trails', async (req, res) => {
 // GET: Fetch all aircraft contributions
 app.get('/api/aircraft', async (req, res) => {
     try {
-        const aircraft = await CommunityAircraft.find().sort({ uploadedAt: -1 });
+        // .lean(): this returns the whole collection on every homepage load, so
+        // skip Mongoose document hydration (change-tracking, getters/setters) and
+        // hand back plain objects. Cuts both the CPU per request and the peak RSS
+        // of the response by several times — the result is only serialized to JSON.
+        const aircraft = await CommunityAircraft.find().sort({ uploadedAt: -1 }).lean();
         res.json(aircraft);
     } catch (error) {
         console.error(error);
@@ -1438,7 +1442,9 @@ app.get('/api/aircraft/lookup', async (req, res) => {
         if (finalLivery) query.liveryName = { $regex: finalLivery, $options: 'i' };
         if (finalTail) query.tailNumber = finalTail;
 
-        const results = await CommunityAircraft.find(query);
+        // .lean(): results are only inspected and serialized (no doc methods),
+        // so return plain objects and skip Mongoose hydration.
+        const results = await CommunityAircraft.find(query).lean();
 
         // 4. FIX: If no results found, return placeholder using the normalized 'finalTail'
         if (results.length === 0) {
