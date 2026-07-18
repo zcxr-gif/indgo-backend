@@ -16,6 +16,7 @@ const {
     registerAuthRoutes,
     bootstrapAdmin,
     requireAuth,
+    requireAdmin,
     requireAuthPage,
 } = require('./staffAuth');
 
@@ -64,7 +65,11 @@ process.on('uncaughtException', (err) => {
 });
 
 // IMPORT THE BOT
-const { startDiscordBot, submitWebAircraftReview, resolveAircraftMatch } = require('./bot');
+const { startDiscordBot, submitWebAircraftReview, resolveAircraftMatch, getBotStats } = require('./bot');
+
+// Live backend diagnostics (memory / CPU / event-loop / per-route timing).
+// Powers the /diagnostics terminal. Kept intentionally low-overhead.
+const diagnostics = require('./diagnostics');
 
 // 1. INITIALIZE APP
 const app = express();
@@ -78,6 +83,10 @@ app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
 // Trust Proxy (Required if behind Nginx/Heroku/Cloudflare to get real IPs)
 app.set('trust proxy', 1);
+
+// Per-request timing for the diagnostics terminal. Mounted before the routes so
+// it observes the full handling time; it only attaches a res 'finish' listener.
+app.use(diagnostics.middleware());
 
 // 2. CONNECT TO MONGODB
 mongoose.connect(process.env.MONGO_URI)
@@ -942,6 +951,18 @@ app.get('/healthz', (req, res) => {
     res.send('Community Aircraft Backend is Running.');
 });
 
+// Live backend diagnostics feed for the /diagnostics terminal. Admin-only: it
+// exposes internal memory/CPU/route/gateway state. Cheap — reads pre-sampled
+// ring buffers, does no DB or network work.
+app.get('/api/admin/diagnostics', requireAdmin, (req, res) => {
+    try {
+        res.json(diagnostics.getSnapshot());
+    } catch (e) {
+        console.error('diagnostics snapshot error:', e);
+        res.status(500).json({ message: 'Failed to build diagnostics snapshot.' });
+    }
+});
+
 // At-a-glance counters for the Staff Hub overview cards. Cheap countDocuments
 // calls — no heavy aggregation. Any signed-in staff member (incl. VA reps) may
 // read this; the figures are non-sensitive operational totals.
@@ -1409,7 +1430,11 @@ app.post('/api/trails', async (req, res) => {
 // GET: Fetch all aircraft contributions
 app.get('/api/aircraft', async (req, res) => {
     try {
-        const aircraft = await CommunityAircraft.find().sort({ uploadedAt: -1 });
+        // .lean(): this returns the whole collection on every homepage load, so
+        // skip Mongoose document hydration (change-tracking, getters/setters) and
+        // hand back plain objects. Cuts both the CPU per request and the peak RSS
+        // of the response by several times — the result is only serialized to JSON.
+        const aircraft = await CommunityAircraft.find().sort({ uploadedAt: -1 }).lean();
         res.json(aircraft);
     } catch (error) {
         console.error(error);
@@ -1438,7 +1463,9 @@ app.get('/api/aircraft/lookup', async (req, res) => {
         if (finalLivery) query.liveryName = { $regex: finalLivery, $options: 'i' };
         if (finalTail) query.tailNumber = finalTail;
 
-        const results = await CommunityAircraft.find(query);
+        // .lean(): results are only inspected and serialized (no doc methods),
+        // so return plain objects and skip Mongoose hydration.
+        const results = await CommunityAircraft.find(query).lean();
 
         // 4. FIX: If no results found, return placeholder using the normalized 'finalTail'
         if (results.length === 0) {
@@ -4082,6 +4109,13 @@ app.get('/staff', (req, res) => {
     res.sendFile(path.join(__dirname, 'staff.html'));
 });
 
+// Backend diagnostics terminal. The page shell is public (like /staff); the
+// data endpoint it calls (/api/admin/diagnostics) is admin-gated, so a non-admin
+// just sees an access-denied banner.
+app.get('/diagnostics', (req, res) => {
+    res.sendFile(path.join(__dirname, 'diagnostics.html'));
+});
+
 // The VA Partnership Portal login + dashboard. Public so partner VAs can reach
 // the login form; the page calls /api/va-portal/auth/me to decide what to show.
 // This is a SEPARATE login from the staff hub (partners are not staff).
@@ -4192,6 +4226,22 @@ setInterval(() => {
         console.log(line);
     }
 }, 5 * 60 * 1000).unref();
+
+// Boot the live diagnostics sampler and feed it the two external state sources
+// the terminal reports on: the Discord client (gateway health + cache sizes +
+// the in-memory maps that have leaked before) and the Mongo connection.
+diagnostics.start({ memoryLimitMb: MEMORY_LIMIT_MB });
+diagnostics.registerSource('discord', () => (typeof getBotStats === 'function' ? getBotStats() : null));
+diagnostics.registerSource('mongo', () => {
+    const states = ['disconnected', 'connected', 'connecting', 'disconnecting'];
+    const conn = mongoose.connection;
+    return {
+        state: states[conn.readyState] || String(conn.readyState),
+        host: conn.host || null,
+        name: conn.name || null,
+        models: Object.keys(conn.models || {}).length,
+    };
+});
 
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);

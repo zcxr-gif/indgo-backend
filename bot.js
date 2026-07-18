@@ -117,6 +117,45 @@ const userSessions = new Map();
 // restart (they are reloaded on `ready` and their end timers re-armed).
 const activeGiveaways = new Map();
 
+// --- DIAGNOSTICS HOOKS ---
+// Module-level references so the diagnostics terminal (see diagnostics.js) can
+// read live bot state — gateway health, cache sizes, and the in-memory maps
+// that have caused leaks before — without reaching into startDiscordBot's scope.
+let botClientRef = null;
+let vaBannerCooldownRef = null;
+
+// Snapshot of everything the bot keeps in memory. Best-effort and defensive:
+// the diagnostics endpoint must work even before the client has logged in.
+function getBotStats() {
+    const c = botClientRef;
+    const guilds = c && c.guilds ? c.guilds.cache : null;
+    let cachedMembers = 0, cachedChannels = 0;
+    if (guilds) {
+        for (const g of guilds.values()) {
+            cachedMembers += g.members ? g.members.cache.size : 0;
+            cachedChannels += g.channels ? g.channels.cache.size : 0;
+        }
+    }
+    return {
+        ready: !!(c && c.isReady && c.isReady()),
+        wsPingMs: c && c.ws ? Math.round(c.ws.ping) : null,
+        uptimeSec: c && c.uptime ? Math.round(c.uptime / 1000) : 0,
+        caches: {
+            guilds: guilds ? guilds.size : 0,
+            users: c && c.users ? c.users.cache.size : 0,
+            channels: c && c.channels ? c.channels.cache.size : 0,
+            members: cachedMembers,
+            guildChannels: cachedChannels,
+        },
+        inMemory: {
+            userSessions: userSessions.size,
+            activeGiveaways: activeGiveaways.size,
+            cachedLiveries: Object.keys(cachedLiveries).length,
+            vaBannerCooldown: vaBannerCooldownRef ? vaBannerCooldownRef.size : 0,
+        },
+    };
+}
+
 // ===================== UNIFIED VISUAL THEME =====================
 // A clean white / dark-gray palette so every embed reads as one product.
 // THEME.WHITE renders as a crisp white accent bar; THEME.GRAY blends into
@@ -500,6 +539,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             GatewayIntentBits.MessageContent
         ]
     });
+    botClientRef = client; // expose to the diagnostics terminal (getBotStats)
 
     // Discord client error surface — without these, transport errors bubble up
     // as unhandled rejections and (without the process-level guards in server.js)
@@ -1796,6 +1836,19 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 }
             });
 
+            // vaBannerCooldown gains an entry per user who posts in the partnership
+            // channel and is otherwise never cleared — a slow unbounded leak. Once
+            // an entry is older than the cooldown window it can't gate anything, so
+            // drop it. (Declared later in startDiscordBot's scope; this interval
+            // fires long after that runs, so the reference is always resolved.)
+            if (typeof vaBannerCooldown !== 'undefined') {
+                vaBannerCooldown.forEach((ts, key) => {
+                    if (now - ts > VA_BANNER_COOLDOWN_MS) {
+                        vaBannerCooldown.delete(key);
+                    }
+                });
+            }
+
             if (global.gc) {
                 global.gc();
             }
@@ -1975,6 +2028,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
     // Per-user cooldown for the partnership-channel banner echo, so a chatty VA
     // member doesn't trigger a banner on every single message.
     const vaBannerCooldown = new Map(); // userId -> last-posted timestamp (ms)
+    vaBannerCooldownRef = vaBannerCooldown; // expose to diagnostics (getBotStats)
     const VA_BANNER_COOLDOWN_MS = 10 * 60 * 1000;
 
     // When a member who belongs to an approved VA posts in the partnership
@@ -4075,4 +4129,4 @@ client.on('interactionCreate', async (interaction) => {
     }
 };
 
-module.exports = { startDiscordBot, postToChannel, submitWebAircraftReview, resolveAircraftMatch };
+module.exports = { startDiscordBot, postToChannel, submitWebAircraftReview, resolveAircraftMatch, getBotStats };

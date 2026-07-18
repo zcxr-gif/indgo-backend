@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Backend Diagnostics — Inflight</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script>tailwind.config = { darkMode: 'class' };</script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+        :root { color-scheme: light dark; }
+        * { -webkit-tap-highlight-color: transparent; }
+        body { font-family: 'Inter', sans-serif; -webkit-font-smoothing: antialiased; }
+        [data-lucide] { width: 1.15em; height: 1.15em; }
+        svg.lucide { stroke-width: 1.75; }
+        .surface { background: #fff; border: 1px solid rgba(0,0,0,.06); box-shadow: 0 1px 2px rgba(0,0,0,.03), 0 1px 1px rgba(0,0,0,.02); }
+        .dark .surface { background: #18181b; border-color: rgba(255,255,255,.07); box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+        .hub-bg { background-image: radial-gradient(rgba(0,0,0,.025) 1px, transparent 1px); background-size: 22px 22px; }
+        .dark .hub-bg { background-image: radial-gradient(rgba(255,255,255,.03) 1px, transparent 1px); }
+        .fade-in { animation: fade .4s cubic-bezier(.2,.8,.2,1) forwards; }
+        @keyframes fade { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .loader { border: 2.5px solid rgba(120,120,128,.25); border-top-color: currentColor; border-radius: 50%; width: 30px; height: 30px; animation: spin .7s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .tnum { font-variant-numeric: tabular-nums; }
+        canvas.spark { width: 100%; height: 44px; display: block; }
+        @keyframes pulse-dot { 50% { opacity: .35; } }
+        .live-dot { animation: pulse-dot 1.4s ease-in-out infinite; }
+        /* thin scrollbar for the routes table */
+        .thin::-webkit-scrollbar { height: 8px; width: 8px; }
+        .thin::-webkit-scrollbar-thumb { background: rgba(120,120,128,.3); border-radius: 8px; }
+    </style>
+</head>
+<body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 antialiased min-h-screen transition-colors duration-300 hub-bg">
+
+    <!-- ============ TOP BAR ============ -->
+    <header class="sticky top-0 z-40 backdrop-blur-xl bg-zinc-50/80 dark:bg-zinc-950/80 border-b border-zinc-200/70 dark:border-zinc-800/70">
+        <div class="max-w-6xl mx-auto px-5 h-16 flex items-center justify-between">
+            <div class="flex items-center gap-2.5">
+                <div class="w-9 h-9 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 flex items-center justify-center">
+                    <i data-lucide="activity" class="w-5 h-5"></i>
+                </div>
+                <div class="leading-tight">
+                    <div class="font-semibold tracking-tight">Backend Diagnostics</div>
+                    <div id="liveState" class="text-[11px] text-zinc-400 dark:text-zinc-500">connecting…</div>
+                </div>
+            </div>
+            <div class="flex items-center gap-2">
+                <button id="pauseBtn" onclick="togglePause()" title="Pause / resume live updates"
+                    class="hidden sm:inline-flex items-center gap-1.5 text-sm font-medium px-3 py-1.5 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition">
+                    <i data-lucide="pause" class="w-4 h-4"></i><span>Pause</span>
+                </button>
+                <button onclick="toggleDarkMode()" title="Toggle theme" class="w-9 h-9 grid place-items-center rounded-full hover:bg-zinc-200/70 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition">
+                    <span id="themeIcon"></span>
+                </button>
+                <a href="/staff" title="Back to Staff Hub" class="w-9 h-9 grid place-items-center rounded-full hover:bg-zinc-200/70 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition">
+                    <i data-lucide="layout-grid" class="w-[18px] h-[18px]"></i>
+                </a>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-6xl mx-auto px-5 py-8">
+
+        <!-- boot -->
+        <div id="bootLoader" class="min-h-[50vh] flex flex-col items-center justify-center gap-4 text-zinc-400">
+            <div class="loader"></div>
+            <p class="text-sm font-medium">Reading backend telemetry…</p>
+        </div>
+
+        <!-- access denied / error -->
+        <div id="errView" class="hidden min-h-[50vh] flex items-center justify-center">
+            <div class="surface rounded-3xl p-10 max-w-md text-center fade-in">
+                <div class="w-14 h-14 rounded-2xl bg-red-50 dark:bg-red-500/10 text-red-500 grid place-items-center mx-auto mb-5">
+                    <i data-lucide="shield-alert" class="w-7 h-7"></i>
+                </div>
+                <h2 id="errTitle" class="text-xl font-bold tracking-tight">Access denied</h2>
+                <p id="errMsg" class="text-sm text-zinc-500 dark:text-zinc-400 mt-2"></p>
+                <a href="/staff" class="mt-6 inline-flex items-center gap-1.5 text-sm font-semibold px-4 py-2 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 hover:opacity-90 transition">
+                    <i data-lucide="arrow-left" class="w-4 h-4"></i> Back to Staff Hub
+                </a>
+            </div>
+        </div>
+
+        <!-- content -->
+        <div id="content" class="hidden">
+            <!-- process summary strip -->
+            <section class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-6 fade-in" id="summary"></section>
+
+            <!-- anomalies -->
+            <section class="mb-8 fade-in">
+                <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-3">Health &amp; anomalies</h2>
+                <div id="anoms" class="space-y-2.5"></div>
+            </section>
+
+            <!-- metric panels -->
+            <section class="fade-in">
+                <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-4">Live metrics</h2>
+                <div id="grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4"></div>
+            </section>
+
+            <!-- routes -->
+            <section class="pt-10 fade-in">
+                <div class="flex items-baseline justify-between mb-4">
+                    <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Routes — ranked by total time cost</h2>
+                    <span class="text-[11px] text-zinc-400 dark:text-zinc-600" id="routesMeta"></span>
+                </div>
+                <div class="surface rounded-2xl overflow-hidden">
+                    <div class="overflow-x-auto thin">
+                        <table class="w-full text-sm tnum">
+                            <thead>
+                                <tr class="text-left text-[11px] uppercase tracking-wide text-zinc-400 dark:text-zinc-500 border-b border-zinc-100 dark:border-zinc-800">
+                                    <th class="px-4 py-3 font-semibold">Method · Path</th>
+                                    <th class="px-4 py-3 font-semibold text-right">Count</th>
+                                    <th class="px-4 py-3 font-semibold text-right">Avg ms</th>
+                                    <th class="px-4 py-3 font-semibold text-right">p95 ms</th>
+                                    <th class="px-4 py-3 font-semibold text-right">Max ms</th>
+                                    <th class="px-4 py-3 font-semibold text-right">5xx</th>
+                                    <th class="px-4 py-3 font-semibold text-right">Last</th>
+                                </tr>
+                            </thead>
+                            <tbody id="routesBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <p class="text-center text-xs text-zinc-400 dark:text-zinc-600 mt-10" id="footNote"></p>
+        </div>
+    </main>
+
+<script>
+const POLL_MS = 3000;
+let paused = false, lastErr = null, hasRendered = false;
+const C = { emerald:'#10b981', amber:'#f59e0b', sky:'#0ea5e9', violet:'#8b5cf6', red:'#ef4444' };
+
+const el = (id) => document.getElementById(id);
+const show = (id) => { ['bootLoader','errView','content'].forEach(x => el(x).classList.toggle('hidden', x !== id)); };
+const drawIcons = () => { if (window.lucide) lucide.createIcons(); };
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+const fmtAge = (ms) => {
+    if (!ms) return '—';
+    const s = Math.round((Date.now() - ms) / 1000);
+    if (s < 60) return s + 's';
+    if (s < 3600) return Math.round(s / 60) + 'm';
+    return Math.round(s / 3600) + 'h';
+};
+const fmtUptime = (sec) => {
+    const d = Math.floor(sec/86400), h = Math.floor(sec%86400/3600), m = Math.floor(sec%3600/60);
+    return (d?d+'d ':'') + (h?h+'h ':'') + m + 'm';
+};
+const tone = (v, warn, bad) => v >= bad ? 'text-red-500' : v >= warn ? 'text-amber-500' : 'text-emerald-500';
+
+// ---- sparkline ----
+function spark(canvas, values, color, opts = {}) {
+    if (!canvas || !values.length) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth || 280, h = canvas.clientHeight || 44;
+    canvas.width = w * dpr; canvas.height = h * dpr;
+    const ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, w, h);
+    const max = opts.max || Math.max(...values, 1), min = opts.min || 0, rng = (max - min) || 1;
+    const x = (i) => values.length < 2 ? 0 : (i / (values.length - 1)) * (w - 2) + 1;
+    const y = (v) => h - 2 - ((Math.max(min, Math.min(max, v)) - min) / rng) * (h - 5);
+    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0, color + '30'); grad.addColorStop(1, color + '00');
+    ctx.beginPath(); ctx.moveTo(x(0), h);
+    values.forEach((v, i) => ctx.lineTo(x(i), y(v)));
+    ctx.lineTo(x(values.length - 1), h); ctx.closePath();
+    ctx.fillStyle = grad; ctx.fill();
+    ctx.beginPath();
+    values.forEach((v, i) => i ? ctx.lineTo(x(i), y(v)) : ctx.moveTo(x(i), y(v)));
+    ctx.strokeStyle = color; ctx.lineWidth = 1.75; ctx.lineJoin = 'round'; ctx.stroke();
+    ctx.beginPath(); ctx.arc(x(values.length - 1), y(values[values.length - 1]), 2.6, 0, 7);
+    ctx.fillStyle = color; ctx.fill();
+}
+
+// ---- markup helpers ----
+function card(title, legend, body, canvasId) {
+    return `<div class="surface rounded-2xl p-5 flex flex-col">
+        <div class="flex items-center justify-between mb-1">
+            <h3 class="text-[11px] font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">${title}</h3>
+            ${legend ? `<span class="text-[10px] text-zinc-400 dark:text-zinc-600">${legend}</span>` : ''}
+        </div>
+        ${body}
+        ${canvasId ? `<canvas class="spark mt-3" id="${canvasId}"></canvas>` : ''}
+    </div>`;
+}
+const big = (v, unit, cls='') => `<div class="mt-1 mb-1"><span class="text-3xl font-bold tracking-tight tnum ${cls}">${v}</span><span class="text-sm text-zinc-400 dark:text-zinc-500 font-medium ml-1">${unit}</span></div>`;
+const row = (k, v, cls='') => `<div class="flex items-center justify-between py-[3px] text-sm"><span class="text-zinc-500 dark:text-zinc-400">${k}</span><span class="tnum font-medium ${cls}">${v}</span></div>`;
+const dot = (ok) => `<span class="inline-block w-2 h-2 rounded-full ${ok?'bg-emerald-500':'bg-red-500'} mr-1.5 align-middle"></span>`;
+function stat(label, value, cls='') {
+    return `<div class="surface rounded-xl px-4 py-3">
+        <div class="text-[10px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500 font-semibold">${label}</div>
+        <div class="text-lg font-bold tracking-tight tnum mt-0.5 ${cls}">${value}</div>
+    </div>`;
+}
+
+// ---- render ----
+function render(d) {
+    show('content'); hasRendered = true;
+    const p = d.process;
+    const disc = d.sources && d.sources.discord;
+    const db = d.sources && d.sources.mongo;
+    const m = d.memory.current || {}, lp = d.eventLoop.current || {}, cp = d.cpu.current || {}, h = d.handles.current || {};
+    const cap = p.memoryLimitMb;
+
+    // summary strip
+    el('summary').innerHTML =
+        stat('Uptime', fmtUptime(p.uptimeSec)) +
+        stat('Req / min', p.reqLastMin) +
+        stat('RSS', (m.rss||0) + ' MB', cap ? tone(m.rss/cap*100, 70, 85) : '') +
+        stat('Event-loop p99', (lp.p99!=null?lp.p99:'—') + ' ms', tone(lp.p99||0, 50, 100)) +
+        stat('CPU', (cp.pct!=null?cp.pct:'—') + '%', tone(cp.pct||0, 60, 90)) +
+        stat('GC exposed', p.gcExposed ? 'yes' : 'no', p.gcExposed ? 'text-emerald-500' : 'text-amber-500');
+
+    // anomalies
+    const anoms = d.anomalies || [];
+    const styleMap = {
+        critical: 'border-red-500 bg-red-50/60 dark:bg-red-500/5',
+        warn: 'border-amber-500 bg-amber-50/60 dark:bg-amber-500/5',
+        info: 'border-sky-500 bg-sky-50/60 dark:bg-sky-500/5',
+    };
+    const sigMap = { critical: 'text-red-500', warn: 'text-amber-500', info: 'text-sky-500' };
+    if (!anoms.length) {
+        el('anoms').innerHTML = `<div class="surface rounded-2xl px-5 py-4 flex items-center gap-3 text-emerald-600 dark:text-emerald-400">
+            <i data-lucide="shield-check" class="w-5 h-5"></i>
+            <span class="text-sm font-medium">No anomalies — memory, event-loop, handles and routes are all within thresholds.</span></div>`;
+    } else {
+        el('anoms').innerHTML = anoms.map(a => `
+            <div class="surface rounded-xl border-l-4 ${styleMap[a.level]||''} px-4 py-3">
+                <div class="text-[10px] font-semibold uppercase tracking-wider ${sigMap[a.level]||'text-zinc-400'}">${a.level} · ${esc(a.signal)}</div>
+                <div class="text-sm text-zinc-700 dark:text-zinc-200 mt-0.5">${esc(a.msg)}</div>
+            </div>`).join('');
+    }
+
+    // panels
+    const g = [];
+    const pct = cap ? Math.round((m.rss/cap)*100) : 0;
+    g.push(card('Memory', 'rss = real footprint',
+        big(m.rss||0, 'MB rss', cap ? tone(pct, 70, 85) : '') +
+        row('Heap used', (m.heapUsed||0) + ' MB') +
+        row('Heap total', (m.heapTotal||0) + ' MB') +
+        row('External', (m.external||0) + ' MB') +
+        row('ArrayBuffers', (m.arrayBuffers||0) + ' MB') +
+        row('Peak rss', p.peakRssMb + ' MB') +
+        (cap
+            ? row('of ' + cap + 'MB cap', pct + '%', tone(pct, 70, 85)) +
+              `<div class="h-1.5 rounded-full bg-zinc-100 dark:bg-zinc-800 mt-2 overflow-hidden"><div class="h-full rounded-full ${pct>=85?'bg-red-500':pct>=70?'bg-amber-500':'bg-emerald-500'}" style="width:${Math.min(100,pct)}%"></div></div>`
+            : row('Cap', 'MEMORY_LIMIT_MB unset', 'text-amber-500')),
+        'c-mem'));
+
+    g.push(card('Event-loop delay', 'spikes = blocking / GC',
+        big(lp.p99!=null?lp.p99:'—', 'ms p99', tone(lp.p99||0, 50, 100)) +
+        row('Mean', (lp.mean!=null?lp.mean:'—') + ' ms') +
+        row('p50', (lp.p50!=null?lp.p50:'—') + ' ms') +
+        row('p99', (lp.p99!=null?lp.p99:'—') + ' ms', tone(lp.p99||0, 50, 100)) +
+        row('Max', (lp.max!=null?lp.max:'—') + ' ms', tone(lp.max||0, 100, 200)),
+        'c-loop'));
+
+    g.push(card('CPU', 'share of 1 core',
+        big(cp.pct!=null?cp.pct:'—', '%', tone(cp.pct||0, 60, 90)) +
+        row('Sampled every', '5s') +
+        row('Reads as', (cp.pct||0) >= 90 ? 'saturated' : (cp.pct||0) >= 60 ? 'busy' : 'healthy',
+            tone(cp.pct||0, 60, 90)) +
+        row('Note', '&gt;100% = multi-core'),
+        'c-cpu'));
+
+    const hTrend = (d.handles.history||[]).length >= 2 ? h.handles - d.handles.history[0].handles : 0;
+    g.push(card('Active handles', 'climbing = leak',
+        big(h.handles!=null?h.handles:'—', 'handles', tone(h.handles||0, 100, 200)) +
+        row('Active requests', h.requests!=null?h.requests:'—') +
+        row('Trend (window)', (hTrend>=0?'+':'') + hTrend, tone(Math.abs(hTrend), 20, 50)) +
+        row('Reads as', hTrend>=50 ? 'climbing — leak?' : 'stable', hTrend>=50?'text-amber-500':''),
+        'c-handles'));
+
+    const gc = d.gc || { count: 0, byKind: {} };
+    const byKind = Object.entries(gc.byKind||{}).map(([k,v]) => row(k, v.count + ' · ' + Math.round(v.ms) + 'ms')).join('');
+    g.push(card('Garbage collection', 'since boot',
+        big(gc.count, 'collections') +
+        row('Total pause', Math.round(gc.totalPauseMs||0) + ' ms') +
+        row('Max pause', Math.round((gc.maxPauseMs||0)*10)/10 + ' ms', (gc.maxPauseMs||0)>=100?'text-amber-500':'') +
+        (byKind || row('Detail', '—'))));
+
+    if (disc) {
+        const c = disc.caches || {}, mem = disc.inMemory || {};
+        g.push(card('Discord gateway', 'bounded caches',
+            row(dot(disc.ready) + (disc.ready ? 'Ready' : 'Not ready'), (disc.wsPingMs!=null?disc.wsPingMs+' ms ping':'')) +
+            row('Bot uptime', fmtUptime(disc.uptimeSec||0)) +
+            `<div class="text-[10px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500 font-semibold mt-3 mb-1">Caches</div>` +
+            row('Guilds', c.guilds) + row('Users', c.users, (c.users||0)>=100?'text-amber-500':'') +
+            row('Members', c.members, (c.members||0)>=200?'text-amber-500':'') + row('Channels', c.channels) +
+            `<div class="text-[10px] uppercase tracking-wider text-zinc-400 dark:text-zinc-500 font-semibold mt-3 mb-1">In-memory maps</div>` +
+            row('userSessions', mem.userSessions) + row('activeGiveaways', mem.activeGiveaways) +
+            row('cachedLiveries', mem.cachedLiveries) + row('vaBannerCooldown', mem.vaBannerCooldown)));
+    }
+    if (db) {
+        g.push(card('MongoDB', 'connection',
+            row(dot(db.state==='connected') + esc(db.state), '') +
+            row('Host', esc(db.host||'—')) + row('Database', esc(db.name||'—')) + row('Models', db.models)));
+    }
+    el('grid').innerHTML = g.join('');
+
+    // sparklines (after DOM insert)
+    spark(el('c-mem'), d.memory.history.map(x=>x.rss), C.emerald, cap ? { max: cap } : {});
+    spark(el('c-loop'), d.eventLoop.history.map(x=>x.p99), C.amber);
+    spark(el('c-cpu'), d.cpu.history.map(x=>x.pct), C.sky, { max: 100 });
+    spark(el('c-handles'), d.handles.history.map(x=>x.handles), C.violet);
+
+    // routes
+    el('routesBody').innerHTML = (d.routes||[]).map(r => {
+        const p95cls = r.p95>=1000 ? 'text-red-500' : r.p95>=300 ? 'text-amber-500' : '';
+        return `<tr class="border-b border-zinc-50 dark:border-zinc-800/50 hover:bg-zinc-50/60 dark:hover:bg-zinc-800/30 transition">
+            <td class="px-4 py-2.5 font-medium text-sky-600 dark:text-sky-400 max-w-[340px] truncate" title="${esc(r.key)}">${esc(r.key)}</td>
+            <td class="px-4 py-2.5 text-right">${r.count}</td>
+            <td class="px-4 py-2.5 text-right">${r.avgMs}</td>
+            <td class="px-4 py-2.5 text-right ${p95cls}">${r.p95}</td>
+            <td class="px-4 py-2.5 text-right">${r.maxMs}</td>
+            <td class="px-4 py-2.5 text-right ${r.errors?'text-red-500 font-semibold':'text-zinc-300 dark:text-zinc-600'}">${r.errors||'0'}</td>
+            <td class="px-4 py-2.5 text-right text-zinc-400 dark:text-zinc-500">${fmtAge(r.lastAt)}</td>
+        </tr>`;
+    }).join('') || `<tr><td colspan="7" class="px-4 py-6 text-center text-sm text-zinc-400">No requests observed yet.</td></tr>`;
+
+    el('routesMeta').textContent = `${(d.routes||[]).length} route(s) · biggest consumers first`;
+    el('footNote').textContent = `pid ${p.pid} · node ${p.node} · sampled every 5s · updated ${new Date(d.now).toLocaleTimeString()}`;
+    drawIcons();
+}
+
+// ---- fetch loop ----
+async function tick() {
+    try {
+        const r = await fetch('/api/admin/diagnostics', { credentials: 'include', cache: 'no-store' });
+        if (r.status === 401 || r.status === 403) {
+            showErr('Access denied', 'This terminal is admin-only. Sign in to the Staff Hub as an admin, then reopen it.');
+            return;
+        }
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const d = await r.json();
+        lastErr = null;
+        render(d);
+        el('liveState').innerHTML = `<span class="live-dot text-emerald-500">●</span> live · every ${POLL_MS/1000}s`;
+    } catch (e) {
+        lastErr = e;
+        el('liveState').innerHTML = `<span class="text-red-500">●</span> poll failed: ${esc(e.message)}`;
+        if (!hasRendered) show('bootLoader');
+    }
+}
+function showErr(title, msg) {
+    show('errView');
+    el('errTitle').textContent = title;
+    el('errMsg').textContent = msg;
+    el('liveState').textContent = 'access denied';
+    drawIcons();
+}
+function loop() { if (!paused) tick(); }
+function togglePause() {
+    paused = !paused;
+    el('pauseBtn').innerHTML = paused
+        ? '<i data-lucide="play" class="w-4 h-4"></i><span>Resume</span>'
+        : '<i data-lucide="pause" class="w-4 h-4"></i><span>Pause</span>';
+    el('liveState').innerHTML = paused ? '<span class="text-amber-500">●</span> paused' : '';
+    drawIcons();
+    if (!paused) loop();
+}
+
+// ---- dark mode (shared with the Staff Hub via localStorage 'theme') ----
+function setThemeIcon() {
+    const dark = document.documentElement.classList.contains('dark');
+    el('themeIcon').innerHTML = `<i data-lucide="${dark ? 'sun' : 'moon'}" class="w-[18px] h-[18px]"></i>`;
+    drawIcons();
+}
+function toggleDarkMode() {
+    const dark = !document.documentElement.classList.contains('dark');
+    localStorage.setItem('theme', dark ? 'dark' : 'light');
+    document.documentElement.classList.toggle('dark', dark);
+    setThemeIcon();
+    if (hasRendered && !lastErr) tick(); // repaint sparklines for the new theme
+}
+document.documentElement.classList.toggle('dark', localStorage.getItem('theme') !== 'light');
+
+// ---- boot ----
+window.addEventListener('DOMContentLoaded', () => {
+    setThemeIcon();
+    drawIcons();
+    tick();
+    setInterval(loop, POLL_MS);
+    window.addEventListener('resize', () => { if (!paused && !lastErr && hasRendered) tick(); });
+});
+</script>
+</body>
+</html>

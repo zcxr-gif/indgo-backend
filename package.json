@@ -4,7 +4,7 @@
   "description": "API for IndGo Virtual Airline",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node --expose-gc server.js",
     "build": "node scripts/build-va-terms-pdf.js",
     "build:terms": "node scripts/build-va-terms-pdf.js"
   },
