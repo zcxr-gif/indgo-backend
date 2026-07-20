@@ -4148,6 +4148,12 @@ app.get('/api/va-terms', (req, res) => {
     });
 });
 
+// Mapbox map-load quota guard (POST/GET /api/maploads/hit, GET /api/maploads/status).
+// The flight tracker calls this once per page-session to decide whether to render
+// with billed Mapbox GL or the free MapLibre + OpenFreeMap engine, so we never bill
+// past Mapbox's free tier. Sends Access-Control-Allow-Origin: * itself (browser call).
+app.use(require('./routes/mapLoads'));
+
 // 1. Serve static files from the root directory
 // This allows the browser to find airports.js, images, and CSS
 app.use(express.static(__dirname));
