@@ -19,11 +19,21 @@ const express = require('express');
 const mongoose = require('mongoose');
 const router = express.Router();
 
-// In-memory counter. Fine for a single instance; use Redis/DB if the backend
-// runs more than one replica so the count is shared (see note below).
+// The counter is kept in memory (the hot /hit path never waits on the DB) and
+// write-through persisted to Mongo, one doc per month, so it survives restarts
+// and redeploys. Single-instance only: with more than one replica the memory
+// caches would race — move the threshold check itself into the DB if that
+// ever happens.
 const counts = new Map(); // "YYYY-MM" -> number
 const DEFAULT_LIMIT = 40000;
 const HARD_CAP = 50000; // never let a client push the threshold above the free tier
+
+const MapLoadCounterSchema = new mongoose.Schema({
+    _id: { type: String }, // "YYYY-MM" — old months stay behind as history
+    count: { type: Number, default: 0 },
+}, { timestamps: true, minimize: false });
+const MapLoadCounter = mongoose.models.MapLoadCounter
+    || mongoose.model('MapLoadCounter', MapLoadCounterSchema);
 
 // ---------------------------------------------------------------------------
 // Admin-adjustable settings (Staff Hub -> /map-usage)
@@ -54,8 +64,42 @@ function loadSettings() {
         })
         .catch(err => console.warn('maploads: could not load persisted settings:', err.message));
 }
-if (mongoose.connection.readyState === 1) loadSettings();
-else mongoose.connection.once('connected', loadSettings);
+// Bring the persisted count for the current month back into memory. Until this
+// completes, hits count in memory only (no DB writes), so the two can't drift;
+// the first sync folds any pre-connect hits into the persisted total. On
+// RE-connects the in-memory count is authoritative (it kept counting while the
+// DB was away), so it's pushed back out instead.
+let counterSynced = false;
+
+function persistCount(month, count) {
+    if (mongoose.connection.readyState !== 1) return;
+    MapLoadCounter.updateOne({ _id: month }, { $set: { count } }, { upsert: true })
+        .catch(err => console.warn('maploads: could not persist counter:', err.message));
+}
+
+function syncCounter() {
+    const month = monthKey();
+    if (counterSynced) { persistCount(month, counts.get(month) || 0); return; }
+    MapLoadCounter.findById(month).lean()
+        .then(doc => {
+            const bootHits = counts.get(month) || 0; // counted before the DB was up
+            const total = ((doc && doc.count) || 0) + bootHits;
+            counts.set(month, total);
+            counterSynced = true;
+            persistCount(month, total);
+        })
+        .catch(err => console.warn('maploads: could not load persisted counter:', err.message));
+}
+
+// Settings load once (after that, memory is the live truth and every change
+// writes through); the counter re-syncs on every (re)connect.
+let settingsLoadStarted = false;
+function boot() {
+    if (!settingsLoadStarted) { settingsLoadStarted = true; loadSettings(); }
+    syncCounter();
+}
+if (mongoose.connection.readyState === 1) boot();
+mongoose.connection.on('connected', boot);
 
 function envForceFreeMap() {
     return String(process.env.FORCE_FREE_MAP || '').toLowerCase() === 'true';
@@ -103,9 +147,15 @@ function handleHit(req, res) {
     }
 
     // Otherwise this session uses Mapbox (under the ceiling, or Pro is exempt) —
-    // it's a real billed load, so count it.
+    // it's a real billed load, so count it. Write-through to Mongo (fire and
+    // forget — the response never waits) so the count survives restarts; before
+    // the first sync the hit stays memory-only and gets folded in by syncCounter.
     const next = current + 1;
     counts.set(month, next);
+    if (counterSynced && mongoose.connection.readyState === 1) {
+        MapLoadCounter.updateOne({ _id: month }, { $inc: { count: 1 } }, { upsert: true })
+            .catch(err => console.warn('maploads: could not persist counter:', err.message));
+    }
     return res.json({ ok: true, month, count: next, limit, pro, forced: false, useFreeMap: false });
 }
 
@@ -181,9 +231,12 @@ const admin = {
         return admin.state();
     },
 
-    // Zero the current month's counter (e.g. after a bug inflated it).
+    // Zero the current month's counter (e.g. after a bug inflated it) — in
+    // memory and in the persisted doc.
     resetMonth() {
-        counts.delete(monthKey());
+        const month = monthKey();
+        counts.delete(month);
+        persistCount(month, 0);
         return admin.state();
     },
 };
