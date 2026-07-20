@@ -963,6 +963,29 @@ app.get('/api/admin/diagnostics', requireAdmin, (req, res) => {
     }
 });
 
+// Mapbox map-load guard controls for the Staff Hub's /map-usage console.
+// The guard itself (mounted further down) stays public for the tracker; these
+// admin endpoints expose the monthly counter and the switches — force-free-map
+// and the monthly limit — plus a counter reset.
+const mapLoadsGuard = require('./routes/mapLoads');
+
+app.get('/api/admin/maploads', requireAdmin, (req, res) => {
+    res.json(mapLoadsGuard.admin.state());
+});
+
+app.patch('/api/admin/maploads', requireAdmin, (req, res) => {
+    try {
+        const { forceFreeMap, limit } = req.body || {};
+        res.json(mapLoadsGuard.admin.update({ forceFreeMap, limit }));
+    } catch (e) {
+        res.status(400).json({ message: e.message });
+    }
+});
+
+app.post('/api/admin/maploads/reset', requireAdmin, (req, res) => {
+    res.json(mapLoadsGuard.admin.resetMonth());
+});
+
 // At-a-glance counters for the Staff Hub overview cards. Cheap countDocuments
 // calls — no heavy aggregation. Any signed-in staff member (incl. VA reps) may
 // read this; the figures are non-sensitive operational totals.
@@ -4116,6 +4139,13 @@ app.get('/diagnostics', (req, res) => {
     res.sendFile(path.join(__dirname, 'diagnostics.html'));
 });
 
+// Map usage & limits console — the Mapbox map-load counter and its switches.
+// Same pattern as /diagnostics: public page shell, admin-gated data endpoints
+// (/api/admin/maploads*), so a non-admin just sees an access-denied banner.
+app.get('/map-usage', (req, res) => {
+    res.sendFile(path.join(__dirname, 'map-usage.html'));
+});
+
 // The VA Partnership Portal login + dashboard. Public so partner VAs can reach
 // the login form; the page calls /api/va-portal/auth/me to decide what to show.
 // This is a SEPARATE login from the staff hub (partners are not staff).
@@ -4152,7 +4182,7 @@ app.get('/api/va-terms', (req, res) => {
 // The flight tracker calls this once per page-session to decide whether to render
 // with billed Mapbox GL or the free MapLibre + OpenFreeMap engine, so we never bill
 // past Mapbox's free tier. Sends Access-Control-Allow-Origin: * itself (browser call).
-app.use(require('./routes/mapLoads'));
+app.use(mapLoadsGuard);
 
 // 1. Serve static files from the root directory
 // This allows the browser to find airports.js, images, and CSS

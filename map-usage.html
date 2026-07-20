@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Map Usage &amp; Limits — Inflight</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script>tailwind.config = { darkMode: 'class' };</script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+        :root { color-scheme: light dark; }
+        * { -webkit-tap-highlight-color: transparent; }
+        body { font-family: 'Inter', sans-serif; -webkit-font-smoothing: antialiased; }
+        [data-lucide] { width: 1.15em; height: 1.15em; }
+        svg.lucide { stroke-width: 1.75; }
+        .surface { background: #fff; border: 1px solid rgba(0,0,0,.06); box-shadow: 0 1px 2px rgba(0,0,0,.03), 0 1px 1px rgba(0,0,0,.02); }
+        .dark .surface { background: #18181b; border-color: rgba(255,255,255,.07); box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+        .hub-bg { background-image: radial-gradient(rgba(0,0,0,.025) 1px, transparent 1px); background-size: 22px 22px; }
+        .dark .hub-bg { background-image: radial-gradient(rgba(255,255,255,.03) 1px, transparent 1px); }
+        .fade-in { animation: fade .4s cubic-bezier(.2,.8,.2,1) forwards; }
+        @keyframes fade { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .loader { border: 2.5px solid rgba(120,120,128,.25); border-top-color: currentColor; border-radius: 50%; width: 30px; height: 30px; animation: spin .7s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .tnum { font-variant-numeric: tabular-nums; }
+
+        /* iOS-style switch */
+        .switch { position: relative; width: 48px; height: 28px; border-radius: 9999px; background: rgba(120,120,128,.28); transition: background .2s; cursor: pointer; flex-shrink: 0; border: none; padding: 0; }
+        .switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 24px; height: 24px; border-radius: 9999px; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.25); transition: transform .2s cubic-bezier(.2,.8,.2,1); }
+        .switch.on { background: #f59e0b; }
+        .switch.on::after { transform: translateX(20px); }
+        .switch:disabled { opacity: .5; cursor: not-allowed; }
+
+        input[type=number] { font-family: inherit; }
+        input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+        ::placeholder { color: #a1a1aa; }
+    </style>
+</head>
+<body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 antialiased min-h-screen transition-colors duration-300 hub-bg">
+
+    <!-- ============ TOP BAR ============ -->
+    <header class="sticky top-0 z-40 backdrop-blur-xl bg-zinc-50/80 dark:bg-zinc-950/80 border-b border-zinc-200/70 dark:border-zinc-800/70">
+        <div class="max-w-4xl mx-auto px-5 h-16 flex items-center justify-between">
+            <div class="flex items-center gap-2.5">
+                <div class="w-9 h-9 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 flex items-center justify-center">
+                    <i data-lucide="map" class="w-5 h-5"></i>
+                </div>
+                <div class="leading-tight">
+                    <div class="font-semibold tracking-tight">Map Usage &amp; Limits</div>
+                    <div id="liveState" class="text-[11px] text-zinc-400 dark:text-zinc-500">connecting…</div>
+                </div>
+            </div>
+            <div class="flex items-center gap-2">
+                <button onclick="refresh()" title="Refresh" class="w-9 h-9 grid place-items-center rounded-full hover:bg-zinc-200/70 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition">
+                    <i data-lucide="refresh-cw" class="w-[18px] h-[18px]"></i>
+                </button>
+                <button onclick="toggleDarkMode()" title="Toggle theme" class="w-9 h-9 grid place-items-center rounded-full hover:bg-zinc-200/70 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition">
+                    <span id="themeIcon"></span>
+                </button>
+                <a href="/staff" title="Back to Staff Hub" class="w-9 h-9 grid place-items-center rounded-full hover:bg-zinc-200/70 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition">
+                    <i data-lucide="layout-grid" class="w-[18px] h-[18px]"></i>
+                </a>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-4xl mx-auto px-5 py-8">
+
+        <!-- boot -->
+        <div id="bootLoader" class="min-h-[50vh] flex flex-col items-center justify-center gap-4 text-zinc-400">
+            <div class="loader"></div>
+            <p class="text-sm font-medium">Reading map-load counters…</p>
+        </div>
+
+        <!-- access denied / error -->
+        <div id="errView" class="hidden min-h-[50vh] flex items-center justify-center">
+            <div class="surface rounded-3xl p-10 max-w-md text-center fade-in">
+                <div class="w-14 h-14 rounded-2xl bg-red-50 dark:bg-red-500/10 text-red-500 grid place-items-center mx-auto mb-5">
+                    <i data-lucide="shield-alert" class="w-7 h-7"></i>
+                </div>
+                <h2 id="errTitle" class="text-xl font-bold tracking-tight">Access denied</h2>
+                <p id="errMsg" class="text-sm text-zinc-500 dark:text-zinc-400 mt-2"></p>
+                <a href="/staff" class="mt-6 inline-flex items-center gap-1.5 text-sm font-semibold px-4 py-2 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 hover:opacity-90 transition">
+                    <i data-lucide="arrow-left" class="w-4 h-4"></i> Back to Staff Hub
+                </a>
+            </div>
+        </div>
+
+        <!-- content -->
+        <div id="content" class="hidden">
+
+            <!-- summary tiles -->
+            <section class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6 fade-in">
+                <div class="surface rounded-2xl p-4">
+                    <div class="flex items-center gap-2 text-zinc-400 dark:text-zinc-500 mb-1.5"><i data-lucide="mouse-pointer-click" class="w-4 h-4"></i><span class="text-[11px] font-semibold uppercase tracking-wide">Loads this month</span></div>
+                    <p class="text-2xl font-bold tracking-tight tnum" id="tCount">—</p>
+                    <p class="text-[11px] text-zinc-400 dark:text-zinc-600 mt-0.5 tnum" id="tMonth"></p>
+                </div>
+                <div class="surface rounded-2xl p-4">
+                    <div class="flex items-center gap-2 text-zinc-400 dark:text-zinc-500 mb-1.5"><i data-lucide="gauge" class="w-4 h-4"></i><span class="text-[11px] font-semibold uppercase tracking-wide">Monthly limit</span></div>
+                    <p class="text-2xl font-bold tracking-tight tnum" id="tLimit">—</p>
+                    <p class="text-[11px] text-zinc-400 dark:text-zinc-600 mt-0.5" id="tLimitNote"></p>
+                </div>
+                <div class="surface rounded-2xl p-4">
+                    <div class="flex items-center gap-2 text-zinc-400 dark:text-zinc-500 mb-1.5"><i data-lucide="battery-medium" class="w-4 h-4"></i><span class="text-[11px] font-semibold uppercase tracking-wide">Remaining</span></div>
+                    <p class="text-2xl font-bold tracking-tight tnum" id="tRemaining">—</p>
+                    <p class="text-[11px] text-zinc-400 dark:text-zinc-600 mt-0.5">until the free map kicks in</p>
+                </div>
+                <div class="surface rounded-2xl p-4">
+                    <div class="flex items-center gap-2 text-zinc-400 dark:text-zinc-500 mb-1.5"><i data-lucide="globe" class="w-4 h-4"></i><span class="text-[11px] font-semibold uppercase tracking-wide">Now serving</span></div>
+                    <p class="text-2xl font-bold tracking-tight" id="tServing">—</p>
+                    <p class="text-[11px] text-zinc-400 dark:text-zinc-600 mt-0.5" id="tServingNote"></p>
+                </div>
+            </section>
+
+            <!-- usage bar -->
+            <section class="surface rounded-2xl p-5 mb-8 fade-in">
+                <div class="flex items-baseline justify-between mb-2.5">
+                    <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Usage vs limit</h2>
+                    <span class="text-[11px] text-zinc-400 dark:text-zinc-600 tnum" id="barLabel"></span>
+                </div>
+                <div class="h-3 rounded-full bg-zinc-100 dark:bg-zinc-800 overflow-hidden">
+                    <div id="barFill" class="h-full rounded-full bg-emerald-500 transition-all duration-500" style="width:0%"></div>
+                </div>
+                <p class="text-[11px] text-zinc-400 dark:text-zinc-600 mt-2.5">
+                    Counter resets on the 1st of each month (UTC). Mapbox's free web tier is
+                    <span class="tnum font-medium" id="hardCapNote">50,000</span> loads/month — the limit can never be set above it.
+                    The count is persisted to the database, so it survives restarts and redeploys.
+                </p>
+            </section>
+
+            <!-- the switches -->
+            <section class="fade-in">
+                <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-4">The switches</h2>
+
+                <!-- force free map -->
+                <div class="surface rounded-2xl p-5 mb-4">
+                    <div class="flex items-start justify-between gap-4">
+                        <div class="flex items-start gap-3.5 min-w-0">
+                            <span class="w-10 h-10 rounded-xl grid place-items-center shrink-0 bg-amber-50 text-amber-500 dark:bg-amber-950/40"><i data-lucide="hand" class="w-5 h-5"></i></span>
+                            <div class="min-w-0">
+                                <p class="font-semibold text-sm">Force the free map for everyone</p>
+                                <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-1">Kill switch: every visitor — Pro included — gets the free MapLibre + OpenFreeMap engine instead of billed Mapbox GL. Nothing counts against the quota while it's on.</p>
+                                <p class="text-[11px] text-zinc-400 dark:text-zinc-600 mt-1.5" id="forceMeta"></p>
+                            </div>
+                        </div>
+                        <button id="forceSwitch" class="switch mt-1" role="switch" aria-checked="false" aria-label="Force the free map for everyone" onclick="toggleForce()"></button>
+                    </div>
+                    <div id="forceEnvRow" class="hidden mt-3 pl-[3.4rem]">
+                        <button onclick="clearForceOverride()" class="text-xs font-semibold text-zinc-500 hover:text-zinc-900 dark:hover:text-white transition inline-flex items-center gap-1.5">
+                            <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i> Clear override — follow the FORCE_FREE_MAP env var
+                        </button>
+                    </div>
+                </div>
+
+                <!-- monthly limit -->
+                <div class="surface rounded-2xl p-5 mb-4">
+                    <div class="flex items-start gap-3.5">
+                        <span class="w-10 h-10 rounded-xl grid place-items-center shrink-0 bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-300"><i data-lucide="sliders-horizontal" class="w-5 h-5"></i></span>
+                        <div class="min-w-0 flex-1">
+                            <p class="font-semibold text-sm">Monthly Mapbox limit</p>
+                            <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-1">Once this many loads are counted, non-Pro visitors drop to the free map for the rest of the month. Setting a value here pins the ceiling — it overrides whatever the tracker requests.</p>
+                            <form class="mt-3 flex flex-wrap items-center gap-2" onsubmit="saveLimit(event)">
+                                <input id="limitInput" type="number" min="1" step="1" inputmode="numeric"
+                                    class="w-36 px-3.5 py-2 rounded-xl bg-zinc-100/70 dark:bg-zinc-800/70 border border-transparent focus:border-zinc-300 dark:focus:border-zinc-600 focus:bg-white dark:focus:bg-zinc-800 focus:outline-none focus:ring-4 focus:ring-zinc-900/5 dark:focus:ring-white/5 transition text-sm tnum">
+                                <button type="submit" id="limitSaveBtn" class="bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 px-4 py-2 rounded-xl text-sm font-semibold hover:opacity-90 active:scale-[.98] transition">Save</button>
+                                <button type="button" onclick="clearLimitOverride()" class="text-xs font-semibold text-zinc-500 hover:text-zinc-900 dark:hover:text-white transition inline-flex items-center gap-1.5">
+                                    <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i> Use default (<span class="tnum" id="defaultLimitNote">40,000</span>)
+                                </button>
+                            </form>
+                            <p class="text-[11px] text-zinc-400 dark:text-zinc-600 mt-2" id="limitMeta"></p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- reset counter -->
+                <div class="surface rounded-2xl p-5">
+                    <div class="flex items-start justify-between gap-4">
+                        <div class="flex items-start gap-3.5 min-w-0">
+                            <span class="w-10 h-10 rounded-xl grid place-items-center shrink-0 bg-red-50 dark:bg-red-500/10 text-red-500"><i data-lucide="timer-reset" class="w-5 h-5"></i></span>
+                            <div class="min-w-0">
+                                <p class="font-semibold text-sm">Reset this month's counter</p>
+                                <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-1">Zeroes the load count for the current month. Only for when the count is wrong (e.g. a bug inflated it) — it does <span class="font-semibold">not</span> reset what Mapbox has actually billed.</p>
+                            </div>
+                        </div>
+                        <button onclick="resetCounter(this)" class="shrink-0 text-xs font-semibold px-3.5 py-2 rounded-xl border border-red-200 dark:border-red-500/30 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 active:scale-95 transition">Reset counter</button>
+                    </div>
+                </div>
+            </section>
+        </div>
+    </main>
+
+    <!-- toast -->
+    <div id="toast" class="hidden fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-2.5 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 text-sm font-medium shadow-lg fade-in"></div>
+
+    <script>
+        const el = id => document.getElementById(id);
+        const show = id => el(id).classList.remove('hidden');
+        const hide = id => el(id).classList.add('hidden');
+        function drawIcons() { if (window.lucide) lucide.createIcons(); }
+
+        // ---- Dark mode (same convention as the hub) ----
+        function setThemeIcon() {
+            const dark = document.documentElement.classList.contains('dark');
+            const t = el('themeIcon');
+            if (t) { t.innerHTML = `<i data-lucide="${dark ? 'sun' : 'moon'}" class="w-[18px] h-[18px]"></i>`; drawIcons(); }
+        }
+        function applyTheme() {
+            const dark = localStorage.getItem('theme') !== 'light';
+            document.documentElement.classList.toggle('dark', dark);
+            setThemeIcon();
+        }
+        function toggleDarkMode() {
+            const dark = !document.documentElement.classList.contains('dark');
+            localStorage.setItem('theme', dark ? 'dark' : 'light');
+            document.documentElement.classList.toggle('dark', dark);
+            setThemeIcon();
+        }
+        applyTheme();
+
+        let state = null;       // last snapshot from the backend
+        let booted = false;
+        let toastTimer = null;
+
+        function toast(msg, bad) {
+            const t = el('toast');
+            t.textContent = msg;
+            t.classList.toggle('!bg-red-600', !!bad);
+            t.classList.toggle('!text-white', !!bad);
+            show('toast');
+            clearTimeout(toastTimer);
+            toastTimer = setTimeout(() => hide('toast'), 2600);
+        }
+
+        function showErr(title, msg) {
+            hide('bootLoader'); hide('content'); show('errView');
+            el('errTitle').textContent = title;
+            el('errMsg').textContent = msg;
+            el('liveState').textContent = 'access denied';
+            drawIcons();
+        }
+
+        async function api(path, opts = {}) {
+            const res = await fetch(path, {
+                credentials: 'include',
+                cache: 'no-store',
+                headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+                ...opts,
+            });
+            let data = null;
+            try { data = await res.json(); } catch {}
+            return { ok: res.ok, status: res.status, data };
+        }
+
+        const fmt = n => (n ?? 0).toLocaleString();
+
+        function render(d) {
+            state = d;
+            hide('bootLoader'); hide('errView'); show('content');
+
+            // Tiles
+            el('tCount').textContent = fmt(d.count);
+            el('tMonth').textContent = d.month + ' (UTC)';
+            el('tLimit').textContent = fmt(d.limit);
+            el('tLimitNote').textContent = d.limitOverride !== null ? 'pinned from this console' : 'tracker default';
+            const remaining = Math.max(0, d.limit - d.count);
+            el('tRemaining').textContent = d.forced ? '—' : fmt(remaining);
+
+            const serving = el('tServing');
+            if (d.forced) {
+                serving.textContent = 'Free map';
+                serving.className = 'text-2xl font-bold tracking-tight text-amber-500';
+                el('tServingNote').textContent = 'forced for everyone, Pro included';
+            } else if (d.useFreeMap) {
+                serving.textContent = 'Free map';
+                serving.className = 'text-2xl font-bold tracking-tight text-amber-500';
+                el('tServingNote').textContent = 'limit reached — Pro still gets Mapbox';
+            } else {
+                serving.textContent = 'Mapbox GL';
+                serving.className = 'text-2xl font-bold tracking-tight text-emerald-500';
+                el('tServingNote').textContent = 'billed loads, under the limit';
+            }
+
+            // Usage bar
+            const pct = Math.min(100, d.limit ? (d.count / d.limit) * 100 : 0);
+            const fill = el('barFill');
+            fill.style.width = pct.toFixed(1) + '%';
+            fill.className = 'h-full rounded-full transition-all duration-500 ' +
+                (pct >= 100 ? 'bg-red-500' : pct >= 80 ? 'bg-amber-500' : 'bg-emerald-500');
+            el('barLabel').textContent = fmt(d.count) + ' / ' + fmt(d.limit) + ' (' + pct.toFixed(1) + '%)';
+            el('hardCapNote').textContent = fmt(d.hardCap);
+
+            // Force switch
+            const sw = el('forceSwitch');
+            sw.classList.toggle('on', d.forced);
+            sw.setAttribute('aria-checked', String(d.forced));
+            el('forceMeta').textContent = d.forceFreeMapOverride === null
+                ? 'Following the FORCE_FREE_MAP env var (currently ' + (d.envForceFreeMap ? 'on' : 'off') + ').'
+                : 'Console override active: ' + (d.forceFreeMapOverride ? 'ON' : 'OFF') + ' · env var says ' + (d.envForceFreeMap ? 'on' : 'off') + '.';
+            el('forceEnvRow').classList.toggle('hidden', d.forceFreeMapOverride === null);
+
+            // Limit controls (don't clobber the input while the admin is typing)
+            const inp = el('limitInput');
+            if (document.activeElement !== inp) {
+                inp.value = d.limitOverride !== null ? d.limitOverride : '';
+                inp.placeholder = fmt(d.defaultLimit);
+            }
+            inp.max = d.hardCap;
+            el('defaultLimitNote').textContent = fmt(d.defaultLimit);
+            el('limitMeta').textContent = d.limitOverride !== null
+                ? 'Override active: ' + fmt(d.limitOverride) + ' loads/month. Hard cap ' + fmt(d.hardCap) + '.'
+                : 'No override — the tracker\'s requested limit (default ' + fmt(d.defaultLimit) + ') applies. Hard cap ' + fmt(d.hardCap) + '.';
+
+            el('liveState').textContent = 'updated ' + new Date().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            drawIcons();
+            booted = true;
+        }
+
+        async function refresh() {
+            const { ok, status, data } = await api('/api/admin/maploads');
+            if (status === 401 || status === 403) {
+                showErr('Access denied', 'This console is admin-only. Sign in to the Staff Hub as an admin, then reopen it.');
+                return;
+            }
+            if (!ok || !data) {
+                if (!booted) showErr('Something broke', 'Could not read the map-load state (HTTP ' + status + '). Try refreshing.');
+                else el('liveState').textContent = 'refresh failed — retrying';
+                return;
+            }
+            render(data);
+        }
+
+        async function patch(body, okMsg) {
+            const { ok, status, data } = await api('/api/admin/maploads', { method: 'PATCH', body: JSON.stringify(body) });
+            if (status === 401 || status === 403) {
+                showErr('Access denied', 'Your session expired or lost admin rights. Sign back in via the Staff Hub.');
+                return false;
+            }
+            if (!ok) {
+                toast((data && data.message) || 'Could not save.', true);
+                refresh();
+                return false;
+            }
+            render(data);
+            if (okMsg) toast(okMsg);
+            return true;
+        }
+
+        // ---- The switches ----
+        function toggleForce() {
+            if (!state) return;
+            const next = !state.forced;
+            patch({ forceFreeMap: next }, next ? 'Free map forced for everyone.' : 'Force-free-map switched off.');
+        }
+
+        function clearForceOverride() {
+            patch({ forceFreeMap: null }, 'Override cleared — following the env var.');
+        }
+
+        function saveLimit(e) {
+            e.preventDefault();
+            if (!state) return;
+            const raw = el('limitInput').value.trim();
+            if (!raw) { clearLimitOverride(); return; }
+            const n = parseInt(raw, 10);
+            if (!Number.isFinite(n) || n < 1) { toast('Enter a positive number.', true); return; }
+            if (n > state.hardCap) { toast('Limit cannot exceed the ' + fmt(state.hardCap) + ' free-tier hard cap.', true); return; }
+            patch({ limit: n }, 'Monthly limit set to ' + fmt(n) + '.');
+        }
+
+        function clearLimitOverride() {
+            patch({ limit: null }, 'Limit override cleared — back to the default.');
+        }
+
+        async function resetCounter(btn) {
+            if (!state) return;
+            if (!confirm('Zero the ' + state.month + ' counter (currently ' + fmt(state.count) + ' loads)? This does not change what Mapbox has billed.')) return;
+            btn.disabled = true;
+            const { ok, status, data } = await api('/api/admin/maploads/reset', { method: 'POST' });
+            btn.disabled = false;
+            if (status === 401 || status === 403) { showErr('Access denied', 'Your session expired or lost admin rights. Sign back in via the Staff Hub.'); return; }
+            if (!ok) { toast((data && data.message) || 'Could not reset.', true); return; }
+            render(data);
+            toast('Counter reset to 0 for ' + data.month + '.');
+        }
+
+        // ---- Boot + gentle live refresh ----
+        refresh();
+        setInterval(() => { if (booted) refresh(); }, 15000);
+        drawIcons();
+    </script>
+</body>
+</html>
