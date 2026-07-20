@@ -1304,6 +1304,56 @@ app.get('/api/image-proxy', async (req, res) => {
  * FLIGHT TRAILS STORAGE
  * ========================= */
 
+// GET: Fetch ALL available replays, across every user.
+// Lets the front end browse the full library of stored flight trails and pick
+// any flight from any user to play back — not just its own. Returns a flat list
+// so the client can group by userId (or filter) however it likes.
+app.get('/api/trails', async (req, res) => {
+    try {
+        const prefix = 'trails/';
+        const trails = [];
+        let ContinuationToken;
+
+        // S3 lists at most 1000 keys per call, so page through until exhausted.
+        do {
+            const cmd = new ListObjectsV2Command({
+                Bucket: process.env.AWS_S3_BUCKET_NAME,
+                Prefix: prefix,
+                ContinuationToken
+            });
+            const data = await s3Client.send(cmd);
+
+            for (const f of data.Contents || []) {
+                // Keys look like: trails/{userId}/{flightId}.json
+                const rest = f.Key.slice(prefix.length);
+                const slash = rest.indexOf('/');
+                if (slash === -1) continue; // skip anything not under a user folder
+                const userId = rest.slice(0, slash);
+                const flightId = rest.slice(slash + 1).replace(/\.json$/, '');
+                if (!userId || !flightId) continue;
+
+                trails.push({
+                    userId,
+                    flightId,
+                    date: f.LastModified,
+                    size: f.Size,
+                    url: `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${f.Key}`
+                });
+            }
+
+            ContinuationToken = data.IsTruncated ? data.NextContinuationToken : undefined;
+        } while (ContinuationToken);
+
+        // Sort Newest First
+        trails.sort((a, b) => b.date - a.date);
+
+        res.json(trails);
+    } catch (e) {
+        console.error("All Trails Fetch Error:", e);
+        res.status(500).json({ message: "Failed to fetch trails" });
+    }
+});
+
 // GET: Fetch a user's trails
 app.get('/api/trails/:userId', async (req, res) => {
     const { userId } = req.params;
