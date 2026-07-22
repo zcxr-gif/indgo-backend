@@ -31,6 +31,10 @@ const {
     VaEvent,
 } = require('./vaPortal');
 
+// Crew Center sign-in (inflight.info/crew/<slug>) — cascades our existing
+// accounts (VA portal accounts + Inflight staff) and routes to the right view.
+const { registerCrewAuthRoutes } = require('./crewAuth');
+
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
@@ -988,6 +992,9 @@ registerAuthRoutes(app);
 // lambda so this call site doesn't touch it before it's initialised — the wrapper
 // only resolves it at request time, when the "send test" button is clicked.
 registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent: (ad) => sendVaTestEvent(ad), renderCardPreview: (ad, opts) => renderCardPreview(ad, opts), applyEmbedAppearance: (cfg, body) => applyEmbedAppearance(cfg, body) });
+
+// Crew Center sign-in routes (POST /api/crew/:slug/login, GET /api/crew/:slug/me).
+registerCrewAuthRoutes(app);
 
 // Health Check — public, unauthenticated (for uptime/platform monitors).
 // NOTE: the site is staff-only, so the homepage ("/") is gated below; point any
