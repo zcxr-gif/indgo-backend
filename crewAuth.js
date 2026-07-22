@@ -20,6 +20,9 @@ const crypto = require('crypto');
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString('hex');
 const TOKEN_TTL = '7d';
 
+// Known layout presets (mirrors the crew center front-end).
+const CREW_LAYOUTS = ['editorial', 'console', 'split', 'classic'];
+
 // Which dashboard a role routes to.
 function viewForRole(role) {
     return role === 'pilot' ? 'pilot' : 'owner';
@@ -104,6 +107,49 @@ function registerCrewAuthRoutes(app) {
         } catch (err) {
             console.error('Crew login error:', err);
             res.status(500).json({ error: 'Sign-in failed.' });
+        }
+    });
+
+    // --- Crew settings (owner/staff or Inflight can change; e.g. the layout) ---
+    app.post('/api/crew/:slug/settings', async (req, res) => {
+        const token = getBearer(req);
+        if (!token) return res.status(401).json({ error: 'Not authenticated.' });
+        let p;
+        try { p = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).json({ error: 'Invalid session.' }); }
+        if (p.typ !== 'crew') return res.status(401).json({ error: 'Invalid session.' });
+
+        const slug = String(req.params.slug || '').toLowerCase();
+        // Pilots can't change crew settings; a VA account is bound to its own crew.
+        const isInflight = p.kind === 'inflight';
+        if (!(isInflight || p.role === 'owner' || p.role === 'staff')) {
+            return res.status(403).json({ error: 'Not allowed to change crew settings.' });
+        }
+        if (!isInflight && p.slug && p.slug !== slug) {
+            return res.status(403).json({ error: 'Wrong crew center.' });
+        }
+
+        try {
+            const va = await resolveVa(slug);
+            if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+            const VirtualAirlineAd = mongoose.model('VirtualAirlineAd');
+            const ad = await VirtualAirlineAd.findById(va._id);
+            if (!ad) return res.status(404).json({ error: 'Crew center not found.' });
+
+            if (typeof req.body?.layout === 'string') {
+                const layout = req.body.layout.toLowerCase();
+                const allowed = (Array.isArray(ad.allowedLayouts) && ad.allowedLayouts.length)
+                    ? ad.allowedLayouts : CREW_LAYOUTS;
+                if (!CREW_LAYOUTS.includes(layout) || !allowed.includes(layout)) {
+                    return res.status(400).json({ error: 'That layout isn’t available for this crew center.' });
+                }
+                ad.layout = layout;
+            }
+            await ad.save();
+            res.set('Cache-Control', 'no-store');
+            res.json({ layout: ad.layout, allowedLayouts: ad.allowedLayouts });
+        } catch (err) {
+            console.error('Crew settings error:', err);
+            res.status(500).json({ error: 'Could not save settings.' });
         }
     });
 

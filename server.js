@@ -179,6 +179,12 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // slug don't collide on null.
     slug: { type: String, trim: true, lowercase: true, default: null },
 
+    // Crew Center layout the VA lands on, and the presets staff permit them to
+    // choose from. The VA picks from allowedLayouts in their crew center settings;
+    // staff manage the allow-list in the Crew Centers tool.
+    layout: { type: String, default: 'editorial' },
+    allowedLayouts: { type: [String], default: ['editorial', 'console', 'split', 'classic'] },
+
     // --- Copy ---
     tagline: { type: String, trim: true, maxlength: 140, default: '' }, // short hook
     description: { type: String, trim: true, maxlength: 4000, default: '' },
@@ -2560,7 +2566,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -2585,6 +2591,9 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             banner: ad.bannerUrl || '',
             website: ad.websiteUrl || '',
             accent,
+            layout: ad.layout || 'editorial',
+            allowedLayouts: (Array.isArray(ad.allowedLayouts) && ad.allowedLayouts.length)
+                ? ad.allowedLayouts : ['editorial', 'console', 'split', 'classic'],
         });
     } catch (err) {
         console.error('Crew center by-slug error:', err);
@@ -2607,7 +2616,7 @@ app.get('/api/crew-admin/vas', requireAuth, async (req, res) => {
             ];
         }
         const ads = await VirtualAirlineAd.find(query)
-            .select('name callsign slug logoUrl bannerUrl status')
+            .select('name callsign slug logoUrl bannerUrl status layout allowedLayouts')
             .sort({ name: 1 }).limit(limit).lean();
 
         // Portal-account counts per VA, grouped by role (owner/staff/pilot).
@@ -2627,6 +2636,8 @@ app.get('/api/crew-admin/vas', requireAuth, async (req, res) => {
             vas: ads.map(a => ({
                 id: a._id, name: a.name, code: a.callsign || null, slug: a.slug || null,
                 logo: a.logoUrl || '', banner: a.bannerUrl || '', status: a.status,
+                layout: a.layout || 'editorial',
+                allowedLayouts: (a.allowedLayouts && a.allowedLayouts.length) ? a.allowedLayouts : ['editorial','console','split','classic'],
                 accounts: byVa[String(a._id)] || {},
             })),
         });
@@ -2646,8 +2657,25 @@ app.patch('/api/crew-admin/vas/:id', requireAuth, async (req, res) => {
         if (typeof req.body.slug === 'string') {
             ad.slug = req.body.slug.trim() || null;
         }
+        // Which layout presets this VA may choose from (staff allow-list).
+        const CREW_LAYOUTS = ['editorial', 'console', 'split', 'classic'];
+        if (Array.isArray(req.body.allowedLayouts)) {
+            const allowed = req.body.allowedLayouts
+                .map(l => String(l).toLowerCase()).filter(l => CREW_LAYOUTS.includes(l));
+            ad.allowedLayouts = allowed.length ? [...new Set(allowed)] : ['editorial'];
+            if (!ad.allowedLayouts.includes(ad.layout || 'editorial')) ad.layout = ad.allowedLayouts[0];
+        }
+        if (typeof req.body.layout === 'string') {
+            const l = req.body.layout.toLowerCase();
+            const allowed = (Array.isArray(ad.allowedLayouts) && ad.allowedLayouts.length) ? ad.allowedLayouts : CREW_LAYOUTS;
+            if (CREW_LAYOUTS.includes(l) && allowed.includes(l)) ad.layout = l;
+        }
         await ad.save();
-        res.json({ id: ad._id, name: ad.name, code: ad.callsign || null, slug: ad.slug || null });
+        res.json({
+            id: ad._id, name: ad.name, code: ad.callsign || null, slug: ad.slug || null,
+            layout: ad.layout || 'editorial',
+            allowedLayouts: (ad.allowedLayouts && ad.allowedLayouts.length) ? ad.allowedLayouts : CREW_LAYOUTS,
+        });
     } catch (err) {
         console.error('crew-admin patch error:', err);
         res.status(500).json({ error: 'Could not update the crew center address.' });
