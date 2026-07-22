@@ -2592,6 +2592,68 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
     }
 });
 
+// ---- Crew Center admin (staff hub "Crew Centers" tool) ----
+// List VAs with their crew center handle + account counts, for the staff manager.
+app.get('/api/crew-admin/vas', requireAuth, async (req, res) => {
+    try {
+        const search = String(req.query.search || '').trim();
+        const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 100, 300));
+        const query = {};
+        if (search) {
+            query.$or = [
+                { name: { $regex: search, $options: 'i' } },
+                { callsign: { $regex: `^${search}`, $options: 'i' } },
+                { slug: { $regex: search, $options: 'i' } },
+            ];
+        }
+        const ads = await VirtualAirlineAd.find(query)
+            .select('name callsign slug logoUrl bannerUrl status')
+            .sort({ name: 1 }).limit(limit).lean();
+
+        // Portal-account counts per VA, grouped by role (owner/staff/pilot).
+        const VaPortalAccount = mongoose.model('VaPortalAccount');
+        const ids = ads.map(a => a._id);
+        const grouped = ids.length ? await VaPortalAccount.aggregate([
+            { $match: { vaAdId: { $in: ids }, active: true } },
+            { $group: { _id: { va: '$vaAdId', role: '$role' }, n: { $sum: 1 } } },
+        ]) : [];
+        const byVa = {};
+        for (const g of grouped) {
+            const k = String(g._id.va);
+            (byVa[k] = byVa[k] || {})[g._id.role] = g.n;
+        }
+
+        res.json({
+            vas: ads.map(a => ({
+                id: a._id, name: a.name, code: a.callsign || null, slug: a.slug || null,
+                logo: a.logoUrl || '', banner: a.bannerUrl || '', status: a.status,
+                accounts: byVa[String(a._id)] || {},
+            })),
+        });
+    } catch (err) {
+        console.error('crew-admin list error:', err);
+        res.status(500).json({ error: 'Could not load crew centers.' });
+    }
+});
+
+// Update a VA's crew center slug (URL handle). A blank value re-derives it from
+// the VA name. The model's pre-save hook slugifies the value and guarantees
+// uniqueness, so we just set it and save; the response returns the final slug.
+app.patch('/api/crew-admin/vas/:id', requireAuth, async (req, res) => {
+    try {
+        const ad = await VirtualAirlineAd.findById(req.params.id);
+        if (!ad) return res.status(404).json({ error: 'VA not found.' });
+        if (typeof req.body.slug === 'string') {
+            ad.slug = req.body.slug.trim() || null;
+        }
+        await ad.save();
+        res.json({ id: ad._id, name: ad.name, code: ad.callsign || null, slug: ad.slug || null });
+    } catch (err) {
+        console.error('crew-admin patch error:', err);
+        res.status(500).json({ error: 'Could not update the crew center address.' });
+    }
+});
+
 // GET: A single VA ad by id.
 //   ?track=view   atomically increment the view counter (for the detail page).
 app.get('/api/va-ads/:id', async (req, res) => {
@@ -4265,6 +4327,7 @@ const STAFF_ONLY_PATHS = new Set([
     '/webhooks', '/webhooks.html',
     '/graphic-designer', '/graphic-designer.html',
     '/va-submissions', '/va-submissions.html',
+    '/crew-centers', '/crew-centers.html',
 ]);
 app.use((req, res, next) => {
     if (req.method === 'GET' && STAFF_ONLY_PATHS.has(req.path)) {
@@ -4298,6 +4361,13 @@ app.get('/map-usage', (req, res) => {
 // This is a SEPARATE login from the staff hub (partners are not staff).
 app.get('/va-portal', (req, res) => {
     res.sendFile(path.join(__dirname, 'va-portal.html'));
+});
+
+// Crew Centers manager (staff hub tool) — set each VA's crew center slug and copy
+// the link. Staff-only (gated by the STAFF_ONLY_PATHS guard above); its data
+// endpoints (/api/crew-admin/*) are requireAuth.
+app.get('/crew-centers', (req, res) => {
+    res.sendFile(path.join(__dirname, 'crew-centers.html'));
 });
 
 // Public Terms & Conditions page (mirrors the signed PDF). Rendered client-side

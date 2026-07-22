@@ -42,6 +42,7 @@ const VA_REP_ALLOWED_PAGES = new Set([
     '/va-admin-manual', '/va-admin-manual.html',
     '/VA-ADMIN-MANUAL.md',
     '/va-submissions', '/va-submissions.html',
+    '/crew-centers', '/crew-centers.html',
 ]);
 
 // Pages a Graphic Designer is allowed to open. Like the VA Rep, anything else

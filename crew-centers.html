@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crew Centers — Staff Hub</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script>tailwind.config = { darkMode: 'class' };</script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+        :root { color-scheme: light dark; }
+        * { -webkit-tap-highlight-color: transparent; }
+        body { font-family: 'Inter', sans-serif; -webkit-font-smoothing: antialiased; }
+        [data-lucide] { width: 1.15em; height: 1.15em; }
+        svg.lucide { stroke-width: 1.75; }
+        .surface { background: #fff; border: 1px solid rgba(0,0,0,.06); box-shadow: 0 1px 2px rgba(0,0,0,.03); }
+        .dark .surface { background: #18181b; border-color: rgba(255,255,255,.07); }
+        .loader { border: 2.5px solid rgba(120,120,128,.25); border-top-color: currentColor; border-radius: 50%; width: 26px; height: 26px; animation: spin .7s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        input { font-family: inherit; }
+        ::placeholder { color: #a1a1aa; }
+    </style>
+</head>
+<body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 antialiased min-h-screen transition-colors duration-300">
+
+    <!-- Top bar -->
+    <header class="sticky top-0 z-40 backdrop-blur-xl bg-zinc-50/80 dark:bg-zinc-950/80 border-b border-zinc-200/70 dark:border-zinc-800/70">
+        <div class="max-w-5xl mx-auto px-5 h-16 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <a href="/staff" class="w-9 h-9 grid place-items-center rounded-full hover:bg-zinc-200/70 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition" title="Back to hub"><i data-lucide="arrow-left" class="w-[18px] h-[18px]"></i></a>
+                <div class="flex items-center gap-2.5">
+                    <div class="w-9 h-9 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 grid place-items-center"><i data-lucide="id-card" class="w-5 h-5"></i></div>
+                    <span class="font-semibold tracking-tight">Crew Centers</span>
+                </div>
+            </div>
+            <button onclick="toggleTheme()" title="Toggle theme" class="w-9 h-9 grid place-items-center rounded-full hover:bg-zinc-200/70 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition"><span id="themeIcon"></span></button>
+        </div>
+    </header>
+
+    <main class="max-w-5xl mx-auto px-5 py-8">
+        <div class="mb-6">
+            <h1 class="text-2xl font-bold tracking-tight">Crew Centers</h1>
+            <p class="text-zinc-500 dark:text-zinc-400 text-sm mt-1">Set each VA's crew center address, then copy the link to hand over. Every approved VA already has one — a blank address re-derives it from the VA name.</p>
+        </div>
+
+        <!-- Search -->
+        <div class="relative mb-5 max-w-md">
+            <i data-lucide="search" class="absolute left-3.5 top-1/2 -translate-y-1/2 text-zinc-400 w-4 h-4"></i>
+            <input id="search" type="text" placeholder="Search by name, callsign or address…"
+                class="w-full pl-10 pr-3 py-2.5 rounded-xl surface focus:outline-none focus:ring-4 focus:ring-zinc-900/5 dark:focus:ring-white/5 text-sm">
+        </div>
+
+        <!-- Boot / states -->
+        <div id="boot" class="flex flex-col items-center justify-center gap-3 py-16 text-zinc-400"><div class="loader"></div><p class="text-sm font-medium">Loading crew centers…</p></div>
+        <p id="emptyMsg" class="hidden text-center text-sm text-zinc-400 py-16"></p>
+
+        <!-- List -->
+        <div id="list" class="space-y-3"></div>
+    </main>
+
+    <!-- Toast -->
+    <div id="toast" class="hidden fixed bottom-5 left-1/2 -translate-x-1/2 z-50 px-4 py-2.5 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 text-sm font-medium shadow-lg"></div>
+
+    <script>
+        const CREW_BASE = 'https://inflight.info';   // where the crew center login lives
+
+        // ---- Theme ----
+        function applyThemeIcon(){ const d=document.documentElement.classList.contains('dark'); const e=document.getElementById('themeIcon'); if(e) e.innerHTML=`<i data-lucide="${d?'sun':'moon'}" class="w-[18px] h-[18px]"></i>`; if(window.lucide) lucide.createIcons(); }
+        function toggleTheme(){ const d=document.documentElement.classList.toggle('dark'); try{localStorage.setItem('staff-theme',d?'dark':'light');}catch{} applyThemeIcon(); }
+        (function(){ let p=null; try{p=localStorage.getItem('staff-theme');}catch{} const d=p?p==='dark':window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches; document.documentElement.classList.toggle('dark',d); })();
+
+        // ---- Helpers ----
+        function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+        function initials(name){const s=(name||'VA').trim();const w=s.split(/\s+/).filter(Boolean);return (w.length>=2?(w[0][0]+w[1][0]):s.slice(0,2)).toUpperCase();}
+        let toastTimer=null;
+        function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.remove('hidden'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.add('hidden'),2200); }
+
+        async function api(path, opts){
+            const res = await fetch(path, Object.assign({ headers:{ 'Content-Type':'application/json', Accept:'application/json' } }, opts||{}));
+            if(res.status===401){ location.href='/staff?next='+encodeURIComponent(location.pathname); throw new Error('unauthenticated'); }
+            const data = await res.json().catch(()=>({}));
+            return { ok: res.ok, data };
+        }
+
+        // ---- Render ----
+        function accountsChip(a){
+            const parts=[];
+            if(a.owner) parts.push(`${a.owner} owner`);
+            if(a.staff) parts.push(`${a.staff} staff`);
+            if(a.pilot) parts.push(`${a.pilot} pilot${a.pilot>1?'s':''}`);
+            return parts.length ? parts.join(' · ') : 'No accounts yet';
+        }
+        function rowHtml(v){
+            const slug = v.slug || '';
+            const link = slug ? `${CREW_BASE}/crew/${slug}` : (v.code ? `${CREW_BASE}/crew/${v.code.toLowerCase()}` : '');
+            const logo = v.logo
+                ? `<img src="${escapeHtml(v.logo)}" alt="" class="w-11 h-11 rounded-xl object-cover bg-zinc-100 dark:bg-zinc-800">`
+                : `<div class="w-11 h-11 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 grid place-items-center font-bold">${escapeHtml(initials(v.name))}</div>`;
+            const statusTag = v.status && v.status!=='approved'
+                ? `<span class="text-[11px] font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-400">${escapeHtml(v.status)}</span>` : '';
+            return `
+            <div class="surface rounded-2xl p-4 sm:p-5" data-id="${v.id}">
+                <div class="flex items-start gap-4">
+                    ${logo}
+                    <div class="min-w-0 flex-1">
+                        <div class="flex items-center gap-2 flex-wrap">
+                            <h3 class="font-semibold tracking-tight truncate">${escapeHtml(v.name)}</h3>
+                            ${v.code?`<span class="text-[11px] font-semibold px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400">${escapeHtml(v.code)}</span>`:''}
+                            ${statusTag}
+                        </div>
+                        <p class="text-xs text-zinc-400 mt-0.5">${escapeHtml(accountsChip(v.accounts||{}))}</p>
+
+                        <!-- Address editor -->
+                        <div class="mt-3 flex flex-wrap items-center gap-2">
+                            <div class="flex items-center rounded-xl border border-zinc-200 dark:border-zinc-700 overflow-hidden">
+                                <span class="px-2.5 py-2 text-xs text-zinc-400 bg-zinc-50 dark:bg-zinc-900 border-r border-zinc-200 dark:border-zinc-700 select-none">inflight.info/crew/</span>
+                                <input value="${escapeHtml(slug)}" data-slug placeholder="${escapeHtml(v.code?v.code.toLowerCase():'address')}"
+                                    class="px-2.5 py-2 text-sm bg-transparent focus:outline-none w-40 sm:w-52">
+                            </div>
+                            <button data-save class="text-sm font-semibold px-3.5 py-2 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 hover:opacity-90 active:scale-95 transition">Save</button>
+                        </div>
+                    </div>
+
+                    <!-- Link actions -->
+                    <div class="flex flex-col items-end gap-2 shrink-0">
+                        <button data-copy ${link?'':'disabled'} class="text-xs font-semibold px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 disabled:opacity-40 transition inline-flex items-center gap-1.5"><i data-lucide="copy" class="w-3.5 h-3.5"></i> Copy link</button>
+                        <a data-open href="${link||'#'}" target="_blank" rel="noopener" class="text-xs font-semibold px-3 py-1.5 rounded-lg text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white transition inline-flex items-center gap-1.5 ${link?'':'pointer-events-none opacity-40'}"><i data-lucide="external-link" class="w-3.5 h-3.5"></i> Open</a>
+                    </div>
+                </div>
+            </div>`;
+        }
+
+        function wireRow(row){
+            const save = row.querySelector('[data-save]');
+            const input = row.querySelector('[data-slug]');
+            const copy = row.querySelector('[data-copy]');
+            const open = row.querySelector('[data-open]');
+            const id = row.getAttribute('data-id');
+
+            async function doSave(){
+                save.disabled=true; const prev=save.textContent; save.textContent='Saving…';
+                const { ok, data } = await api('/api/crew-admin/vas/'+id, { method:'PATCH', body: JSON.stringify({ slug: input.value.trim() }) });
+                save.disabled=false; save.textContent=prev;
+                if(!ok){ toast(data.error||'Could not save.'); return; }
+                input.value = data.slug || '';
+                const link = data.slug ? `${CREW_BASE}/crew/${data.slug}` : (data.code?`${CREW_BASE}/crew/${data.code.toLowerCase()}`:'');
+                copy.disabled = !link;
+                open.href = link || '#';
+                open.classList.toggle('pointer-events-none', !link);
+                open.classList.toggle('opacity-40', !link);
+                toast('Crew center address saved.');
+            }
+            save.addEventListener('click', doSave);
+            input.addEventListener('keydown', e=>{ if(e.key==='Enter') doSave(); });
+            copy.addEventListener('click', async ()=>{
+                const link = open.getAttribute('href');
+                if(!link||link==='#') return;
+                try{ await navigator.clipboard.writeText(link); toast('Link copied.'); }
+                catch{ toast(link); }
+            });
+        }
+
+        async function load(){
+            const q = document.getElementById('search').value.trim();
+            const { ok, data } = await api('/api/crew-admin/vas'+(q?('?search='+encodeURIComponent(q)):''));
+            document.getElementById('boot').classList.add('hidden');
+            const list = document.getElementById('list');
+            const empty = document.getElementById('emptyMsg');
+            if(!ok){ empty.textContent = (data && data.error) || 'Could not load crew centers.'; empty.classList.remove('hidden'); list.innerHTML=''; return; }
+            const vas = data.vas || [];
+            if(!vas.length){ empty.textContent = q?'No VAs match your search.':'No VAs yet.'; empty.classList.remove('hidden'); list.innerHTML=''; return; }
+            empty.classList.add('hidden');
+            list.innerHTML = vas.map(rowHtml).join('');
+            list.querySelectorAll('[data-id]').forEach(wireRow);
+            if(window.lucide) lucide.createIcons();
+        }
+
+        // ---- Boot ----
+        let searchTimer=null;
+        document.getElementById('search').addEventListener('input', ()=>{ clearTimeout(searchTimer); searchTimer=setTimeout(load, 250); });
+        applyThemeIcon();
+        load().then(()=>{ if(window.lucide) lucide.createIcons(); });
+    </script>
+</body>
+</html>
