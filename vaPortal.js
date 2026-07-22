@@ -61,7 +61,10 @@ const COOKIE_MAX_AGE = 30 * 24 * 60 * 60 * 1000; // 30 days
 //           manage their own staff sub-accounts.
 //   staff - a member of the VA's team. Can submit and view their VA's inbox, but
 //           cannot manage accounts.
-const PORTAL_ROLES = ['owner', 'staff'];
+//   pilot - a crew member. Signs in ONLY at the VA's Crew Center (never this
+//           partnership portal) and lands on the pilot home. Kept in the same
+//           account table so a VA has one set of people.
+const PORTAL_ROLES = ['owner', 'staff', 'pilot'];
 
 // Inflight-side roles allowed to oversee the portal (read everything, manage
 // accounts, triage submissions). Mirrors who can already touch VA tools.
@@ -1014,6 +1017,11 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             const account = await VaPortalAccount.findOne({ username: String(username).toLowerCase().trim() });
             const ok = account && account.active && await bcrypt.compare(password, account.passwordHash);
             if (!ok) return res.status(401).json({ error: 'Invalid username or password.' });
+            // Pilots don't belong in the partnership portal — they sign in at the
+            // Crew Center. Blocking them here keeps portal data owner/staff-only.
+            if (account.role === 'pilot') {
+                return res.status(403).json({ error: 'Pilots sign in through your VA’s crew center.' });
+            }
 
             account.lastLoginAt = new Date();
             await account.save();
@@ -1724,6 +1732,11 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             if (String(password).length < 8) {
                 return res.status(400).json({ error: 'Password must be at least 8 characters.' });
             }
+            // Owners can mint their own team: a fellow 'staff' admin or a 'pilot'
+            // crew login. Never another owner.
+            const role = ['staff', 'pilot'].includes(String(req.body.role || '').toLowerCase())
+                ? String(req.body.role).toLowerCase()
+                : 'staff';
             const uname = String(username).toLowerCase().trim();
             if (await VaPortalAccount.exists({ username: uname })) {
                 return res.status(409).json({ error: 'That username is already taken.' });
@@ -1733,7 +1746,7 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
                 username: uname,
                 displayName: displayName || username,
                 passwordHash,
-                role: 'staff', // VAs can only mint staff, never another owner
+                role,
                 vaAdId: req.portal.vaAdId,
                 vaName: req.portal.vaName,
                 createdVia: 'owner',

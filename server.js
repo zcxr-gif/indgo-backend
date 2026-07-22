@@ -31,6 +31,10 @@ const {
     VaEvent,
 } = require('./vaPortal');
 
+// Crew Center sign-in (inflight.info/crew/<slug>) — cascades our existing
+// accounts (VA portal accounts + Inflight staff) and routes to the right view.
+const { registerCrewAuthRoutes } = require('./crewAuth');
+
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
@@ -168,6 +172,13 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     callsigns: { type: [String], default: [] },
     type: { type: String, enum: VA_AD_TYPES, default: 'VA' },
 
+    // URL handle for the VA's Crew Center — inflight.info/crew/<slug>. Unique
+    // when set; auto-derived from `name` on save when left blank (see the slug
+    // pre-save hook + slugifyVaName), and overridable by staff in the Crew
+    // Centers manager. Stored lowercase; sparse-unique so legacy docs without a
+    // slug don't collide on null.
+    slug: { type: String, trim: true, lowercase: true, default: null },
+
     // --- Copy ---
     tagline: { type: String, trim: true, maxlength: 140, default: '' }, // short hook
     description: { type: String, trim: true, maxlength: 4000, default: '' },
@@ -259,6 +270,9 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
 VirtualAirlineAdSchema.index({ status: 1, featured: -1, createdAt: -1 });
 VirtualAirlineAdSchema.index({ region: 1 });
 VirtualAirlineAdSchema.index({ callsign: 1 });
+// Crew Center slug lookup (inflight.info/crew/<slug>). Sparse so the many docs
+// with a null slug don't collide; unique so a slug maps to exactly one VA.
+VirtualAirlineAdSchema.index({ slug: 1 }, { unique: true, sparse: true });
 // Back the "which VAs are based at this airport?" lookup (e.g. to render a VA's
 // banner on an airport page). hubs holds the primary hub ICAOs for each VA.
 VirtualAirlineAdSchema.index({ hubs: 1 });
@@ -286,6 +300,41 @@ VirtualAirlineAdSchema.pre('save', function (next) {
         this.callsigns = [];
     }
     next();
+});
+
+// Turn a VA name (or a staff-typed handle) into a URL-safe Crew Center slug:
+// lowercase, accents stripped, non-alphanumerics collapsed to single hyphens.
+// "Air Canada Virtual" -> "air-canada-virtual".
+function slugifyVaName(s) {
+    return String(s || '')
+        .normalize('NFKD').replace(/[\u0300-\u036f]/g, '') // strip diacritics
+        .toLowerCase()
+        .replace(/[’'".]/g, '')        // drop apostrophes / quotes / dots outright
+        .replace(/[^a-z0-9]+/g, '-')   // any other run of non-alnum -> one hyphen
+        .replace(/^-+|-+$/g, '')       // trim leading/trailing hyphens
+        .slice(0, 40);
+}
+
+// Fill in / normalise the Crew Center slug before save. A staff-set slug is
+// slugified as-is; otherwise it's derived from the VA name. Either way we ensure
+// uniqueness by appending -2, -3, … on the rare collision, so a save never fails
+// on the unique index. Kept separate from the callsign hook for readability.
+VirtualAirlineAdSchema.pre('save', async function (next) {
+    try {
+        const Model = this.constructor;
+        let slug = this.slug ? slugifyVaName(this.slug) : '';
+        if (!slug && this.name) slug = slugifyVaName(this.name);
+        if (slug) {
+            let candidate = slug, n = 2;
+            while (await Model.exists({ slug: candidate, _id: { $ne: this._id } })) {
+                candidate = `${slug}-${n++}`;
+            }
+            this.slug = candidate;
+        } else {
+            this.slug = null; // nothing usable -> stay null (sparse index skips it)
+        }
+        next();
+    } catch (err) { next(err); }
 });
 
 const VirtualAirlineAd = mongoose.model('VirtualAirlineAd', VirtualAirlineAdSchema);
@@ -943,6 +992,9 @@ registerAuthRoutes(app);
 // lambda so this call site doesn't touch it before it's initialised — the wrapper
 // only resolves it at request time, when the "send test" button is clicked.
 registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent: (ad) => sendVaTestEvent(ad), renderCardPreview: (ad, opts) => renderCardPreview(ad, opts), applyEmbedAppearance: (cfg, body) => applyEmbedAppearance(cfg, body) });
+
+// Crew Center sign-in routes (POST /api/crew/:slug/login, GET /api/crew/:slug/me).
+registerCrewAuthRoutes(app);
 
 // Health Check — public, unauthenticated (for uptime/platform monitors).
 // NOTE: the site is staff-only, so the homepage ("/") is gated below; point any
@@ -2492,6 +2544,113 @@ app.get('/api/va-ads/banner/:icao', async (req, res) => {
     } catch (error) {
         console.error('VA Ad Banner Error:', error);
         res.status(500).json({ message: 'Error fetching VA banners for airport.' });
+    }
+});
+
+// GET: Crew Center branding by slug — powers the branded login served at
+// inflight.info/crew/<slug>. Public + CORS-open (global cors() sends
+// Access-Control-Allow-Origin: *), returns ONLY presentational fields (never any
+// secret). Resolves by slug first, then falls back to callsign so existing VAs
+// work before their slugs are backfilled (e.g. /crew/aca). Accent comes from the
+// VA's embed config (its brand colour) when present, else empty so the login can
+// derive one from the logo. Registered before /api/va-ads/:id — matched by the
+// two-segment path, so it never collides with the id route.
+app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
+    try {
+        const raw = String(req.params.slug || '').trim().toLowerCase();
+        if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
+
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl';
+        let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
+            .select(fields).lean();
+        if (!ad) {
+            ad = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' })
+                .select(fields).lean();
+        }
+        if (!ad) return res.status(404).json({ message: 'Unknown crew center.' });
+
+        // Brand accent: prefer the embed-config accent's first stop, then the
+        // legacy brandColor; '' means "let the login decide".
+        let accent = '';
+        const cfg = await EmbedConfig.findOne({ vaAdId: ad._id }).select('accent brandColor').lean();
+        if (cfg) accent = (Array.isArray(cfg.accent) && cfg.accent[0]) || cfg.brandColor || '';
+
+        res.set('Cache-Control', 'public, max-age=300'); // 5 min — branding rarely changes
+        res.json({
+            slug: ad.slug || null,
+            code: ad.callsign || null,
+            name: ad.name,
+            tagline: ad.tagline || '',
+            logo: ad.logoUrl || '',
+            banner: ad.bannerUrl || '',
+            website: ad.websiteUrl || '',
+            accent,
+        });
+    } catch (err) {
+        console.error('Crew center by-slug error:', err);
+        res.status(500).json({ message: 'Error resolving crew center.' });
+    }
+});
+
+// ---- Crew Center admin (staff hub "Crew Centers" tool) ----
+// List VAs with their crew center handle + account counts, for the staff manager.
+app.get('/api/crew-admin/vas', requireAuth, async (req, res) => {
+    try {
+        const search = String(req.query.search || '').trim();
+        const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 100, 300));
+        const query = {};
+        if (search) {
+            query.$or = [
+                { name: { $regex: search, $options: 'i' } },
+                { callsign: { $regex: `^${search}`, $options: 'i' } },
+                { slug: { $regex: search, $options: 'i' } },
+            ];
+        }
+        const ads = await VirtualAirlineAd.find(query)
+            .select('name callsign slug logoUrl bannerUrl status')
+            .sort({ name: 1 }).limit(limit).lean();
+
+        // Portal-account counts per VA, grouped by role (owner/staff/pilot).
+        const VaPortalAccount = mongoose.model('VaPortalAccount');
+        const ids = ads.map(a => a._id);
+        const grouped = ids.length ? await VaPortalAccount.aggregate([
+            { $match: { vaAdId: { $in: ids }, active: true } },
+            { $group: { _id: { va: '$vaAdId', role: '$role' }, n: { $sum: 1 } } },
+        ]) : [];
+        const byVa = {};
+        for (const g of grouped) {
+            const k = String(g._id.va);
+            (byVa[k] = byVa[k] || {})[g._id.role] = g.n;
+        }
+
+        res.json({
+            vas: ads.map(a => ({
+                id: a._id, name: a.name, code: a.callsign || null, slug: a.slug || null,
+                logo: a.logoUrl || '', banner: a.bannerUrl || '', status: a.status,
+                accounts: byVa[String(a._id)] || {},
+            })),
+        });
+    } catch (err) {
+        console.error('crew-admin list error:', err);
+        res.status(500).json({ error: 'Could not load crew centers.' });
+    }
+});
+
+// Update a VA's crew center slug (URL handle). A blank value re-derives it from
+// the VA name. The model's pre-save hook slugifies the value and guarantees
+// uniqueness, so we just set it and save; the response returns the final slug.
+app.patch('/api/crew-admin/vas/:id', requireAuth, async (req, res) => {
+    try {
+        const ad = await VirtualAirlineAd.findById(req.params.id);
+        if (!ad) return res.status(404).json({ error: 'VA not found.' });
+        if (typeof req.body.slug === 'string') {
+            ad.slug = req.body.slug.trim() || null;
+        }
+        await ad.save();
+        res.json({ id: ad._id, name: ad.name, code: ad.callsign || null, slug: ad.slug || null });
+    } catch (err) {
+        console.error('crew-admin patch error:', err);
+        res.status(500).json({ error: 'Could not update the crew center address.' });
     }
 });
 
@@ -4168,6 +4327,7 @@ const STAFF_ONLY_PATHS = new Set([
     '/webhooks', '/webhooks.html',
     '/graphic-designer', '/graphic-designer.html',
     '/va-submissions', '/va-submissions.html',
+    '/crew-centers', '/crew-centers.html',
 ]);
 app.use((req, res, next) => {
     if (req.method === 'GET' && STAFF_ONLY_PATHS.has(req.path)) {
@@ -4201,6 +4361,13 @@ app.get('/map-usage', (req, res) => {
 // This is a SEPARATE login from the staff hub (partners are not staff).
 app.get('/va-portal', (req, res) => {
     res.sendFile(path.join(__dirname, 'va-portal.html'));
+});
+
+// Crew Centers manager (staff hub tool) — set each VA's crew center slug and copy
+// the link. Staff-only (gated by the STAFF_ONLY_PATHS guard above); its data
+// endpoints (/api/crew-admin/*) are requireAuth.
+app.get('/crew-centers', (req, res) => {
+    res.sendFile(path.join(__dirname, 'crew-centers.html'));
 });
 
 // Public Terms & Conditions page (mirrors the signed PDF). Rendered client-side
