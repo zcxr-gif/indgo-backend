@@ -33,7 +33,7 @@ const {
 
 // Crew Center sign-in (inflight.info/crew/<slug>) — cascades our existing
 // accounts (VA portal accounts + Inflight staff) and routes to the right view.
-const { registerCrewAuthRoutes } = require('./crewAuth');
+const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps } = require('./crewAuth');
 
 const express = require('express');
 const mongoose = require('mongoose');
@@ -179,6 +179,73 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // slug don't collide on null.
     slug: { type: String, trim: true, lowercase: true, default: null },
 
+    // Crew Center layout the VA lands on, and the presets staff permit them to
+    // choose from. The VA picks from allowedLayouts in their crew center settings;
+    // staff manage the allow-list in the Crew Centers tool.
+    layout: { type: String, default: 'editorial' },
+    allowedLayouts: { type: [String], default: ['editorial', 'console', 'split', 'classic'] },
+    // Which login-page look the VA uses (owner-chosen). See the crew.html looks.
+    loginLook: { type: String, default: 'center' },
+    // Owner/staff-chosen accent for the crew center + login. Overrides the accent
+    // otherwise derived from the VA's embed config. '' = fall back to that.
+    crewAccent: { type: String, trim: true, default: '' },
+
+    // Crew structure the VA defines (all optional): a rank ladder + roles, each
+    // carrying a badge (colour + icon). These are the DEFINITIONS; per-pilot
+    // assignments live in the VA's own Supabase.
+    ranks: { type: [{ _id: false, name: String, minHours: Number, color: String, icon: String, image: String }], default: [] },
+    roles: { type: [{ _id: false, name: String, color: String, icon: String, image: String, staff: Boolean }], default: [] },
+    // Owner-defined STAFF roles (permissions) + which staff account (by login
+    // username) holds each. Distinct from the display `roles` above: these gate
+    // what a signed-in staff member can do. See crewAuth CREW_CAPABILITIES.
+    staffRoles: { type: [{ _id: false, id: String, name: String, color: String, permissions: [String] }], default: [] },
+    staffAssignments: { type: [{ _id: false, username: String, roleId: String }], default: [] },
+    // The VA's fleet — aircraft they operate (name/type + optional livery image).
+    // NOTE: named crewFleet (not fleet) to avoid colliding with the older
+    // directory-level `fleet: [String]` field further down this schema.
+    crewFleet: { type: [{ _id: false, type: String, name: String, image: String }], default: [] },
+
+    // --- Recruitment / join settings ---
+    // joinMode: 'free' = instant account; 'application' = staff review.
+    joinMode: { type: String, enum: ['free', 'application'], default: 'application' },
+    callsignPrefix: { type: String, trim: true, default: '' }, // default prefix for pilot callsigns
+    // A staff-built application form: ordered questions.
+    applicationForm: { type: [{ _id: false, label: String, type: String, options: [String], required: Boolean }], default: [] },
+    // Extensible join requirements. Auto types are checked against the
+    // applicant's REAL Infinite Flight stats (verified through our tooling);
+    // 'agree' is a custom checkbox the applicant must tick.
+    //   type: 'grade'|'hours'|'landings'|'xp'|'flights'|'violations'|'agree'
+    //   value: numeric threshold (min for most, MAX for 'violations')
+    //   label: custom text (used by 'agree', optional note for others)
+    //   required: for 'agree', whether ticking is mandatory
+    joinRequirements: { type: [{ _id: false, type: String, value: Number, label: String, required: Boolean }], default: [] },
+    // A Discord webhook the VA sets so recruitment activity (new applications,
+    // accept / decline decisions + the staff's message) is posted to their
+    // server. Secret (contains a token) → select:false, never echoed back.
+    crewWebhookUrl: { type: String, trim: true, default: null, select: false },
+
+    // --- Bring-your-own email provider (applicant notifications) ---
+    // When set, applicant emails go through the VA's OWN provider/account so
+    // mail comes from their domain and their quota. Falls back to the platform
+    // key when left blank. crewEmailKey is a secret → select:false.
+    crewEmailProvider: { type: String, enum: ['', 'resend', 'sendgrid', 'postmark', 'mailgun'], default: '' },
+    crewEmailFrom: { type: String, trim: true, default: '' },       // "VA Name <crew@va.com>"
+    crewEmailReplyTo: { type: String, trim: true, default: '' },    // optional Reply-To
+    crewEmailDomain: { type: String, trim: true, default: '' },     // Mailgun sending domain
+    crewEmailRegion: { type: String, enum: ['us', 'eu'], default: 'us' }, // Mailgun region
+    crewEmailKey: { type: String, default: '', select: false },     // API key / server token (secret)
+    crewEmailConfigured: { type: Boolean, default: false },          // non-secret mirror: is BYO email ready to send?
+
+    // --- The VA's own Supabase project (bring-your-own data store) ---
+    // The VA connects their Supabase in owner onboarding; their crew data lives
+    // there and stays theirs. anonKey is the PUBLIC browser key (safe to expose
+    // via by-slug so the crew center can talk to their project). serviceKey is a
+    // SECRET with full access — select:false so it is NEVER returned to the
+    // browser; kept only for Inflight's retained server-side access.
+    supabaseUrl: { type: String, trim: true, default: '' },
+    supabaseAnonKey: { type: String, trim: true, default: '' },
+    supabaseServiceKey: { type: String, trim: true, default: '', select: false },
+
     // --- Copy ---
     tagline: { type: String, trim: true, maxlength: 140, default: '' }, // short hook
     description: { type: String, trim: true, maxlength: 4000, default: '' },
@@ -199,8 +266,8 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     fleet: { type: [String], default: [] },                         // aircraft types operated
     pilotCount: { type: Number, default: 0, min: 0 },
     recruiting: { type: Boolean, default: true },                   // currently accepting applications?
-    minGrade: { type: Number, default: null, min: 1, max: 5 },      // IF grade requirement (1-5), if any
-    requirements: { type: String, trim: true, default: '' },        // free-text joining requirements
+    minGrade: { type: Number, default: 0, min: 0, max: 5 },         // IF grade requirement; 0 = none (single source of truth)
+    requirements: { type: String, trim: true, default: '' },        // free-text joining requirements (directory display)
     tags: { type: [String], default: [] },                          // searchable keywords
 
     // --- Ownership / contact (who submitted) ---
@@ -338,6 +405,266 @@ VirtualAirlineAdSchema.pre('save', async function (next) {
 });
 
 const VirtualAirlineAd = mongoose.model('VirtualAirlineAd', VirtualAirlineAdSchema);
+
+// A crew roster member (rich profile). Rank is NOT stored — it's derived from
+// `hours` against the VA's rank ladder. Managed storage so a roster works with
+// zero VA setup; a VA can later mirror this into their own Supabase.
+const CrewMemberSchema = new mongoose.Schema({
+    vaAdId:   { type: mongoose.Schema.Types.ObjectId, ref: 'VirtualAirlineAd', required: true, index: true },
+    name:     { type: String, trim: true, default: '' },
+    callsign: { type: String, trim: true, default: '' },
+    hours:    { type: Number, default: 0, min: 0 },
+    role:     { type: String, trim: true, default: '' },
+    aircraft: { type: [String], default: [] },
+    status:   { type: String, enum: ['active', 'loa', 'inactive'], default: 'active' },
+}, { timestamps: true });
+const CrewMember = mongoose.models.CrewMember || mongoose.model('CrewMember', CrewMemberSchema);
+
+// A membership application submitted through the crew center's join form.
+const CrewApplicationSchema = new mongoose.Schema({
+    vaAdId:   { type: mongoose.Schema.Types.ObjectId, ref: 'VirtualAirlineAd', required: true, index: true },
+    ifcName:  { type: String, trim: true, default: '' },       // Infinite Flight Community name
+    email:    { type: String, trim: true, lowercase: true, default: '' }, // optional contact for decision emails
+    callsignPrefix: { type: String, trim: true, default: '' },
+    callsignNumber: { type: String, trim: true, default: '' },
+    grade:    { type: Number, default: 0 },                    // IF grade (verified if ifVerified)
+    ifVerified: { type: Boolean, default: false },             // did our IF lookup confirm this account?
+    ifUserId: { type: String, trim: true, default: '' },       // resolved Infinite Flight user id
+    answers:  { type: [{ _id: false, q: String, a: String }], default: [] },
+    status:   { type: String, enum: ['pending', 'accepted', 'declined'], default: 'pending' },
+    // A message the reviewing staff can leave for the applicant, shown on the
+    // status page when they check back (accept or decline).
+    staffMessage: { type: String, trim: true, default: '' },
+    // Opaque token the applicant is handed so they can check their status
+    // without an account or email. Indexed so lookups are cheap.
+    statusToken: { type: String, trim: true, default: '', index: true },
+    reviewedAt: { type: Date, default: null },
+}, { timestamps: true });
+const CrewApplication = mongoose.models.CrewApplication || mongoose.model('CrewApplication', CrewApplicationSchema);
+
+// A route in the VA's network — a flyable leg pilots can pick up.
+const CrewRouteSchema = new mongoose.Schema({
+    vaAdId:      { type: mongoose.Schema.Types.ObjectId, ref: 'VirtualAirlineAd', required: true, index: true },
+    flightNumber:{ type: String, trim: true, default: '' },   // e.g. "ACA123"
+    origin:      { type: String, trim: true, uppercase: true, default: '' },  // departure ICAO
+    destination: { type: String, trim: true, uppercase: true, default: '' },  // arrival ICAO
+    aircraft:    { type: String, trim: true, default: '' },   // aircraft type/name (often from the fleet)
+    distanceNm:  { type: Number, default: 0, min: 0 },        // optional great-circle distance
+    notes:       { type: String, trim: true, default: '' },
+    active:      { type: Boolean, default: true },            // hidden from pilots when false
+}, { timestamps: true });
+const CrewRoute = mongoose.models.CrewRoute || mongoose.model('CrewRoute', CrewRouteSchema);
+
+// ---- Infinite Flight identity verification ----
+// We already run an acars backend that proxies the official IF API. It resolves
+// a community name to a userId (proof the account exists + the canonical
+// spelling) and its stats carry the real grade. We reuse it here so a crew
+// center never has to trust a self-reported grade. Best-effort: if the service
+// is unreachable we return { ok:false } and callers fall back gracefully.
+const ACARS_BACKEND_URL = (process.env.ACARS_BACKEND_URL || 'https://site--acars-backend--6dmjph8ltlhv.code.run').replace(/\/+$/, '');
+async function verifyIfUser(name) {
+    const q = String(name || '').trim();
+    if (!q) return { ok: false, reason: 'empty' };
+    try {
+        // 1) Resolve the community name → userId + canonical spelling.
+        const lookup = await axios.post(`${ACARS_BACKEND_URL}/users`,
+            { discourseNames: [q], userHashes: [q] },
+            { timeout: 8000, headers: { 'Content-Type': 'application/json' } });
+        const u = lookup?.data?.users?.[0];
+        if (!u || !u.userId) return { ok: true, found: false };
+        const out = {
+            ok: true, found: true,
+            userId: String(u.userId),
+            username: String(u.discourseUsername || q),
+            grade: Number.isFinite(u.grade) ? Number(u.grade) : null,
+            stats: null,
+        };
+        // 2) Pull the account's real stats (grade + hours/landings/xp/…) so we
+        // can gate on them. Best-effort: existence is what matters most.
+        try {
+            const resp = await axios.get(`${ACARS_BACKEND_URL}/api/users/${encodeURIComponent(out.userId)}/stats`, { timeout: 8000 });
+            const s = resp?.data?.stats || resp?.data?.gradeInfo || resp?.data || {};
+            const gi = s?.gradeDetails?.gradeIndex;
+            if (out.grade == null) {
+                if (Number.isFinite(gi)) out.grade = Number(gi);
+                else if (Number.isFinite(s?.grade)) out.grade = Number(s.grade);
+            }
+            const viol = Number.isFinite(s?.violations) ? Number(s.violations)
+                : ((s?.violationCountByLevel?.level1 || 0) + (s?.violationCountByLevel?.level2 || 0) + (s?.violationCountByLevel?.level3 || 0));
+            out.stats = {
+                grade: out.grade,
+                hours: Math.floor((Number(s?.flightTime) || 0) / 60),   // flightTime is minutes
+                landings: Number(s?.landingCount) || 0,
+                xp: Number(s?.totalXP ?? s?.xp) || 0,
+                flights: Number(s?.onlineFlights) || 0,
+                violations: viol,
+            };
+        } catch (_) { /* stats unavailable; out.stats stays null */ }
+        return out;
+    } catch (err) {
+        console.error('verifyIfUser error:', err?.message || err);
+        return { ok: false, reason: 'unreachable' };
+    }
+}
+
+// Evaluate a VA's join requirements against an applicant. `stats` is the real
+// IF stat block from verifyIfUser (or null when unavailable); `agreed` is the
+// set of agreement labels the applicant ticked. Returns { ok, autoChecked,
+// failures:[{type,label,need,have,cmp}] }.
+const REQ_META = {
+    grade:      { label: 'Grade',        cmp: 'min', stat: 'grade' },
+    hours:      { label: 'Flight hours', cmp: 'min', stat: 'hours' },
+    landings:   { label: 'Landings',     cmp: 'min', stat: 'landings' },
+    xp:         { label: 'XP',           cmp: 'min', stat: 'xp' },
+    flights:    { label: 'Online flights', cmp: 'min', stat: 'flights' },
+    violations: { label: 'Violations',   cmp: 'max', stat: 'violations' },
+};
+// ---- Crew Center Discord notifications ----
+// Post a small embed to a VA's crew webhook. Fire-and-forget: never let a
+// webhook hiccup fail the applicant's request.
+const CREW_COLORS = { new: 0xF59E0B, accepted: 0x16A34A, declined: 0x6E685D };
+async function postCrewNotice(url, { title, description, color, fields }) {
+    if (!url || !isDiscordWebhookUrl(url)) return false;
+    try {
+        await axios.post(url, {
+            embeds: [{
+                title: String(title || '').slice(0, 256),
+                description: description ? String(description).slice(0, 2000) : undefined,
+                color: color != null ? color : 0x1C1A16,
+                fields: Array.isArray(fields) ? fields.slice(0, 10) : [],
+                footer: { text: 'Inflight · Crew Center' },
+                timestamp: new Date().toISOString(),
+            }],
+        }, { timeout: 8000, headers: { 'Content-Type': 'application/json' } });
+        return true;
+    } catch (err) { console.error('crew webhook post failed:', err?.message || err); return false; }
+}
+// ---- Crew Center applicant emails ----
+// Email is strictly bring-your-own: there is NO platform sending account. A VA
+// that wants applicant emails plugs in their own provider (below); otherwise no
+// email is ever sent and applicants rely on the status page.
+const SITE_ORIGIN = (process.env.CREW_SITE_ORIGIN || 'https://inflight.info').replace(/\/+$/, '');
+const CREW_EMAIL_PROVIDERS = ['resend', 'sendgrid', 'postmark', 'mailgun'];
+const escHtml = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const isEmail = (s) => EMAIL_RE.test(String(s || '').trim());
+const maskKey = (k) => k ? '••••••' + String(k).slice(-4) : '';
+// Split "Name <email>" → { name, email }.
+function parseAddress(s) {
+    const m = String(s || '').match(/^\s*(.*?)\s*<([^>]+)>\s*$/);
+    if (m) return { name: m[1].replace(/^"|"$/g, '').trim(), email: m[2].trim() };
+    return { name: '', email: String(s || '').trim() };
+}
+// Is an email-provider config complete enough to send with?
+function emailCfgReady(cfg) {
+    if (!cfg || !cfg.provider || !cfg.key || !cfg.from) return false;
+    if (cfg.provider === 'mailgun' && !cfg.domain) return false;
+    return true;
+}
+
+// One send, dispatched to whichever provider the config names. Every provider
+// here is a pure HTTPS JSON/form API (no SMTP), so axios covers them all.
+async function sendCrewEmail(cfg, { to, subject, html, replyTo }) {
+    if (!emailCfgReady(cfg) || !isEmail(to)) return false;
+    const rt = (replyTo && isEmail(replyTo)) ? replyTo : (isEmail(cfg.replyTo) ? cfg.replyTo : undefined);
+    const subj = String(subject || '').slice(0, 200);
+    try {
+        if (cfg.provider === 'resend') {
+            await axios.post('https://api.resend.com/emails',
+                { from: cfg.from, to: [to], subject: subj, html, reply_to: rt },
+                { timeout: 10000, headers: { Authorization: `Bearer ${cfg.key}`, 'Content-Type': 'application/json' } });
+        } else if (cfg.provider === 'sendgrid') {
+            const f = parseAddress(cfg.from);
+            const payload = {
+                personalizations: [{ to: [{ email: to }] }],
+                from: f.name ? { email: f.email, name: f.name } : { email: f.email },
+                subject: subj, content: [{ type: 'text/html', value: html }],
+            };
+            if (rt) payload.reply_to = { email: rt };
+            await axios.post('https://api.sendgrid.com/v3/mail/send', payload,
+                { timeout: 10000, headers: { Authorization: `Bearer ${cfg.key}`, 'Content-Type': 'application/json' } });
+        } else if (cfg.provider === 'postmark') {
+            await axios.post('https://api.postmarkapp.com/email',
+                { From: cfg.from, To: to, Subject: subj, HtmlBody: html, ReplyTo: rt, MessageStream: 'outbound' },
+                { timeout: 10000, headers: { 'X-Postmark-Server-Token': cfg.key, Accept: 'application/json', 'Content-Type': 'application/json' } });
+        } else if (cfg.provider === 'mailgun') {
+            const base = cfg.region === 'eu' ? 'https://api.eu.mailgun.net' : 'https://api.mailgun.net';
+            const form = new URLSearchParams({ from: cfg.from, to, subject: subj, html });
+            if (rt) form.append('h:Reply-To', rt);
+            await axios.post(`${base}/v3/${encodeURIComponent(cfg.domain)}/messages`, form,
+                { timeout: 10000, auth: { username: 'api', password: cfg.key }, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+        } else return false;
+        return true;
+    } catch (err) { console.error(`crew email failed (${cfg.provider}):`, err?.response?.data || err?.message || err); return false; }
+}
+// Resolve the email config for a VA: their OWN provider if configured, else null
+// (email off — there is no platform fallback).
+async function crewEmailConfigFor(vaId) {
+    let doc = null;
+    try { doc = await VirtualAirlineAd.findById(vaId).select('+crewEmailKey crewEmailProvider crewEmailFrom crewEmailReplyTo crewEmailDomain crewEmailRegion contactEmail').lean(); } catch { /* fall through */ }
+    if (doc && doc.crewEmailProvider && doc.crewEmailKey && doc.crewEmailFrom) {
+        return {
+            provider: doc.crewEmailProvider, key: doc.crewEmailKey, from: doc.crewEmailFrom,
+            replyTo: doc.crewEmailReplyTo || doc.contactEmail || '', domain: doc.crewEmailDomain || '', region: doc.crewEmailRegion || 'us',
+        };
+    }
+    return null;
+}
+// Minimal, warm, inline-styled email shell (email clients ignore <style>/CSS).
+function crewEmailHtml({ vaName, heading, accent, bodyHtml, button }) {
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const a = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(accent || '') ? accent : '#1C1A16';
+    const btn = button ? `<tr><td style="padding-top:20px"><a href="${esc(button.url)}" style="display:inline-block;background:${a};color:#fff;text-decoration:none;font-weight:600;font-size:14px;padding:11px 20px;border-radius:8px">${esc(button.label)}</a></td></tr>` : '';
+    return `<!doctype html><html><body style="margin:0;background:#F6F3ED;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1C1A16">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F6F3ED;padding:28px 16px"><tr><td align="center">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#fff;border:1px solid #E7E2D8;border-radius:16px;overflow:hidden">
+          <tr><td style="height:4px;background:${a}"></td></tr>
+          <tr><td style="padding:28px 28px 24px">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+              <tr><td style="font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:#A8A296;padding-bottom:8px">${esc(vaName || 'Crew Center')}</td></tr>
+              <tr><td style="font-size:20px;font-weight:700;padding-bottom:10px">${esc(heading)}</td></tr>
+              <tr><td style="font-size:14px;line-height:1.6;color:#3a362f">${bodyHtml}</td></tr>
+              ${btn}
+            </table>
+          </td></tr>
+          <tr><td style="padding:14px 28px;border-top:1px solid #F0ECE4;font-size:11px;color:#A8A296">Sent by ${esc(vaName || 'this VA')} via Inflight · Crew Center</td></tr>
+        </table>
+      </td></tr></table></body></html>`;
+}
+
+// Load a VA's (secret) crew webhook url by id. Returns '' when unset/invalid.
+async function crewWebhookUrlFor(vaId) {
+    try {
+        const doc = await VirtualAirlineAd.findById(vaId).select('+crewWebhookUrl').lean();
+        const u = doc && doc.crewWebhookUrl;
+        return u && isDiscordWebhookUrl(u) ? u : '';
+    } catch { return ''; }
+}
+
+function evaluateRequirements(reqs, stats, agreed) {
+    const failures = [];
+    let autoChecked = false;
+    const agreedSet = new Set((agreed || []).map(x => String(x).trim().toLowerCase()));
+    for (const r of (reqs || [])) {
+        if (r.type === 'agree') {
+            if (r.required && !agreedSet.has(String(r.label || '').trim().toLowerCase())) {
+                failures.push({ type: 'agree', label: r.label || 'Agreement', need: 'accepted', have: 'not accepted', cmp: 'agree' });
+            }
+            continue;
+        }
+        const meta = REQ_META[r.type];
+        if (!meta) continue;
+        autoChecked = true;
+        if (!stats) { // can't verify this numeric requirement right now
+            failures.push({ type: r.type, label: meta.label, need: r.value, have: null, cmp: meta.cmp, unverified: true });
+            continue;
+        }
+        const have = Number(stats[meta.stat]) || 0;
+        const pass = meta.cmp === 'max' ? have <= r.value : have >= r.value;
+        if (!pass) failures.push({ type: r.type, label: meta.label, need: r.value, have, cmp: meta.cmp });
+    }
+    return { ok: failures.length === 0, autoChecked, failures };
+}
 
 /* =========================
  * VA PILOT ROSTER
@@ -995,6 +1322,544 @@ registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, 
 
 // Crew Center sign-in routes (POST /api/crew/:slug/login, GET /api/crew/:slug/me).
 registerCrewAuthRoutes(app);
+
+// ---- Crew roster (managed storage) ----
+async function resolveCrewVa(slug) {
+    const raw = String(slug || '').trim().toLowerCase();
+    if (!raw) return null;
+    const sel = '_id slug callsign name contactEmail crewAccent';
+    let va = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' }).select(sel).lean();
+    if (!va) va = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' }).select(sel).lean();
+    return va;
+}
+function cleanMember(b) {
+    b = b || {};
+    return {
+        name: String(b.name || '').trim().slice(0, 60),
+        callsign: String(b.callsign || '').trim().slice(0, 20),
+        hours: Math.max(0, Math.min(1e6, Number(b.hours) || 0)),
+        role: String(b.role || '').trim().slice(0, 40),
+        aircraft: Array.isArray(b.aircraft) ? b.aircraft.slice(0, 40).map(a => String(a).trim().slice(0, 40)).filter(Boolean) : [],
+        status: ['active', 'loa', 'inactive'].includes(b.status) ? b.status : 'active',
+    };
+}
+const publicMember = (m) => ({
+    id: m._id, name: m.name, callsign: m.callsign, hours: m.hours,
+    role: m.role, aircraft: m.aircraft || [], status: m.status,
+});
+// Owner/staff (or Inflight) gate for roster writes.
+function crewCanManage(req, slug) {
+    const p = verifyCrewRequest(req);
+    if (!p) return { error: 401 };
+    if (!(p.kind === 'inflight' || p.role === 'owner' || p.role === 'staff')) return { error: 403 };
+    if (p.kind !== 'inflight' && p.slug && p.slug !== String(slug).toLowerCase()) return { error: 403 };
+    return { p };
+}
+// Capability gate: like crewCanManage, but a staff member must additionally
+// hold `capability`. Owner + Inflight always pass. Async because a staff
+// member's permissions live on the VA (staffRoles/staffAssignments).
+async function requireCap(req, slug, capability) {
+    const base = crewCanManage(req, slug);
+    if (base.error) return base;
+    const p = base.p;
+    if (p.kind === 'inflight' || p.role === 'owner') return { p };
+    // staff: resolve their role's permissions from the VA.
+    const va = await VirtualAirlineAd.findById(p.vaId).select('staffRoles staffAssignments').lean();
+    if (effectiveCaps(va, p).includes(capability)) return { p };
+    return { error: 403 };
+}
+
+// Public read — the roster is shown on the crew center.
+app.get('/api/crew/:slug/roster', async (req, res) => {
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const members = await CrewMember.find({ vaAdId: va._id }).sort({ hours: -1, name: 1 }).limit(2000).lean();
+        res.json({ roster: members.map(publicMember) });
+    } catch (err) { console.error('roster list error:', err); res.status(500).json({ error: 'Could not load the roster.' }); }
+});
+// Add a member.
+app.post('/api/crew/:slug/roster', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const m = await CrewMember.create({ vaAdId: va._id, ...cleanMember(req.body) });
+        res.status(201).json({ member: publicMember(m) });
+    } catch (err) { console.error('roster add error:', err); res.status(500).json({ error: 'Could not add the pilot.' }); }
+});
+// Edit a member.
+app.patch('/api/crew/:slug/roster/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const m = await CrewMember.findOne({ _id: req.params.id, vaAdId: va._id });
+        if (!m) return res.status(404).json({ error: 'Pilot not found.' });
+        Object.assign(m, cleanMember({ ...m.toObject(), ...req.body }));
+        await m.save();
+        res.json({ member: publicMember(m) });
+    } catch (err) { console.error('roster edit error:', err); res.status(500).json({ error: 'Could not update the pilot.' }); }
+});
+// Remove a member.
+app.delete('/api/crew/:slug/roster/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        await CrewMember.deleteOne({ _id: req.params.id, vaAdId: va._id });
+        res.json({ ok: true });
+    } catch (err) { console.error('roster delete error:', err); res.status(500).json({ error: 'Could not remove the pilot.' }); }
+});
+
+// ---- Route network ----
+const cleanRoute = (b) => {
+    b = b || {};
+    const icao = (v) => String(v || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
+    return {
+        flightNumber: String(b.flightNumber || '').trim().slice(0, 12),
+        origin: icao(b.origin),
+        destination: icao(b.destination),
+        aircraft: String(b.aircraft || '').trim().slice(0, 60),
+        distanceNm: Math.max(0, Math.min(20000, Math.round(Number(b.distanceNm) || 0))),
+        notes: String(b.notes || '').trim().slice(0, 500),
+        active: b.active === undefined ? true : !!b.active,
+    };
+};
+const publicRoute = (r) => ({
+    id: r._id, flightNumber: r.flightNumber, origin: r.origin, destination: r.destination,
+    aircraft: r.aircraft, distanceNm: r.distanceNm, notes: r.notes, active: r.active,
+});
+// Public: the VA's route network (active only for non-managers is handled client-side;
+// here we return all so managers see drafts too — the list isn't sensitive).
+app.get('/api/crew/:slug/routes', async (req, res) => {
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const routes = await CrewRoute.find({ vaAdId: va._id }).sort({ flightNumber: 1, createdAt: -1 }).limit(3000).lean();
+        res.json({ routes: routes.map(publicRoute) });
+    } catch (err) { console.error('routes list error:', err); res.status(500).json({ error: 'Could not load routes.' }); }
+});
+app.post('/api/crew/:slug/routes', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const r = await CrewRoute.create({ vaAdId: va._id, ...cleanRoute(req.body) });
+        res.status(201).json({ route: publicRoute(r) });
+    } catch (err) { console.error('route add error:', err); res.status(500).json({ error: 'Could not add the route.' }); }
+});
+app.patch('/api/crew/:slug/routes/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const r = await CrewRoute.findOne({ _id: req.params.id, vaAdId: va._id });
+        if (!r) return res.status(404).json({ error: 'Route not found.' });
+        Object.assign(r, cleanRoute({ ...r.toObject(), ...req.body }));
+        await r.save();
+        res.json({ route: publicRoute(r) });
+    } catch (err) { console.error('route edit error:', err); res.status(500).json({ error: 'Could not update the route.' }); }
+});
+app.delete('/api/crew/:slug/routes/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        await CrewRoute.deleteOne({ _id: req.params.id, vaAdId: va._id });
+        res.json({ ok: true });
+    } catch (err) { console.error('route delete error:', err); res.status(500).json({ error: 'Could not remove the route.' }); }
+});
+
+// ---- Recruitment: applications ----
+// Submit a join application (public). Free mode creates the pilot instantly;
+// application mode leaves it pending for staff. A min-grade gate blocks
+// self-reported grades below the requirement.
+app.post('/api/crew/:slug/apply', async (req, res) => {
+    try {
+        const raw = String(req.params.slug || '').trim().toLowerCase();
+        const applyFields = '_id slug joinMode minGrade callsignPrefix callsign name contactEmail crewAccent applicationForm joinRequirements +crewWebhookUrl';
+        let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
+            .select(applyFields).lean();
+        if (!ad) ad = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' })
+            .select(applyFields).lean();
+        if (!ad) return res.status(404).json({ error: 'Crew center not found.' });
+
+        const b = req.body || {};
+        let ifcName = String(b.ifcName || '').trim().slice(0, 60);
+        if (!ifcName) return res.status(400).json({ error: 'Your Infinite Flight Community name is required.' });
+
+        // Verify the account against Infinite Flight using our own tooling. When
+        // the lookup succeeds we trust its grade over anything self-reported;
+        // when the service is down we fall back to the self-reported grade so a
+        // pilot is never blocked by our outage.
+        const check = await verifyIfUser(ifcName);
+        let ifVerified = false, ifUserId = '';
+        let grade = Math.max(0, Math.min(5, Number(b.grade) || 0));
+        if (check.ok && check.found) {
+            ifVerified = true;
+            ifUserId = check.userId;
+            if (check.username) ifcName = check.username.slice(0, 60); // canonical spelling
+            if (check.grade != null) grade = Math.max(0, Math.min(5, check.grade));
+        } else if (check.ok && !check.found) {
+            // We reached IF and it has no such account — reject clearly.
+            return res.status(404).json({ error: `We couldn't find an Infinite Flight account named "${ifcName}". Check the spelling of your Community name.` });
+        }
+        // (check.ok === false → service unreachable → proceed unverified.)
+
+        // Assemble the effective requirement set: the extensible list, plus the
+        // legacy minGrade gate folded in (unless a grade requirement is already
+        // present) so old VAs keep working.
+        const reqs = Array.isArray(ad.joinRequirements) ? ad.joinRequirements.slice() : [];
+        if (ad.minGrade > 0 && !reqs.some(r => r.type === 'grade')) reqs.push({ type: 'grade', value: ad.minGrade });
+
+        const stats = check.stats || (ifVerified ? { grade } : null);
+        const agreed = Array.isArray(b.agreed) ? b.agreed.slice(0, 20).map(x => String(x).slice(0, 200)) : [];
+        const evalRes = evaluateRequirements(reqs, stats, agreed);
+        if (!evalRes.ok) {
+            // If the only reason we failed is that IF stats were unavailable, ask
+            // them to retry rather than reject them outright.
+            const onlyUnverified = evalRes.failures.every(f => f.unverified);
+            if (onlyUnverified) {
+                return res.status(422).json({ error: 'We couldn’t reach Infinite Flight to verify your stats. Please try again in a moment.', requirementFailures: evalRes.failures });
+            }
+            const human = evalRes.failures.filter(f => !f.unverified).map(f => {
+                if (f.cmp === 'agree') return `You must accept: “${f.label}”`;
+                const word = f.cmp === 'max' ? 'at most' : 'at least';
+                const have = f.have == null ? '' : ` (you have ${f.have})`;
+                return `${f.label}: ${word} ${f.need}${have}`;
+            });
+            return res.status(403).json({ error: `You don’t meet this VA’s requirements yet — ${human.join('; ')}.`, requirementFailures: evalRes.failures });
+        }
+        const prefix = (String(b.callsignPrefix || '').trim() || ad.callsignPrefix || ad.callsign || '').slice(0, 10);
+        const number = String(b.callsignNumber || '').trim().slice(0, 10);
+        const cs = (prefix + number).trim();
+        const email = isEmail(b.email) ? String(b.email).trim().toLowerCase().slice(0, 120) : '';
+        const answers = Array.isArray(b.answers)
+            ? b.answers.slice(0, 50).map(x => ({ q: String(x.q || '').slice(0, 120), a: String(x.a || '').slice(0, 2000) })) : [];
+
+        const statusToken = crypto.randomBytes(16).toString('hex');
+        const status = ad.joinMode === 'free' ? 'accepted' : 'pending';
+        const appDoc = await CrewApplication.create({
+            vaAdId: ad._id, ifcName, email, callsignPrefix: prefix, callsignNumber: number, grade,
+            ifVerified, ifUserId, answers, statusToken,
+            status, reviewedAt: status === 'accepted' ? new Date() : null,
+        });
+        if (status === 'accepted') {
+            await CrewMember.create({
+                vaAdId: ad._id, name: ifcName, callsign: (prefix + number).trim(),
+                hours: 0, role: '', aircraft: [], status: 'active',
+            });
+        }
+        // Notify the VA's Discord (fire-and-forget). Free-mode joins and
+        // pending applications both post so staff see activity in real time.
+        if (ad.crewWebhookUrl) {
+            postCrewNotice(ad.crewWebhookUrl, status === 'accepted' ? {
+                title: `🎉 New pilot joined — ${ifcName}`,
+                color: CREW_COLORS.accepted,
+                fields: [
+                    { name: 'Callsign', value: cs || '—', inline: true },
+                    { name: 'Grade', value: grade ? `Grade ${grade}` : '—', inline: true },
+                    { name: 'Verified', value: ifVerified ? '✓ yes' : 'no', inline: true },
+                ],
+            } : {
+                title: `📝 New application — ${ifcName}`,
+                description: 'Review it in your Crew Center → Roster → Applications.',
+                color: CREW_COLORS.new,
+                fields: [
+                    { name: 'Callsign', value: cs || '—', inline: true },
+                    { name: 'Grade', value: grade ? `Grade ${grade}` : '—', inline: true },
+                    { name: 'Verified', value: ifVerified ? '✓ yes' : 'no', inline: true },
+                ],
+            }).catch(() => {});
+        }
+        // Acknowledge to the applicant by email (if they gave one). Free-mode
+        // joins get a welcome; applications get a "received + your status link".
+        if (email) {
+            const emailCfg = await crewEmailConfigFor(ad._id);
+            const slug = ad.slug || raw;
+            const statusUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}/status?id=${statusToken}`;
+            const centerUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}`;
+            if (status === 'accepted') {
+                sendCrewEmail(emailCfg, { to: email, subject: `Welcome to ${ad.name || 'the crew'}!`,
+                    html: crewEmailHtml({ vaName: ad.name, accent: ad.crewAccent, heading: 'Welcome aboard! 🎉',
+                        bodyHtml: `You’re now flying with <b>${escHtml(ad.name || 'the crew')}</b>${cs ? `, as <b>${escHtml(cs)}</b>` : ''}.`,
+                        button: { label: 'Open the crew center', url: centerUrl } }) }).catch(() => {});
+            } else {
+                sendCrewEmail(emailCfg, { to: email, subject: `Application received — ${ad.name || 'Crew Center'}`,
+                    html: crewEmailHtml({ vaName: ad.name, accent: ad.crewAccent, heading: 'Application received',
+                        bodyHtml: `Thanks, <b>${escHtml(ifcName)}</b>. The ${escHtml(ad.name || 'VA')} team will review your application and we’ll email you here as soon as there’s a decision.`,
+                        button: { label: 'Check your status', url: statusUrl } }) }).catch(() => {});
+            }
+        }
+        res.json({ status, callsign: cs, applicationId: appDoc._id, statusToken, ifVerified, grade, emailed: !!email });
+    } catch (err) { console.error('apply error:', err); res.status(500).json({ error: 'Could not submit your application.' }); }
+});
+// Public: verify an Infinite Flight Community name in real time so the join
+// form can show a "✓ verified" badge and lock in the true grade before the
+// pilot submits. Returns { found, username, grade } — never an error for a
+// simple "not found", so the form can react smoothly.
+app.post('/api/crew/:slug/verify-if', async (req, res) => {
+    try {
+        const name = String(req.body?.ifcName || '').trim().slice(0, 60);
+        if (!name) return res.status(400).json({ error: 'Enter your Infinite Flight Community name.' });
+        const check = await verifyIfUser(name);
+        if (!check.ok) return res.json({ available: false }); // service down; form falls back
+        if (!check.found) return res.json({ available: true, found: false });
+        res.json({ available: true, found: true, username: check.username, grade: check.grade, stats: check.stats || null });
+    } catch (err) { console.error('verify-if error:', err); res.status(500).json({ error: 'Verification is unavailable right now.' }); }
+});
+
+// Public: an applicant checks the state of their application with the opaque
+// token they were handed at submit time. No account or email needed. Includes
+// any message staff left when they reviewed it.
+app.get('/api/crew/:slug/application-status/:token', async (req, res) => {
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const token = String(req.params.token || '').trim();
+        if (!token) return res.status(400).json({ error: 'Missing status token.' });
+        const appDoc = await CrewApplication.findOne({ vaAdId: va._id, statusToken: token })
+            .select('status staffMessage ifcName callsignPrefix callsignNumber reviewedAt createdAt').lean();
+        if (!appDoc) return res.status(404).json({ error: 'We could not find that application.' });
+        res.json({
+            status: appDoc.status,
+            message: appDoc.staffMessage || '',
+            ifcName: appDoc.ifcName || '',
+            callsign: ((appDoc.callsignPrefix || '') + (appDoc.callsignNumber || '')).trim(),
+            reviewedAt: appDoc.reviewedAt || null,
+            submittedAt: appDoc.createdAt || null,
+        });
+    } catch (err) { console.error('application-status error:', err); res.status(500).json({ error: 'Could not load that application.' }); }
+});
+
+// Staff: list applications (default pending).
+app.get('/api/crew/:slug/applications', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'applications.review');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const q = { vaAdId: va._id };
+        if (req.query.status && ['pending', 'accepted', 'declined'].includes(req.query.status)) q.status = req.query.status;
+        else q.status = 'pending';
+        const apps = await CrewApplication.find(q).sort({ createdAt: -1 }).limit(500).lean();
+        res.json({ applications: apps });
+    } catch (err) { console.error('applications list error:', err); res.status(500).json({ error: 'Could not load applications.' }); }
+});
+// Staff: accept / decline an application. Accept creates the pilot.
+app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'applications.review');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const appDoc = await CrewApplication.findOne({ _id: req.params.id, vaAdId: va._id });
+        if (!appDoc) return res.status(404).json({ error: 'Application not found.' });
+        const action = String(req.body?.action || '');
+        const message = String(req.body?.message || '').trim().slice(0, 2000);
+        if (action === 'accept') {
+            if (appDoc.status !== 'accepted') {
+                await CrewMember.create({
+                    vaAdId: va._id, name: appDoc.ifcName, callsign: (appDoc.callsignPrefix + appDoc.callsignNumber).trim(),
+                    hours: 0, role: '', aircraft: [], status: 'active',
+                });
+            }
+            appDoc.status = 'accepted';
+        } else if (action === 'decline') {
+            appDoc.status = 'declined';
+        } else return res.status(400).json({ error: 'Unknown action.' });
+        if (message) appDoc.staffMessage = message;
+        appDoc.reviewedAt = new Date();
+        await appDoc.save();
+
+        const cs = (appDoc.callsignPrefix + appDoc.callsignNumber).trim();
+        const accepted = appDoc.status === 'accepted';
+        // Post the decision (+ the staff's message) to the VA's Discord.
+        const hook = await crewWebhookUrlFor(va._id);
+        if (hook) {
+            postCrewNotice(hook, {
+                title: `${accepted ? '✅ Accepted' : '🚫 Declined'} — ${appDoc.ifcName}`,
+                description: message || undefined,
+                color: accepted ? CREW_COLORS.accepted : CREW_COLORS.declined,
+                fields: accepted && cs ? [{ name: 'Callsign', value: cs, inline: true }] : [],
+            }).catch(() => {});
+        }
+        // Email the applicant the decision + the staff's message (if they left one).
+        if (appDoc.email) {
+            const emailCfg = await crewEmailConfigFor(va._id);
+            const slug = va.slug || req.params.slug;
+            const statusUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}/status?id=${appDoc.statusToken}`;
+            const centerUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}`;
+            const body = (accepted
+                ? `Great news — welcome to <b>${escHtml(va.name || 'the crew')}</b>${cs ? `, flying as <b>${escHtml(cs)}</b>` : ''}.`
+                : `Thanks for applying to <b>${escHtml(va.name || 'the VA')}</b>. Unfortunately they weren’t able to accept your application this time.`)
+                + (message ? `<br><br><b>Message from the team:</b><br>${escHtml(message).replace(/\n/g, '<br>')}` : '');
+            sendCrewEmail(emailCfg, { to: appDoc.email,
+                subject: accepted ? `You’re in — ${va.name || 'Crew Center'}` : `Update on your application — ${va.name || 'Crew Center'}`,
+                html: crewEmailHtml({ vaName: va.name, accent: va.crewAccent, heading: accepted ? 'You’re in! 🎉' : 'Application update',
+                    bodyHtml: body,
+                    button: accepted ? { label: 'Open the crew center', url: centerUrl } : { label: 'View your application', url: statusUrl } }) }).catch(() => {});
+        }
+        res.json({ status: appDoc.status, message: appDoc.staffMessage || '' });
+    } catch (err) { console.error('application review error:', err); res.status(500).json({ error: 'Could not update the application.' }); }
+});
+
+// Staff: read the crew webhook state (never the secret URL itself, just a hint).
+app.get('/api/crew/:slug/webhook', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'settings.notifications');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const doc = await VirtualAirlineAd.findById(va._id).select('+crewWebhookUrl').lean();
+        res.set('Cache-Control', 'no-store');
+        res.json({ configured: !!(doc && doc.crewWebhookUrl), hint: maskWebhookUrl(doc && doc.crewWebhookUrl) });
+    } catch (err) { console.error('crew webhook get error:', err); res.status(500).json({ error: 'Could not load the webhook.' }); }
+});
+// Staff: set / clear ('' clears) / test the crew Discord webhook.
+app.post('/api/crew/:slug/webhook', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'settings.notifications');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const ad = await VirtualAirlineAd.findById(va._id).select('+crewWebhookUrl name callsign');
+        if (!ad) return res.status(404).json({ error: 'Crew center not found.' });
+        const b = req.body || {};
+        if (b.webhookUrl !== undefined) {
+            const raw = String(b.webhookUrl || '').trim();
+            if (raw && !isDiscordWebhookUrl(raw)) {
+                return res.status(400).json({ error: 'That doesn’t look like a Discord webhook URL (https://discord.com/api/webhooks/…).' });
+            }
+            ad.crewWebhookUrl = raw || null;
+            await ad.save();
+        }
+        if (b.test) {
+            if (!ad.crewWebhookUrl) return res.status(400).json({ error: 'Add a webhook URL first.' });
+            const ok = await postCrewNotice(ad.crewWebhookUrl, {
+                title: `🔔 ${ad.name || 'Crew Center'} — test message`,
+                description: 'Your Crew Center is connected. New applications and accept / decline decisions will show up here.',
+                color: CREW_COLORS.new,
+            });
+            if (!ok) return res.status(502).json({ error: 'We couldn’t deliver a message to that webhook. Double-check the URL.' });
+        }
+        res.set('Cache-Control', 'no-store');
+        res.json({ configured: !!ad.crewWebhookUrl, hint: maskWebhookUrl(ad.crewWebhookUrl) });
+    } catch (err) { console.error('crew webhook set error:', err); res.status(500).json({ error: 'Could not save the webhook.' }); }
+});
+
+// Staff: read the VA's email-provider config (never the secret key). Reports
+// whether the platform fallback is available so the UI can explain what happens.
+app.get('/api/crew/:slug/email', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'settings.notifications');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const doc = await VirtualAirlineAd.findById(va._id).select('+crewEmailKey crewEmailProvider crewEmailFrom crewEmailReplyTo crewEmailDomain crewEmailRegion').lean();
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            provider: (doc && doc.crewEmailProvider) || '',
+            from: (doc && doc.crewEmailFrom) || '',
+            replyTo: (doc && doc.crewEmailReplyTo) || '',
+            domain: (doc && doc.crewEmailDomain) || '',
+            region: (doc && doc.crewEmailRegion) || 'us',
+            keyHint: maskKey(doc && doc.crewEmailKey),
+            configured: !!(doc && doc.crewEmailProvider && doc.crewEmailKey && doc.crewEmailFrom),
+        });
+    } catch (err) { console.error('crew email get error:', err); res.status(500).json({ error: 'Could not load email settings.' }); }
+});
+// Staff: set / clear (provider:'') / test the VA's own email provider.
+app.post('/api/crew/:slug/email', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'settings.notifications');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const ad = await VirtualAirlineAd.findById(va._id).select('+crewEmailKey crewEmailProvider crewEmailFrom crewEmailReplyTo crewEmailDomain crewEmailRegion name contactEmail crewAccent slug');
+        if (!ad) return res.status(404).json({ error: 'Crew center not found.' });
+        const b = req.body || {};
+
+        // Empty provider clears the whole BYO config (falls back to platform).
+        if (b.provider !== undefined) {
+            const p = String(b.provider || '').toLowerCase();
+            if (p && !CREW_EMAIL_PROVIDERS.includes(p)) return res.status(400).json({ error: 'Unknown email provider.' });
+            ad.crewEmailProvider = p;
+            if (!p) { ad.crewEmailKey = ''; ad.crewEmailFrom = ''; ad.crewEmailReplyTo = ''; ad.crewEmailDomain = ''; }
+        }
+        if (b.from !== undefined) {
+            const from = String(b.from || '').trim().slice(0, 160);
+            if (from && !isEmail(parseAddress(from).email)) return res.status(400).json({ error: 'From must be a valid email (optionally "Name <email>").' });
+            ad.crewEmailFrom = from;
+        }
+        if (b.replyTo !== undefined) {
+            const rt = String(b.replyTo || '').trim().slice(0, 160);
+            if (rt && !isEmail(rt)) return res.status(400).json({ error: 'Reply-to must be a valid email.' });
+            ad.crewEmailReplyTo = rt;
+        }
+        if (b.domain !== undefined) ad.crewEmailDomain = String(b.domain || '').trim().slice(0, 120);
+        if (b.region !== undefined) ad.crewEmailRegion = b.region === 'eu' ? 'eu' : 'us';
+        // Only overwrite the key when a non-empty one is sent (blank means "keep").
+        if (typeof b.apiKey === 'string' && b.apiKey.trim()) ad.crewEmailKey = b.apiKey.trim().slice(0, 400);
+        // Keep the non-secret mirror in sync for the public join page.
+        ad.crewEmailConfigured = !!(ad.crewEmailProvider && ad.crewEmailKey && ad.crewEmailFrom);
+        await ad.save();
+
+        if (b.test) {
+            const to = isEmail(b.testTo) ? String(b.testTo).trim() : (ad.contactEmail || '');
+            if (!isEmail(to)) return res.status(400).json({ error: 'Enter a valid address to send the test to.' });
+            const cfg = { provider: ad.crewEmailProvider, key: ad.crewEmailKey, from: ad.crewEmailFrom, replyTo: ad.crewEmailReplyTo || ad.contactEmail || '', domain: ad.crewEmailDomain || '', region: ad.crewEmailRegion || 'us' };
+            if (!emailCfgReady(cfg)) return res.status(400).json({ error: 'Add a provider, From address and API key first.' });
+            const ok = await sendCrewEmail(cfg, {
+                to, subject: `${ad.name || 'Crew Center'} — email test`,
+                html: crewEmailHtml({ vaName: ad.name, accent: ad.crewAccent, heading: 'Email is working 🎉',
+                    bodyHtml: 'This is a test from your Crew Center. Applicant notifications will be delivered through your own provider.' }),
+            });
+            if (!ok) return res.status(502).json({ error: 'The provider rejected the test — double-check the From address, API key and (for Mailgun) the sending domain.' });
+        }
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            provider: ad.crewEmailProvider || '', from: ad.crewEmailFrom || '', replyTo: ad.crewEmailReplyTo || '',
+            domain: ad.crewEmailDomain || '', region: ad.crewEmailRegion || 'us', keyHint: maskKey(ad.crewEmailKey),
+            configured: ad.crewEmailConfigured,
+        });
+    } catch (err) { console.error('crew email set error:', err); res.status(500).json({ error: 'Could not save email settings.' }); }
+});
+
+// Crew Center badge-image upload — owner/staff (or Inflight) upload their own
+// rank/role badge art. Reuses the VA image pipeline (WebP, alpha preserved).
+// Bearer-authed (no cookie), so CORS stays simple.
+app.post('/api/crew/:slug/badge-image', upload.single('image'), async (req, res) => {
+    try {
+        const p = verifyCrewRequest(req);
+        if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+        if (!(p.kind === 'inflight' || p.role === 'owner' || p.role === 'staff')) {
+            return res.status(403).json({ error: 'Not allowed to upload badges.' });
+        }
+        const slug = String(req.params.slug || '').toLowerCase();
+        if (p.kind !== 'inflight' && p.slug && p.slug !== slug) {
+            return res.status(403).json({ error: 'Wrong crew center.' });
+        }
+        if (!req.file) return res.status(400).json({ error: 'No image uploaded.' });
+
+        let va = await VirtualAirlineAd.findOne({ slug }).select('_id').lean();
+        if (!va) va = await VirtualAirlineAd.findOne({ callsign: slug.toUpperCase() }).select('_id').lean();
+        const ref = va ? String(va._id) : slug;
+        const url = await uploadVaImage(s3Client, req.file, ref, 'logo'); // 512² profile, keeps transparency
+        res.set('Cache-Control', 'no-store');
+        res.json({ url });
+    } catch (err) {
+        console.error('Crew badge upload error:', err);
+        res.status(500).json({ error: 'Could not upload the badge image.' });
+    }
+});
 
 // Health Check — public, unauthenticated (for uptime/platform monitors).
 // NOTE: the site is staff-only, so the homepage ("/") is gated below; point any
@@ -2560,7 +3425,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles crewFleet joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -2569,11 +3434,13 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         }
         if (!ad) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        // Brand accent: prefer the embed-config accent's first stop, then the
-        // legacy brandColor; '' means "let the login decide".
-        let accent = '';
-        const cfg = await EmbedConfig.findOne({ vaAdId: ad._id }).select('accent brandColor').lean();
-        if (cfg) accent = (Array.isArray(cfg.accent) && cfg.accent[0]) || cfg.brandColor || '';
+        // Brand accent: the VA's own crewAccent wins; otherwise the embed-config
+        // accent's first stop, then the legacy brandColor; '' means "decide".
+        let accent = ad.crewAccent || '';
+        if (!accent) {
+            const cfg = await EmbedConfig.findOne({ vaAdId: ad._id }).select('accent brandColor').lean();
+            if (cfg) accent = (Array.isArray(cfg.accent) && cfg.accent[0]) || cfg.brandColor || '';
+        }
 
         res.set('Cache-Control', 'public, max-age=300'); // 5 min — branding rarely changes
         res.json({
@@ -2585,6 +3452,27 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             banner: ad.bannerUrl || '',
             website: ad.websiteUrl || '',
             accent,
+            layout: ad.layout || 'editorial',
+            allowedLayouts: (Array.isArray(ad.allowedLayouts) && ad.allowedLayouts.length)
+                ? ad.allowedLayouts : ['editorial', 'console', 'split', 'classic'],
+            loginLook: ad.loginLook || 'center',
+            ranks: Array.isArray(ad.ranks) ? ad.ranks : [],
+            roles: Array.isArray(ad.roles) ? ad.roles : [],
+            fleet: Array.isArray(ad.crewFleet) ? ad.crewFleet : [],
+            join: {
+                mode: ad.joinMode || 'application',
+                minGrade: ad.minGrade || 0,
+                callsignPrefix: ad.callsignPrefix || ad.callsign || '',
+                form: Array.isArray(ad.applicationForm) ? ad.applicationForm : [],
+                requirements: Array.isArray(ad.joinRequirements) ? ad.joinRequirements : [],
+                emailEnabled: !!ad.crewEmailConfigured,
+            },
+            // Public Supabase connection (never the secret service key).
+            supabase: {
+                url: ad.supabaseUrl || '',
+                anonKey: ad.supabaseAnonKey || '',
+                connected: !!(ad.supabaseUrl && ad.supabaseAnonKey),
+            },
         });
     } catch (err) {
         console.error('Crew center by-slug error:', err);
@@ -2607,7 +3495,7 @@ app.get('/api/crew-admin/vas', requireAuth, async (req, res) => {
             ];
         }
         const ads = await VirtualAirlineAd.find(query)
-            .select('name callsign slug logoUrl bannerUrl status')
+            .select('name callsign slug logoUrl bannerUrl status layout allowedLayouts')
             .sort({ name: 1 }).limit(limit).lean();
 
         // Portal-account counts per VA, grouped by role (owner/staff/pilot).
@@ -2627,6 +3515,8 @@ app.get('/api/crew-admin/vas', requireAuth, async (req, res) => {
             vas: ads.map(a => ({
                 id: a._id, name: a.name, code: a.callsign || null, slug: a.slug || null,
                 logo: a.logoUrl || '', banner: a.bannerUrl || '', status: a.status,
+                layout: a.layout || 'editorial',
+                allowedLayouts: (a.allowedLayouts && a.allowedLayouts.length) ? a.allowedLayouts : ['editorial','console','split','classic'],
                 accounts: byVa[String(a._id)] || {},
             })),
         });
@@ -2646,8 +3536,25 @@ app.patch('/api/crew-admin/vas/:id', requireAuth, async (req, res) => {
         if (typeof req.body.slug === 'string') {
             ad.slug = req.body.slug.trim() || null;
         }
+        // Which layout presets this VA may choose from (staff allow-list).
+        const CREW_LAYOUTS = ['editorial', 'console', 'split', 'classic'];
+        if (Array.isArray(req.body.allowedLayouts)) {
+            const allowed = req.body.allowedLayouts
+                .map(l => String(l).toLowerCase()).filter(l => CREW_LAYOUTS.includes(l));
+            ad.allowedLayouts = allowed.length ? [...new Set(allowed)] : ['editorial'];
+            if (!ad.allowedLayouts.includes(ad.layout || 'editorial')) ad.layout = ad.allowedLayouts[0];
+        }
+        if (typeof req.body.layout === 'string') {
+            const l = req.body.layout.toLowerCase();
+            const allowed = (Array.isArray(ad.allowedLayouts) && ad.allowedLayouts.length) ? ad.allowedLayouts : CREW_LAYOUTS;
+            if (CREW_LAYOUTS.includes(l) && allowed.includes(l)) ad.layout = l;
+        }
         await ad.save();
-        res.json({ id: ad._id, name: ad.name, code: ad.callsign || null, slug: ad.slug || null });
+        res.json({
+            id: ad._id, name: ad.name, code: ad.callsign || null, slug: ad.slug || null,
+            layout: ad.layout || 'editorial',
+            allowedLayouts: (ad.allowedLayouts && ad.allowedLayouts.length) ? ad.allowedLayouts : CREW_LAYOUTS,
+        });
     } catch (err) {
         console.error('crew-admin patch error:', err);
         res.status(500).json({ error: 'Could not update the crew center address.' });
@@ -2717,7 +3624,7 @@ app.post('/api/va-ads', requireAuth, uploadVaImages, async (req, res) => {
             fleet: parseListField(req.body.fleet),
             pilotCount: parseInt(req.body.pilotCount, 10) || 0,
             recruiting: req.body.recruiting === undefined ? true : req.body.recruiting !== 'false',
-            minGrade: req.body.minGrade ? parseInt(req.body.minGrade, 10) : null,
+            minGrade: req.body.minGrade ? parseInt(req.body.minGrade, 10) : 0,
             requirements: req.body.requirements,
             tags: parseListField(req.body.tags),
             ownerName: req.body.ownerName || 'Unknown',
@@ -2794,7 +3701,7 @@ app.put('/api/va-ads/:id', requireAuth, uploadVaImages, async (req, res) => {
         if (b.fleet !== undefined) ad.fleet = parseListField(b.fleet);
         if (b.pilotCount !== undefined) ad.pilotCount = parseInt(b.pilotCount, 10) || 0;
         if (b.recruiting !== undefined) ad.recruiting = b.recruiting !== 'false' && b.recruiting !== false;
-        if (b.minGrade !== undefined) ad.minGrade = b.minGrade ? parseInt(b.minGrade, 10) : null;
+        if (b.minGrade !== undefined) ad.minGrade = b.minGrade ? parseInt(b.minGrade, 10) : 0;
         if (b.requirements !== undefined) ad.requirements = b.requirements;
         if (b.tags !== undefined) ad.tags = parseListField(b.tags);
         if (b.ownerName !== undefined) ad.ownerName = b.ownerName || 'Unknown';

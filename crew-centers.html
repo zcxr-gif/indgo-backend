@@ -64,6 +64,7 @@
 
     <script>
         const CREW_BASE = 'https://inflight.info';   // where the crew center login lives
+        const LAYOUTS = ['editorial','console','split','classic'];
 
         // ---- Theme ----
         function applyThemeIcon(){ const d=document.documentElement.classList.contains('dark'); const e=document.getElementById('themeIcon'); if(e) e.innerHTML=`<i data-lucide="${d?'sun':'moon'}" class="w-[18px] h-[18px]"></i>`; if(window.lucide) lucide.createIcons(); }
@@ -120,6 +121,20 @@
                             </div>
                             <button data-save class="text-sm font-semibold px-3.5 py-2 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 hover:opacity-90 active:scale-95 transition">Save</button>
                         </div>
+
+                        <!-- Allowed layouts (staff allow-list) -->
+                        <div class="mt-3">
+                            <div class="text-[11px] font-semibold uppercase tracking-wider text-zinc-400 mb-1.5">Layouts this VA can use</div>
+                            <div data-layouts class="flex flex-wrap gap-1.5">
+                                ${LAYOUTS.map(l=>{
+                                    const on=(v.allowedLayouts||['editorial','console','split','classic']).includes(l);
+                                    return `<button type="button" data-layout="${l}" aria-pressed="${on}"
+                                        class="text-xs font-semibold px-2.5 py-1 rounded-lg border transition ${on
+                                          ?'border-zinc-900 dark:border-white bg-zinc-900 dark:bg-white text-white dark:text-zinc-900'
+                                          :'border-zinc-200 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400 hover:border-zinc-400'}">${l[0].toUpperCase()+l.slice(1)}</button>`;
+                                }).join('')}
+                            </div>
+                        </div>
                     </div>
 
                     <!-- Link actions -->
@@ -159,6 +174,23 @@
                 try{ await navigator.clipboard.writeText(link); toast('Link copied.'); }
                 catch{ toast(link); }
             });
+
+            // Allowed-layouts chips: toggle, keep at least one, save on change.
+            const chips = [...row.querySelectorAll('[data-layouts] [data-layout]')];
+            chips.forEach(chip=>chip.addEventListener('click', async ()=>{
+                const on = chip.getAttribute('aria-pressed')==='true';
+                const pressed = chips.filter(c=>c.getAttribute('aria-pressed')==='true');
+                if(on && pressed.length<=1){ toast('At least one layout must stay enabled.'); return; }
+                const next = !on;
+                chip.setAttribute('aria-pressed', String(next));
+                chip.className = 'text-xs font-semibold px-2.5 py-1 rounded-lg border transition ' + (next
+                    ? 'border-zinc-900 dark:border-white bg-zinc-900 dark:bg-white text-white dark:text-zinc-900'
+                    : 'border-zinc-200 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400 hover:border-zinc-400');
+                const allowedLayouts = chips.filter(c=>c.getAttribute('aria-pressed')==='true').map(c=>c.getAttribute('data-layout'));
+                const { ok, data } = await api('/api/crew-admin/vas/'+id, { method:'PATCH', body: JSON.stringify({ allowedLayouts }) });
+                if(!ok){ toast(data.error||'Could not update layouts.'); chip.setAttribute('aria-pressed', String(on)); }
+                else toast('Layouts updated.');
+            }));
         }
 
         async function load(){
