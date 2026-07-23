@@ -204,6 +204,10 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // NOTE: named crewFleet (not fleet) to avoid colliding with the older
     // directory-level `fleet: [String]` field further down this schema.
     crewFleet: { type: [{ _id: false, type: String, name: String, image: String }], default: [] },
+    // Auto-PIREP handling. false (default) = auto-captured flights land as pending
+    // for staff review; true = a flight that matches the fleet is approved on
+    // capture and its hours roll straight onto the roster.
+    crewPirepAutoApprove: { type: Boolean, default: false },
 
     // --- Recruitment / join settings ---
     // joinMode: 'free' = instant account; 'application' = staff review.
@@ -417,6 +421,10 @@ const CrewMemberSchema = new mongoose.Schema({
     role:     { type: String, trim: true, default: '' },
     aircraft: { type: [String], default: [] },
     status:   { type: String, enum: ['active', 'loa', 'inactive'], default: 'active' },
+    // Infinite Flight identity — carried from the accepted application so auto
+    // PIREPs can pull this pilot's real flights and attribute them here.
+    ifUserId: { type: String, trim: true, default: '', index: true },
+    ifcName:  { type: String, trim: true, default: '' },            // IF Community name (canonical)
 }, { timestamps: true });
 const CrewMember = mongoose.models.CrewMember || mongoose.model('CrewMember', CrewMemberSchema);
 
@@ -454,6 +462,43 @@ const CrewRouteSchema = new mongoose.Schema({
     active:      { type: Boolean, default: true },            // hidden from pilots when false
 }, { timestamps: true });
 const CrewRoute = mongoose.models.CrewRoute || mongoose.model('CrewRoute', CrewRouteSchema);
+
+// A flight report (PIREP). Auto-captured from a pilot's real Infinite Flight
+// history (source 'auto') or filed by hand (source 'manual'). The aircraft/
+// livery are the canonical API names so a PIREP lines up with the fleet and,
+// where it exists, a route in the network.
+const CrewPirepSchema = new mongoose.Schema({
+    vaAdId:      { type: mongoose.Schema.Types.ObjectId, ref: 'VirtualAirlineAd', required: true, index: true },
+    memberId:    { type: mongoose.Schema.Types.ObjectId, ref: 'CrewMember', default: null, index: true },
+    routeId:     { type: mongoose.Schema.Types.ObjectId, ref: 'CrewRoute', default: null },
+    // Denormalised so a PIREP still reads correctly if the pilot/route is later removed.
+    pilotName:   { type: String, trim: true, default: '' },
+    callsign:    { type: String, trim: true, default: '' },
+    flightNumber:{ type: String, trim: true, default: '' },
+    ifUserId:    { type: String, trim: true, default: '' },
+    // The Infinite Flight flight id — the dedupe key so a flight is captured once.
+    flightId:    { type: String, trim: true, default: '', index: true },
+    origin:      { type: String, trim: true, uppercase: true, default: '' },
+    destination: { type: String, trim: true, uppercase: true, default: '' },
+    aircraftName:{ type: String, trim: true, default: '' },   // canonical IF aircraft name
+    liveryName:  { type: String, trim: true, default: '' },   // canonical IF livery name
+    durationMin: { type: Number, default: 0, min: 0 },
+    landings:    { type: Number, default: 0, min: 0 },
+    xp:          { type: Number, default: 0 },
+    violations:  { type: Number, default: 0, min: 0 },
+    distanceNm:  { type: Number, default: 0, min: 0 },
+    server:      { type: String, trim: true, default: '' },
+    inFleet:     { type: Boolean, default: false },           // did the aircraft match the VA fleet?
+    source:      { type: String, enum: ['auto', 'manual'], default: 'auto' },
+    status:      { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
+    hoursApplied:{ type: Boolean, default: false },           // guard so approving twice can't double-credit
+    flownAt:     { type: Date, default: null },
+    reviewedAt:  { type: Date, default: null },
+}, { timestamps: true });
+// Fast "already captured?" checks and per-VA listings.
+CrewPirepSchema.index({ vaAdId: 1, flightId: 1 });
+CrewPirepSchema.index({ vaAdId: 1, status: 1, flownAt: -1 });
+const CrewPirep = mongoose.models.CrewPirep || mongoose.model('CrewPirep', CrewPirepSchema);
 
 // ---- Infinite Flight identity verification ----
 // We already run an acars backend that proxies the official IF API. It resolves
@@ -1323,6 +1368,66 @@ registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, 
 // Crew Center sign-in routes (POST /api/crew/:slug/login, GET /api/crew/:slug/me).
 registerCrewAuthRoutes(app);
 
+// ---- Infinite Flight aircraft + livery reference ----
+// The crew center fleet builder lets a VA declare which aircraft/liveries they
+// operate. For the tracker to attribute live flights to that fleet, the names a
+// VA types have to be the SAME canonical strings the live API reports. We proxy
+// the ACARS backend's /api/metadata (the single source of truth for aircraft and
+// livery names) and reshape it into { aircraft:[names], liveries:{ name:[…] } }
+// so the fleet editor can offer exact matches instead of free text. Cached in
+// memory because the catalogue changes only when IF ships an update.
+let _acMetaCache = { at: 0, data: null };
+const AC_META_TTL = 6 * 60 * 60 * 1000; // 6h
+async function loadAircraftMetadata() {
+    if (_acMetaCache.data && (Date.now() - _acMetaCache.at) < AC_META_TTL) return _acMetaCache.data;
+    const resp = await axios.get(`${ACARS_BACKEND_URL}/api/metadata`, { timeout: 8000 });
+    const j = resp?.data || {};
+    if (!j.ok) throw new Error('metadata upstream not ok');
+    // aircraft: canonical type names (sorted, de-duped) + an id→name map used to
+    // resolve the UUIDs on a live flight back to a name.
+    const acById = new Map();
+    for (const a of (j.aircraft || [])) {
+        const id = String(a && a.id || '').toLowerCase(); const name = String(a && a.name || '').trim();
+        if (id && name) acById.set(id, name);
+    }
+    const aircraft = [...new Set([...acById.values()])].sort((a, b) => a.localeCompare(b));
+    // liveries: keyed by their aircraft name so the editor can filter per type;
+    // plus an id→{liveryName,aircraftName} map for flight resolution.
+    const liveries = {};
+    const livById = new Map();
+    for (const l of (j.liveries || [])) {
+        const ac = String(l && l.aircraftName || '').trim();
+        const name = String(l && l.name || '').trim();
+        const id = String(l && l.id || '').toLowerCase();
+        if (id && name) livById.set(id, { liveryName: name, aircraftName: ac });
+        if (!ac || !name) continue;
+        (liveries[ac] = liveries[ac] || []).push(name);
+    }
+    for (const ac of Object.keys(liveries)) {
+        liveries[ac] = [...new Set(liveries[ac])].sort((a, b) => a.localeCompare(b));
+    }
+    const data = { aircraft, liveries, acById, livById };
+    _acMetaCache = { at: Date.now(), data };
+    return data;
+}
+// Public reference — no auth. Reference data the fleet builder reads. Only the
+// name lists are exposed (the id maps are for server-side flight resolution).
+app.get('/api/crew/aircraft-metadata', async (req, res) => {
+    try {
+        const { aircraft, liveries } = await loadAircraftMetadata();
+        res.set('Cache-Control', 'public, max-age=3600');
+        res.json({ ok: true, aircraft, liveries });
+    } catch (err) {
+        console.error('aircraft-metadata error:', err?.message || err);
+        // Serve a stale copy rather than nothing if we have one.
+        if (_acMetaCache.data) {
+            const { aircraft, liveries } = _acMetaCache.data;
+            return res.json({ ok: true, stale: true, aircraft, liveries });
+        }
+        res.status(502).json({ ok: false, error: 'Aircraft metadata unavailable.', aircraft: [], liveries: {} });
+    }
+});
+
 // ---- Crew roster (managed storage) ----
 async function resolveCrewVa(slug) {
     const raw = String(slug || '').trim().toLowerCase();
@@ -1341,11 +1446,16 @@ function cleanMember(b) {
         role: String(b.role || '').trim().slice(0, 40),
         aircraft: Array.isArray(b.aircraft) ? b.aircraft.slice(0, 40).map(a => String(a).trim().slice(0, 40)).filter(Boolean) : [],
         status: ['active', 'loa', 'inactive'].includes(b.status) ? b.status : 'active',
+        // Preserved through edits (PATCH merges the existing member through here);
+        // staff may also set/clear the IF link by hand.
+        ifUserId: String(b.ifUserId || '').trim().slice(0, 40),
+        ifcName: String(b.ifcName || '').trim().slice(0, 60),
     };
 }
 const publicMember = (m) => ({
     id: m._id, name: m.name, callsign: m.callsign, hours: m.hours,
     role: m.role, aircraft: m.aircraft || [], status: m.status,
+    linked: !!m.ifUserId,   // is this pilot linked to an IF account for auto-PIREPs?
 });
 // Owner/staff (or Inflight) gate for roster writes.
 function crewCanManage(req, slug) {
@@ -1477,6 +1587,249 @@ app.delete('/api/crew/:slug/routes/:id', async (req, res) => {
     } catch (err) { console.error('route delete error:', err); res.status(500).json({ error: 'Could not remove the route.' }); }
 });
 
+// ---- Flight reports (PIREPs) — auto-captured from real IF history ----
+const _norm = (s) => String(s || '').trim().toLowerCase();
+// Loose aircraft-name match. Fleet types are the canonical IF names now, so an
+// exact match is the norm; the contains fallback tolerates minor variants.
+function aircraftMatches(a, b) {
+    const x = _norm(a), y = _norm(b);
+    if (!x || !y) return false;
+    return x === y || x.includes(y) || y.includes(x);
+}
+function pirepInFleet(fleet, aircraftName) {
+    if (!Array.isArray(fleet) || !fleet.length || !aircraftName) return false;
+    return fleet.some(f => aircraftMatches(f.type || f.name, aircraftName));
+}
+// Best route in the network for a flown leg: same origin+destination, preferring
+// one whose aircraft also matches.
+function matchRoute(routes, origin, dest, aircraftName) {
+    if (!Array.isArray(routes)) return null;
+    const o = _norm(origin), d = _norm(dest);
+    if (!o || !d) return null;
+    const cands = routes.filter(r => r.active !== false && _norm(r.origin) === o && _norm(r.destination) === d);
+    if (!cands.length) return null;
+    return cands.find(r => r.aircraft && aircraftMatches(r.aircraft, aircraftName)) || cands[0];
+}
+// Resolve a live flight's aircraft/livery UUIDs to canonical names via metadata.
+function resolveFlightNames(flight, meta) {
+    const livId = String(flight.liveryID || flight.liveryId || '').toLowerCase();
+    const liv = livId && meta.livById && meta.livById.get(livId);
+    let aircraftName = liv ? liv.aircraftName : '';
+    const liveryName = liv ? liv.liveryName : '';
+    if (!aircraftName) {
+        const acId = String(flight.aircraftID || flight.aircraftId || '').toLowerCase();
+        aircraftName = (acId && meta.acById && meta.acById.get(acId)) || '';
+    }
+    return { aircraftName, liveryName };
+}
+// Credit a PIREP's hours to its pilot exactly once.
+async function applyPirepHours(pirep) {
+    if (!pirep || pirep.hoursApplied || !pirep.memberId) return;
+    const hrs = (Number(pirep.durationMin) || 0) / 60;
+    if (hrs > 0) await CrewMember.updateOne({ _id: pirep.memberId }, { $inc: { hours: hrs } });
+    pirep.hoursApplied = true;
+    await pirep.save();
+}
+// Roll a PIREP's credited hours back off its pilot (on reject/delete), clamped at 0.
+async function reversePirepHours(pirep) {
+    if (!pirep || !pirep.hoursApplied || !pirep.memberId) return;
+    const hrs = (Number(pirep.durationMin) || 0) / 60;
+    if (hrs > 0) {
+        const m = await CrewMember.findById(pirep.memberId).select('hours');
+        if (m) { m.hours = Math.max(0, (Number(m.hours) || 0) - hrs); await m.save(); }
+    }
+    pirep.hoursApplied = false;
+}
+const publicPirep = (p) => ({
+    id: p._id, memberId: p.memberId, routeId: p.routeId,
+    pilotName: p.pilotName, callsign: p.callsign, flightNumber: p.flightNumber,
+    origin: p.origin, destination: p.destination,
+    aircraftName: p.aircraftName, liveryName: p.liveryName,
+    durationMin: p.durationMin, landings: p.landings, xp: p.xp, violations: p.violations,
+    distanceNm: p.distanceNm, server: p.server, inFleet: p.inFleet,
+    routeMatched: !!p.routeId,   // did this leg match a route in the network?
+    source: p.source, status: p.status, flownAt: p.flownAt, createdAt: p.createdAt,
+});
+
+// List PIREPs. Managers (flights.review) see everything and can filter by status;
+// everyone else sees the approved flights only — a public flight log.
+app.get('/api/crew/:slug/pireps', async (req, res) => {
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const gate = await requireCap(req, req.params.slug, 'flights.review');
+        const isManager = !gate.error;
+        const q = { vaAdId: va._id };
+        if (isManager) {
+            const s = String(req.query.status || '');
+            if (['pending', 'approved', 'rejected'].includes(s)) q.status = s;
+        } else {
+            q.status = 'approved';
+        }
+        const pireps = await CrewPirep.find(q).sort({ flownAt: -1, createdAt: -1 }).limit(500).lean();
+        res.json({ pireps: pireps.map(publicPirep), canReview: isManager });
+    } catch (err) { console.error('pireps list error:', err); res.status(500).json({ error: 'Could not load flights.' }); }
+});
+
+// File a PIREP by hand. Any signed-in crew member of this VA can submit one.
+// Crucially we compare the filed leg against the CURRENT route network to decide
+// whether it's a real route: an active route with the same origin+destination
+// (preferring an aircraft match) attaches its id + flight number, and the reply
+// tells the caller whether the route checked out. Manual reports always land as
+// pending for staff review.
+app.post('/api/crew/:slug/pireps', async (req, res) => {
+    const p = verifyCrewRequest(req);
+    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+    if (p.kind !== 'inflight' && p.slug && p.slug !== String(req.params.slug).toLowerCase()) {
+        return res.status(403).json({ error: 'Wrong crew center.' });
+    }
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const b = req.body || {};
+        const icao = (v) => String(v || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
+        const origin = icao(b.origin), destination = icao(b.destination);
+        if (!origin || !destination) return res.status(400).json({ error: 'Enter both a departure and an arrival airport.' });
+        const aircraftName = String(b.aircraftName || b.aircraft || '').trim().slice(0, 60);
+        const liveryName = String(b.liveryName || b.livery || '').trim().slice(0, 80);
+        // Duration accepts either a minutes number or hours+minutes fields.
+        let durationMin = Math.round(Number(b.durationMin) || 0);
+        if (!durationMin && (b.hours || b.minutes)) durationMin = Math.round((Number(b.hours) || 0) * 60 + (Number(b.minutes) || 0));
+        durationMin = Math.max(0, Math.min(100000, durationMin));
+        const landings = Math.max(0, Math.min(100, Math.round(Number(b.landings) || 0)));
+
+        // Optional: attribute to a roster pilot (so approving can credit hours).
+        let member = null;
+        if (b.memberId) member = await CrewMember.findOne({ _id: b.memberId, vaAdId: va._id }).lean();
+
+        // Compare against the current network to judge whether the route is real.
+        const vaFull = await VirtualAirlineAd.findById(va._id).select('crewFleet').lean();
+        const routes = await CrewRoute.find({ vaAdId: va._id, active: true }).limit(3000).lean();
+        const route = matchRoute(routes, origin, destination, aircraftName);
+        const inFleet = pirepInFleet((vaFull && vaFull.crewFleet) || [], aircraftName);
+        // If the pilot typed a flight number, note when it disagrees with the route's.
+        const claimedFlight = String(b.flightNumber || '').trim().slice(0, 12);
+        const flightNumberMismatch = !!(route && route.flightNumber && claimedFlight && _norm(route.flightNumber) !== _norm(claimedFlight));
+
+        const doc = await CrewPirep.create({
+            vaAdId: va._id, memberId: (member && member._id) || null, routeId: (route && route._id) || null,
+            pilotName: (member && member.name) || p.name || '', callsign: String(b.callsign || (member && member.callsign) || '').slice(0, 20),
+            flightNumber: (route && route.flightNumber) || claimedFlight, ifUserId: (member && member.ifUserId) || '',
+            origin, destination, aircraftName, liveryName,
+            durationMin, landings, distanceNm: (route && route.distanceNm) || 0,
+            inFleet, source: 'manual', status: 'pending',
+            flownAt: b.flownAt ? new Date(b.flownAt) : new Date(),
+        });
+        res.status(201).json({
+            pirep: publicPirep(doc),
+            routeMatched: !!route,
+            flightNumberMismatch,
+            route: route ? { id: route._id, flightNumber: route.flightNumber, origin: route.origin, destination: route.destination, aircraft: route.aircraft } : null,
+        });
+    } catch (err) { console.error('pirep file error:', err); res.status(500).json({ error: 'Could not file the flight.' }); }
+});
+
+// Auto-capture: pull each linked pilot's recent IF flights and turn any we
+// haven't seen into PIREPs — matched to the fleet + route network by canonical
+// names. In auto-approve mode a fleet match is credited immediately.
+app.post('/api/crew/:slug/pireps/sync', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'flights.review');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const vaFull = await VirtualAirlineAd.findById(va._id).select('crewFleet crewPirepAutoApprove').lean();
+        const autoApprove = !!(vaFull && vaFull.crewPirepAutoApprove);
+        const fleet = (vaFull && vaFull.crewFleet) || [];
+        const routes = await CrewRoute.find({ vaAdId: va._id, active: true }).limit(3000).lean();
+        // Only active pilots linked to an IF account can be auto-tracked. Cap the
+        // batch so one sync can't run unbounded.
+        const members = await CrewMember.find({ vaAdId: va._id, status: 'active', ifUserId: { $exists: true, $ne: '' } }).limit(300).lean();
+        let meta;
+        try { meta = await loadAircraftMetadata(); } catch { meta = { acById: new Map(), livById: new Map() }; }
+
+        let created = 0, approved = 0, scanned = 0;
+        for (const m of members) {
+            let flights = [];
+            try {
+                const r = await axios.get(`${ACARS_BACKEND_URL}/api/users/${encodeURIComponent(m.ifUserId)}/flights?page=1`, { timeout: 8000 });
+                flights = Array.isArray(r.data && r.data.flights) ? r.data.flights : [];
+            } catch { continue; }
+            if (!flights.length) continue;
+            const ids = flights.map(f => String(f.id || '')).filter(Boolean);
+            const seen = new Set((await CrewPirep.find({ vaAdId: va._id, flightId: { $in: ids } }).select('flightId').lean()).map(p => p.flightId));
+            for (const f of flights) {
+                scanned++;
+                const flightId = String(f.id || '');
+                if (!flightId || seen.has(flightId)) continue;
+                const { aircraftName, liveryName } = resolveFlightNames(f, meta);
+                const origin = String(f.originAirport || '').toUpperCase();
+                const destination = String(f.destinationAirport || '').toUpperCase();
+                const inFleet = pirepInFleet(fleet, aircraftName);
+                const route = matchRoute(routes, origin, destination, aircraftName);
+                const durationMin = Math.max(0, Math.round(Number(f.totalTime) || 0));
+                const landings = Array.isArray(f.landingStats) ? f.landingStats.length : Math.max(0, Math.round(Number(f.landingCount) || 0));
+                const violations = Array.isArray(f.violations) ? f.violations.length : Math.max(0, Math.round(Number(f.violations) || 0));
+                const willApprove = autoApprove && inFleet;
+                let doc;
+                try {
+                    doc = await CrewPirep.create({
+                        vaAdId: va._id, memberId: m._id, routeId: (route && route._id) || null,
+                        pilotName: m.name || m.ifcName || '', callsign: String(f.callsign || m.callsign || '').slice(0, 20),
+                        flightNumber: (route && route.flightNumber) || '', ifUserId: m.ifUserId, flightId,
+                        origin, destination, aircraftName, liveryName,
+                        durationMin, landings, xp: Math.round(Number(f.xp) || 0), violations,
+                        distanceNm: (route && route.distanceNm) || 0, server: String(f.server || '').slice(0, 40),
+                        inFleet, source: 'auto',
+                        status: willApprove ? 'approved' : 'pending',
+                        flownAt: f.created ? new Date(f.created) : null,
+                        reviewedAt: willApprove ? new Date() : null,
+                    });
+                } catch { continue; } // a concurrent sync may have inserted the same flight
+                created++;
+                if (willApprove) { await applyPirepHours(doc); approved++; }
+            }
+        }
+        res.json({ ok: true, created, approved, scanned, pilots: members.length });
+    } catch (err) { console.error('pirep sync error:', err); res.status(500).json({ error: 'Sync failed.' }); }
+});
+
+// Approve / reject a PIREP. Approving credits the pilot's hours; rejecting an
+// already-credited one rolls them back.
+app.patch('/api/crew/:slug/pireps/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'flights.review');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const p = await CrewPirep.findOne({ _id: req.params.id, vaAdId: va._id });
+        if (!p) return res.status(404).json({ error: 'Flight not found.' });
+        const action = String(req.body && req.body.action || '');
+        if (action === 'approve') {
+            if (p.status !== 'approved') { p.status = 'approved'; p.reviewedAt = new Date(); await p.save(); await applyPirepHours(p); }
+        } else if (action === 'reject') {
+            await reversePirepHours(p);
+            p.status = 'rejected'; p.reviewedAt = new Date(); await p.save();
+        } else return res.status(400).json({ error: 'Unknown action.' });
+        res.json({ pirep: publicPirep(p) });
+    } catch (err) { console.error('pirep review error:', err); res.status(500).json({ error: 'Could not update the flight.' }); }
+});
+
+// Remove a PIREP (rolling back its hours if they were credited).
+app.delete('/api/crew/:slug/pireps/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'flights.review');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const p = await CrewPirep.findOne({ _id: req.params.id, vaAdId: va._id });
+        if (!p) return res.status(404).json({ error: 'Flight not found.' });
+        await reversePirepHours(p);
+        await CrewPirep.deleteOne({ _id: p._id });
+        res.json({ ok: true });
+    } catch (err) { console.error('pirep delete error:', err); res.status(500).json({ error: 'Could not remove the flight.' }); }
+});
+
 // ---- Recruitment: applications ----
 // Submit a join application (public). Free mode creates the pilot instantly;
 // application mode leaves it pending for staff. A min-grade gate blocks
@@ -1555,6 +1908,7 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
             await CrewMember.create({
                 vaAdId: ad._id, name: ifcName, callsign: (prefix + number).trim(),
                 hours: 0, role: '', aircraft: [], status: 'active',
+                ifUserId: ifUserId || '', ifcName,
             });
         }
         // Notify the VA's Discord (fire-and-forget). Free-mode joins and
@@ -1669,6 +2023,7 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
                 await CrewMember.create({
                     vaAdId: va._id, name: appDoc.ifcName, callsign: (appDoc.callsignPrefix + appDoc.callsignNumber).trim(),
                     hours: 0, role: '', aircraft: [], status: 'active',
+                    ifUserId: appDoc.ifUserId || '', ifcName: appDoc.ifcName || '',
                 });
             }
             appDoc.status = 'accepted';
@@ -3425,7 +3780,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles crewFleet joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles crewFleet crewPirepAutoApprove joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -3459,6 +3814,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             ranks: Array.isArray(ad.ranks) ? ad.ranks : [],
             roles: Array.isArray(ad.roles) ? ad.roles : [],
             fleet: Array.isArray(ad.crewFleet) ? ad.crewFleet : [],
+            pirepAutoApprove: !!ad.crewPirepAutoApprove,
             join: {
                 mode: ad.joinMode || 'application',
                 minGrade: ad.minGrade || 0,
