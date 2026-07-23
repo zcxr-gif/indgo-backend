@@ -108,10 +108,10 @@ const CREW_CAPABILITIES = [
     { id: 'settings.branding',      group: 'Appearance',    label: 'Change appearance, ranks, roles & fleet' },
     { id: 'settings.notifications', group: 'Notifications',  label: 'Manage Discord & email notifications' },
     { id: 'routes.manage',          group: 'Operations',    label: 'Create & manage the route network' },
+    { id: 'flights.review',         group: 'Operations',    label: 'Review flights (PIREPs) & auto-tracking' },
     // Room to grow, e.g.:
     // { id: 'events.manage',     group: 'Operations', label: 'Create & manage events' },
     // { id: 'schedules.manage',  group: 'Operations', label: 'Manage schedules & bookings' },
-    // { id: 'flights.review',    group: 'Operations', label: 'Review submitted flights (PIREPs)' },
     // { id: 'members.message',   group: 'Roster',     label: 'Message crew members' },
 ];
 const CREW_CAP_IDS = CREW_CAPABILITIES.map(c => c.id);
@@ -287,9 +287,11 @@ function registerCrewAuthRoutes(app) {
             const touchesBranding = ['layout', 'accent', 'loginLook', 'ranks', 'roles', 'fleet'].some(f => body[f] !== undefined);
             const touchesRecruit = ['joinMode', 'minGrade', 'callsignPrefix', 'applicationForm', 'joinRequirements'].some(f => body[f] !== undefined);
             const touchesTeam = body.staffRoles !== undefined || body.staffAssignments !== undefined;
+            const touchesOps = body.pirepAutoApprove !== undefined;
             if (touchesBranding && !can('settings.branding')) return res.status(403).json({ error: 'You don’t have permission to change appearance.' });
             if (touchesRecruit && !can('settings.recruitment')) return res.status(403).json({ error: 'You don’t have permission to change recruitment settings.' });
             if (touchesTeam && !(isInflight || p.role === 'owner')) return res.status(403).json({ error: 'Only the owner can manage staff roles.' });
+            if (touchesOps && !can('flights.review')) return res.status(403).json({ error: 'You don’t have permission to change flight tracking.' });
 
             if (typeof req.body?.layout === 'string') {
                 const layout = req.body.layout.toLowerCase();
@@ -353,6 +355,7 @@ function registerCrewAuthRoutes(app) {
                 if (req.body.staffRoles !== undefined) { const r = sanitizeStaffRoles(req.body.staffRoles); if (r) ad.staffRoles = r; }
                 if (req.body.staffAssignments !== undefined) { const a = sanitizeAssignments(req.body.staffAssignments); if (a) ad.staffAssignments = a; }
             }
+            if (touchesOps) ad.crewPirepAutoApprove = !!req.body.pirepAutoApprove;
             await ad.save();
             res.set('Cache-Control', 'no-store');
             res.json({
@@ -361,6 +364,7 @@ function registerCrewAuthRoutes(app) {
                 joinMode: ad.joinMode, minGrade: ad.minGrade, callsignPrefix: ad.callsignPrefix || '',
                 applicationForm: ad.applicationForm || [], joinRequirements: ad.joinRequirements || [],
                 staffRoles: ad.staffRoles || [], staffAssignments: ad.staffAssignments || [],
+                pirepAutoApprove: !!ad.crewPirepAutoApprove,
             });
         } catch (err) {
             console.error('Crew settings error:', err);
