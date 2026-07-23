@@ -442,6 +442,19 @@ const CrewApplicationSchema = new mongoose.Schema({
 }, { timestamps: true });
 const CrewApplication = mongoose.models.CrewApplication || mongoose.model('CrewApplication', CrewApplicationSchema);
 
+// A route in the VA's network — a flyable leg pilots can pick up.
+const CrewRouteSchema = new mongoose.Schema({
+    vaAdId:      { type: mongoose.Schema.Types.ObjectId, ref: 'VirtualAirlineAd', required: true, index: true },
+    flightNumber:{ type: String, trim: true, default: '' },   // e.g. "ACA123"
+    origin:      { type: String, trim: true, uppercase: true, default: '' },  // departure ICAO
+    destination: { type: String, trim: true, uppercase: true, default: '' },  // arrival ICAO
+    aircraft:    { type: String, trim: true, default: '' },   // aircraft type/name (often from the fleet)
+    distanceNm:  { type: Number, default: 0, min: 0 },        // optional great-circle distance
+    notes:       { type: String, trim: true, default: '' },
+    active:      { type: Boolean, default: true },            // hidden from pilots when false
+}, { timestamps: true });
+const CrewRoute = mongoose.models.CrewRoute || mongoose.model('CrewRoute', CrewRouteSchema);
+
 // ---- Infinite Flight identity verification ----
 // We already run an acars backend that proxies the official IF API. It resolves
 // a community name to a userId (proof the account exists + the canonical
@@ -1400,6 +1413,68 @@ app.delete('/api/crew/:slug/roster/:id', async (req, res) => {
         await CrewMember.deleteOne({ _id: req.params.id, vaAdId: va._id });
         res.json({ ok: true });
     } catch (err) { console.error('roster delete error:', err); res.status(500).json({ error: 'Could not remove the pilot.' }); }
+});
+
+// ---- Route network ----
+const cleanRoute = (b) => {
+    b = b || {};
+    const icao = (v) => String(v || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
+    return {
+        flightNumber: String(b.flightNumber || '').trim().slice(0, 12),
+        origin: icao(b.origin),
+        destination: icao(b.destination),
+        aircraft: String(b.aircraft || '').trim().slice(0, 60),
+        distanceNm: Math.max(0, Math.min(20000, Math.round(Number(b.distanceNm) || 0))),
+        notes: String(b.notes || '').trim().slice(0, 500),
+        active: b.active === undefined ? true : !!b.active,
+    };
+};
+const publicRoute = (r) => ({
+    id: r._id, flightNumber: r.flightNumber, origin: r.origin, destination: r.destination,
+    aircraft: r.aircraft, distanceNm: r.distanceNm, notes: r.notes, active: r.active,
+});
+// Public: the VA's route network (active only for non-managers is handled client-side;
+// here we return all so managers see drafts too — the list isn't sensitive).
+app.get('/api/crew/:slug/routes', async (req, res) => {
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const routes = await CrewRoute.find({ vaAdId: va._id }).sort({ flightNumber: 1, createdAt: -1 }).limit(3000).lean();
+        res.json({ routes: routes.map(publicRoute) });
+    } catch (err) { console.error('routes list error:', err); res.status(500).json({ error: 'Could not load routes.' }); }
+});
+app.post('/api/crew/:slug/routes', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const r = await CrewRoute.create({ vaAdId: va._id, ...cleanRoute(req.body) });
+        res.status(201).json({ route: publicRoute(r) });
+    } catch (err) { console.error('route add error:', err); res.status(500).json({ error: 'Could not add the route.' }); }
+});
+app.patch('/api/crew/:slug/routes/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const r = await CrewRoute.findOne({ _id: req.params.id, vaAdId: va._id });
+        if (!r) return res.status(404).json({ error: 'Route not found.' });
+        Object.assign(r, cleanRoute({ ...r.toObject(), ...req.body }));
+        await r.save();
+        res.json({ route: publicRoute(r) });
+    } catch (err) { console.error('route edit error:', err); res.status(500).json({ error: 'Could not update the route.' }); }
+});
+app.delete('/api/crew/:slug/routes/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        await CrewRoute.deleteOne({ _id: req.params.id, vaAdId: va._id });
+        res.json({ ok: true });
+    } catch (err) { console.error('route delete error:', err); res.status(500).json({ error: 'Could not remove the route.' }); }
 });
 
 // ---- Recruitment: applications ----

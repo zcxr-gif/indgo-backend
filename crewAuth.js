@@ -103,6 +103,7 @@ const CREW_CAPABILITIES = [
     { id: 'settings.recruitment',   group: 'Recruitment',   label: 'Edit join settings, questions & requirements' },
     { id: 'settings.branding',      group: 'Appearance',    label: 'Change appearance, ranks, roles & fleet' },
     { id: 'settings.notifications', group: 'Notifications',  label: 'Manage Discord & email notifications' },
+    { id: 'routes.manage',          group: 'Operations',    label: 'Create & manage the route network' },
     // Room to grow, e.g.:
     // { id: 'events.manage',     group: 'Operations', label: 'Create & manage events' },
     // { id: 'schedules.manage',  group: 'Operations', label: 'Manage schedules & bookings' },
