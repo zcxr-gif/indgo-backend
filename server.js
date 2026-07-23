@@ -185,6 +185,16 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     layout: { type: String, default: 'editorial' },
     allowedLayouts: { type: [String], default: ['editorial', 'console', 'split', 'classic'] },
 
+    // --- The VA's own Supabase project (bring-your-own data store) ---
+    // The VA connects their Supabase in owner onboarding; their crew data lives
+    // there and stays theirs. anonKey is the PUBLIC browser key (safe to expose
+    // via by-slug so the crew center can talk to their project). serviceKey is a
+    // SECRET with full access — select:false so it is NEVER returned to the
+    // browser; kept only for Inflight's retained server-side access.
+    supabaseUrl: { type: String, trim: true, default: '' },
+    supabaseAnonKey: { type: String, trim: true, default: '' },
+    supabaseServiceKey: { type: String, trim: true, default: '', select: false },
+
     // --- Copy ---
     tagline: { type: String, trim: true, maxlength: 140, default: '' }, // short hook
     description: { type: String, trim: true, maxlength: 4000, default: '' },
@@ -2566,7 +2576,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -2594,6 +2604,12 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             layout: ad.layout || 'editorial',
             allowedLayouts: (Array.isArray(ad.allowedLayouts) && ad.allowedLayouts.length)
                 ? ad.allowedLayouts : ['editorial', 'console', 'split', 'classic'],
+            // Public Supabase connection (never the secret service key).
+            supabase: {
+                url: ad.supabaseUrl || '',
+                anonKey: ad.supabaseAnonKey || '',
+                connected: !!(ad.supabaseUrl && ad.supabaseAnonKey),
+            },
         });
     } catch (err) {
         console.error('Crew center by-slug error:', err);

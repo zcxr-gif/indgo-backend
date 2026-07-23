@@ -153,6 +153,62 @@ function registerCrewAuthRoutes(app) {
         }
     });
 
+    // --- Connect the VA's Supabase project (owner or Inflight only) ---
+    // Stores the project URL + public anon key (browser-safe) and, optionally,
+    // the secret service-role key (never returned). Staff/pilots cannot touch it.
+    app.post('/api/crew/:slug/supabase', async (req, res) => {
+        const token = getBearer(req);
+        if (!token) return res.status(401).json({ error: 'Not authenticated.' });
+        let p;
+        try { p = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).json({ error: 'Invalid session.' }); }
+        if (p.typ !== 'crew') return res.status(401).json({ error: 'Invalid session.' });
+
+        const slug = String(req.params.slug || '').toLowerCase();
+        const isInflight = p.kind === 'inflight';
+        if (!(isInflight || p.role === 'owner')) {
+            return res.status(403).json({ error: 'Only the VA owner can connect Supabase.' });
+        }
+        if (!isInflight && p.slug && p.slug !== slug) {
+            return res.status(403).json({ error: 'Wrong crew center.' });
+        }
+
+        try {
+            const va = await resolveVa(slug);
+            if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+            const VirtualAirlineAd = mongoose.model('VirtualAirlineAd');
+            const ad = await VirtualAirlineAd.findById(va._id).select('+supabaseServiceKey');
+            if (!ad) return res.status(404).json({ error: 'Crew center not found.' });
+
+            const body = req.body || {};
+            if (body.url !== undefined) {
+                const u = String(body.url || '').trim().replace(/\/+$/, '');
+                if (u && !/^https:\/\/[a-z0-9.-]+/i.test(u)) {
+                    return res.status(400).json({ error: 'Enter a valid https Supabase project URL.' });
+                }
+                ad.supabaseUrl = u;
+            }
+            if (body.anonKey !== undefined) ad.supabaseAnonKey = String(body.anonKey || '').trim();
+            // Only overwrite the secret when a new non-empty value is supplied, so
+            // re-saving without re-typing it doesn't wipe it. '' with clear:true clears.
+            if (typeof body.serviceKey === 'string' && body.serviceKey.trim()) {
+                ad.supabaseServiceKey = body.serviceKey.trim();
+            } else if (body.clearServiceKey === true) {
+                ad.supabaseServiceKey = '';
+            }
+            await ad.save();
+            res.set('Cache-Control', 'no-store');
+            res.json({
+                connected: !!(ad.supabaseUrl && ad.supabaseAnonKey),
+                url: ad.supabaseUrl || '',
+                anonKey: ad.supabaseAnonKey || '',
+                hasServiceKey: !!ad.supabaseServiceKey,
+            });
+        } catch (err) {
+            console.error('Crew supabase save error:', err);
+            res.status(500).json({ error: 'Could not save the Supabase connection.' });
+        }
+    });
+
     // --- Who am I (verify a Bearer token for this crew center) ---
     app.get('/api/crew/:slug/me', async (req, res) => {
         const token = getBearer(req);
