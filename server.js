@@ -214,6 +214,10 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     //   label: custom text (used by 'agree', optional note for others)
     //   required: for 'agree', whether ticking is mandatory
     joinRequirements: { type: [{ _id: false, type: String, value: Number, label: String, required: Boolean }], default: [] },
+    // A Discord webhook the VA sets so recruitment activity (new applications,
+    // accept / decline decisions + the staff's message) is posted to their
+    // server. Secret (contains a token) → select:false, never echoed back.
+    crewWebhookUrl: { type: String, trim: true, default: null, select: false },
 
     // --- The VA's own Supabase project (bring-your-own data store) ---
     // The VA connects their Supabase in owner onboarding; their crew data lives
@@ -484,6 +488,35 @@ const REQ_META = {
     flights:    { label: 'Online flights', cmp: 'min', stat: 'flights' },
     violations: { label: 'Violations',   cmp: 'max', stat: 'violations' },
 };
+// ---- Crew Center Discord notifications ----
+// Post a small embed to a VA's crew webhook. Fire-and-forget: never let a
+// webhook hiccup fail the applicant's request.
+const CREW_COLORS = { new: 0xF59E0B, accepted: 0x16A34A, declined: 0x6E685D };
+async function postCrewNotice(url, { title, description, color, fields }) {
+    if (!url || !isDiscordWebhookUrl(url)) return false;
+    try {
+        await axios.post(url, {
+            embeds: [{
+                title: String(title || '').slice(0, 256),
+                description: description ? String(description).slice(0, 2000) : undefined,
+                color: color != null ? color : 0x1C1A16,
+                fields: Array.isArray(fields) ? fields.slice(0, 10) : [],
+                footer: { text: 'Inflight · Crew Center' },
+                timestamp: new Date().toISOString(),
+            }],
+        }, { timeout: 8000, headers: { 'Content-Type': 'application/json' } });
+        return true;
+    } catch (err) { console.error('crew webhook post failed:', err?.message || err); return false; }
+}
+// Load a VA's (secret) crew webhook url by id. Returns '' when unset/invalid.
+async function crewWebhookUrlFor(vaId) {
+    try {
+        const doc = await VirtualAirlineAd.findById(vaId).select('+crewWebhookUrl').lean();
+        const u = doc && doc.crewWebhookUrl;
+        return u && isDiscordWebhookUrl(u) ? u : '';
+    } catch { return ''; }
+}
+
 function evaluateRequirements(reqs, stats, agreed) {
     const failures = [];
     let autoChecked = false;
@@ -1251,7 +1284,7 @@ app.delete('/api/crew/:slug/roster/:id', async (req, res) => {
 app.post('/api/crew/:slug/apply', async (req, res) => {
     try {
         const raw = String(req.params.slug || '').trim().toLowerCase();
-        const applyFields = '_id joinMode minGrade callsignPrefix callsign applicationForm joinRequirements';
+        const applyFields = '_id joinMode minGrade callsignPrefix callsign name applicationForm joinRequirements +crewWebhookUrl';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(applyFields).lean();
         if (!ad) ad = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' })
@@ -1321,6 +1354,29 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
                 vaAdId: ad._id, name: ifcName, callsign: (prefix + number).trim(),
                 hours: 0, role: '', aircraft: [], status: 'active',
             });
+        }
+        // Notify the VA's Discord (fire-and-forget). Free-mode joins and
+        // pending applications both post so staff see activity in real time.
+        if (ad.crewWebhookUrl) {
+            const cs = (prefix + number).trim();
+            postCrewNotice(ad.crewWebhookUrl, status === 'accepted' ? {
+                title: `🎉 New pilot joined — ${ifcName}`,
+                color: CREW_COLORS.accepted,
+                fields: [
+                    { name: 'Callsign', value: cs || '—', inline: true },
+                    { name: 'Grade', value: grade ? `Grade ${grade}` : '—', inline: true },
+                    { name: 'Verified', value: ifVerified ? '✓ yes' : 'no', inline: true },
+                ],
+            } : {
+                title: `📝 New application — ${ifcName}`,
+                description: 'Review it in your Crew Center → Roster → Applications.',
+                color: CREW_COLORS.new,
+                fields: [
+                    { name: 'Callsign', value: cs || '—', inline: true },
+                    { name: 'Grade', value: grade ? `Grade ${grade}` : '—', inline: true },
+                    { name: 'Verified', value: ifVerified ? '✓ yes' : 'no', inline: true },
+                ],
+            }).catch(() => {});
         }
         res.json({ status, callsign: (prefix + number).trim(), applicationId: appDoc._id, statusToken, ifVerified, grade });
     } catch (err) { console.error('apply error:', err); res.status(500).json({ error: 'Could not submit your application.' }); }
@@ -1402,8 +1458,65 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
         if (message) appDoc.staffMessage = message;
         appDoc.reviewedAt = new Date();
         await appDoc.save();
+
+        // Post the decision (+ the staff's message) to the VA's Discord.
+        const hook = await crewWebhookUrlFor(va._id);
+        if (hook) {
+            const cs = (appDoc.callsignPrefix + appDoc.callsignNumber).trim();
+            const accepted = appDoc.status === 'accepted';
+            postCrewNotice(hook, {
+                title: `${accepted ? '✅ Accepted' : '🚫 Declined'} — ${appDoc.ifcName}`,
+                description: message || undefined,
+                color: accepted ? CREW_COLORS.accepted : CREW_COLORS.declined,
+                fields: accepted && cs ? [{ name: 'Callsign', value: cs, inline: true }] : [],
+            }).catch(() => {});
+        }
         res.json({ status: appDoc.status, message: appDoc.staffMessage || '' });
     } catch (err) { console.error('application review error:', err); res.status(500).json({ error: 'Could not update the application.' }); }
+});
+
+// Staff: read the crew webhook state (never the secret URL itself, just a hint).
+app.get('/api/crew/:slug/webhook', async (req, res) => {
+    const gate = crewCanManage(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const doc = await VirtualAirlineAd.findById(va._id).select('+crewWebhookUrl').lean();
+        res.set('Cache-Control', 'no-store');
+        res.json({ configured: !!(doc && doc.crewWebhookUrl), hint: maskWebhookUrl(doc && doc.crewWebhookUrl) });
+    } catch (err) { console.error('crew webhook get error:', err); res.status(500).json({ error: 'Could not load the webhook.' }); }
+});
+// Staff: set / clear ('' clears) / test the crew Discord webhook.
+app.post('/api/crew/:slug/webhook', async (req, res) => {
+    const gate = crewCanManage(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const ad = await VirtualAirlineAd.findById(va._id).select('+crewWebhookUrl name callsign');
+        if (!ad) return res.status(404).json({ error: 'Crew center not found.' });
+        const b = req.body || {};
+        if (b.webhookUrl !== undefined) {
+            const raw = String(b.webhookUrl || '').trim();
+            if (raw && !isDiscordWebhookUrl(raw)) {
+                return res.status(400).json({ error: 'That doesn’t look like a Discord webhook URL (https://discord.com/api/webhooks/…).' });
+            }
+            ad.crewWebhookUrl = raw || null;
+            await ad.save();
+        }
+        if (b.test) {
+            if (!ad.crewWebhookUrl) return res.status(400).json({ error: 'Add a webhook URL first.' });
+            const ok = await postCrewNotice(ad.crewWebhookUrl, {
+                title: `🔔 ${ad.name || 'Crew Center'} — test message`,
+                description: 'Your Crew Center is connected. New applications and accept / decline decisions will show up here.',
+                color: CREW_COLORS.new,
+            });
+            if (!ok) return res.status(502).json({ error: 'We couldn’t deliver a message to that webhook. Double-check the URL.' });
+        }
+        res.set('Cache-Control', 'no-store');
+        res.json({ configured: !!ad.crewWebhookUrl, hint: maskWebhookUrl(ad.crewWebhookUrl) });
+    } catch (err) { console.error('crew webhook set error:', err); res.status(500).json({ error: 'Could not save the webhook.' }); }
 });
 
 // Crew Center badge-image upload — owner/staff (or Inflight) upload their own
