@@ -396,12 +396,60 @@ const CrewApplicationSchema = new mongoose.Schema({
     ifcName:  { type: String, trim: true, default: '' },       // Infinite Flight Community name
     callsignPrefix: { type: String, trim: true, default: '' },
     callsignNumber: { type: String, trim: true, default: '' },
-    grade:    { type: Number, default: 0 },                    // self-reported IF grade
+    grade:    { type: Number, default: 0 },                    // IF grade (verified if ifVerified)
+    ifVerified: { type: Boolean, default: false },             // did our IF lookup confirm this account?
+    ifUserId: { type: String, trim: true, default: '' },       // resolved Infinite Flight user id
     answers:  { type: [{ _id: false, q: String, a: String }], default: [] },
     status:   { type: String, enum: ['pending', 'accepted', 'declined'], default: 'pending' },
+    // A message the reviewing staff can leave for the applicant, shown on the
+    // status page when they check back (accept or decline).
+    staffMessage: { type: String, trim: true, default: '' },
+    // Opaque token the applicant is handed so they can check their status
+    // without an account or email. Indexed so lookups are cheap.
+    statusToken: { type: String, trim: true, default: '', index: true },
     reviewedAt: { type: Date, default: null },
 }, { timestamps: true });
 const CrewApplication = mongoose.models.CrewApplication || mongoose.model('CrewApplication', CrewApplicationSchema);
+
+// ---- Infinite Flight identity verification ----
+// We already run an acars backend that proxies the official IF API. It resolves
+// a community name to a userId (proof the account exists + the canonical
+// spelling) and its stats carry the real grade. We reuse it here so a crew
+// center never has to trust a self-reported grade. Best-effort: if the service
+// is unreachable we return { ok:false } and callers fall back gracefully.
+const ACARS_BACKEND_URL = (process.env.ACARS_BACKEND_URL || 'https://site--acars-backend--6dmjph8ltlhv.code.run').replace(/\/+$/, '');
+async function verifyIfUser(name) {
+    const q = String(name || '').trim();
+    if (!q) return { ok: false, reason: 'empty' };
+    try {
+        // 1) Resolve the community name → userId + canonical spelling.
+        const lookup = await axios.post(`${ACARS_BACKEND_URL}/users`,
+            { discourseNames: [q], userHashes: [q] },
+            { timeout: 8000, headers: { 'Content-Type': 'application/json' } });
+        const u = lookup?.data?.users?.[0];
+        if (!u || !u.userId) return { ok: true, found: false };
+        const out = {
+            ok: true, found: true,
+            userId: String(u.userId),
+            username: String(u.discourseUsername || q),
+            grade: Number.isFinite(u.grade) ? Number(u.grade) : null,
+        };
+        // 2) Grade is authoritative from stats when the lookup didn't carry it.
+        if (out.grade == null) {
+            try {
+                const stats = await axios.get(`${ACARS_BACKEND_URL}/api/users/${encodeURIComponent(out.userId)}/stats`, { timeout: 8000 });
+                const s = stats?.data?.stats || stats?.data?.gradeInfo || stats?.data;
+                const gi = s?.gradeDetails?.gradeIndex;
+                if (Number.isFinite(gi)) out.grade = Number(gi);
+                else if (Number.isFinite(s?.grade)) out.grade = Number(s.grade);
+            } catch (_) { /* grade stays null; account existence is what matters */ }
+        }
+        return out;
+    } catch (err) {
+        console.error('verifyIfUser error:', err?.message || err);
+        return { ok: false, reason: 'unreachable' };
+    }
+}
 
 /* =========================
  * VA PILOT ROSTER
@@ -1152,20 +1200,40 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
         if (!ad) return res.status(404).json({ error: 'Crew center not found.' });
 
         const b = req.body || {};
-        const ifcName = String(b.ifcName || '').trim().slice(0, 60);
+        let ifcName = String(b.ifcName || '').trim().slice(0, 60);
         if (!ifcName) return res.status(400).json({ error: 'Your Infinite Flight Community name is required.' });
-        const grade = Math.max(0, Math.min(5, Number(b.grade) || 0));
+
+        // Verify the account against Infinite Flight using our own tooling. When
+        // the lookup succeeds we trust its grade over anything self-reported;
+        // when the service is down we fall back to the self-reported grade so a
+        // pilot is never blocked by our outage.
+        const check = await verifyIfUser(ifcName);
+        let ifVerified = false, ifUserId = '';
+        let grade = Math.max(0, Math.min(5, Number(b.grade) || 0));
+        if (check.ok && check.found) {
+            ifVerified = true;
+            ifUserId = check.userId;
+            if (check.username) ifcName = check.username.slice(0, 60); // canonical spelling
+            if (check.grade != null) grade = Math.max(0, Math.min(5, check.grade));
+        } else if (check.ok && !check.found) {
+            // We reached IF and it has no such account — reject clearly.
+            return res.status(404).json({ error: `We couldn't find an Infinite Flight account named "${ifcName}". Check the spelling of your Community name.` });
+        }
+        // (check.ok === false → service unreachable → proceed unverified.)
+
         if (ad.minGrade && grade && grade < ad.minGrade) {
-            return res.status(403).json({ error: `This VA requires Grade ${ad.minGrade} or higher.` });
+            return res.status(403).json({ error: `This VA requires Grade ${ad.minGrade} or higher${ifVerified ? ` — your account is Grade ${grade}.` : '.'}` });
         }
         const prefix = (String(b.callsignPrefix || '').trim() || ad.callsignPrefix || ad.callsign || '').slice(0, 10);
         const number = String(b.callsignNumber || '').trim().slice(0, 10);
         const answers = Array.isArray(b.answers)
             ? b.answers.slice(0, 50).map(x => ({ q: String(x.q || '').slice(0, 120), a: String(x.a || '').slice(0, 2000) })) : [];
 
+        const statusToken = crypto.randomBytes(16).toString('hex');
         const status = ad.joinMode === 'free' ? 'accepted' : 'pending';
         const appDoc = await CrewApplication.create({
-            vaAdId: ad._id, ifcName, callsignPrefix: prefix, callsignNumber: number, grade, answers,
+            vaAdId: ad._id, ifcName, callsignPrefix: prefix, callsignNumber: number, grade,
+            ifVerified, ifUserId, answers, statusToken,
             status, reviewedAt: status === 'accepted' ? new Date() : null,
         });
         if (status === 'accepted') {
@@ -1174,9 +1242,47 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
                 hours: 0, role: '', aircraft: [], status: 'active',
             });
         }
-        res.json({ status, callsign: (prefix + number).trim(), applicationId: appDoc._id });
+        res.json({ status, callsign: (prefix + number).trim(), applicationId: appDoc._id, statusToken, ifVerified, grade });
     } catch (err) { console.error('apply error:', err); res.status(500).json({ error: 'Could not submit your application.' }); }
 });
+// Public: verify an Infinite Flight Community name in real time so the join
+// form can show a "✓ verified" badge and lock in the true grade before the
+// pilot submits. Returns { found, username, grade } — never an error for a
+// simple "not found", so the form can react smoothly.
+app.post('/api/crew/:slug/verify-if', async (req, res) => {
+    try {
+        const name = String(req.body?.ifcName || '').trim().slice(0, 60);
+        if (!name) return res.status(400).json({ error: 'Enter your Infinite Flight Community name.' });
+        const check = await verifyIfUser(name);
+        if (!check.ok) return res.json({ available: false }); // service down; form falls back
+        if (!check.found) return res.json({ available: true, found: false });
+        res.json({ available: true, found: true, username: check.username, grade: check.grade });
+    } catch (err) { console.error('verify-if error:', err); res.status(500).json({ error: 'Verification is unavailable right now.' }); }
+});
+
+// Public: an applicant checks the state of their application with the opaque
+// token they were handed at submit time. No account or email needed. Includes
+// any message staff left when they reviewed it.
+app.get('/api/crew/:slug/application-status/:token', async (req, res) => {
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const token = String(req.params.token || '').trim();
+        if (!token) return res.status(400).json({ error: 'Missing status token.' });
+        const appDoc = await CrewApplication.findOne({ vaAdId: va._id, statusToken: token })
+            .select('status staffMessage ifcName callsignPrefix callsignNumber reviewedAt createdAt').lean();
+        if (!appDoc) return res.status(404).json({ error: 'We could not find that application.' });
+        res.json({
+            status: appDoc.status,
+            message: appDoc.staffMessage || '',
+            ifcName: appDoc.ifcName || '',
+            callsign: ((appDoc.callsignPrefix || '') + (appDoc.callsignNumber || '')).trim(),
+            reviewedAt: appDoc.reviewedAt || null,
+            submittedAt: appDoc.createdAt || null,
+        });
+    } catch (err) { console.error('application-status error:', err); res.status(500).json({ error: 'Could not load that application.' }); }
+});
+
 // Staff: list applications (default pending).
 app.get('/api/crew/:slug/applications', async (req, res) => {
     const gate = crewCanManage(req, req.params.slug);
@@ -1201,6 +1307,7 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
         const appDoc = await CrewApplication.findOne({ _id: req.params.id, vaAdId: va._id });
         if (!appDoc) return res.status(404).json({ error: 'Application not found.' });
         const action = String(req.body?.action || '');
+        const message = String(req.body?.message || '').trim().slice(0, 2000);
         if (action === 'accept') {
             if (appDoc.status !== 'accepted') {
                 await CrewMember.create({
@@ -1212,9 +1319,10 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
         } else if (action === 'decline') {
             appDoc.status = 'declined';
         } else return res.status(400).json({ error: 'Unknown action.' });
+        if (message) appDoc.staffMessage = message;
         appDoc.reviewedAt = new Date();
         await appDoc.save();
-        res.json({ status: appDoc.status });
+        res.json({ status: appDoc.status, message: appDoc.staffMessage || '' });
     } catch (err) { console.error('application review error:', err); res.status(500).json({ error: 'Could not update the application.' }); }
 });
 
