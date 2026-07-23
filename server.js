@@ -407,6 +407,7 @@ const CrewMember = mongoose.models.CrewMember || mongoose.model('CrewMember', Cr
 const CrewApplicationSchema = new mongoose.Schema({
     vaAdId:   { type: mongoose.Schema.Types.ObjectId, ref: 'VirtualAirlineAd', required: true, index: true },
     ifcName:  { type: String, trim: true, default: '' },       // Infinite Flight Community name
+    email:    { type: String, trim: true, lowercase: true, default: '' }, // optional contact for decision emails
     callsignPrefix: { type: String, trim: true, default: '' },
     callsignNumber: { type: String, trim: true, default: '' },
     grade:    { type: Number, default: 0 },                    // IF grade (verified if ifVerified)
@@ -508,6 +509,56 @@ async function postCrewNotice(url, { title, description, color, fields }) {
         return true;
     } catch (err) { console.error('crew webhook post failed:', err?.message || err); return false; }
 }
+// ---- Crew Center applicant emails ----
+// Sent via Resend's HTTPS API (no SMTP needed). Configure with env:
+//   RESEND_API_KEY   — required; without it every send is a graceful no-op
+//   CREW_EMAIL_FROM  — the From header (a domain verified with the provider)
+// The From MUST be an Inflight-controlled address; the VA's name goes in the
+// subject/body and their contactEmail (if any) becomes Reply-To, so replies
+// reach the VA directly.
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const CREW_EMAIL_FROM = process.env.CREW_EMAIL_FROM || 'Inflight Crew Center <crew@inflight.info>';
+const SITE_ORIGIN = (process.env.CREW_SITE_ORIGIN || 'https://inflight.info').replace(/\/+$/, '');
+const crewEmailEnabled = () => !!RESEND_API_KEY;
+const escHtml = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const isEmail = (s) => EMAIL_RE.test(String(s || '').trim());
+
+async function sendCrewEmail({ to, subject, html, replyTo }) {
+    if (!RESEND_API_KEY || !isEmail(to)) return false;
+    try {
+        await axios.post('https://api.resend.com/emails', {
+            from: CREW_EMAIL_FROM,
+            to: [String(to).trim()],
+            subject: String(subject || '').slice(0, 200),
+            html,
+            reply_to: replyTo && isEmail(replyTo) ? replyTo : undefined,
+        }, { timeout: 10000, headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' } });
+        return true;
+    } catch (err) { console.error('crew email failed:', err?.response?.data || err?.message || err); return false; }
+}
+// Minimal, warm, inline-styled email shell (email clients ignore <style>/CSS).
+function crewEmailHtml({ vaName, heading, accent, bodyHtml, button }) {
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const a = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(accent || '') ? accent : '#1C1A16';
+    const btn = button ? `<tr><td style="padding-top:20px"><a href="${esc(button.url)}" style="display:inline-block;background:${a};color:#fff;text-decoration:none;font-weight:600;font-size:14px;padding:11px 20px;border-radius:8px">${esc(button.label)}</a></td></tr>` : '';
+    return `<!doctype html><html><body style="margin:0;background:#F6F3ED;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1C1A16">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F6F3ED;padding:28px 16px"><tr><td align="center">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#fff;border:1px solid #E7E2D8;border-radius:16px;overflow:hidden">
+          <tr><td style="height:4px;background:${a}"></td></tr>
+          <tr><td style="padding:28px 28px 24px">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+              <tr><td style="font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:#A8A296;padding-bottom:8px">${esc(vaName || 'Crew Center')}</td></tr>
+              <tr><td style="font-size:20px;font-weight:700;padding-bottom:10px">${esc(heading)}</td></tr>
+              <tr><td style="font-size:14px;line-height:1.6;color:#3a362f">${bodyHtml}</td></tr>
+              ${btn}
+            </table>
+          </td></tr>
+          <tr><td style="padding:14px 28px;border-top:1px solid #F0ECE4;font-size:11px;color:#A8A296">Sent by ${esc(vaName || 'this VA')} via Inflight · Crew Center</td></tr>
+        </table>
+      </td></tr></table></body></html>`;
+}
+
 // Load a VA's (secret) crew webhook url by id. Returns '' when unset/invalid.
 async function crewWebhookUrlFor(vaId) {
     try {
@@ -1203,8 +1254,9 @@ registerCrewAuthRoutes(app);
 async function resolveCrewVa(slug) {
     const raw = String(slug || '').trim().toLowerCase();
     if (!raw) return null;
-    let va = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' }).select('_id').lean();
-    if (!va) va = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' }).select('_id').lean();
+    const sel = '_id slug callsign name contactEmail crewAccent';
+    let va = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' }).select(sel).lean();
+    if (!va) va = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' }).select(sel).lean();
     return va;
 }
 function cleanMember(b) {
@@ -1284,7 +1336,7 @@ app.delete('/api/crew/:slug/roster/:id', async (req, res) => {
 app.post('/api/crew/:slug/apply', async (req, res) => {
     try {
         const raw = String(req.params.slug || '').trim().toLowerCase();
-        const applyFields = '_id joinMode minGrade callsignPrefix callsign name applicationForm joinRequirements +crewWebhookUrl';
+        const applyFields = '_id slug joinMode minGrade callsignPrefix callsign name contactEmail crewAccent applicationForm joinRequirements +crewWebhookUrl';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(applyFields).lean();
         if (!ad) ad = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' })
@@ -1339,13 +1391,15 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
         }
         const prefix = (String(b.callsignPrefix || '').trim() || ad.callsignPrefix || ad.callsign || '').slice(0, 10);
         const number = String(b.callsignNumber || '').trim().slice(0, 10);
+        const cs = (prefix + number).trim();
+        const email = isEmail(b.email) ? String(b.email).trim().toLowerCase().slice(0, 120) : '';
         const answers = Array.isArray(b.answers)
             ? b.answers.slice(0, 50).map(x => ({ q: String(x.q || '').slice(0, 120), a: String(x.a || '').slice(0, 2000) })) : [];
 
         const statusToken = crypto.randomBytes(16).toString('hex');
         const status = ad.joinMode === 'free' ? 'accepted' : 'pending';
         const appDoc = await CrewApplication.create({
-            vaAdId: ad._id, ifcName, callsignPrefix: prefix, callsignNumber: number, grade,
+            vaAdId: ad._id, ifcName, email, callsignPrefix: prefix, callsignNumber: number, grade,
             ifVerified, ifUserId, answers, statusToken,
             status, reviewedAt: status === 'accepted' ? new Date() : null,
         });
@@ -1358,7 +1412,6 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
         // Notify the VA's Discord (fire-and-forget). Free-mode joins and
         // pending applications both post so staff see activity in real time.
         if (ad.crewWebhookUrl) {
-            const cs = (prefix + number).trim();
             postCrewNotice(ad.crewWebhookUrl, status === 'accepted' ? {
                 title: `🎉 New pilot joined — ${ifcName}`,
                 color: CREW_COLORS.accepted,
@@ -1378,7 +1431,25 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
                 ],
             }).catch(() => {});
         }
-        res.json({ status, callsign: (prefix + number).trim(), applicationId: appDoc._id, statusToken, ifVerified, grade });
+        // Acknowledge to the applicant by email (if they gave one). Free-mode
+        // joins get a welcome; applications get a "received + your status link".
+        if (email) {
+            const slug = ad.slug || raw;
+            const statusUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}/status?id=${statusToken}`;
+            const centerUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}`;
+            if (status === 'accepted') {
+                sendCrewEmail({ to: email, replyTo: ad.contactEmail, subject: `Welcome to ${ad.name || 'the crew'}!`,
+                    html: crewEmailHtml({ vaName: ad.name, accent: ad.crewAccent, heading: 'Welcome aboard! 🎉',
+                        bodyHtml: `You’re now flying with <b>${escHtml(ad.name || 'the crew')}</b>${cs ? `, as <b>${escHtml(cs)}</b>` : ''}.`,
+                        button: { label: 'Open the crew center', url: centerUrl } }) }).catch(() => {});
+            } else {
+                sendCrewEmail({ to: email, replyTo: ad.contactEmail, subject: `Application received — ${ad.name || 'Crew Center'}`,
+                    html: crewEmailHtml({ vaName: ad.name, accent: ad.crewAccent, heading: 'Application received',
+                        bodyHtml: `Thanks, <b>${escHtml(ifcName)}</b>. The ${escHtml(ad.name || 'VA')} team will review your application and we’ll email you here as soon as there’s a decision.`,
+                        button: { label: 'Check your status', url: statusUrl } }) }).catch(() => {});
+            }
+        }
+        res.json({ status, callsign: cs, applicationId: appDoc._id, statusToken, ifVerified, grade, emailed: !!email });
     } catch (err) { console.error('apply error:', err); res.status(500).json({ error: 'Could not submit your application.' }); }
 });
 // Public: verify an Infinite Flight Community name in real time so the join
@@ -1459,17 +1530,32 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
         appDoc.reviewedAt = new Date();
         await appDoc.save();
 
+        const cs = (appDoc.callsignPrefix + appDoc.callsignNumber).trim();
+        const accepted = appDoc.status === 'accepted';
         // Post the decision (+ the staff's message) to the VA's Discord.
         const hook = await crewWebhookUrlFor(va._id);
         if (hook) {
-            const cs = (appDoc.callsignPrefix + appDoc.callsignNumber).trim();
-            const accepted = appDoc.status === 'accepted';
             postCrewNotice(hook, {
                 title: `${accepted ? '✅ Accepted' : '🚫 Declined'} — ${appDoc.ifcName}`,
                 description: message || undefined,
                 color: accepted ? CREW_COLORS.accepted : CREW_COLORS.declined,
                 fields: accepted && cs ? [{ name: 'Callsign', value: cs, inline: true }] : [],
             }).catch(() => {});
+        }
+        // Email the applicant the decision + the staff's message (if they left one).
+        if (appDoc.email) {
+            const slug = va.slug || req.params.slug;
+            const statusUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}/status?id=${appDoc.statusToken}`;
+            const centerUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}`;
+            const body = (accepted
+                ? `Great news — welcome to <b>${escHtml(va.name || 'the crew')}</b>${cs ? `, flying as <b>${escHtml(cs)}</b>` : ''}.`
+                : `Thanks for applying to <b>${escHtml(va.name || 'the VA')}</b>. Unfortunately they weren’t able to accept your application this time.`)
+                + (message ? `<br><br><b>Message from the team:</b><br>${escHtml(message).replace(/\n/g, '<br>')}` : '');
+            sendCrewEmail({ to: appDoc.email, replyTo: va.contactEmail,
+                subject: accepted ? `You’re in — ${va.name || 'Crew Center'}` : `Update on your application — ${va.name || 'Crew Center'}`,
+                html: crewEmailHtml({ vaName: va.name, accent: va.crewAccent, heading: accepted ? 'You’re in! 🎉' : 'Application update',
+                    bodyHtml: body,
+                    button: accepted ? { label: 'Open the crew center', url: centerUrl } : { label: 'View your application', url: statusUrl } }) }).catch(() => {});
         }
         res.json({ status: appDoc.status, message: appDoc.staffMessage || '' });
     } catch (err) { console.error('application review error:', err); res.status(500).json({ error: 'Could not update the application.' }); }
