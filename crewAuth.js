@@ -20,8 +20,9 @@ const crypto = require('crypto');
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString('hex');
 const TOKEN_TTL = '7d';
 
-// Known layout presets (mirrors the crew center front-end).
+// Known layout presets + login looks (mirrors the crew center front-end).
 const CREW_LAYOUTS = ['editorial', 'console', 'split', 'classic'];
+const LOGIN_LOOKS = ['center', 'split'];
 
 const isHexColor = (c) => /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(c || '');
 const clampStr = (s, n) => String(s == null ? '' : s).trim().slice(0, n);
@@ -187,6 +188,13 @@ function registerCrewAuthRoutes(app) {
                 }
                 ad.crewAccent = a; // '' clears it (falls back to the derived accent)
             }
+            if (typeof req.body?.loginLook === 'string') {
+                const look = req.body.loginLook.toLowerCase();
+                if (!LOGIN_LOOKS.includes(look)) {
+                    return res.status(400).json({ error: 'Unknown login look.' });
+                }
+                ad.loginLook = look;
+            }
             if (req.body?.ranks !== undefined) {
                 const r = sanitizeRanks(req.body.ranks);
                 if (r) ad.ranks = r;
@@ -199,7 +207,7 @@ function registerCrewAuthRoutes(app) {
             res.set('Cache-Control', 'no-store');
             res.json({
                 layout: ad.layout, allowedLayouts: ad.allowedLayouts, accent: ad.crewAccent || '',
-                ranks: ad.ranks || [], roles: ad.roles || [],
+                loginLook: ad.loginLook || 'center', ranks: ad.ranks || [], roles: ad.roles || [],
             });
         } catch (err) {
             console.error('Crew settings error:', err);
