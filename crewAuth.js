@@ -144,9 +144,16 @@ function registerCrewAuthRoutes(app) {
                 }
                 ad.layout = layout;
             }
+            if (typeof req.body?.accent === 'string') {
+                const a = req.body.accent.trim();
+                if (a && !/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(a)) {
+                    return res.status(400).json({ error: 'Enter a valid hex colour like #1c1a16.' });
+                }
+                ad.crewAccent = a; // '' clears it (falls back to the derived accent)
+            }
             await ad.save();
             res.set('Cache-Control', 'no-store');
-            res.json({ layout: ad.layout, allowedLayouts: ad.allowedLayouts });
+            res.json({ layout: ad.layout, allowedLayouts: ad.allowedLayouts, accent: ad.crewAccent || '' });
         } catch (err) {
             console.error('Crew settings error:', err);
             res.status(500).json({ error: 'Could not save settings.' });

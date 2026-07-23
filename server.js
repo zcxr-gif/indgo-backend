@@ -184,6 +184,9 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // staff manage the allow-list in the Crew Centers tool.
     layout: { type: String, default: 'editorial' },
     allowedLayouts: { type: [String], default: ['editorial', 'console', 'split', 'classic'] },
+    // Owner/staff-chosen accent for the crew center + login. Overrides the accent
+    // otherwise derived from the VA's embed config. '' = fall back to that.
+    crewAccent: { type: String, trim: true, default: '' },
 
     // --- The VA's own Supabase project (bring-your-own data store) ---
     // The VA connects their Supabase in owner onboarding; their crew data lives
@@ -2576,7 +2579,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts crewAccent supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -2585,11 +2588,13 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         }
         if (!ad) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        // Brand accent: prefer the embed-config accent's first stop, then the
-        // legacy brandColor; '' means "let the login decide".
-        let accent = '';
-        const cfg = await EmbedConfig.findOne({ vaAdId: ad._id }).select('accent brandColor').lean();
-        if (cfg) accent = (Array.isArray(cfg.accent) && cfg.accent[0]) || cfg.brandColor || '';
+        // Brand accent: the VA's own crewAccent wins; otherwise the embed-config
+        // accent's first stop, then the legacy brandColor; '' means "decide".
+        let accent = ad.crewAccent || '';
+        if (!accent) {
+            const cfg = await EmbedConfig.findOne({ vaAdId: ad._id }).select('accent brandColor').lean();
+            if (cfg) accent = (Array.isArray(cfg.accent) && cfg.accent[0]) || cfg.brandColor || '';
+        }
 
         res.set('Cache-Control', 'public, max-age=300'); // 5 min — branding rarely changes
         res.json({
