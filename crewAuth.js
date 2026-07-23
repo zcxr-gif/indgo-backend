@@ -92,6 +92,72 @@ function sanitizeRequirements(arr) {
     }).filter(r => (r.type === 'agree' ? r.label : r.value > 0));
 }
 
+// ---- Staff permissions ----
+// The catalog of things a staff member can be granted. This is the ONE place to
+// extend the permission system — add a row here (and gate an endpoint on it) and
+// it flows through to the owner's role builder automatically. Owner-only powers
+// (connect Supabase, manage the team itself) are deliberately NOT here.
+const CREW_CAPABILITIES = [
+    { id: 'roster.manage',          group: 'Roster',        label: 'Add, edit & remove pilots' },
+    { id: 'applications.review',    group: 'Recruitment',   label: 'Review applications — accept / decline' },
+    { id: 'settings.recruitment',   group: 'Recruitment',   label: 'Edit join settings, questions & requirements' },
+    { id: 'settings.branding',      group: 'Appearance',    label: 'Change appearance, ranks, roles & fleet' },
+    { id: 'settings.notifications', group: 'Notifications',  label: 'Manage Discord & email notifications' },
+    // Room to grow, e.g.:
+    // { id: 'events.manage',     group: 'Operations', label: 'Create & manage events' },
+    // { id: 'schedules.manage',  group: 'Operations', label: 'Manage schedules & bookings' },
+    // { id: 'flights.review',    group: 'Operations', label: 'Review submitted flights (PIREPs)' },
+    // { id: 'members.message',   group: 'Roster',     label: 'Message crew members' },
+];
+const CREW_CAP_IDS = CREW_CAPABILITIES.map(c => c.id);
+
+function slugifyRoleId(s) {
+    const base = String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+    return base || ('role-' + Math.random().toString(36).slice(2, 8));
+}
+// Owner-defined staff roles: a name + colour + a set of capability ids.
+function sanitizeStaffRoles(arr) {
+    if (!Array.isArray(arr)) return null;
+    const seen = new Set();
+    return arr.slice(0, 30).map(r => {
+        let id = slugifyRoleId(clampStr(r && r.id, 40) || (r && r.name));
+        while (seen.has(id)) id = id + '-' + Math.random().toString(36).slice(2, 4);
+        seen.add(id);
+        return {
+            id, name: clampStr(r && r.name, 40),
+            color: isHexColor(r && r.color) ? r.color : '',
+            permissions: Array.isArray(r && r.permissions) ? r.permissions.filter(c => CREW_CAP_IDS.includes(c)) : [],
+        };
+    }).filter(r => r.name);
+}
+// Which staff account (by login username) maps to which staff role.
+function sanitizeAssignments(arr) {
+    if (!Array.isArray(arr)) return null;
+    const seen = new Set();
+    return arr.slice(0, 300).map(a => ({
+        username: clampStr(a && a.username, 60).toLowerCase(),
+        roleId: clampStr(a && a.roleId, 40),
+    })).filter(a => { if (!a.username || !a.roleId || seen.has(a.username)) return false; seen.add(a.username); return true; });
+}
+// The capabilities a caller effectively has. Owner + Inflight get everything;
+// pilots get nothing. A staff member gets their assigned role's permissions —
+// but a staff member with NO assignment keeps full access, so turning on the
+// system doesn't silently lock out a VA's existing team until they choose to.
+function effectiveCaps(va, p) {
+    if (!p) return [];
+    if (p.kind === 'inflight' || p.role === 'owner') return CREW_CAP_IDS.slice();
+    if (p.role !== 'staff') return [];
+    const roles = Array.isArray(va && va.staffRoles) ? va.staffRoles : [];
+    const asn = Array.isArray(va && va.staffAssignments) ? va.staffAssignments : [];
+    const uname = String(p.uname || '').toLowerCase();
+    const a = uname && asn.find(x => String(x.username || '').toLowerCase() === uname);
+    if (a) {
+        const role = roles.find(r => r.id === a.roleId);
+        return role ? (role.permissions || []).filter(c => CREW_CAP_IDS.includes(c)) : [];
+    }
+    return CREW_CAP_IDS.slice(); // unassigned staff → full (non-breaking default)
+}
+
 // Which dashboard a role routes to.
 function viewForRole(role) {
     return role === 'pilot' ? 'pilot' : 'owner';
@@ -113,11 +179,12 @@ async function resolveVa(slug) {
     const VirtualAirlineAd = mongoose.model('VirtualAirlineAd');
     const raw = String(slug || '').trim().toLowerCase();
     if (!raw) return null;
+    const sel = '_id name slug callsign staffRoles staffAssignments';
     let va = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
-        .select('_id name slug callsign').lean();
+        .select(sel).lean();
     if (!va) {
         va = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' })
-            .select('_id name slug callsign').lean();
+            .select(sel).lean();
     }
     return va;
 }
@@ -165,12 +232,16 @@ function registerCrewAuthRoutes(app) {
             const view = viewForRole(identity.role);
             const token = signCrewToken({
                 sub: identity.sub, kind: identity.kind, role: identity.role, view,
-                slug: va.slug || String(req.params.slug).toLowerCase(), vaId: String(va._id), name: identity.name,
+                slug: va.slug || String(req.params.slug).toLowerCase(), vaId: String(va._id),
+                name: identity.name, uname: username,
             });
+            const payload = { kind: identity.kind, role: identity.role, uname: username };
+            const caps = effectiveCaps(va, payload);
 
             res.set('Cache-Control', 'no-store');
             res.json({
                 token, view, role: identity.role, oversight: identity.kind === 'inflight', name: identity.name,
+                caps, capabilities: CREW_CAPABILITIES,
                 va: { name: va.name, slug: va.slug || null, code: va.callsign || null },
             });
         } catch (err) {
@@ -203,6 +274,17 @@ function registerCrewAuthRoutes(app) {
             const VirtualAirlineAd = mongoose.model('VirtualAirlineAd');
             const ad = await VirtualAirlineAd.findById(va._id);
             if (!ad) return res.status(404).json({ error: 'Crew center not found.' });
+
+            // Per-capability gate: staff can only change the areas their role allows.
+            const caps = effectiveCaps(ad, p);
+            const can = (c) => caps.includes(c);
+            const body = req.body || {};
+            const touchesBranding = ['layout', 'accent', 'loginLook', 'ranks', 'roles', 'fleet'].some(f => body[f] !== undefined);
+            const touchesRecruit = ['joinMode', 'minGrade', 'callsignPrefix', 'applicationForm', 'joinRequirements'].some(f => body[f] !== undefined);
+            const touchesTeam = body.staffRoles !== undefined || body.staffAssignments !== undefined;
+            if (touchesBranding && !can('settings.branding')) return res.status(403).json({ error: 'You don’t have permission to change appearance.' });
+            if (touchesRecruit && !can('settings.recruitment')) return res.status(403).json({ error: 'You don’t have permission to change recruitment settings.' });
+            if (touchesTeam && !(isInflight || p.role === 'owner')) return res.status(403).json({ error: 'Only the owner can manage staff roles.' });
 
             if (typeof req.body?.layout === 'string') {
                 const layout = req.body.layout.toLowerCase();
@@ -262,6 +344,10 @@ function registerCrewAuthRoutes(app) {
                     if (g) ad.minGrade = Math.max(0, Math.min(5, g.value));
                 }
             }
+            if (touchesTeam) {
+                if (req.body.staffRoles !== undefined) { const r = sanitizeStaffRoles(req.body.staffRoles); if (r) ad.staffRoles = r; }
+                if (req.body.staffAssignments !== undefined) { const a = sanitizeAssignments(req.body.staffAssignments); if (a) ad.staffAssignments = a; }
+            }
             await ad.save();
             res.set('Cache-Control', 'no-store');
             res.json({
@@ -269,6 +355,7 @@ function registerCrewAuthRoutes(app) {
                 loginLook: ad.loginLook || 'center', ranks: ad.ranks || [], roles: ad.roles || [], fleet: ad.crewFleet || [],
                 joinMode: ad.joinMode, minGrade: ad.minGrade, callsignPrefix: ad.callsignPrefix || '',
                 applicationForm: ad.applicationForm || [], joinRequirements: ad.joinRequirements || [],
+                staffRoles: ad.staffRoles || [], staffAssignments: ad.staffAssignments || [],
             });
         } catch (err) {
             console.error('Crew settings error:', err);
@@ -341,9 +428,19 @@ function registerCrewAuthRoutes(app) {
         if (p.typ !== 'crew') return res.status(401).json({ error: 'Invalid session.' });
         const slug = String(req.params.slug || '').toLowerCase();
         if (p.slug && slug && p.slug !== slug) return res.status(403).json({ error: 'Wrong crew center.' });
+        // Resolve fresh caps from the VA (so an owner's change takes effect without
+        // waiting for re-login). The owner also gets the role config to manage it.
+        const va = await resolveVa(slug || p.slug);
+        const caps = effectiveCaps(va, p);
+        const isOwner = p.kind === 'inflight' || p.role === 'owner';
         res.set('Cache-Control', 'no-store');
-        res.json({ role: p.role, view: p.view, name: p.name, oversight: p.kind === 'inflight' });
+        res.json({
+            role: p.role, view: p.view, name: p.name, oversight: p.kind === 'inflight',
+            caps, capabilities: CREW_CAPABILITIES,
+            staffRoles: (isOwner && va && va.staffRoles) || [],
+            staffAssignments: (isOwner && va && va.staffAssignments) || [],
+        });
     });
 }
 
-module.exports = { registerCrewAuthRoutes, viewForRole, verifyCrewRequest };
+module.exports = { registerCrewAuthRoutes, viewForRole, verifyCrewRequest, effectiveCaps, CREW_CAPABILITIES, CREW_CAP_IDS };

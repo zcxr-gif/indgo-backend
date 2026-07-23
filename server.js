@@ -33,7 +33,7 @@ const {
 
 // Crew Center sign-in (inflight.info/crew/<slug>) — cascades our existing
 // accounts (VA portal accounts + Inflight staff) and routes to the right view.
-const { registerCrewAuthRoutes, verifyCrewRequest } = require('./crewAuth');
+const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps } = require('./crewAuth');
 
 const express = require('express');
 const mongoose = require('mongoose');
@@ -195,6 +195,11 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // assignments live in the VA's own Supabase.
     ranks: { type: [{ _id: false, name: String, minHours: Number, color: String, icon: String, image: String }], default: [] },
     roles: { type: [{ _id: false, name: String, color: String, icon: String, image: String, staff: Boolean }], default: [] },
+    // Owner-defined STAFF roles (permissions) + which staff account (by login
+    // username) holds each. Distinct from the display `roles` above: these gate
+    // what a signed-in staff member can do. See crewAuth CREW_CAPABILITIES.
+    staffRoles: { type: [{ _id: false, id: String, name: String, color: String, permissions: [String] }], default: [] },
+    staffAssignments: { type: [{ _id: false, username: String, roleId: String }], default: [] },
     // The VA's fleet — aircraft they operate (name/type + optional livery image).
     // NOTE: named crewFleet (not fleet) to avoid colliding with the older
     // directory-level `fleet: [String]` field further down this schema.
@@ -1337,6 +1342,19 @@ function crewCanManage(req, slug) {
     if (p.kind !== 'inflight' && p.slug && p.slug !== String(slug).toLowerCase()) return { error: 403 };
     return { p };
 }
+// Capability gate: like crewCanManage, but a staff member must additionally
+// hold `capability`. Owner + Inflight always pass. Async because a staff
+// member's permissions live on the VA (staffRoles/staffAssignments).
+async function requireCap(req, slug, capability) {
+    const base = crewCanManage(req, slug);
+    if (base.error) return base;
+    const p = base.p;
+    if (p.kind === 'inflight' || p.role === 'owner') return { p };
+    // staff: resolve their role's permissions from the VA.
+    const va = await VirtualAirlineAd.findById(p.vaId).select('staffRoles staffAssignments').lean();
+    if (effectiveCaps(va, p).includes(capability)) return { p };
+    return { error: 403 };
+}
 
 // Public read — the roster is shown on the crew center.
 app.get('/api/crew/:slug/roster', async (req, res) => {
@@ -1349,7 +1367,7 @@ app.get('/api/crew/:slug/roster', async (req, res) => {
 });
 // Add a member.
 app.post('/api/crew/:slug/roster', async (req, res) => {
-    const gate = crewCanManage(req, req.params.slug);
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -1360,7 +1378,7 @@ app.post('/api/crew/:slug/roster', async (req, res) => {
 });
 // Edit a member.
 app.patch('/api/crew/:slug/roster/:id', async (req, res) => {
-    const gate = crewCanManage(req, req.params.slug);
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -1374,7 +1392,7 @@ app.patch('/api/crew/:slug/roster/:id', async (req, res) => {
 });
 // Remove a member.
 app.delete('/api/crew/:slug/roster/:id', async (req, res) => {
-    const gate = crewCanManage(req, req.params.slug);
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -1548,7 +1566,7 @@ app.get('/api/crew/:slug/application-status/:token', async (req, res) => {
 
 // Staff: list applications (default pending).
 app.get('/api/crew/:slug/applications', async (req, res) => {
-    const gate = crewCanManage(req, req.params.slug);
+    const gate = await requireCap(req, req.params.slug, 'applications.review');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -1562,7 +1580,7 @@ app.get('/api/crew/:slug/applications', async (req, res) => {
 });
 // Staff: accept / decline an application. Accept creates the pilot.
 app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
-    const gate = crewCanManage(req, req.params.slug);
+    const gate = await requireCap(req, req.params.slug, 'applications.review');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -1620,7 +1638,7 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
 
 // Staff: read the crew webhook state (never the secret URL itself, just a hint).
 app.get('/api/crew/:slug/webhook', async (req, res) => {
-    const gate = crewCanManage(req, req.params.slug);
+    const gate = await requireCap(req, req.params.slug, 'settings.notifications');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -1632,7 +1650,7 @@ app.get('/api/crew/:slug/webhook', async (req, res) => {
 });
 // Staff: set / clear ('' clears) / test the crew Discord webhook.
 app.post('/api/crew/:slug/webhook', async (req, res) => {
-    const gate = crewCanManage(req, req.params.slug);
+    const gate = await requireCap(req, req.params.slug, 'settings.notifications');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -1665,7 +1683,7 @@ app.post('/api/crew/:slug/webhook', async (req, res) => {
 // Staff: read the VA's email-provider config (never the secret key). Reports
 // whether the platform fallback is available so the UI can explain what happens.
 app.get('/api/crew/:slug/email', async (req, res) => {
-    const gate = crewCanManage(req, req.params.slug);
+    const gate = await requireCap(req, req.params.slug, 'settings.notifications');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -1685,7 +1703,7 @@ app.get('/api/crew/:slug/email', async (req, res) => {
 });
 // Staff: set / clear (provider:'') / test the VA's own email provider.
 app.post('/api/crew/:slug/email', async (req, res) => {
-    const gate = crewCanManage(req, req.params.slug);
+    const gate = await requireCap(req, req.params.slug, 'settings.notifications');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const va = await resolveCrewVa(req.params.slug);
