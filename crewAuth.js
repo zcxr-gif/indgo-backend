@@ -59,6 +59,14 @@ function sanitizeRoles(arr) {
         staff: !!(r && r.staff),
     })).filter(r => r.name);
 }
+function sanitizeFleet(arr) {
+    if (!Array.isArray(arr)) return null;
+    return arr.slice(0, 100).map(a => ({
+        type: clampStr(a && a.type, 30),
+        name: clampStr(a && a.name, 60),
+        image: cleanImageUrl(a && a.image),
+    })).filter(a => a.type || a.name);
+}
 
 // Which dashboard a role routes to.
 function viewForRole(role) {
@@ -203,11 +211,15 @@ function registerCrewAuthRoutes(app) {
                 const r = sanitizeRoles(req.body.roles);
                 if (r) ad.roles = r;
             }
+            if (req.body?.fleet !== undefined) {
+                const f = sanitizeFleet(req.body.fleet);
+                if (f) ad.fleet = f;
+            }
             await ad.save();
             res.set('Cache-Control', 'no-store');
             res.json({
                 layout: ad.layout, allowedLayouts: ad.allowedLayouts, accent: ad.crewAccent || '',
-                loginLook: ad.loginLook || 'center', ranks: ad.ranks || [], roles: ad.roles || [],
+                loginLook: ad.loginLook || 'center', ranks: ad.ranks || [], roles: ad.roles || [], fleet: ad.fleet || [],
             });
         } catch (err) {
             console.error('Crew settings error:', err);

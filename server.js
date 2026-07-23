@@ -195,6 +195,8 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // assignments live in the VA's own Supabase.
     ranks: { type: [{ _id: false, name: String, minHours: Number, color: String, icon: String, image: String }], default: [] },
     roles: { type: [{ _id: false, name: String, color: String, icon: String, image: String, staff: Boolean }], default: [] },
+    // The VA's fleet — aircraft they operate (name/type + optional livery image).
+    fleet: { type: [{ _id: false, type: String, name: String, image: String }], default: [] },
 
     // --- The VA's own Supabase project (bring-your-own data store) ---
     // The VA connects their Supabase in owner onboarding; their crew data lives
@@ -365,6 +367,20 @@ VirtualAirlineAdSchema.pre('save', async function (next) {
 });
 
 const VirtualAirlineAd = mongoose.model('VirtualAirlineAd', VirtualAirlineAdSchema);
+
+// A crew roster member (rich profile). Rank is NOT stored — it's derived from
+// `hours` against the VA's rank ladder. Managed storage so a roster works with
+// zero VA setup; a VA can later mirror this into their own Supabase.
+const CrewMemberSchema = new mongoose.Schema({
+    vaAdId:   { type: mongoose.Schema.Types.ObjectId, ref: 'VirtualAirlineAd', required: true, index: true },
+    name:     { type: String, trim: true, default: '' },
+    callsign: { type: String, trim: true, default: '' },
+    hours:    { type: Number, default: 0, min: 0 },
+    role:     { type: String, trim: true, default: '' },
+    aircraft: { type: [String], default: [] },
+    status:   { type: String, enum: ['active', 'loa', 'inactive'], default: 'active' },
+}, { timestamps: true });
+const CrewMember = mongoose.models.CrewMember || mongoose.model('CrewMember', CrewMemberSchema);
 
 /* =========================
  * VA PILOT ROSTER
@@ -1022,6 +1038,84 @@ registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, 
 
 // Crew Center sign-in routes (POST /api/crew/:slug/login, GET /api/crew/:slug/me).
 registerCrewAuthRoutes(app);
+
+// ---- Crew roster (managed storage) ----
+async function resolveCrewVa(slug) {
+    const raw = String(slug || '').trim().toLowerCase();
+    if (!raw) return null;
+    let va = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' }).select('_id').lean();
+    if (!va) va = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' }).select('_id').lean();
+    return va;
+}
+function cleanMember(b) {
+    b = b || {};
+    return {
+        name: String(b.name || '').trim().slice(0, 60),
+        callsign: String(b.callsign || '').trim().slice(0, 20),
+        hours: Math.max(0, Math.min(1e6, Number(b.hours) || 0)),
+        role: String(b.role || '').trim().slice(0, 40),
+        aircraft: Array.isArray(b.aircraft) ? b.aircraft.slice(0, 40).map(a => String(a).trim().slice(0, 40)).filter(Boolean) : [],
+        status: ['active', 'loa', 'inactive'].includes(b.status) ? b.status : 'active',
+    };
+}
+const publicMember = (m) => ({
+    id: m._id, name: m.name, callsign: m.callsign, hours: m.hours,
+    role: m.role, aircraft: m.aircraft || [], status: m.status,
+});
+// Owner/staff (or Inflight) gate for roster writes.
+function crewCanManage(req, slug) {
+    const p = verifyCrewRequest(req);
+    if (!p) return { error: 401 };
+    if (!(p.kind === 'inflight' || p.role === 'owner' || p.role === 'staff')) return { error: 403 };
+    if (p.kind !== 'inflight' && p.slug && p.slug !== String(slug).toLowerCase()) return { error: 403 };
+    return { p };
+}
+
+// Public read — the roster is shown on the crew center.
+app.get('/api/crew/:slug/roster', async (req, res) => {
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const members = await CrewMember.find({ vaAdId: va._id }).sort({ hours: -1, name: 1 }).limit(2000).lean();
+        res.json({ roster: members.map(publicMember) });
+    } catch (err) { console.error('roster list error:', err); res.status(500).json({ error: 'Could not load the roster.' }); }
+});
+// Add a member.
+app.post('/api/crew/:slug/roster', async (req, res) => {
+    const gate = crewCanManage(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const m = await CrewMember.create({ vaAdId: va._id, ...cleanMember(req.body) });
+        res.status(201).json({ member: publicMember(m) });
+    } catch (err) { console.error('roster add error:', err); res.status(500).json({ error: 'Could not add the pilot.' }); }
+});
+// Edit a member.
+app.patch('/api/crew/:slug/roster/:id', async (req, res) => {
+    const gate = crewCanManage(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const m = await CrewMember.findOne({ _id: req.params.id, vaAdId: va._id });
+        if (!m) return res.status(404).json({ error: 'Pilot not found.' });
+        Object.assign(m, cleanMember({ ...m.toObject(), ...req.body }));
+        await m.save();
+        res.json({ member: publicMember(m) });
+    } catch (err) { console.error('roster edit error:', err); res.status(500).json({ error: 'Could not update the pilot.' }); }
+});
+// Remove a member.
+app.delete('/api/crew/:slug/roster/:id', async (req, res) => {
+    const gate = crewCanManage(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        await CrewMember.deleteOne({ _id: req.params.id, vaAdId: va._id });
+        res.json({ ok: true });
+    } catch (err) { console.error('roster delete error:', err); res.status(500).json({ error: 'Could not remove the pilot.' }); }
+});
 
 // Crew Center badge-image upload — owner/staff (or Inflight) upload their own
 // rank/role badge art. Reuses the VA image pipeline (WebP, alpha preserved).
@@ -2615,7 +2709,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles fleet supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -2648,6 +2742,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             loginLook: ad.loginLook || 'center',
             ranks: Array.isArray(ad.ranks) ? ad.ranks : [],
             roles: Array.isArray(ad.roles) ? ad.roles : [],
+            fleet: Array.isArray(ad.fleet) ? ad.fleet : [],
             // Public Supabase connection (never the secret service key).
             supabase: {
                 url: ad.supabaseUrl || '',
