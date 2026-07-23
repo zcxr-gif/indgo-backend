@@ -992,6 +992,21 @@ const callsignAirlineBase = (raw) => {
     return clean || null;
 };
 
+// Does this LIVE callsign DECLARE a VA identity? True only for the strict VA
+// shape "<base> <number>VA" (case-insensitive; number may use "#" placeholders;
+// the space before VA is optional) — the same shape callsignMatchesVaBase keys
+// on. When it does, the base it declares is the airline the pilot is *visibly*
+// flying for right now, and we return that base (e.g. "Oceanic 123VA" ->
+// "OCEANIC"). A generic/personal callsign ("N123AB", "Heavy 747", "Oceanic 100"
+// with no VA tag) declares nothing and returns null. Used to stop roster
+// attribution from handing a flight to a partner VA when the callsign plainly
+// belongs to a DIFFERENT VA — see resolveVaEventPartnerByRoster.
+const callsignDeclaredVaBase = (raw) => {
+    const cs = String(raw || '').trim().toUpperCase();
+    const m = cs.match(/^(.+?)\s+[0-9#]+\s*VA$/);
+    return m ? m[1].trim() : null;
+};
+
 // True only for a well-formed Discord webhook URL. Partner VAs paste these into
 // the portal themselves, so we gate both the write (vaPortal.js) and the post
 // (VA flight events, below) on this — without it the per-VA delivery would be an
@@ -4879,8 +4894,11 @@ const PARTNER_SELECT = 'name callsigns logoUrl flightEventsCard +flightEventsWeb
 // (e.username) is on that VA's roster of Infinite Flight usernames. This is what
 // lets a VA say "these are our pilots" and catch their members' flights even
 // when the live callsign doesn't fit the VA's registered pattern. Used only as a
-// fallback (see resolveVaEventPartner) so it never redirects a flight away from
-// the VA the sender explicitly attributed it to. Returns an opted-in ad or null.
+// fallback (see resolveVaEventPartner). Roster membership is a WEAKER signal than
+// the live callsign, so it can't override it: if the callsign declares a
+// different VA ("<other> ###VA"), this returns null rather than misdelivering a
+// pilot's other-VA flight to a VA they merely belong to. Returns an opted-in ad
+// or null.
 const resolveVaEventPartnerByRoster = async (e) => {
     const u = String(e.username || '').trim().toLowerCase();
     if (!u) return null;
@@ -4902,8 +4920,29 @@ const resolveVaEventPartnerByRoster = async (e) => {
         console.error('[va-events] roster partner lookup failed:', err.message);
         return null;
     }
-    const valid = ads.filter((a) => a.flightEventsWebhookUrl && isDiscordWebhookUrl(a.flightEventsWebhookUrl));
+    let valid = ads.filter((a) => a.flightEventsWebhookUrl && isDiscordWebhookUrl(a.flightEventsWebhookUrl));
     if (!valid.length) return null;
+
+    // GUARD: is the pilot visibly flying under a VA's banner right now? A live
+    // callsign shaped "<base> ###VA" DECLARES an airline (e.g. "Oceanic 123VA"
+    // -> "OCEANIC"). Roster membership must NOT override that: a pilot who's on
+    // partner "SkyHigh"'s roster but is currently flying "Oceanic 123VA" is
+    // flying for Oceanic, not SkyHigh, and their flight must never be posted to
+    // SkyHigh's Discord. So when the callsign declares a VA, only a roster VA
+    // whose OWN stored callsigns match that live callsign may claim it; if none
+    // do, the pilot is flying for someone else entirely — attribute to no one.
+    // A generic/personal callsign declares nothing, so the roster still catches
+    // it (that's the whole point of the roster path).
+    const declaredBase = callsignDeclaredVaBase(e.callsign);
+    if (declaredBase) {
+        const onBanner = valid.filter((a) => matchVaCallsign(e.callsign, a.callsigns || []));
+        if (!onBanner.length) {
+            console.log(`[va-events] roster suppressed: pilot "${e.username}" is flying "${e.callsign}" (declares "${declaredBase}"), which matches none of their opted-in rosters — not their VA`);
+            return null;
+        }
+        valid = onBanner;
+    }
+
     // A pilot on several opted-in rosters is ambiguous; pick deterministically
     // (name-sorted) and log it so the overlap is visible rather than silent.
     if (valid.length > 1) {
