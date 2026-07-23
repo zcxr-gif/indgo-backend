@@ -67,6 +67,15 @@ function sanitizeFleet(arr) {
         image: cleanImageUrl(a && a.image),
     })).filter(a => a.type || a.name);
 }
+function sanitizeForm(arr) {
+    if (!Array.isArray(arr)) return null;
+    return arr.slice(0, 30).map(q => ({
+        label: clampStr(q && q.label, 120),
+        type: ['text', 'textarea', 'select'].includes(q && q.type) ? q.type : 'text',
+        options: Array.isArray(q && q.options) ? q.options.slice(0, 20).map(o => clampStr(o, 60)).filter(Boolean) : [],
+        required: !!(q && q.required),
+    })).filter(q => q.label);
+}
 
 // Which dashboard a role routes to.
 function viewForRole(role) {
@@ -215,11 +224,25 @@ function registerCrewAuthRoutes(app) {
                 const f = sanitizeFleet(req.body.fleet);
                 if (f) ad.fleet = f;
             }
+            if (typeof req.body?.joinMode === 'string' && ['free', 'application'].includes(req.body.joinMode)) {
+                ad.joinMode = req.body.joinMode;
+            }
+            if (req.body?.minGrade !== undefined) {
+                ad.minGrade = Math.max(0, Math.min(5, Number(req.body.minGrade) || 0));
+            }
+            if (typeof req.body?.callsignPrefix === 'string') {
+                ad.callsignPrefix = req.body.callsignPrefix.trim().slice(0, 10);
+            }
+            if (req.body?.applicationForm !== undefined) {
+                const f = sanitizeForm(req.body.applicationForm);
+                if (f) ad.applicationForm = f;
+            }
             await ad.save();
             res.set('Cache-Control', 'no-store');
             res.json({
                 layout: ad.layout, allowedLayouts: ad.allowedLayouts, accent: ad.crewAccent || '',
                 loginLook: ad.loginLook || 'center', ranks: ad.ranks || [], roles: ad.roles || [], fleet: ad.fleet || [],
+                joinMode: ad.joinMode, minGrade: ad.minGrade, callsignPrefix: ad.callsignPrefix || '', applicationForm: ad.applicationForm || [],
             });
         } catch (err) {
             console.error('Crew settings error:', err);

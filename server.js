@@ -198,6 +198,14 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // The VA's fleet — aircraft they operate (name/type + optional livery image).
     fleet: { type: [{ _id: false, type: String, name: String, image: String }], default: [] },
 
+    // --- Recruitment / join settings ---
+    // joinMode: 'free' = instant account; 'application' = staff review.
+    joinMode: { type: String, enum: ['free', 'application'], default: 'application' },
+    minGrade: { type: Number, default: 0, min: 0, max: 5 },   // 0 = no grade requirement
+    callsignPrefix: { type: String, trim: true, default: '' }, // default prefix for pilot callsigns
+    // A staff-built application form: ordered questions.
+    applicationForm: { type: [{ _id: false, label: String, type: String, options: [String], required: Boolean }], default: [] },
+
     // --- The VA's own Supabase project (bring-your-own data store) ---
     // The VA connects their Supabase in owner onboarding; their crew data lives
     // there and stays theirs. anonKey is the PUBLIC browser key (safe to expose
@@ -381,6 +389,19 @@ const CrewMemberSchema = new mongoose.Schema({
     status:   { type: String, enum: ['active', 'loa', 'inactive'], default: 'active' },
 }, { timestamps: true });
 const CrewMember = mongoose.models.CrewMember || mongoose.model('CrewMember', CrewMemberSchema);
+
+// A membership application submitted through the crew center's join form.
+const CrewApplicationSchema = new mongoose.Schema({
+    vaAdId:   { type: mongoose.Schema.Types.ObjectId, ref: 'VirtualAirlineAd', required: true, index: true },
+    ifcName:  { type: String, trim: true, default: '' },       // Infinite Flight Community name
+    callsignPrefix: { type: String, trim: true, default: '' },
+    callsignNumber: { type: String, trim: true, default: '' },
+    grade:    { type: Number, default: 0 },                    // self-reported IF grade
+    answers:  { type: [{ _id: false, q: String, a: String }], default: [] },
+    status:   { type: String, enum: ['pending', 'accepted', 'declined'], default: 'pending' },
+    reviewedAt: { type: Date, default: null },
+}, { timestamps: true });
+const CrewApplication = mongoose.models.CrewApplication || mongoose.model('CrewApplication', CrewApplicationSchema);
 
 /* =========================
  * VA PILOT ROSTER
@@ -1115,6 +1136,86 @@ app.delete('/api/crew/:slug/roster/:id', async (req, res) => {
         await CrewMember.deleteOne({ _id: req.params.id, vaAdId: va._id });
         res.json({ ok: true });
     } catch (err) { console.error('roster delete error:', err); res.status(500).json({ error: 'Could not remove the pilot.' }); }
+});
+
+// ---- Recruitment: applications ----
+// Submit a join application (public). Free mode creates the pilot instantly;
+// application mode leaves it pending for staff. A min-grade gate blocks
+// self-reported grades below the requirement.
+app.post('/api/crew/:slug/apply', async (req, res) => {
+    try {
+        const raw = String(req.params.slug || '').trim().toLowerCase();
+        let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
+            .select('_id joinMode minGrade callsignPrefix callsign applicationForm').lean();
+        if (!ad) ad = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' })
+            .select('_id joinMode minGrade callsignPrefix callsign applicationForm').lean();
+        if (!ad) return res.status(404).json({ error: 'Crew center not found.' });
+
+        const b = req.body || {};
+        const ifcName = String(b.ifcName || '').trim().slice(0, 60);
+        if (!ifcName) return res.status(400).json({ error: 'Your Infinite Flight Community name is required.' });
+        const grade = Math.max(0, Math.min(5, Number(b.grade) || 0));
+        if (ad.minGrade && grade && grade < ad.minGrade) {
+            return res.status(403).json({ error: `This VA requires Grade ${ad.minGrade} or higher.` });
+        }
+        const prefix = (String(b.callsignPrefix || '').trim() || ad.callsignPrefix || ad.callsign || '').slice(0, 10);
+        const number = String(b.callsignNumber || '').trim().slice(0, 10);
+        const answers = Array.isArray(b.answers)
+            ? b.answers.slice(0, 50).map(x => ({ q: String(x.q || '').slice(0, 120), a: String(x.a || '').slice(0, 2000) })) : [];
+
+        const status = ad.joinMode === 'free' ? 'accepted' : 'pending';
+        const appDoc = await CrewApplication.create({
+            vaAdId: ad._id, ifcName, callsignPrefix: prefix, callsignNumber: number, grade, answers,
+            status, reviewedAt: status === 'accepted' ? new Date() : null,
+        });
+        if (status === 'accepted') {
+            await CrewMember.create({
+                vaAdId: ad._id, name: ifcName, callsign: (prefix + number).trim(),
+                hours: 0, role: '', aircraft: [], status: 'active',
+            });
+        }
+        res.json({ status, callsign: (prefix + number).trim(), applicationId: appDoc._id });
+    } catch (err) { console.error('apply error:', err); res.status(500).json({ error: 'Could not submit your application.' }); }
+});
+// Staff: list applications (default pending).
+app.get('/api/crew/:slug/applications', async (req, res) => {
+    const gate = crewCanManage(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const q = { vaAdId: va._id };
+        if (req.query.status && ['pending', 'accepted', 'declined'].includes(req.query.status)) q.status = req.query.status;
+        else q.status = 'pending';
+        const apps = await CrewApplication.find(q).sort({ createdAt: -1 }).limit(500).lean();
+        res.json({ applications: apps });
+    } catch (err) { console.error('applications list error:', err); res.status(500).json({ error: 'Could not load applications.' }); }
+});
+// Staff: accept / decline an application. Accept creates the pilot.
+app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
+    const gate = crewCanManage(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const appDoc = await CrewApplication.findOne({ _id: req.params.id, vaAdId: va._id });
+        if (!appDoc) return res.status(404).json({ error: 'Application not found.' });
+        const action = String(req.body?.action || '');
+        if (action === 'accept') {
+            if (appDoc.status !== 'accepted') {
+                await CrewMember.create({
+                    vaAdId: va._id, name: appDoc.ifcName, callsign: (appDoc.callsignPrefix + appDoc.callsignNumber).trim(),
+                    hours: 0, role: '', aircraft: [], status: 'active',
+                });
+            }
+            appDoc.status = 'accepted';
+        } else if (action === 'decline') {
+            appDoc.status = 'declined';
+        } else return res.status(400).json({ error: 'Unknown action.' });
+        appDoc.reviewedAt = new Date();
+        await appDoc.save();
+        res.json({ status: appDoc.status });
+    } catch (err) { console.error('application review error:', err); res.status(500).json({ error: 'Could not update the application.' }); }
 });
 
 // Crew Center badge-image upload — owner/staff (or Inflight) upload their own
@@ -2709,7 +2810,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles fleet supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles fleet joinMode minGrade callsignPrefix applicationForm supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -2743,6 +2844,12 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             ranks: Array.isArray(ad.ranks) ? ad.ranks : [],
             roles: Array.isArray(ad.roles) ? ad.roles : [],
             fleet: Array.isArray(ad.fleet) ? ad.fleet : [],
+            join: {
+                mode: ad.joinMode || 'application',
+                minGrade: ad.minGrade || 0,
+                callsignPrefix: ad.callsignPrefix || ad.callsign || '',
+                form: Array.isArray(ad.applicationForm) ? ad.applicationForm : [],
+            },
             // Public Supabase connection (never the secret service key).
             supabase: {
                 url: ad.supabaseUrl || '',
