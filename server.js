@@ -219,6 +219,17 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // server. Secret (contains a token) → select:false, never echoed back.
     crewWebhookUrl: { type: String, trim: true, default: null, select: false },
 
+    // --- Bring-your-own email provider (applicant notifications) ---
+    // When set, applicant emails go through the VA's OWN provider/account so
+    // mail comes from their domain and their quota. Falls back to the platform
+    // key when left blank. crewEmailKey is a secret → select:false.
+    crewEmailProvider: { type: String, enum: ['', 'resend', 'sendgrid', 'postmark', 'mailgun'], default: '' },
+    crewEmailFrom: { type: String, trim: true, default: '' },       // "VA Name <crew@va.com>"
+    crewEmailReplyTo: { type: String, trim: true, default: '' },    // optional Reply-To
+    crewEmailDomain: { type: String, trim: true, default: '' },     // Mailgun sending domain
+    crewEmailRegion: { type: String, enum: ['us', 'eu'], default: 'us' }, // Mailgun region
+    crewEmailKey: { type: String, default: '', select: false },     // API key / server token (secret)
+
     // --- The VA's own Supabase project (bring-your-own data store) ---
     // The VA connects their Supabase in owner onboarding; their crew data lives
     // there and stays theirs. anonKey is the PUBLIC browser key (safe to expose
@@ -519,23 +530,74 @@ async function postCrewNotice(url, { title, description, color, fields }) {
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const CREW_EMAIL_FROM = process.env.CREW_EMAIL_FROM || 'Inflight Crew Center <crew@inflight.info>';
 const SITE_ORIGIN = (process.env.CREW_SITE_ORIGIN || 'https://inflight.info').replace(/\/+$/, '');
-const crewEmailEnabled = () => !!RESEND_API_KEY;
+const CREW_EMAIL_PROVIDERS = ['resend', 'sendgrid', 'postmark', 'mailgun'];
 const escHtml = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const isEmail = (s) => EMAIL_RE.test(String(s || '').trim());
+const maskKey = (k) => k ? '••••••' + String(k).slice(-4) : '';
+// Split "Name <email>" → { name, email }.
+function parseAddress(s) {
+    const m = String(s || '').match(/^\s*(.*?)\s*<([^>]+)>\s*$/);
+    if (m) return { name: m[1].replace(/^"|"$/g, '').trim(), email: m[2].trim() };
+    return { name: '', email: String(s || '').trim() };
+}
+// Is an email-provider config complete enough to send with?
+function emailCfgReady(cfg) {
+    if (!cfg || !cfg.provider || !cfg.key || !cfg.from) return false;
+    if (cfg.provider === 'mailgun' && !cfg.domain) return false;
+    return true;
+}
 
-async function sendCrewEmail({ to, subject, html, replyTo }) {
-    if (!RESEND_API_KEY || !isEmail(to)) return false;
+// One send, dispatched to whichever provider the config names. Every provider
+// here is a pure HTTPS JSON/form API (no SMTP), so axios covers them all.
+async function sendCrewEmail(cfg, { to, subject, html, replyTo }) {
+    if (!emailCfgReady(cfg) || !isEmail(to)) return false;
+    const rt = (replyTo && isEmail(replyTo)) ? replyTo : (isEmail(cfg.replyTo) ? cfg.replyTo : undefined);
+    const subj = String(subject || '').slice(0, 200);
     try {
-        await axios.post('https://api.resend.com/emails', {
-            from: CREW_EMAIL_FROM,
-            to: [String(to).trim()],
-            subject: String(subject || '').slice(0, 200),
-            html,
-            reply_to: replyTo && isEmail(replyTo) ? replyTo : undefined,
-        }, { timeout: 10000, headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' } });
+        if (cfg.provider === 'resend') {
+            await axios.post('https://api.resend.com/emails',
+                { from: cfg.from, to: [to], subject: subj, html, reply_to: rt },
+                { timeout: 10000, headers: { Authorization: `Bearer ${cfg.key}`, 'Content-Type': 'application/json' } });
+        } else if (cfg.provider === 'sendgrid') {
+            const f = parseAddress(cfg.from);
+            const payload = {
+                personalizations: [{ to: [{ email: to }] }],
+                from: f.name ? { email: f.email, name: f.name } : { email: f.email },
+                subject: subj, content: [{ type: 'text/html', value: html }],
+            };
+            if (rt) payload.reply_to = { email: rt };
+            await axios.post('https://api.sendgrid.com/v3/mail/send', payload,
+                { timeout: 10000, headers: { Authorization: `Bearer ${cfg.key}`, 'Content-Type': 'application/json' } });
+        } else if (cfg.provider === 'postmark') {
+            await axios.post('https://api.postmarkapp.com/email',
+                { From: cfg.from, To: to, Subject: subj, HtmlBody: html, ReplyTo: rt, MessageStream: 'outbound' },
+                { timeout: 10000, headers: { 'X-Postmark-Server-Token': cfg.key, Accept: 'application/json', 'Content-Type': 'application/json' } });
+        } else if (cfg.provider === 'mailgun') {
+            const base = cfg.region === 'eu' ? 'https://api.eu.mailgun.net' : 'https://api.mailgun.net';
+            const form = new URLSearchParams({ from: cfg.from, to, subject: subj, html });
+            if (rt) form.append('h:Reply-To', rt);
+            await axios.post(`${base}/v3/${encodeURIComponent(cfg.domain)}/messages`, form,
+                { timeout: 10000, auth: { username: 'api', password: cfg.key }, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+        } else return false;
         return true;
-    } catch (err) { console.error('crew email failed:', err?.response?.data || err?.message || err); return false; }
+    } catch (err) { console.error(`crew email failed (${cfg.provider}):`, err?.response?.data || err?.message || err); return false; }
+}
+// Resolve the email config for a VA: their OWN provider if configured, else the
+// platform Resend key (env). Returns null when neither is available (email off).
+async function crewEmailConfigFor(vaId) {
+    let doc = null;
+    try { doc = await VirtualAirlineAd.findById(vaId).select('+crewEmailKey crewEmailProvider crewEmailFrom crewEmailReplyTo crewEmailDomain crewEmailRegion contactEmail').lean(); } catch { /* fall through */ }
+    if (doc && doc.crewEmailProvider && doc.crewEmailKey && doc.crewEmailFrom) {
+        return {
+            own: true, provider: doc.crewEmailProvider, key: doc.crewEmailKey, from: doc.crewEmailFrom,
+            replyTo: doc.crewEmailReplyTo || doc.contactEmail || '', domain: doc.crewEmailDomain || '', region: doc.crewEmailRegion || 'us',
+        };
+    }
+    if (RESEND_API_KEY) {
+        return { own: false, provider: 'resend', key: RESEND_API_KEY, from: CREW_EMAIL_FROM, replyTo: (doc && doc.contactEmail) || '', domain: '', region: 'us' };
+    }
+    return null;
 }
 // Minimal, warm, inline-styled email shell (email clients ignore <style>/CSS).
 function crewEmailHtml({ vaName, heading, accent, bodyHtml, button }) {
@@ -1434,16 +1496,17 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
         // Acknowledge to the applicant by email (if they gave one). Free-mode
         // joins get a welcome; applications get a "received + your status link".
         if (email) {
+            const emailCfg = await crewEmailConfigFor(ad._id);
             const slug = ad.slug || raw;
             const statusUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}/status?id=${statusToken}`;
             const centerUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}`;
             if (status === 'accepted') {
-                sendCrewEmail({ to: email, replyTo: ad.contactEmail, subject: `Welcome to ${ad.name || 'the crew'}!`,
+                sendCrewEmail(emailCfg, { to: email, subject: `Welcome to ${ad.name || 'the crew'}!`,
                     html: crewEmailHtml({ vaName: ad.name, accent: ad.crewAccent, heading: 'Welcome aboard! 🎉',
                         bodyHtml: `You’re now flying with <b>${escHtml(ad.name || 'the crew')}</b>${cs ? `, as <b>${escHtml(cs)}</b>` : ''}.`,
                         button: { label: 'Open the crew center', url: centerUrl } }) }).catch(() => {});
             } else {
-                sendCrewEmail({ to: email, replyTo: ad.contactEmail, subject: `Application received — ${ad.name || 'Crew Center'}`,
+                sendCrewEmail(emailCfg, { to: email, subject: `Application received — ${ad.name || 'Crew Center'}`,
                     html: crewEmailHtml({ vaName: ad.name, accent: ad.crewAccent, heading: 'Application received',
                         bodyHtml: `Thanks, <b>${escHtml(ifcName)}</b>. The ${escHtml(ad.name || 'VA')} team will review your application and we’ll email you here as soon as there’s a decision.`,
                         button: { label: 'Check your status', url: statusUrl } }) }).catch(() => {});
@@ -1544,6 +1607,7 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
         }
         // Email the applicant the decision + the staff's message (if they left one).
         if (appDoc.email) {
+            const emailCfg = await crewEmailConfigFor(va._id);
             const slug = va.slug || req.params.slug;
             const statusUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}/status?id=${appDoc.statusToken}`;
             const centerUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}`;
@@ -1551,7 +1615,7 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
                 ? `Great news — welcome to <b>${escHtml(va.name || 'the crew')}</b>${cs ? `, flying as <b>${escHtml(cs)}</b>` : ''}.`
                 : `Thanks for applying to <b>${escHtml(va.name || 'the VA')}</b>. Unfortunately they weren’t able to accept your application this time.`)
                 + (message ? `<br><br><b>Message from the team:</b><br>${escHtml(message).replace(/\n/g, '<br>')}` : '');
-            sendCrewEmail({ to: appDoc.email, replyTo: va.contactEmail,
+            sendCrewEmail(emailCfg, { to: appDoc.email,
                 subject: accepted ? `You’re in — ${va.name || 'Crew Center'}` : `Update on your application — ${va.name || 'Crew Center'}`,
                 html: crewEmailHtml({ vaName: va.name, accent: va.crewAccent, heading: accepted ? 'You’re in! 🎉' : 'Application update',
                     bodyHtml: body,
@@ -1603,6 +1667,85 @@ app.post('/api/crew/:slug/webhook', async (req, res) => {
         res.set('Cache-Control', 'no-store');
         res.json({ configured: !!ad.crewWebhookUrl, hint: maskWebhookUrl(ad.crewWebhookUrl) });
     } catch (err) { console.error('crew webhook set error:', err); res.status(500).json({ error: 'Could not save the webhook.' }); }
+});
+
+// Staff: read the VA's email-provider config (never the secret key). Reports
+// whether the platform fallback is available so the UI can explain what happens.
+app.get('/api/crew/:slug/email', async (req, res) => {
+    const gate = crewCanManage(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const doc = await VirtualAirlineAd.findById(va._id).select('+crewEmailKey crewEmailProvider crewEmailFrom crewEmailReplyTo crewEmailDomain crewEmailRegion').lean();
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            provider: (doc && doc.crewEmailProvider) || '',
+            from: (doc && doc.crewEmailFrom) || '',
+            replyTo: (doc && doc.crewEmailReplyTo) || '',
+            domain: (doc && doc.crewEmailDomain) || '',
+            region: (doc && doc.crewEmailRegion) || 'us',
+            keyHint: maskKey(doc && doc.crewEmailKey),
+            configured: !!(doc && doc.crewEmailProvider && doc.crewEmailKey && doc.crewEmailFrom),
+            platformFallback: !!RESEND_API_KEY,
+        });
+    } catch (err) { console.error('crew email get error:', err); res.status(500).json({ error: 'Could not load email settings.' }); }
+});
+// Staff: set / clear (provider:'') / test the VA's own email provider.
+app.post('/api/crew/:slug/email', async (req, res) => {
+    const gate = crewCanManage(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const ad = await VirtualAirlineAd.findById(va._id).select('+crewEmailKey crewEmailProvider crewEmailFrom crewEmailReplyTo crewEmailDomain crewEmailRegion name contactEmail crewAccent slug');
+        if (!ad) return res.status(404).json({ error: 'Crew center not found.' });
+        const b = req.body || {};
+
+        // Empty provider clears the whole BYO config (falls back to platform).
+        if (b.provider !== undefined) {
+            const p = String(b.provider || '').toLowerCase();
+            if (p && !CREW_EMAIL_PROVIDERS.includes(p)) return res.status(400).json({ error: 'Unknown email provider.' });
+            ad.crewEmailProvider = p;
+            if (!p) { ad.crewEmailKey = ''; ad.crewEmailFrom = ''; ad.crewEmailReplyTo = ''; ad.crewEmailDomain = ''; }
+        }
+        if (b.from !== undefined) {
+            const from = String(b.from || '').trim().slice(0, 160);
+            if (from && !isEmail(parseAddress(from).email)) return res.status(400).json({ error: 'From must be a valid email (optionally "Name <email>").' });
+            ad.crewEmailFrom = from;
+        }
+        if (b.replyTo !== undefined) {
+            const rt = String(b.replyTo || '').trim().slice(0, 160);
+            if (rt && !isEmail(rt)) return res.status(400).json({ error: 'Reply-to must be a valid email.' });
+            ad.crewEmailReplyTo = rt;
+        }
+        if (b.domain !== undefined) ad.crewEmailDomain = String(b.domain || '').trim().slice(0, 120);
+        if (b.region !== undefined) ad.crewEmailRegion = b.region === 'eu' ? 'eu' : 'us';
+        // Only overwrite the key when a non-empty one is sent (blank means "keep").
+        if (typeof b.apiKey === 'string' && b.apiKey.trim()) ad.crewEmailKey = b.apiKey.trim().slice(0, 400);
+        await ad.save();
+
+        if (b.test) {
+            const to = isEmail(b.testTo) ? String(b.testTo).trim() : (ad.contactEmail || '');
+            if (!isEmail(to)) return res.status(400).json({ error: 'Enter a valid address to send the test to.' });
+            const cfg = ad.crewEmailProvider && ad.crewEmailKey && ad.crewEmailFrom
+                ? { own: true, provider: ad.crewEmailProvider, key: ad.crewEmailKey, from: ad.crewEmailFrom, replyTo: ad.crewEmailReplyTo || ad.contactEmail || '', domain: ad.crewEmailDomain || '', region: ad.crewEmailRegion || 'us' }
+                : await crewEmailConfigFor(ad._id);
+            if (!emailCfgReady(cfg)) return res.status(400).json({ error: 'Add a provider, From address and API key first.' });
+            const ok = await sendCrewEmail(cfg, {
+                to, subject: `${ad.name || 'Crew Center'} — email test`,
+                html: crewEmailHtml({ vaName: ad.name, accent: ad.crewAccent, heading: 'Email is working 🎉',
+                    bodyHtml: `This is a test from your Crew Center. Applicant notifications will be delivered ${cfg.own ? 'through your own provider' : 'via Inflight'}.` }),
+            });
+            if (!ok) return res.status(502).json({ error: 'The provider rejected the test — double-check the From address, API key and (for Mailgun) the sending domain.' });
+        }
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            provider: ad.crewEmailProvider || '', from: ad.crewEmailFrom || '', replyTo: ad.crewEmailReplyTo || '',
+            domain: ad.crewEmailDomain || '', region: ad.crewEmailRegion || 'us', keyHint: maskKey(ad.crewEmailKey),
+            configured: !!(ad.crewEmailProvider && ad.crewEmailKey && ad.crewEmailFrom), platformFallback: !!RESEND_API_KEY,
+        });
+    } catch (err) { console.error('crew email set error:', err); res.status(500).json({ error: 'Could not save email settings.' }); }
 });
 
 // Crew Center badge-image upload — owner/staff (or Inflight) upload their own
