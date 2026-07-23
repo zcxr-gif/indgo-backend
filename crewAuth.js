@@ -25,6 +25,17 @@ const CREW_LAYOUTS = ['editorial', 'console', 'split', 'classic'];
 
 const isHexColor = (c) => /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(c || '');
 const clampStr = (s, n) => String(s == null ? '' : s).trim().slice(0, n);
+const cleanImageUrl = (u) => { const s = clampStr(u, 600); return /^https:\/\//i.test(s) ? s : ''; };
+
+// Verify a crew Bearer token on a request (used by routes registered outside
+// this module, e.g. the badge-image upload in server.js). Returns the crew
+// payload or null.
+function verifyCrewRequest(req) {
+    const token = getBearer(req);
+    if (!token) return null;
+    try { const p = jwt.verify(token, JWT_SECRET); return p.typ === 'crew' ? p : null; }
+    catch { return null; }
+}
 
 // Sanitize the VA-defined rank ladder / role list before saving.
 function sanitizeRanks(arr) {
@@ -34,6 +45,7 @@ function sanitizeRanks(arr) {
         minHours: Math.max(0, Math.min(100000, Number(r && r.minHours) || 0)),
         color: isHexColor(r && r.color) ? r.color : '',
         icon: clampStr(r && r.icon, 30),
+        image: cleanImageUrl(r && r.image),
     })).filter(r => r.name).sort((a, b) => a.minHours - b.minHours);
 }
 function sanitizeRoles(arr) {
@@ -42,6 +54,7 @@ function sanitizeRoles(arr) {
         name: clampStr(r && r.name, 40),
         color: isHexColor(r && r.color) ? r.color : '',
         icon: clampStr(r && r.icon, 30),
+        image: cleanImageUrl(r && r.image),
         staff: !!(r && r.staff),
     })).filter(r => r.name);
 }
@@ -264,4 +277,4 @@ function registerCrewAuthRoutes(app) {
     });
 }
 
-module.exports = { registerCrewAuthRoutes, viewForRole };
+module.exports = { registerCrewAuthRoutes, viewForRole, verifyCrewRequest };

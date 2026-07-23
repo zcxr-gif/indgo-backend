@@ -33,7 +33,7 @@ const {
 
 // Crew Center sign-in (inflight.info/crew/<slug>) — cascades our existing
 // accounts (VA portal accounts + Inflight staff) and routes to the right view.
-const { registerCrewAuthRoutes } = require('./crewAuth');
+const { registerCrewAuthRoutes, verifyCrewRequest } = require('./crewAuth');
 
 const express = require('express');
 const mongoose = require('mongoose');
@@ -191,8 +191,8 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // Crew structure the VA defines (all optional): a rank ladder + roles, each
     // carrying a badge (colour + icon). These are the DEFINITIONS; per-pilot
     // assignments live in the VA's own Supabase.
-    ranks: { type: [{ _id: false, name: String, minHours: Number, color: String, icon: String }], default: [] },
-    roles: { type: [{ _id: false, name: String, color: String, icon: String, staff: Boolean }], default: [] },
+    ranks: { type: [{ _id: false, name: String, minHours: Number, color: String, icon: String, image: String }], default: [] },
+    roles: { type: [{ _id: false, name: String, color: String, icon: String, image: String, staff: Boolean }], default: [] },
 
     // --- The VA's own Supabase project (bring-your-own data store) ---
     // The VA connects their Supabase in owner onboarding; their crew data lives
@@ -1020,6 +1020,34 @@ registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, 
 
 // Crew Center sign-in routes (POST /api/crew/:slug/login, GET /api/crew/:slug/me).
 registerCrewAuthRoutes(app);
+
+// Crew Center badge-image upload — owner/staff (or Inflight) upload their own
+// rank/role badge art. Reuses the VA image pipeline (WebP, alpha preserved).
+// Bearer-authed (no cookie), so CORS stays simple.
+app.post('/api/crew/:slug/badge-image', upload.single('image'), async (req, res) => {
+    try {
+        const p = verifyCrewRequest(req);
+        if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+        if (!(p.kind === 'inflight' || p.role === 'owner' || p.role === 'staff')) {
+            return res.status(403).json({ error: 'Not allowed to upload badges.' });
+        }
+        const slug = String(req.params.slug || '').toLowerCase();
+        if (p.kind !== 'inflight' && p.slug && p.slug !== slug) {
+            return res.status(403).json({ error: 'Wrong crew center.' });
+        }
+        if (!req.file) return res.status(400).json({ error: 'No image uploaded.' });
+
+        let va = await VirtualAirlineAd.findOne({ slug }).select('_id').lean();
+        if (!va) va = await VirtualAirlineAd.findOne({ callsign: slug.toUpperCase() }).select('_id').lean();
+        const ref = va ? String(va._id) : slug;
+        const url = await uploadVaImage(s3Client, req.file, ref, 'logo'); // 512² profile, keeps transparency
+        res.set('Cache-Control', 'no-store');
+        res.json({ url });
+    } catch (err) {
+        console.error('Crew badge upload error:', err);
+        res.status(500).json({ error: 'Could not upload the badge image.' });
+    }
+});
 
 // Health Check — public, unauthenticated (for uptime/platform monitors).
 // NOTE: the site is staff-only, so the homepage ("/") is gated below; point any
