@@ -992,18 +992,33 @@ const callsignAirlineBase = (raw) => {
     return clean || null;
 };
 
-// Does this LIVE callsign DECLARE a VA identity? True only for the strict VA
-// shape "<base> <number>VA" (case-insensitive; number may use "#" placeholders;
-// the space before VA is optional) — the same shape callsignMatchesVaBase keys
-// on. When it does, the base it declares is the airline the pilot is *visibly*
-// flying for right now, and we return that base (e.g. "Oceanic 123VA" ->
-// "OCEANIC"). A generic/personal callsign ("N123AB", "Heavy 747", "Oceanic 100"
-// with no VA tag) declares nothing and returns null. Used to stop roster
-// attribution from handing a flight to a partner VA when the callsign plainly
-// belongs to a DIFFERENT VA — see resolveVaEventPartnerByRoster.
+// Reduce ANY callsign — live or a stored base — to its airline base, dropping a
+// trailing flight number and/or VA-style tag. Tag-agnostic: not every VA flies
+// under "VA"; some use "VG" or another short tag, so we strip any 2–3 letter
+// group rather than the literal "VA". A separator (space or "#") is required
+// before a bare tag so multi-word bases aren't truncated:
+//   "Oceanic 124VG" -> "OCEANIC"   "OCEANIC ##VA" -> "OCEANIC"
+//   "OCEANIC"       -> "OCEANIC"   "AIR CANADA"   -> "AIR CANADA"
+const callsignBaseOnly = (raw) => {
+    let s = String(raw || '').trim().toUpperCase();
+    s = s.replace(/\s+[0-9#]+\s*[A-Z]{0,3}$/, ''); // " 124VG" / " 12" / " 007VA"
+    s = s.replace(/\s*#+\s*[A-Z]{2,3}$/, '');       // "##VA" / " ##VG"
+    s = s.replace(/\s+[A-Z]{2,3}$/, '');            // " VA" / " VG"
+    return s.trim() || null;
+};
+
+// Does this LIVE callsign DECLARE a VA identity? True for the VA shape
+// "<base> <number><tag>" where <tag> is a 2–3 letter group (VA, VG, …) — NOT
+// hardcoded to "VA", because VAs fly under different tags. The tag is REQUIRED:
+// that's what separates a VA callsign from a generic/personal one ("N123AB",
+// "Heavy 747", "Speedbird 100"), which declare nothing and return null so the
+// roster still catches them. When it matches, we return the declared base — the
+// airline the pilot is *visibly* flying for right now (e.g. "Oceanic 123VG" ->
+// "OCEANIC"). Used to stop roster attribution from handing a flight to a VA the
+// callsign plainly doesn't belong to — see resolveVaEventPartnerByRoster.
 const callsignDeclaredVaBase = (raw) => {
     const cs = String(raw || '').trim().toUpperCase();
-    const m = cs.match(/^(.+?)\s+[0-9#]+\s*VA$/);
+    const m = cs.match(/^(.+?)\s+[0-9#]+\s*[A-Z]{2,3}$/);
     return m ? m[1].trim() : null;
 };
 
@@ -4924,20 +4939,24 @@ const resolveVaEventPartnerByRoster = async (e) => {
     if (!valid.length) return null;
 
     // GUARD: is the pilot visibly flying under a VA's banner right now? A live
-    // callsign shaped "<base> ###VA" DECLARES an airline (e.g. "Oceanic 123VA"
-    // -> "OCEANIC"). Roster membership must NOT override that: a pilot who's on
-    // partner "SkyHigh"'s roster but is currently flying "Oceanic 123VA" is
-    // flying for Oceanic, not SkyHigh, and their flight must never be posted to
-    // SkyHigh's Discord. So when the callsign declares a VA, only a roster VA
-    // whose OWN stored callsigns match that live callsign may claim it; if none
-    // do, the pilot is flying for someone else entirely — attribute to no one.
-    // A generic/personal callsign declares nothing, so the roster still catches
-    // it (that's the whole point of the roster path).
+    // callsign shaped "<base> <number><tag>" DECLARES an airline (e.g. "Oceanic
+    // 123VG" -> "OCEANIC"), whatever tag the VA uses. Roster membership must NOT
+    // override that: a pilot who's on partner "SkyHigh"'s roster but is currently
+    // flying "Oceanic 123VG" is flying for Oceanic, not SkyHigh, and their flight
+    // must never be posted to SkyHigh's Discord. So when the callsign declares a
+    // VA, only a roster VA that OPERATES that base — the declared base equals one
+    // of the VA's own registered callsign bases, which is how a codeshare the VA
+    // has listed still counts — may claim it. If none do, the pilot is flying for
+    // someone else entirely, so attribute to no one. The comparison is on the
+    // BASE (tag-agnostic), so it doesn't matter whether the VA or the flight uses
+    // "VA", "VG" or anything else. A generic/personal callsign declares nothing,
+    // so the roster still catches it (that's the whole point of the roster path).
     const declaredBase = callsignDeclaredVaBase(e.callsign);
     if (declaredBase) {
-        const onBanner = valid.filter((a) => matchVaCallsign(e.callsign, a.callsigns || []));
+        const onBanner = valid.filter((a) =>
+            (a.callsigns || []).some((c) => callsignBaseOnly(c) === declaredBase));
         if (!onBanner.length) {
-            console.log(`[va-events] roster suppressed: pilot "${e.username}" is flying "${e.callsign}" (declares "${declaredBase}"), which matches none of their opted-in rosters — not their VA`);
+            console.log(`[va-events] roster suppressed: pilot "${e.username}" is flying "${e.callsign}" (declares "${declaredBase}"), which none of their opted-in VAs operate — not their VA`);
             return null;
         }
         valid = onBanner;
