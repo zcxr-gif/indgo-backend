@@ -61,9 +61,13 @@ function sanitizeRoles(arr) {
 }
 function sanitizeFleet(arr) {
     if (!Array.isArray(arr)) return null;
+    // `type` holds the aircraft name and `name` the livery — both are meant to be
+    // the canonical Infinite Flight API strings (offered by the fleet editor) so
+    // the tracker can match live flights to the fleet. Canonical aircraft names
+    // ("Boeing 787-10 Dreamliner") run long, so type is clamped generously.
     return arr.slice(0, 100).map(a => ({
-        type: clampStr(a && a.type, 30),
-        name: clampStr(a && a.name, 60),
+        type: clampStr(a && a.type, 60),
+        name: clampStr(a && a.name, 80),
         image: cleanImageUrl(a && a.image),
     })).filter(a => a.type || a.name);
 }

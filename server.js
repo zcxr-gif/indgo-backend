@@ -1323,6 +1323,53 @@ registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, 
 // Crew Center sign-in routes (POST /api/crew/:slug/login, GET /api/crew/:slug/me).
 registerCrewAuthRoutes(app);
 
+// ---- Infinite Flight aircraft + livery reference ----
+// The crew center fleet builder lets a VA declare which aircraft/liveries they
+// operate. For the tracker to attribute live flights to that fleet, the names a
+// VA types have to be the SAME canonical strings the live API reports. We proxy
+// the ACARS backend's /api/metadata (the single source of truth for aircraft and
+// livery names) and reshape it into { aircraft:[names], liveries:{ name:[…] } }
+// so the fleet editor can offer exact matches instead of free text. Cached in
+// memory because the catalogue changes only when IF ships an update.
+let _acMetaCache = { at: 0, data: null };
+const AC_META_TTL = 6 * 60 * 60 * 1000; // 6h
+async function loadAircraftMetadata() {
+    if (_acMetaCache.data && (Date.now() - _acMetaCache.at) < AC_META_TTL) return _acMetaCache.data;
+    const resp = await axios.get(`${ACARS_BACKEND_URL}/api/metadata`, { timeout: 8000 });
+    const j = resp?.data || {};
+    if (!j.ok) throw new Error('metadata upstream not ok');
+    // aircraft: canonical type names (sorted, de-duped).
+    const aircraft = [...new Set((j.aircraft || []).map(a => String(a && a.name || '').trim()).filter(Boolean))]
+        .sort((a, b) => a.localeCompare(b));
+    // liveries: keyed by their aircraft name so the editor can filter per type.
+    const liveries = {};
+    for (const l of (j.liveries || [])) {
+        const ac = String(l && l.aircraftName || '').trim();
+        const name = String(l && l.name || '').trim();
+        if (!ac || !name) continue;
+        (liveries[ac] = liveries[ac] || []).push(name);
+    }
+    for (const ac of Object.keys(liveries)) {
+        liveries[ac] = [...new Set(liveries[ac])].sort((a, b) => a.localeCompare(b));
+    }
+    const data = { aircraft, liveries };
+    _acMetaCache = { at: Date.now(), data };
+    return data;
+}
+// Public reference — no auth. Reference data the fleet builder reads.
+app.get('/api/crew/aircraft-metadata', async (req, res) => {
+    try {
+        const data = await loadAircraftMetadata();
+        res.set('Cache-Control', 'public, max-age=3600');
+        res.json({ ok: true, ...data });
+    } catch (err) {
+        console.error('aircraft-metadata error:', err?.message || err);
+        // Serve a stale copy rather than nothing if we have one.
+        if (_acMetaCache.data) return res.json({ ok: true, stale: true, ..._acMetaCache.data });
+        res.status(502).json({ ok: false, error: 'Aircraft metadata unavailable.', aircraft: [], liveries: {} });
+    }
+});
+
 // ---- Crew roster (managed storage) ----
 async function resolveCrewVa(slug) {
     const raw = String(slug || '').trim().toLowerCase();
