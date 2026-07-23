@@ -229,6 +229,7 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     crewEmailDomain: { type: String, trim: true, default: '' },     // Mailgun sending domain
     crewEmailRegion: { type: String, enum: ['us', 'eu'], default: 'us' }, // Mailgun region
     crewEmailKey: { type: String, default: '', select: false },     // API key / server token (secret)
+    crewEmailConfigured: { type: Boolean, default: false },          // non-secret mirror: is BYO email ready to send?
 
     // --- The VA's own Supabase project (bring-your-own data store) ---
     // The VA connects their Supabase in owner onboarding; their crew data lives
@@ -521,14 +522,9 @@ async function postCrewNotice(url, { title, description, color, fields }) {
     } catch (err) { console.error('crew webhook post failed:', err?.message || err); return false; }
 }
 // ---- Crew Center applicant emails ----
-// Sent via Resend's HTTPS API (no SMTP needed). Configure with env:
-//   RESEND_API_KEY   — required; without it every send is a graceful no-op
-//   CREW_EMAIL_FROM  — the From header (a domain verified with the provider)
-// The From MUST be an Inflight-controlled address; the VA's name goes in the
-// subject/body and their contactEmail (if any) becomes Reply-To, so replies
-// reach the VA directly.
-const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
-const CREW_EMAIL_FROM = process.env.CREW_EMAIL_FROM || 'Inflight Crew Center <crew@inflight.info>';
+// Email is strictly bring-your-own: there is NO platform sending account. A VA
+// that wants applicant emails plugs in their own provider (below); otherwise no
+// email is ever sent and applicants rely on the status page.
 const SITE_ORIGIN = (process.env.CREW_SITE_ORIGIN || 'https://inflight.info').replace(/\/+$/, '');
 const CREW_EMAIL_PROVIDERS = ['resend', 'sendgrid', 'postmark', 'mailgun'];
 const escHtml = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -583,19 +579,16 @@ async function sendCrewEmail(cfg, { to, subject, html, replyTo }) {
         return true;
     } catch (err) { console.error(`crew email failed (${cfg.provider}):`, err?.response?.data || err?.message || err); return false; }
 }
-// Resolve the email config for a VA: their OWN provider if configured, else the
-// platform Resend key (env). Returns null when neither is available (email off).
+// Resolve the email config for a VA: their OWN provider if configured, else null
+// (email off — there is no platform fallback).
 async function crewEmailConfigFor(vaId) {
     let doc = null;
     try { doc = await VirtualAirlineAd.findById(vaId).select('+crewEmailKey crewEmailProvider crewEmailFrom crewEmailReplyTo crewEmailDomain crewEmailRegion contactEmail').lean(); } catch { /* fall through */ }
     if (doc && doc.crewEmailProvider && doc.crewEmailKey && doc.crewEmailFrom) {
         return {
-            own: true, provider: doc.crewEmailProvider, key: doc.crewEmailKey, from: doc.crewEmailFrom,
+            provider: doc.crewEmailProvider, key: doc.crewEmailKey, from: doc.crewEmailFrom,
             replyTo: doc.crewEmailReplyTo || doc.contactEmail || '', domain: doc.crewEmailDomain || '', region: doc.crewEmailRegion || 'us',
         };
-    }
-    if (RESEND_API_KEY) {
-        return { own: false, provider: 'resend', key: RESEND_API_KEY, from: CREW_EMAIL_FROM, replyTo: (doc && doc.contactEmail) || '', domain: '', region: 'us' };
     }
     return null;
 }
@@ -1687,7 +1680,6 @@ app.get('/api/crew/:slug/email', async (req, res) => {
             region: (doc && doc.crewEmailRegion) || 'us',
             keyHint: maskKey(doc && doc.crewEmailKey),
             configured: !!(doc && doc.crewEmailProvider && doc.crewEmailKey && doc.crewEmailFrom),
-            platformFallback: !!RESEND_API_KEY,
         });
     } catch (err) { console.error('crew email get error:', err); res.status(500).json({ error: 'Could not load email settings.' }); }
 });
@@ -1723,19 +1715,19 @@ app.post('/api/crew/:slug/email', async (req, res) => {
         if (b.region !== undefined) ad.crewEmailRegion = b.region === 'eu' ? 'eu' : 'us';
         // Only overwrite the key when a non-empty one is sent (blank means "keep").
         if (typeof b.apiKey === 'string' && b.apiKey.trim()) ad.crewEmailKey = b.apiKey.trim().slice(0, 400);
+        // Keep the non-secret mirror in sync for the public join page.
+        ad.crewEmailConfigured = !!(ad.crewEmailProvider && ad.crewEmailKey && ad.crewEmailFrom);
         await ad.save();
 
         if (b.test) {
             const to = isEmail(b.testTo) ? String(b.testTo).trim() : (ad.contactEmail || '');
             if (!isEmail(to)) return res.status(400).json({ error: 'Enter a valid address to send the test to.' });
-            const cfg = ad.crewEmailProvider && ad.crewEmailKey && ad.crewEmailFrom
-                ? { own: true, provider: ad.crewEmailProvider, key: ad.crewEmailKey, from: ad.crewEmailFrom, replyTo: ad.crewEmailReplyTo || ad.contactEmail || '', domain: ad.crewEmailDomain || '', region: ad.crewEmailRegion || 'us' }
-                : await crewEmailConfigFor(ad._id);
+            const cfg = { provider: ad.crewEmailProvider, key: ad.crewEmailKey, from: ad.crewEmailFrom, replyTo: ad.crewEmailReplyTo || ad.contactEmail || '', domain: ad.crewEmailDomain || '', region: ad.crewEmailRegion || 'us' };
             if (!emailCfgReady(cfg)) return res.status(400).json({ error: 'Add a provider, From address and API key first.' });
             const ok = await sendCrewEmail(cfg, {
                 to, subject: `${ad.name || 'Crew Center'} — email test`,
                 html: crewEmailHtml({ vaName: ad.name, accent: ad.crewAccent, heading: 'Email is working 🎉',
-                    bodyHtml: `This is a test from your Crew Center. Applicant notifications will be delivered ${cfg.own ? 'through your own provider' : 'via Inflight'}.` }),
+                    bodyHtml: 'This is a test from your Crew Center. Applicant notifications will be delivered through your own provider.' }),
             });
             if (!ok) return res.status(502).json({ error: 'The provider rejected the test — double-check the From address, API key and (for Mailgun) the sending domain.' });
         }
@@ -1743,7 +1735,7 @@ app.post('/api/crew/:slug/email', async (req, res) => {
         res.json({
             provider: ad.crewEmailProvider || '', from: ad.crewEmailFrom || '', replyTo: ad.crewEmailReplyTo || '',
             domain: ad.crewEmailDomain || '', region: ad.crewEmailRegion || 'us', keyHint: maskKey(ad.crewEmailKey),
-            configured: !!(ad.crewEmailProvider && ad.crewEmailKey && ad.crewEmailFrom), platformFallback: !!RESEND_API_KEY,
+            configured: ad.crewEmailConfigured,
         });
     } catch (err) { console.error('crew email set error:', err); res.status(500).json({ error: 'Could not save email settings.' }); }
 });
@@ -3340,7 +3332,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles crewFleet joinMode minGrade callsignPrefix applicationForm joinRequirements supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles crewFleet joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -3380,6 +3372,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
                 callsignPrefix: ad.callsignPrefix || ad.callsign || '',
                 form: Array.isArray(ad.applicationForm) ? ad.applicationForm : [],
                 requirements: Array.isArray(ad.joinRequirements) ? ad.joinRequirements : [],
+                emailEnabled: !!ad.crewEmailConfigured,
             },
             // Public Supabase connection (never the secret service key).
             supabase: {
