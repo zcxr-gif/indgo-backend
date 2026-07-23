@@ -23,6 +23,29 @@ const TOKEN_TTL = '7d';
 // Known layout presets (mirrors the crew center front-end).
 const CREW_LAYOUTS = ['editorial', 'console', 'split', 'classic'];
 
+const isHexColor = (c) => /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(c || '');
+const clampStr = (s, n) => String(s == null ? '' : s).trim().slice(0, n);
+
+// Sanitize the VA-defined rank ladder / role list before saving.
+function sanitizeRanks(arr) {
+    if (!Array.isArray(arr)) return null;
+    return arr.slice(0, 40).map(r => ({
+        name: clampStr(r && r.name, 40),
+        minHours: Math.max(0, Math.min(100000, Number(r && r.minHours) || 0)),
+        color: isHexColor(r && r.color) ? r.color : '',
+        icon: clampStr(r && r.icon, 30),
+    })).filter(r => r.name).sort((a, b) => a.minHours - b.minHours);
+}
+function sanitizeRoles(arr) {
+    if (!Array.isArray(arr)) return null;
+    return arr.slice(0, 40).map(r => ({
+        name: clampStr(r && r.name, 40),
+        color: isHexColor(r && r.color) ? r.color : '',
+        icon: clampStr(r && r.icon, 30),
+        staff: !!(r && r.staff),
+    })).filter(r => r.name);
+}
+
 // Which dashboard a role routes to.
 function viewForRole(role) {
     return role === 'pilot' ? 'pilot' : 'owner';
@@ -151,9 +174,20 @@ function registerCrewAuthRoutes(app) {
                 }
                 ad.crewAccent = a; // '' clears it (falls back to the derived accent)
             }
+            if (req.body?.ranks !== undefined) {
+                const r = sanitizeRanks(req.body.ranks);
+                if (r) ad.ranks = r;
+            }
+            if (req.body?.roles !== undefined) {
+                const r = sanitizeRoles(req.body.roles);
+                if (r) ad.roles = r;
+            }
             await ad.save();
             res.set('Cache-Control', 'no-store');
-            res.json({ layout: ad.layout, allowedLayouts: ad.allowedLayouts, accent: ad.crewAccent || '' });
+            res.json({
+                layout: ad.layout, allowedLayouts: ad.allowedLayouts, accent: ad.crewAccent || '',
+                ranks: ad.ranks || [], roles: ad.roles || [],
+            });
         } catch (err) {
             console.error('Crew settings error:', err);
             res.status(500).json({ error: 'Could not save settings.' });
