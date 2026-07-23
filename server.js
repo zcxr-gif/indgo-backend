@@ -1617,6 +1617,89 @@ app.delete('/api/crew/:slug/routes/:id', async (req, res) => {
     } catch (err) { console.error('route delete error:', err); res.status(500).json({ error: 'Could not remove the route.' }); }
 });
 
+// Great-circle distance (nautical miles) between two [lat, lon] points. Used to
+// backfill a route's distance for the map when the VA didn't enter one.
+const greatCircleNm = (a, b) => {
+    if (!a || !b) return 0;
+    const toRad = (d) => (d * Math.PI) / 180, R = 3440.065; // earth radius in NM
+    const dLat = toRad(b[0] - a[0]), dLon = toRad(b[1] - a[1]);
+    const s = Math.sin(dLat / 2) ** 2
+        + Math.cos(toRad(a[0])) * Math.cos(toRad(b[0])) * Math.sin(dLon / 2) ** 2;
+    return Math.round(2 * R * Math.asin(Math.min(1, Math.sqrt(s))));
+};
+
+// Public: the VA's route network shaped for the map view. Same routes as
+// /routes, but each endpoint is resolved to coordinates (from AIRPORT_COORDS)
+// and the network is summarised (airport nodes with degree, hubs, longest leg,
+// total distance). Routes whose airports we can't place still come back — with
+// null coords and counted as `unmapped` — so the UI can show "3 routes not on
+// the map yet" rather than silently dropping them. The list isn't sensitive, so
+// (like /routes) we return drafts too and let the client filter for pilots.
+app.get('/api/crew/:slug/route-map', async (req, res) => {
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const routes = await CrewRoute.find({ vaAdId: va._id })
+            .sort({ flightNumber: 1, createdAt: -1 }).limit(3000).lean();
+
+        const coordsFor = (icao) => {
+            const c = AIRPORT_COORDS[String(icao || '').toUpperCase()];
+            return (Array.isArray(c) && c.length >= 2) ? [c[0], c[1]] : null;
+        };
+        const airports = new Map(); // icao -> { icao, lat, lon, dep, arr }
+        const touch = (icao, coord, kind) => {
+            if (!icao) return;
+            let a = airports.get(icao);
+            if (!a) { a = { icao, lat: coord ? coord[0] : null, lon: coord ? coord[1] : null, dep: 0, arr: 0 }; airports.set(icao, a); }
+            a[kind]++;
+        };
+
+        let unmapped = 0, longest = null, totalDistanceNm = 0;
+        const outRoutes = routes.map((r) => {
+            const o = coordsFor(r.origin), d = coordsFor(r.destination);
+            touch(r.origin, o, 'dep');
+            touch(r.destination, d, 'arr');
+            const mapped = !!(o && d);
+            if (!mapped) unmapped++;
+            const distanceNm = r.distanceNm || (mapped ? greatCircleNm(o, d) : 0);
+            if (r.active && mapped) {
+                totalDistanceNm += distanceNm;
+                if (!longest || distanceNm > longest.distanceNm) {
+                    longest = { origin: r.origin, destination: r.destination, distanceNm };
+                }
+            }
+            return {
+                id: r._id, flightNumber: r.flightNumber, origin: r.origin, destination: r.destination,
+                aircraft: r.aircraft, distanceNm, notes: r.notes, active: r.active,
+                o, d, mapped,
+            };
+        });
+
+        const nodes = [...airports.values()].map((a) => ({
+            ...a, routes: a.dep + a.arr, mapped: a.lat != null,
+        }));
+        const hubs = nodes.filter(n => n.mapped)
+            .sort((a, b) => b.routes - a.routes).slice(0, 5)
+            .map(n => ({ icao: n.icao, routes: n.routes }));
+        const activeMapped = outRoutes.filter(r => r.active && r.mapped).length;
+
+        res.json({
+            routes: outRoutes,
+            airports: nodes,
+            stats: {
+                total: routes.length,
+                active: outRoutes.filter(r => r.active).length,
+                mapped: activeMapped,
+                unmapped,
+                airports: nodes.filter(n => n.mapped).length,
+                hubs,
+                longest,
+                totalDistanceNm,
+            },
+        });
+    } catch (err) { console.error('route-map error:', err); res.status(500).json({ error: 'Could not load the route map.' }); }
+});
+
 // ---- Flight reports (PIREPs) — auto-captured from real IF history ----
 const _norm = (s) => String(s || '').trim().toLowerCase();
 // Loose aircraft-name match. Fleet types are the canonical IF names now, so an
