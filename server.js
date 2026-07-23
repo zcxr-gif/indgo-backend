@@ -1647,6 +1647,7 @@ const publicPirep = (p) => ({
     aircraftName: p.aircraftName, liveryName: p.liveryName,
     durationMin: p.durationMin, landings: p.landings, xp: p.xp, violations: p.violations,
     distanceNm: p.distanceNm, server: p.server, inFleet: p.inFleet,
+    routeMatched: !!p.routeId,   // did this leg match a route in the network?
     source: p.source, status: p.status, flownAt: p.flownAt, createdAt: p.createdAt,
 });
 
@@ -1668,6 +1669,64 @@ app.get('/api/crew/:slug/pireps', async (req, res) => {
         const pireps = await CrewPirep.find(q).sort({ flownAt: -1, createdAt: -1 }).limit(500).lean();
         res.json({ pireps: pireps.map(publicPirep), canReview: isManager });
     } catch (err) { console.error('pireps list error:', err); res.status(500).json({ error: 'Could not load flights.' }); }
+});
+
+// File a PIREP by hand. Any signed-in crew member of this VA can submit one.
+// Crucially we compare the filed leg against the CURRENT route network to decide
+// whether it's a real route: an active route with the same origin+destination
+// (preferring an aircraft match) attaches its id + flight number, and the reply
+// tells the caller whether the route checked out. Manual reports always land as
+// pending for staff review.
+app.post('/api/crew/:slug/pireps', async (req, res) => {
+    const p = verifyCrewRequest(req);
+    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+    if (p.kind !== 'inflight' && p.slug && p.slug !== String(req.params.slug).toLowerCase()) {
+        return res.status(403).json({ error: 'Wrong crew center.' });
+    }
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const b = req.body || {};
+        const icao = (v) => String(v || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
+        const origin = icao(b.origin), destination = icao(b.destination);
+        if (!origin || !destination) return res.status(400).json({ error: 'Enter both a departure and an arrival airport.' });
+        const aircraftName = String(b.aircraftName || b.aircraft || '').trim().slice(0, 60);
+        const liveryName = String(b.liveryName || b.livery || '').trim().slice(0, 80);
+        // Duration accepts either a minutes number or hours+minutes fields.
+        let durationMin = Math.round(Number(b.durationMin) || 0);
+        if (!durationMin && (b.hours || b.minutes)) durationMin = Math.round((Number(b.hours) || 0) * 60 + (Number(b.minutes) || 0));
+        durationMin = Math.max(0, Math.min(100000, durationMin));
+        const landings = Math.max(0, Math.min(100, Math.round(Number(b.landings) || 0)));
+
+        // Optional: attribute to a roster pilot (so approving can credit hours).
+        let member = null;
+        if (b.memberId) member = await CrewMember.findOne({ _id: b.memberId, vaAdId: va._id }).lean();
+
+        // Compare against the current network to judge whether the route is real.
+        const vaFull = await VirtualAirlineAd.findById(va._id).select('crewFleet').lean();
+        const routes = await CrewRoute.find({ vaAdId: va._id, active: true }).limit(3000).lean();
+        const route = matchRoute(routes, origin, destination, aircraftName);
+        const inFleet = pirepInFleet((vaFull && vaFull.crewFleet) || [], aircraftName);
+        // If the pilot typed a flight number, note when it disagrees with the route's.
+        const claimedFlight = String(b.flightNumber || '').trim().slice(0, 12);
+        const flightNumberMismatch = !!(route && route.flightNumber && claimedFlight && _norm(route.flightNumber) !== _norm(claimedFlight));
+
+        const doc = await CrewPirep.create({
+            vaAdId: va._id, memberId: (member && member._id) || null, routeId: (route && route._id) || null,
+            pilotName: (member && member.name) || p.name || '', callsign: String(b.callsign || (member && member.callsign) || '').slice(0, 20),
+            flightNumber: (route && route.flightNumber) || claimedFlight, ifUserId: (member && member.ifUserId) || '',
+            origin, destination, aircraftName, liveryName,
+            durationMin, landings, distanceNm: (route && route.distanceNm) || 0,
+            inFleet, source: 'manual', status: 'pending',
+            flownAt: b.flownAt ? new Date(b.flownAt) : new Date(),
+        });
+        res.status(201).json({
+            pirep: publicPirep(doc),
+            routeMatched: !!route,
+            flightNumberMismatch,
+            route: route ? { id: route._id, flightNumber: route.flightNumber, origin: route.origin, destination: route.destination, aircraft: route.aircraft } : null,
+        });
+    } catch (err) { console.error('pirep file error:', err); res.status(500).json({ error: 'Could not file the flight.' }); }
 });
 
 // Auto-capture: pull each linked pilot's recent IF flights and turn any we
