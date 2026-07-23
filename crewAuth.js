@@ -76,6 +76,21 @@ function sanitizeForm(arr) {
         required: !!(q && q.required),
     })).filter(q => q.label);
 }
+// Extensible join requirements. Numeric-threshold types are auto-checked
+// against real IF stats; 'agree' is a custom checkbox the applicant must tick.
+const REQ_TYPES = ['grade', 'hours', 'landings', 'xp', 'flights', 'violations', 'agree'];
+function sanitizeRequirements(arr) {
+    if (!Array.isArray(arr)) return null;
+    return arr.slice(0, 20).map(r => {
+        const type = REQ_TYPES.includes(r && r.type) ? r.type : 'agree';
+        if (type === 'agree') {
+            return { type, value: 0, label: clampStr(r && r.label, 200), required: r && r.required === false ? false : true };
+        }
+        // grade caps at 5; the rest are open-ended non-negative integers.
+        const cap = type === 'grade' ? 5 : 10000000;
+        return { type, value: Math.max(0, Math.min(cap, Math.round(Number(r && r.value) || 0))), label: clampStr(r && r.label, 200), required: true };
+    }).filter(r => (r.type === 'agree' ? r.label : r.value > 0));
+}
 
 // Which dashboard a role routes to.
 function viewForRole(role) {
@@ -222,7 +237,7 @@ function registerCrewAuthRoutes(app) {
             }
             if (req.body?.fleet !== undefined) {
                 const f = sanitizeFleet(req.body.fleet);
-                if (f) ad.fleet = f;
+                if (f) ad.crewFleet = f;
             }
             if (typeof req.body?.joinMode === 'string' && ['free', 'application'].includes(req.body.joinMode)) {
                 ad.joinMode = req.body.joinMode;
@@ -237,12 +252,23 @@ function registerCrewAuthRoutes(app) {
                 const f = sanitizeForm(req.body.applicationForm);
                 if (f) ad.applicationForm = f;
             }
+            if (req.body?.joinRequirements !== undefined) {
+                const r = sanitizeRequirements(req.body.joinRequirements);
+                if (r) {
+                    ad.joinRequirements = r;
+                    // Keep minGrade mirrored from a grade requirement so the public
+                    // directory + legacy gate stay in sync with the builder.
+                    const g = r.find(x => x.type === 'grade');
+                    if (g) ad.minGrade = Math.max(0, Math.min(5, g.value));
+                }
+            }
             await ad.save();
             res.set('Cache-Control', 'no-store');
             res.json({
                 layout: ad.layout, allowedLayouts: ad.allowedLayouts, accent: ad.crewAccent || '',
-                loginLook: ad.loginLook || 'center', ranks: ad.ranks || [], roles: ad.roles || [], fleet: ad.fleet || [],
-                joinMode: ad.joinMode, minGrade: ad.minGrade, callsignPrefix: ad.callsignPrefix || '', applicationForm: ad.applicationForm || [],
+                loginLook: ad.loginLook || 'center', ranks: ad.ranks || [], roles: ad.roles || [], fleet: ad.crewFleet || [],
+                joinMode: ad.joinMode, minGrade: ad.minGrade, callsignPrefix: ad.callsignPrefix || '',
+                applicationForm: ad.applicationForm || [], joinRequirements: ad.joinRequirements || [],
             });
         } catch (err) {
             console.error('Crew settings error:', err);

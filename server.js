@@ -196,15 +196,24 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     ranks: { type: [{ _id: false, name: String, minHours: Number, color: String, icon: String, image: String }], default: [] },
     roles: { type: [{ _id: false, name: String, color: String, icon: String, image: String, staff: Boolean }], default: [] },
     // The VA's fleet — aircraft they operate (name/type + optional livery image).
-    fleet: { type: [{ _id: false, type: String, name: String, image: String }], default: [] },
+    // NOTE: named crewFleet (not fleet) to avoid colliding with the older
+    // directory-level `fleet: [String]` field further down this schema.
+    crewFleet: { type: [{ _id: false, type: String, name: String, image: String }], default: [] },
 
     // --- Recruitment / join settings ---
     // joinMode: 'free' = instant account; 'application' = staff review.
     joinMode: { type: String, enum: ['free', 'application'], default: 'application' },
-    minGrade: { type: Number, default: 0, min: 0, max: 5 },   // 0 = no grade requirement
     callsignPrefix: { type: String, trim: true, default: '' }, // default prefix for pilot callsigns
     // A staff-built application form: ordered questions.
     applicationForm: { type: [{ _id: false, label: String, type: String, options: [String], required: Boolean }], default: [] },
+    // Extensible join requirements. Auto types are checked against the
+    // applicant's REAL Infinite Flight stats (verified through our tooling);
+    // 'agree' is a custom checkbox the applicant must tick.
+    //   type: 'grade'|'hours'|'landings'|'xp'|'flights'|'violations'|'agree'
+    //   value: numeric threshold (min for most, MAX for 'violations')
+    //   label: custom text (used by 'agree', optional note for others)
+    //   required: for 'agree', whether ticking is mandatory
+    joinRequirements: { type: [{ _id: false, type: String, value: Number, label: String, required: Boolean }], default: [] },
 
     // --- The VA's own Supabase project (bring-your-own data store) ---
     // The VA connects their Supabase in owner onboarding; their crew data lives
@@ -236,8 +245,8 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     fleet: { type: [String], default: [] },                         // aircraft types operated
     pilotCount: { type: Number, default: 0, min: 0 },
     recruiting: { type: Boolean, default: true },                   // currently accepting applications?
-    minGrade: { type: Number, default: null, min: 1, max: 5 },      // IF grade requirement (1-5), if any
-    requirements: { type: String, trim: true, default: '' },        // free-text joining requirements
+    minGrade: { type: Number, default: 0, min: 0, max: 5 },         // IF grade requirement; 0 = none (single source of truth)
+    requirements: { type: String, trim: true, default: '' },        // free-text joining requirements (directory display)
     tags: { type: [String], default: [] },                          // searchable keywords
 
     // --- Ownership / contact (who submitted) ---
@@ -433,22 +442,71 @@ async function verifyIfUser(name) {
             userId: String(u.userId),
             username: String(u.discourseUsername || q),
             grade: Number.isFinite(u.grade) ? Number(u.grade) : null,
+            stats: null,
         };
-        // 2) Grade is authoritative from stats when the lookup didn't carry it.
-        if (out.grade == null) {
-            try {
-                const stats = await axios.get(`${ACARS_BACKEND_URL}/api/users/${encodeURIComponent(out.userId)}/stats`, { timeout: 8000 });
-                const s = stats?.data?.stats || stats?.data?.gradeInfo || stats?.data;
-                const gi = s?.gradeDetails?.gradeIndex;
+        // 2) Pull the account's real stats (grade + hours/landings/xp/…) so we
+        // can gate on them. Best-effort: existence is what matters most.
+        try {
+            const resp = await axios.get(`${ACARS_BACKEND_URL}/api/users/${encodeURIComponent(out.userId)}/stats`, { timeout: 8000 });
+            const s = resp?.data?.stats || resp?.data?.gradeInfo || resp?.data || {};
+            const gi = s?.gradeDetails?.gradeIndex;
+            if (out.grade == null) {
                 if (Number.isFinite(gi)) out.grade = Number(gi);
                 else if (Number.isFinite(s?.grade)) out.grade = Number(s.grade);
-            } catch (_) { /* grade stays null; account existence is what matters */ }
-        }
+            }
+            const viol = Number.isFinite(s?.violations) ? Number(s.violations)
+                : ((s?.violationCountByLevel?.level1 || 0) + (s?.violationCountByLevel?.level2 || 0) + (s?.violationCountByLevel?.level3 || 0));
+            out.stats = {
+                grade: out.grade,
+                hours: Math.floor((Number(s?.flightTime) || 0) / 60),   // flightTime is minutes
+                landings: Number(s?.landingCount) || 0,
+                xp: Number(s?.totalXP ?? s?.xp) || 0,
+                flights: Number(s?.onlineFlights) || 0,
+                violations: viol,
+            };
+        } catch (_) { /* stats unavailable; out.stats stays null */ }
         return out;
     } catch (err) {
         console.error('verifyIfUser error:', err?.message || err);
         return { ok: false, reason: 'unreachable' };
     }
+}
+
+// Evaluate a VA's join requirements against an applicant. `stats` is the real
+// IF stat block from verifyIfUser (or null when unavailable); `agreed` is the
+// set of agreement labels the applicant ticked. Returns { ok, autoChecked,
+// failures:[{type,label,need,have,cmp}] }.
+const REQ_META = {
+    grade:      { label: 'Grade',        cmp: 'min', stat: 'grade' },
+    hours:      { label: 'Flight hours', cmp: 'min', stat: 'hours' },
+    landings:   { label: 'Landings',     cmp: 'min', stat: 'landings' },
+    xp:         { label: 'XP',           cmp: 'min', stat: 'xp' },
+    flights:    { label: 'Online flights', cmp: 'min', stat: 'flights' },
+    violations: { label: 'Violations',   cmp: 'max', stat: 'violations' },
+};
+function evaluateRequirements(reqs, stats, agreed) {
+    const failures = [];
+    let autoChecked = false;
+    const agreedSet = new Set((agreed || []).map(x => String(x).trim().toLowerCase()));
+    for (const r of (reqs || [])) {
+        if (r.type === 'agree') {
+            if (r.required && !agreedSet.has(String(r.label || '').trim().toLowerCase())) {
+                failures.push({ type: 'agree', label: r.label || 'Agreement', need: 'accepted', have: 'not accepted', cmp: 'agree' });
+            }
+            continue;
+        }
+        const meta = REQ_META[r.type];
+        if (!meta) continue;
+        autoChecked = true;
+        if (!stats) { // can't verify this numeric requirement right now
+            failures.push({ type: r.type, label: meta.label, need: r.value, have: null, cmp: meta.cmp, unverified: true });
+            continue;
+        }
+        const have = Number(stats[meta.stat]) || 0;
+        const pass = meta.cmp === 'max' ? have <= r.value : have >= r.value;
+        if (!pass) failures.push({ type: r.type, label: meta.label, need: r.value, have, cmp: meta.cmp });
+    }
+    return { ok: failures.length === 0, autoChecked, failures };
 }
 
 /* =========================
@@ -1193,10 +1251,11 @@ app.delete('/api/crew/:slug/roster/:id', async (req, res) => {
 app.post('/api/crew/:slug/apply', async (req, res) => {
     try {
         const raw = String(req.params.slug || '').trim().toLowerCase();
+        const applyFields = '_id joinMode minGrade callsignPrefix callsign applicationForm joinRequirements';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
-            .select('_id joinMode minGrade callsignPrefix callsign applicationForm').lean();
+            .select(applyFields).lean();
         if (!ad) ad = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' })
-            .select('_id joinMode minGrade callsignPrefix callsign applicationForm').lean();
+            .select(applyFields).lean();
         if (!ad) return res.status(404).json({ error: 'Crew center not found.' });
 
         const b = req.body || {};
@@ -1221,8 +1280,29 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
         }
         // (check.ok === false → service unreachable → proceed unverified.)
 
-        if (ad.minGrade && grade && grade < ad.minGrade) {
-            return res.status(403).json({ error: `This VA requires Grade ${ad.minGrade} or higher${ifVerified ? ` — your account is Grade ${grade}.` : '.'}` });
+        // Assemble the effective requirement set: the extensible list, plus the
+        // legacy minGrade gate folded in (unless a grade requirement is already
+        // present) so old VAs keep working.
+        const reqs = Array.isArray(ad.joinRequirements) ? ad.joinRequirements.slice() : [];
+        if (ad.minGrade > 0 && !reqs.some(r => r.type === 'grade')) reqs.push({ type: 'grade', value: ad.minGrade });
+
+        const stats = check.stats || (ifVerified ? { grade } : null);
+        const agreed = Array.isArray(b.agreed) ? b.agreed.slice(0, 20).map(x => String(x).slice(0, 200)) : [];
+        const evalRes = evaluateRequirements(reqs, stats, agreed);
+        if (!evalRes.ok) {
+            // If the only reason we failed is that IF stats were unavailable, ask
+            // them to retry rather than reject them outright.
+            const onlyUnverified = evalRes.failures.every(f => f.unverified);
+            if (onlyUnverified) {
+                return res.status(422).json({ error: 'We couldn’t reach Infinite Flight to verify your stats. Please try again in a moment.', requirementFailures: evalRes.failures });
+            }
+            const human = evalRes.failures.filter(f => !f.unverified).map(f => {
+                if (f.cmp === 'agree') return `You must accept: “${f.label}”`;
+                const word = f.cmp === 'max' ? 'at most' : 'at least';
+                const have = f.have == null ? '' : ` (you have ${f.have})`;
+                return `${f.label}: ${word} ${f.need}${have}`;
+            });
+            return res.status(403).json({ error: `You don’t meet this VA’s requirements yet — ${human.join('; ')}.`, requirementFailures: evalRes.failures });
         }
         const prefix = (String(b.callsignPrefix || '').trim() || ad.callsignPrefix || ad.callsign || '').slice(0, 10);
         const number = String(b.callsignNumber || '').trim().slice(0, 10);
@@ -1256,7 +1336,7 @@ app.post('/api/crew/:slug/verify-if', async (req, res) => {
         const check = await verifyIfUser(name);
         if (!check.ok) return res.json({ available: false }); // service down; form falls back
         if (!check.found) return res.json({ available: true, found: false });
-        res.json({ available: true, found: true, username: check.username, grade: check.grade });
+        res.json({ available: true, found: true, username: check.username, grade: check.grade, stats: check.stats || null });
     } catch (err) { console.error('verify-if error:', err); res.status(500).json({ error: 'Verification is unavailable right now.' }); }
 });
 
@@ -2918,7 +2998,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles fleet joinMode minGrade callsignPrefix applicationForm supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles crewFleet joinMode minGrade callsignPrefix applicationForm joinRequirements supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -2951,12 +3031,13 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             loginLook: ad.loginLook || 'center',
             ranks: Array.isArray(ad.ranks) ? ad.ranks : [],
             roles: Array.isArray(ad.roles) ? ad.roles : [],
-            fleet: Array.isArray(ad.fleet) ? ad.fleet : [],
+            fleet: Array.isArray(ad.crewFleet) ? ad.crewFleet : [],
             join: {
                 mode: ad.joinMode || 'application',
                 minGrade: ad.minGrade || 0,
                 callsignPrefix: ad.callsignPrefix || ad.callsign || '',
                 form: Array.isArray(ad.applicationForm) ? ad.applicationForm : [],
+                requirements: Array.isArray(ad.joinRequirements) ? ad.joinRequirements : [],
             },
             // Public Supabase connection (never the secret service key).
             supabase: {
@@ -3115,7 +3196,7 @@ app.post('/api/va-ads', requireAuth, uploadVaImages, async (req, res) => {
             fleet: parseListField(req.body.fleet),
             pilotCount: parseInt(req.body.pilotCount, 10) || 0,
             recruiting: req.body.recruiting === undefined ? true : req.body.recruiting !== 'false',
-            minGrade: req.body.minGrade ? parseInt(req.body.minGrade, 10) : null,
+            minGrade: req.body.minGrade ? parseInt(req.body.minGrade, 10) : 0,
             requirements: req.body.requirements,
             tags: parseListField(req.body.tags),
             ownerName: req.body.ownerName || 'Unknown',
@@ -3192,7 +3273,7 @@ app.put('/api/va-ads/:id', requireAuth, uploadVaImages, async (req, res) => {
         if (b.fleet !== undefined) ad.fleet = parseListField(b.fleet);
         if (b.pilotCount !== undefined) ad.pilotCount = parseInt(b.pilotCount, 10) || 0;
         if (b.recruiting !== undefined) ad.recruiting = b.recruiting !== 'false' && b.recruiting !== false;
-        if (b.minGrade !== undefined) ad.minGrade = b.minGrade ? parseInt(b.minGrade, 10) : null;
+        if (b.minGrade !== undefined) ad.minGrade = b.minGrade ? parseInt(b.minGrade, 10) : 0;
         if (b.requirements !== undefined) ad.requirements = b.requirements;
         if (b.tags !== undefined) ad.tags = parseListField(b.tags);
         if (b.ownerName !== undefined) ad.ownerName = b.ownerName || 'Unknown';
