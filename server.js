@@ -1479,6 +1479,59 @@ async function requireCap(req, slug, capability) {
     return { error: 403 };
 }
 
+// Public read — the Virtual Airlines a pilot flies for, resolved from their
+// Infinite Flight identity (community name and/or IF user id). Powers the
+// "Your Virtual Airlines" badges on a Pro pilot's profile. Returns each VA's
+// public branding plus this pilot's role/callsign/hours in it.
+app.get('/api/pilot/vas', async (req, res) => {
+    try {
+        const ifc = String(req.query.ifc || '').trim();
+        const ifUserId = String(req.query.ifUserId || '').trim();
+        if (!ifc && !ifUserId) return res.status(400).json({ error: 'ifc or ifUserId is required.' });
+
+        const or = [];
+        if (ifc) or.push({ ifcName: new RegExp('^' + ifc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
+        if (ifUserId) or.push({ ifUserId });
+
+        const members = await CrewMember.find({ $or: or })
+            .select('vaAdId role callsign hours status')
+            .limit(200).lean();
+        if (!members.length) return res.json({ vas: [] });
+
+        // First membership record wins per VA (a pilot has one row per VA).
+        const byVa = new Map();
+        members.forEach(m => { const k = String(m.vaAdId); if (!byVa.has(k)) byVa.set(k, m); });
+
+        const ads = await VirtualAirlineAd.find({ _id: { $in: [...byVa.keys()] }, status: 'approved' })
+            .select('name slug callsign tagline logoUrl bannerUrl crewAccent websiteUrl')
+            .lean();
+
+        const vas = ads.map(v => {
+            const m = byVa.get(String(v._id)) || {};
+            return {
+                name: v.name || '',
+                slug: v.slug || null,
+                code: v.callsign || null,
+                tagline: v.tagline || '',
+                logo: v.logoUrl || '',
+                banner: v.bannerUrl || '',
+                accent: v.crewAccent || '',
+                website: v.websiteUrl || '',
+                role: m.role || '',
+                callsign: m.callsign || '',
+                hours: m.hours || 0,
+                status: m.status || 'active',
+            };
+        }).sort((a, b) => b.hours - a.hours);
+
+        res.set('Cache-Control', 'public, max-age=120');
+        res.json({ vas });
+    } catch (err) {
+        console.error('pilot vas error:', err);
+        res.status(500).json({ error: 'Could not load Virtual Airlines.' });
+    }
+});
+
 // Public read — the roster is shown on the crew center.
 app.get('/api/crew/:slug/roster', async (req, res) => {
     try {
