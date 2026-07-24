@@ -3557,6 +3557,25 @@ app.get('/api/airport/:icao', (req, res) => {
     res.json({ ok: true, icao, name: icao, latitude, longitude, lat: latitude, lon: longitude });
 });
 
+// Bulk coordinate lookup — resolve many airports in one request so a pilot's
+// whole logbook (potentially thousands of legs → hundreds of unique airports)
+// can be plotted without a request per airport. Public + cacheable; unknown
+// codes are simply omitted. Deduped and capped so a huge body can't hurt us.
+app.post('/api/airports/coords', (req, res) => {
+    const list = Array.isArray(req.body && req.body.icaos) ? req.body.icaos : [];
+    const out = {};
+    let n = 0;
+    for (const raw of list) {
+        if (n >= 3000) break;
+        const icao = String(raw || '').trim().toUpperCase();
+        if (!icao || out[icao]) continue;
+        const c = AIRPORT_COORDS[icao];
+        if (Array.isArray(c) && c.length >= 2) { out[icao] = [c[0], c[1]]; n++; }
+    }
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.json({ coords: out });
+});
+
 /**
  * DELETE: Remove all images/data for an airport
  */
