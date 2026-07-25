@@ -754,6 +754,28 @@ Discord unfurls with the title, VA and aircraft count before redirecting.
   the tracker then offers *Watch live*.
 * Staff can see every published group at `GET /api/admin/group-flights`.
 
+### 13C-i. Events on the live map (opt-in)
+
+A pilot can switch on **Settings → Virtual Airlines → VA Events on Map** and see
+partner VA events pinned to their **departure airport**, with a countdown. It is
+**off by default** — the map is busy enough — and it is a viewer-side choice, not
+something a VA turns on.
+
+What decides whether a VA's event appears:
+
+* It must have a **departure airport set**. No ICAO, no pin — there is nowhere to
+  put it. This is the single most common reason a VA's event is missing.
+* It must start within the **next 72 hours** (or have started in the last 12).
+* Its VA must still be **approved** in the directory.
+* **One pin per airport** — the soonest event at that field wins. Two VAs
+  departing the same hub means only the earlier one is pinned; that is deliberate
+  so a busy hub doesn't stack.
+
+Tapping a pin gives the event, the VA, and two actions: *View VA* (opens the
+partner panel) and — once the VA has published a group flight for that event —
+*Watch live*, which drops the viewer into the same formation view a shared group
+link opens.
+
 ### 13D. VA banners on pilot profiles (free)
 
 Any Inflight pilot — **free account included** — can set their profile banner to

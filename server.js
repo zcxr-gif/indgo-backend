@@ -4495,6 +4495,71 @@ app.get('/api/public/va/:id/events', async (req, res) => {
     }
 });
 
+// GET /api/public/va-events/upcoming — EVERY partner VA's upcoming events in
+// one response, each carrying enough of its VA (name, logo, accent) to be drawn
+// without a second lookup.
+//
+// The per-VA route above is the right shape for a VA's own site; the live map
+// needs the opposite — every VA at once — and asking it per VA would be one
+// request per partner on a map that may be showing dozens. Only events with a
+// departure airport are returned, since a map pin has to go somewhere.
+//   ?window=<hours>  how far ahead to look (default 72, max 336)
+app.get('/api/public/va-events/upcoming', async (req, res) => {
+    try {
+        const hours = Math.max(1, Math.min(336, parseInt(req.query.window, 10) || 72));
+        // Started up to 12h ago stays in: an event under way is exactly what a
+        // live map wants to show, and it matches the per-VA route's window.
+        const since = new Date(Date.now() - 12 * 60 * 60 * 1000);
+        const until = new Date(Date.now() + hours * 60 * 60 * 1000);
+
+        const events = await VaEvent.find({
+            startsAt: { $gte: since, $lte: until },
+            departureIcao: { $nin: ['', null] },
+        }).sort({ startsAt: 1 }).limit(300).lean();
+
+        if (!events.length) {
+            res.set('Cache-Control', 'public, max-age=60');
+            return res.json({ events: [] });
+        }
+
+        // One lookup for every VA involved, rather than one per event.
+        const vaIds = [...new Set(events.map(e => String(e.vaAdId)).filter(Boolean))];
+        const ads = await VirtualAirlineAd.find({ _id: { $in: vaIds }, status: 'approved' })
+            .select('_id name logoUrl callsign').lean();
+        const adById = new Map(ads.map(a => [String(a._id), a]));
+
+        res.set('Cache-Control', 'public, max-age=60');
+        res.json({
+            events: events
+                // Drop events whose VA is gone or no longer approved — the map
+                // shouldn't advertise a listing the directory won't show.
+                .filter(e => adById.has(String(e.vaAdId)))
+                .map(e => {
+                    const ad = adById.get(String(e.vaAdId));
+                    return {
+                        id: String(e._id),
+                        title: e.title,
+                        description: e.description || '',
+                        link: e.link || '',
+                        departureIcao: e.departureIcao || '',
+                        bannerUrl: e.bannerUrl || '',
+                        groupCode: e.groupCode || '',
+                        startsAt: e.startsAt,
+                        va: {
+                            id: String(ad._id),
+                            name: ad.name,
+                            logo: ad.logoUrl || '',
+                            callsign: ad.callsign || '',
+                        },
+                    };
+                }),
+        });
+    } catch (error) {
+        console.error('Upcoming VA events error:', error);
+        res.status(500).json({ message: 'Server error while loading events.' });
+    }
+});
+
 // POST: Track a click-through (e.g. on the join/apply link). Returns the target
 // URL so the frontend can redirect after recording the click.
 //   ?type=apply|website|discord  attribute the click to a specific destination
