@@ -699,6 +699,73 @@ A VA with no approved webhook still accumulates statistics and still sees them i
 the portal — it just doesn't get the Discord post. Point a VA asking for the
 report at the Flight events tab first.
 
+### 13C. Group flights (and how a VA gets access)
+
+A VA runs an event, a dozen aircraft depart together, and the VA wants **one
+link** to post on the IFC so people can watch the whole formation instead of
+opening twelve separate flights. That link is a **group flight**.
+
+**How a VA is given access — this is the part support will be asked about**
+
+There is no new password. A VA claims its own listing by signing in to Inflight
+with the **same email address we already hold in `contactEmail`** on the
+listing, then pressing *Link my account* on their VA's panel in the tracker.
+
+* The address is verified against Supabase, so signing in is proof — a VA cannot
+  claim a listing by typing someone else's address.
+* An **unconfirmed** email is refused. The person must have opened the
+  confirmation mail.
+* **Exactly one account can hold a VA.** A second person on the same shared
+  inbox gets *"already linked to another Inflight account"*, by design.
+
+So the two things that make a claim fail, in order of likelihood:
+
+1. The VA is signing in with a **personal** address, not the one on file. Fix by
+   editing `contactEmail` on the listing (VA editor) to the address they actually
+   use — or tell them to use the one already there.
+2. **Someone already claimed it.** Check the listing; if it needs to move (the VA
+   changed hands, or the wrong person claimed it), release it — see below.
+
+**Releasing a claim**
+
+`POST /api/admin/va-link/:id/release` clears the binding and the VA can be
+claimed again. Use it when a VA changes hands or a claim was made in error.
+Releasing does **not** delete any group flight already published.
+
+**What a group flight is**
+
+A snapshot of who was airborne when it was published, plus the flight ids. The
+tracker re-finds those flights **live**, so a viewer sees where the formation is
+now; the snapshot only keeps the link readable once the aircraft have landed.
+Group links **self-delete after `VA_GROUP_TTL_DAYS`** (default 30) — they are for
+an event happening now, not an archive.
+
+**The link**
+
+`https://inflight.info/?g=<code>` is what the VA copies. `/g/<code>` on the
+backend serves the same group with Open Graph tags, so a paste on the IFC or
+Discord unfurls with the title, VA and aircraft count before redirecting.
+
+**Where it shows up**
+
+* Published group flights are **named** in that VA's end-of-day report
+  (§13B) — "Transatlantic Friday — 14 aircraft".
+* A group can be attached to a scheduled portal **event**, and the event card in
+  the tracker then offers *Watch live*.
+* Staff can see every published group at `GET /api/admin/group-flights`.
+
+### 13D. VA banners on pilot profiles (free)
+
+Any Inflight pilot — **free account included** — can set their profile banner to
+a partner VA's artwork, picked from the live directory. Aircraft photos and
+custom image URLs remain Pro; a VA's colours do not. A pilot wearing a VA banner
+also gets that VA's name badged on their dossier.
+
+The picker lists **every approved VA that has banner artwork uploaded**, so a VA
+partnered next month appears automatically. Practical consequence for staff: a
+listing with no banner image is invisible in that picker — if a VA asks why
+pilots can't wear their colours, upload their banner.
+
 ---
 
 ## 14. Quick Reference Card

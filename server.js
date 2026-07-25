@@ -41,6 +41,11 @@ const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps } = require('./
 // reported to each VA's webhook at end of day and then erased. See vaStats.js.
 const vaStats = require('./vaStats');
 
+// Group flights — a VA owner selects the aircraft flying their event and mints
+// one short link to share. Ownership is claimed with the contact email already
+// on file for the partnership. See vaGroupFlights.js.
+const vaGroupFlights = require('./vaGroupFlights');
+
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
@@ -333,6 +338,16 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
         title:      { type: String, trim: true, default: '' },      // custom embed title; '' = default
         fields:     { type: [String], default: [] },                // ordered subset; [] = default set
     },
+
+    // --- Group-flight ownership (see vaGroupFlights.js) ---
+    // A VA claims its own listing by signing in to Inflight with the SAME email
+    // we already hold in contactEmail above — no extra credential. The claim
+    // binds the Supabase user id here, and exactly ONE account can hold a VA, so
+    // a shared inbox can't become several people publishing under one brand.
+    // Staff can clear these three to hand the VA to someone else.
+    groupOwnerUserId: { type: String, default: null, index: true },
+    groupOwnerEmail: { type: String, default: null },
+    groupOwnerClaimedAt: { type: Date, default: null },
 
     // --- Analytics ---
     views: { type: Number, default: 0 },                            // detail-page impressions
@@ -4467,6 +4482,9 @@ app.get('/api/public/va/:id/events', async (req, res) => {
                 link: e.link || '',
                 departureIcao: e.departureIcao || '',
                 bannerUrl: e.bannerUrl || '',
+                // Set once the event's formation is airborne and its owner has
+                // minted a group link — the tracker turns this into "watch live".
+                groupCode: e.groupCode || '',
                 startsAt: e.startsAt,
                 createdAt: e.createdAt,
             })),
@@ -5756,6 +5774,10 @@ app.use(mapLoadsGuard);
 // Registered here, BEFORE the static handler and the SPA catch-all below, so the
 // /api paths resolve instead of falling through to index.html.
 vaStats.registerVaStatsRoutes(app, { requireAuth, requireAdmin, requirePortal: requireVaPortalSession });
+// Group-flight claim/publish/watch routes, plus the /g/<code> preview page that
+// makes a pasted link unfurl on the IFC. Registered here for the same reason:
+// the SPA catch-all below would otherwise swallow both.
+vaGroupFlights.registerGroupFlightRoutes(app, { VirtualAirlineAd, VaEvent, requireAuth, vaStats });
 // Boot the day-boundary scheduler: at the end of each stats day it posts every
 // VA's daily report to their Discord webhook, posts the network report to the
 // central feed, and then ERASES that day's raw takeoff/landing records.

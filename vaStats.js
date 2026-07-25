@@ -140,6 +140,10 @@ const COUNTER_FIELDS = [
     'applications',
     'pireps',
     'newCrew',
+    // Group flights the VA published today, and how many aircraft they gathered
+    // across all of them (so "3 group flights, 27 aircraft" is answerable).
+    'groupFlights',
+    'groupAircraft',
     // Operations (ACARS events)
     'takeoffs',
     'landings',
@@ -178,6 +182,14 @@ const VaStatDailySchema = new mongoose.Schema({
 
     // Highest number of this VA's aircraft airborne at once, today.
     peakAirborne: { type: Number, default: 0 },
+
+    // The group flights published today, by name, so the end-of-day report can
+    // say WHICH events went out rather than just how many. Capped — a runaway
+    // day still can't grow this doc without bound.
+    groups: {
+        type: [{ _id: false, title: String, size: Number, code: String, at: Date }],
+        default: [],
+    },
 
     // Set once the end-of-day report has been delivered. Doubles as the guard
     // that stops a restart from posting the same day twice.
@@ -381,7 +393,50 @@ const ENGAGEMENT_TYPES = {
     application: 'applications',
     pirep: 'pireps',
     crewJoin: 'newCrew',
+    groupFlight: 'groupFlights',
 };
+
+// Which of those a BROWSER may report. The tracking beacon is unauthenticated
+// by necessity, so it only gets the types it is actually the witness to —
+// what was seen and what was clicked. Everything else (a crew application, a
+// filed PIREP, a published group flight, a Crew Centre or embed load) is
+// recorded server-side at the point it really happens; accepting those from a
+// page would let anyone inflate a VA's funnel with a curl loop.
+const PUBLIC_TRACK_TYPES = new Set([
+    'impression', 'click', 'open', 'profile',
+    'apply', 'website', 'discord', 'event', 'fleet', 'roster', 'badge', 'share',
+]);
+
+// Record the DETAIL of one published group flight, alongside the plain counter
+// that recordEngagement('groupFlight') already bumped. Kept separate so the
+// counter stays a simple $inc and this stays a bounded $push — the report wants
+// both "how many" and "which ones".
+const GROUP_LIST_CAP = 20;
+
+function recordGroupFlight(vaAdId, vaName, { title, size, code } = {}) {
+    const id = asId(vaAdId);
+    if (!id || !dbUp()) return;
+    const entry = {
+        title: String(title || 'Group flight').slice(0, 90),
+        size: Math.max(0, Math.min(200, parseInt(size, 10) || 0)),
+        code: String(code || '').slice(0, 16),
+        at: new Date(),
+    };
+    const day = dayKey();
+    bg(VaStatDaily.updateOne(
+        { day, scope: 'va', vaAdId: id },
+        {
+            $setOnInsert: { createdAt: new Date() },
+            $set: { vaName },
+            $inc: { groupAircraft: entry.size },
+            // $slice keeps the newest GROUP_LIST_CAP and drops the rest, so this
+            // array can never grow past its cap however many are published.
+            $push: { groups: { $each: [entry], $slice: -GROUP_LIST_CAP } },
+        },
+        { upsert: true, setDefaultsOnInsert: false },
+    ), 'group flight detail');
+    bg(bumpDoc({ day, scope: 'network', vaAdId: null }, { inc: { groupAircraft: entry.size } }), 'network group');
+}
 
 // Bump one or more engagement counters. Safe to call from anywhere — it never
 // throws, never awaits a DB round-trip on the caller's behalf.
@@ -567,6 +622,12 @@ function shapeDaily(doc, day) {
             const src = d.byHour instanceof Map ? Object.fromEntries(d.byHour) : (d.byHour || {});
             return Array.from({ length: 24 }, (_, h) => Number(src[String(h)] || 0));
         })(),
+        groups: (d.groups || []).map(g => ({
+            title: g.title || 'Group flight',
+            size: Number(g.size || 0),
+            code: g.code || '',
+            at: g.at || null,
+        })),
         busiestHour: (() => {
             const src = d.byHour instanceof Map ? Object.fromEntries(d.byHour) : (d.byHour || {});
             let best = null;
@@ -618,9 +679,11 @@ function sumSeries(rows, label = '') {
     const byHour = new Array(24).fill(0);
     let peakAirborne = 0;
     let uniquePilots = 0; let pilotsDeparted = 0; let pilotsLanded = 0;
+    const groups = [];
 
     for (const r of rows) {
         for (const f of COUNTER_FIELDS) total[f] += Number(r[f] || 0);
+        if (r.groups && r.groups.length) groups.push(...r.groups);
         merge(aircraft, r.topAircraft); merge(routes, r.topRoutes);
         merge(pilots, r.topPilots); merge(servers, r.topServers);
         r.byHour.forEach((v, i) => { byHour[i] += v; });
@@ -643,6 +706,9 @@ function sumSeries(rows, label = '') {
         topAircraft: toList(aircraft), topRoutes: toList(routes),
         topPilots: toList(pilots), topServers: toList(servers),
         byHour,
+        // Newest first across the window, capped the same as a single day so a
+        // 90-day view can't return hundreds of rows to the portal.
+        groups: groups.sort((a, b) => new Date(b.at || 0) - new Date(a.at || 0)).slice(0, 20),
     };
 }
 
@@ -771,10 +837,26 @@ function buildReportEmbed({ day, stats, prev, scopeName, logoUrl, accentInt, ext
         ? { name, value: rows.map((r, i) => `\`${i + 1}.\` ${render(r)}`).join('\n').slice(0, 1024), inline: true }
         : null);
 
+    // Group flights get named, not just counted — "Transatlantic Friday, 14
+    // aircraft" is the line a VA actually wants to see the morning after.
+    const groupField = stats.groups && stats.groups.length
+        ? {
+            name: `🛬 Group flights (${fmt(stats.groupFlights)})`,
+            value: stats.groups
+                .slice(-5)
+                .reverse()
+                .map(g => `**${g.title}** — ${fmt(g.size)} aircraft`)
+                .join('\n')
+                .slice(0, 1024),
+            inline: false,
+        }
+        : null;
+
     const fields = [
         { name: '✈️ Flights', value: flightsLine, inline: true },
         { name: '👨‍✈️ Pilots', value: pilotsLine, inline: true },
         { name: '⏱️ Air time', value: timeLine || '—', inline: false },
+        groupField,
         { name: '👀 Reach', value: reachLine, inline: true },
         { name: '🔗 Engagement', value: outboundLine, inline: true },
         listField('🛫 Top routes', stats.topRoutes, r => `${prettyRoute(r.key)} — ${fmt(r.count)}`),
@@ -1061,6 +1143,7 @@ function registerVaStatsRoutes(app, { requireAuth, requireAdmin, requirePortal }
         let accepted = 0;
         for (const ev of list) {
             if (!ev || typeof ev !== 'object') continue;
+            if (!PUBLIC_TRACK_TYPES.has(ev.type)) continue; // server-recorded only
             if (recordEngagement(ev.vaId || ev.vaAdId || body.vaId, ev.type, ev.count, ev.vaName || '')) accepted += 1;
         }
         res.json({ ok: true, accepted });
@@ -1218,6 +1301,7 @@ module.exports = {
     // writing
     recordFlightEvent,
     recordEngagement,
+    recordGroupFlight,
     ENGAGEMENT_TYPES,
     // reading
     dayKey,
