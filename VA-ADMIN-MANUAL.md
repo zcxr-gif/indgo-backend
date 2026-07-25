@@ -650,6 +650,144 @@ featuring. Contact details a VA supplies are used **solely** to administer the
 Program. We make **no guarantee** of visibility, traffic, or recruitment
 (Terms §11) — never promise a VA results.
 
+### 13B. Daily VA statistics
+
+Beyond the two lifetime counters above, the platform keeps a **per-day
+scorecard** for every VA in the directory — not just partners with a webhook.
+
+**What is measured**
+
+| Group | Figures |
+| --- | --- |
+| Operations | takeoffs, landings, completed flights (a landing paired to its takeoff), total and average air time, peak aircraft airborne at once, busiest hour, top routes / aircraft / pilots, servers |
+| People | unique pilots who flew, how many departed, how many landed, who is airborne **right now** |
+| Reach | card/banner impressions, profile views, clicks, click-through rate |
+| Outbound | apply, website and Discord click-throughs, Crew Centre loads, embed widget loads |
+| Crew funnel | applications received, PIREPs filed, new crew added |
+
+Operations come from the same ACARS takeoff/landing feed as the flight cards
+(§ VA flight events). Reach and outbound come from the tracker itself.
+
+**What is stored, and for how long — this matters**
+
+* Each takeoff and landing is written as a **raw row** so the report can name the
+  busiest route and total the air time.
+* At the **end of every day** those raw rows are **deleted**, right after the
+  reports go out. We do not keep a flight history.
+* What survives is the small **per-day summary** (the counters above), kept for
+  `VA_STATS_RETENTION_DAYS` (default 120 days) so the portal can draw a trend.
+
+**Where it shows up**
+
+* **VA Partnership Portal → Statistics** — the VA's own live and daily numbers,
+  a 30-day trend, and a preview of tonight's report.
+* **Staff Hub → VA Statistics** — network totals, a per-VA leaderboard for any
+  day, what's airborne now, and how many raw rows are still pending erase.
+* **Discord** — at end of day each VA whose flight-events webhook is
+  **staff-approved and enabled** gets its own report posted there; a network-wide
+  report goes to the central VA-events feed.
+
+**Two staff buttons, and the difference between them**
+
+* *Preview report* — builds the reports for the selected day and shows them.
+  Posts nothing, erases nothing. Safe at any time.
+* *Send & erase now* (admin only) — actually posts every report for that day
+  **and deletes that day's raw takeoff/landing rows**. Irreversible. Only use it
+  when the scheduler missed a day; the per-day totals are kept either way.
+
+A VA with no approved webhook still accumulates statistics and still sees them in
+the portal — it just doesn't get the Discord post. Point a VA asking for the
+report at the Flight events tab first.
+
+### 13C. Group flights (and how a VA gets access)
+
+A VA runs an event, a dozen aircraft depart together, and the VA wants **one
+link** to post on the IFC so people can watch the whole formation instead of
+opening twelve separate flights. That link is a **group flight**.
+
+**How a VA is given access — this is the part support will be asked about**
+
+There is no new password. A VA claims its own listing by signing in to Inflight
+with the **same email address we already hold in `contactEmail`** on the
+listing, then pressing *Link my account* on their VA's panel in the tracker.
+
+* The address is verified against Supabase, so signing in is proof — a VA cannot
+  claim a listing by typing someone else's address.
+* An **unconfirmed** email is refused. The person must have opened the
+  confirmation mail.
+* **Exactly one account can hold a VA.** A second person on the same shared
+  inbox gets *"already linked to another Inflight account"*, by design.
+
+So the two things that make a claim fail, in order of likelihood:
+
+1. The VA is signing in with a **personal** address, not the one on file. Fix by
+   editing `contactEmail` on the listing (VA editor) to the address they actually
+   use — or tell them to use the one already there.
+2. **Someone already claimed it.** Check the listing; if it needs to move (the VA
+   changed hands, or the wrong person claimed it), release it — see below.
+
+**Releasing a claim**
+
+`POST /api/admin/va-link/:id/release` clears the binding and the VA can be
+claimed again. Use it when a VA changes hands or a claim was made in error.
+Releasing does **not** delete any group flight already published.
+
+**What a group flight is**
+
+A snapshot of who was airborne when it was published, plus the flight ids. The
+tracker re-finds those flights **live**, so a viewer sees where the formation is
+now; the snapshot only keeps the link readable once the aircraft have landed.
+Group links **self-delete after `VA_GROUP_TTL_DAYS`** (default 30) — they are for
+an event happening now, not an archive.
+
+**The link**
+
+`https://inflight.info/?g=<code>` is what the VA copies. `/g/<code>` on the
+backend serves the same group with Open Graph tags, so a paste on the IFC or
+Discord unfurls with the title, VA and aircraft count before redirecting.
+
+**Where it shows up**
+
+* Published group flights are **named** in that VA's end-of-day report
+  (§13B) — "Transatlantic Friday — 14 aircraft".
+* A group can be attached to a scheduled portal **event**, and the event card in
+  the tracker then offers *Watch live*.
+* Staff can see every published group at `GET /api/admin/group-flights`.
+
+### 13C-i. Events on the live map (opt-in)
+
+A pilot can switch on **Settings → Virtual Airlines → VA Events on Map** and see
+partner VA events pinned to their **departure airport**, with a countdown. It is
+**off by default** — the map is busy enough — and it is a viewer-side choice, not
+something a VA turns on.
+
+What decides whether a VA's event appears:
+
+* It must have a **departure airport set**. No ICAO, no pin — there is nowhere to
+  put it. This is the single most common reason a VA's event is missing.
+* It must start within the **next 72 hours** (or have started in the last 12).
+* Its VA must still be **approved** in the directory.
+* **One pin per airport** — the soonest event at that field wins. Two VAs
+  departing the same hub means only the earlier one is pinned; that is deliberate
+  so a busy hub doesn't stack.
+
+Tapping a pin gives the event, the VA, and two actions: *View VA* (opens the
+partner panel) and — once the VA has published a group flight for that event —
+*Watch live*, which drops the viewer into the same formation view a shared group
+link opens.
+
+### 13D. VA banners on pilot profiles (free)
+
+Any Inflight pilot — **free account included** — can set their profile banner to
+a partner VA's artwork, picked from the live directory. Aircraft photos and
+custom image URLs remain Pro; a VA's colours do not. A pilot wearing a VA banner
+also gets that VA's name badged on their dossier.
+
+The picker lists **every approved VA that has banner artwork uploaded**, so a VA
+partnered next month appears automatically. Practical consequence for staff: a
+listing with no banner image is invisible in that picker — if a VA asks why
+pilots can't wear their colours, upload their banner.
+
 ---
 
 ## 14. Quick Reference Card

@@ -188,6 +188,7 @@
             <button class="tab active" data-tab="submit" onclick="switchTab('submit')"><i data-lucide="send" class="w-4 h-4"></i> <span data-i18n="tab.submit">Submit</span></button>
             <button class="tab" data-tab="events" onclick="switchTab('events')"><i data-lucide="calendar" class="w-4 h-4"></i> <span data-i18n="tab.events">Events</span></button>
             <button class="tab" data-tab="flightevents" onclick="switchTab('flightevents')"><i data-lucide="plane-takeoff" class="w-4 h-4"></i> <span data-i18n="tab.flightevents">Flight events</span></button>
+            <button class="tab" data-tab="stats" onclick="switchTab('stats')"><i data-lucide="bar-chart-3" class="w-4 h-4"></i> <span data-i18n="tab.stats">Statistics</span></button>
             <button class="tab" data-tab="profile" onclick="switchTab('profile')"><i data-lucide="building-2" class="w-4 h-4"></i> <span data-i18n="tab.profile">VA Profile</span></button>
             <button class="tab" data-tab="embed" onclick="switchTab('embed')"><i data-lucide="code-2" class="w-4 h-4"></i> <span data-i18n="tab.embed">Embed</span></button>
             <button id="tabComplianceBtn" class="tab relative" data-tab="compliance" onclick="switchTab('compliance')"><i data-lucide="shield-check" class="w-4 h-4"></i> <span data-i18n="tab.compliance">Terms &amp; standing</span><span id="complianceDot" class="hidden absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-rose-500 ring-2 ring-white dark:ring-zinc-900"></span></button>
@@ -433,6 +434,91 @@
             </div>
 
             <p id="flightReadonly" class="hidden text-xs text-zinc-400 mt-3 flex items-center gap-1.5"><i data-lucide="lock" class="w-3.5 h-3.5"></i> <span data-i18n="fe.readonly">Only the VA owner can manage flight notifications.</span></p>
+        </section>
+
+        <!-- ===== TAB: STATISTICS =====
+             Everything we can measure about the VA: who's flying right now, the
+             day's operations, how many people saw and clicked the listing, and
+             the crew funnel. The raw takeoff/landing rows shown at the bottom are
+             deleted after tonight's report — the tiles and the 30-day trend are
+             what's kept. -->
+        <section id="panel-stats" class="tab-panel hidden">
+            <div class="mb-3 flex items-start justify-between gap-3 flex-wrap">
+                <div>
+                    <h2 class="text-base font-bold tracking-tight" data-i18n="st.heading">Your statistics</h2>
+                    <p class="text-sm text-zinc-500 dark:text-zinc-400" data-i18n="st.sub">Live operations, daily flights and how your listing is performing on the tracker.</p>
+                </div>
+                <div class="flex items-center gap-2">
+                    <select id="stRange" class="field !w-auto !py-1.5 text-xs">
+                        <option value="7" data-i18n="st.range7">Last 7 days</option>
+                        <option value="30" selected data-i18n="st.range30">Last 30 days</option>
+                        <option value="90" data-i18n="st.range90">Last 90 days</option>
+                    </select>
+                    <button type="button" id="stRefresh" class="btn !py-1.5 !px-3 text-xs" data-i18n="st.refresh">Refresh</button>
+                </div>
+            </div>
+
+            <!-- Live now -->
+            <div class="surface rounded-2xl p-5 sm:p-6 mb-4">
+                <div class="flex items-center justify-between gap-3 mb-3 flex-wrap">
+                    <p class="text-sm font-semibold flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span> <span data-i18n="st.live">In the air right now</span></p>
+                    <p class="text-[11px] text-zinc-400" id="stUpdated">—</p>
+                </div>
+                <div class="grid grid-cols-2 sm:grid-cols-4 gap-3" id="stLiveTiles"></div>
+                <div id="stLiveList" class="mt-4 space-y-1.5"></div>
+            </div>
+
+            <!-- Today -->
+            <div class="surface rounded-2xl p-5 sm:p-6 mb-4">
+                <p class="text-sm font-semibold mb-1" data-i18n="st.today">Today's operations</p>
+                <p class="text-xs text-zinc-500 dark:text-zinc-400 mb-3" data-i18n="st.todaySub">Counted from the takeoff and landing events we receive for your pilots. Change against yesterday is shown under each figure.</p>
+                <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3" id="stTodayTiles"></div>
+            </div>
+
+            <!-- Reach -->
+            <div class="surface rounded-2xl p-5 sm:p-6 mb-4">
+                <p class="text-sm font-semibold mb-1" data-i18n="st.reach">Reach &amp; engagement</p>
+                <p class="text-xs text-zinc-500 dark:text-zinc-400 mb-3" data-i18n="st.reachSub">How many people saw your VA on the tracker today, and what they did next.</p>
+                <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3" id="stReachTiles"></div>
+            </div>
+
+            <!-- Trend -->
+            <div class="surface rounded-2xl p-5 sm:p-6 mb-4">
+                <div class="flex items-center justify-between gap-3 mb-3 flex-wrap">
+                    <p class="text-sm font-semibold" id="stTrendTitle" data-i18n="st.trend">Daily trend</p>
+                    <select id="stTrendMetric" class="field !w-auto !py-1.5 text-xs">
+                        <option value="flights" data-i18n="st.mFlights">Completed flights</option>
+                        <option value="takeoffs" data-i18n="st.mTakeoffs">Takeoffs</option>
+                        <option value="landings" data-i18n="st.mLandings">Landings</option>
+                        <option value="uniquePilots" data-i18n="st.mPilots">Pilots flying</option>
+                        <option value="adImpressions" data-i18n="st.mImpressions">Impressions</option>
+                        <option value="adClicks" data-i18n="st.mClicks">Clicks</option>
+                        <option value="profileViews" data-i18n="st.mProfile">Profile views</option>
+                    </select>
+                </div>
+                <div id="stChart" class="w-full overflow-x-auto"></div>
+                <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-4" id="stRangeTiles"></div>
+            </div>
+
+            <!-- Breakdowns -->
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-4">
+                <div class="surface rounded-2xl p-5"><p class="text-sm font-semibold mb-3" data-i18n="st.topRoutes">Top routes</p><div id="stTopRoutes"></div></div>
+                <div class="surface rounded-2xl p-5"><p class="text-sm font-semibold mb-3" data-i18n="st.topAircraft">Top aircraft</p><div id="stTopAircraft"></div></div>
+                <div class="surface rounded-2xl p-5"><p class="text-sm font-semibold mb-3" data-i18n="st.topPilots">Most active pilots</p><div id="stTopPilots"></div></div>
+            </div>
+
+            <!-- Today's movements (erased tonight) -->
+            <div class="surface rounded-2xl p-5 sm:p-6">
+                <div class="flex items-start justify-between gap-3 mb-3 flex-wrap">
+                    <div>
+                        <p class="text-sm font-semibold" data-i18n="st.movements">Today's movements</p>
+                        <p class="text-xs text-zinc-500 dark:text-zinc-400" data-i18n="st.movementsSub">Every takeoff and landing logged today. These rows are deleted right after tonight's report is sent — only the totals above are kept.</p>
+                    </div>
+                    <button type="button" id="stPreviewBtn" class="btn !py-1.5 !px-3 text-xs" data-i18n="st.preview">Preview tonight's report</button>
+                </div>
+                <div id="stLegs" class="space-y-1.5"></div>
+                <div id="stPreview" class="hidden mt-4 rounded-xl bg-zinc-50 dark:bg-zinc-800/60 p-4 text-xs overflow-x-auto"></div>
+            </div>
         </section>
 
         <!-- ===== TAB: VA PROFILE ===== -->
@@ -876,7 +962,188 @@
             const panel = $('panel-' + name);
             if (panel) { panel.classList.remove('hidden'); panel.classList.add('fade-in'); }
             document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+            // Statistics are fetched on demand — the panel is heavier than the
+            // others and most sessions never open it.
+            if (name === 'stats') loadStats();
             drawIcons();
+        }
+
+        /* ---------- Statistics ----------
+           One GET returns the whole picture (today, yesterday, the daily series,
+           what's airborne right now, and today's raw movements). Everything below
+           just renders that payload; nothing is computed twice. */
+        let statsData = null;
+        let statsLoading = false;
+
+        const stNum = (n) => Number(n || 0).toLocaleString();
+        const stDur = (mins) => {
+            const m = Math.max(0, Math.round(Number(mins) || 0));
+            const h = Math.floor(m / 60);
+            return h ? h + 'h ' + String(m % 60).padStart(2, '0') + 'm' : m + 'm';
+        };
+        // Change against yesterday, coloured by direction. Flat reads as a dash so
+        // "no movement" doesn't look like a win or a loss.
+        const stDelta = (now, before) => {
+            const d = Number(now || 0) - Number(before || 0);
+            if (!d) return '<span class="text-zinc-400">—</span>';
+            const cls = d > 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400';
+            return '<span class="' + cls + '">' + (d > 0 ? '▲ ' : '▼ ') + stNum(Math.abs(d)) + '</span>';
+        };
+        const stTile = (label, value, sub) => `
+            <div class="rounded-xl bg-zinc-50 dark:bg-zinc-800/60 p-3">
+                <p class="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">${esc(label)}</p>
+                <p class="text-xl font-extrabold tracking-tight mt-0.5">${esc(String(value))}</p>
+                <p class="text-[11px] mt-0.5">${sub || '<span class="text-zinc-400">—</span>'}</p>
+            </div>`;
+        const stList = (rows, render) => (rows && rows.length)
+            ? rows.map((r, i) => `
+                <div class="flex items-center justify-between gap-3 text-sm py-1.5 border-b border-zinc-100 dark:border-zinc-800 last:border-0">
+                    <span class="truncate"><span class="text-zinc-400 tabular-nums mr-2">${i + 1}.</span>${esc(render(r))}</span>
+                    <span class="font-semibold tabular-nums shrink-0">${stNum(r.count)}</span>
+                </div>`).join('')
+            : `<p class="text-xs text-zinc-400 py-3">${esc(t('st.none'))}</p>`;
+
+        async function loadStats(force) {
+            if (statsLoading) return;
+            if (statsData && !force) { renderStats(); return; }
+            statsLoading = true;
+            $('stLiveTiles').innerHTML = `<p class="text-xs text-zinc-400 col-span-full py-4">${esc(t('st.loading'))}</p>`;
+            try {
+                const days = $('stRange').value || '30';
+                statsData = await api('/api/va-portal/stats?days=' + encodeURIComponent(days));
+                renderStats();
+            } catch (e) {
+                $('stLiveTiles').innerHTML = `<p class="text-xs text-rose-500 col-span-full py-4">${esc(e.message)}</p>`;
+            } finally {
+                statsLoading = false;
+            }
+        }
+
+        function renderStats() {
+            const d = statsData;
+            if (!d) return;
+            const today = d.today, yday = d.yesterday, live = d.live;
+
+            $('stUpdated').textContent = t('st.updated') + ' ' + new Date().toLocaleTimeString();
+
+            // --- live ---
+            $('stLiveTiles').innerHTML = [
+                stTile(t('st.airborne'), stNum(live.airborne), t('st.airborneSub')),
+                stTile(t('st.pilotsNow'), stNum(live.pilots), t('st.pilotsNowSub')),
+                stTile(t('st.peak'), stNum(today.peakAirborne), t('st.peakSub')),
+                stTile(t('st.airtime'), stDur(today.flightMinutes), t('st.airtimeSub')),
+            ].join('');
+            $('stLiveList').innerHTML = (live.flights && live.flights.length)
+                ? live.flights.slice(0, 12).map(f => `
+                    <div class="flex items-center justify-between gap-3 text-xs rounded-lg bg-zinc-50 dark:bg-zinc-800/60 px-3 py-2">
+                        <span class="truncate"><span class="font-semibold">${esc(f.callsign || f.pilot || '—')}</span>
+                            <span class="text-zinc-400 mx-1.5">${esc(f.dep || '????')} → ${esc(f.arr || '????')}</span>
+                            <span class="text-zinc-400">${esc(f.aircraft || '')}</span></span>
+                        <span class="text-zinc-400 shrink-0 tabular-nums">${stDur(f.minutesAirborne)}</span>
+                    </div>`).join('')
+                : `<p class="text-xs text-zinc-400 py-2">${esc(t('st.noneAirborne'))}</p>`;
+
+            // --- today ---
+            $('stTodayTiles').innerHTML = [
+                stTile(t('st.takeoffs'), stNum(today.takeoffs), stDelta(today.takeoffs, yday.takeoffs)),
+                stTile(t('st.landings'), stNum(today.landings), stDelta(today.landings, yday.landings)),
+                stTile(t('st.flights'), stNum(today.flights), stDelta(today.flights, yday.flights)),
+                stTile(t('st.pilotsFlew'), stNum(today.uniquePilots), stDelta(today.uniquePilots, yday.uniquePilots)),
+                stTile(t('st.departed'), stNum(today.pilotsDeparted), t('st.landedN', { n: stNum(today.pilotsLanded) })),
+                stTile(t('st.avgLeg'), stDur(today.avgFlightMinutes), today.busiestHour
+                    ? t('st.busiest', { h: String(today.busiestHour.hour).padStart(2, '0') }) : ''),
+            ].join('');
+
+            // --- reach ---
+            $('stReachTiles').innerHTML = [
+                stTile(t('st.impressions'), stNum(today.adImpressions), stDelta(today.adImpressions, yday.adImpressions)),
+                stTile(t('st.profileViews'), stNum(today.profileViews), stDelta(today.profileViews, yday.profileViews)),
+                stTile(t('st.clicks'), stNum(today.adClicks), t('st.ctr', { p: today.clickRate })),
+                stTile(t('st.outbound'), stNum(today.applyClicks + today.websiteClicks + today.discordClicks),
+                    esc(today.applyClicks + ' · ' + today.websiteClicks + ' · ' + today.discordClicks)),
+                stTile(t('st.crewCentre'), stNum(today.crewCenterViews), t('st.embedsN', { n: stNum(today.embedLoads) })),
+                stTile(t('st.applications'), stNum(today.applications), t('st.pirepsN', { n: stNum(today.pireps) })),
+            ].join('');
+
+            renderStatsChart();
+
+            // last7/last30 are the server's two rollups; last30 actually spans
+            // whatever window was requested, so label it with its real day count.
+            const r = $('stRange').value === '7' ? d.last7 : d.last30;
+            $('stTrendTitle').textContent = t('st.trend') + ' · ' + t('st.rDays', { n: r.days });
+            $('stRangeTiles').innerHTML = [
+                stTile(t('st.rFlights'), stNum(r.flights), t('st.rDays', { n: r.days })),
+                stTile(t('st.rAirtime'), stDur(r.flightMinutes), t('st.rAvg', { d: stDur(r.avgFlightMinutes) })),
+                stTile(t('st.rImpressions'), stNum(r.adImpressions), t('st.ctr', { p: r.clickRate })),
+                stTile(t('st.rApplications'), stNum(r.applications), t('st.rCrew', { n: stNum(r.newCrew) })),
+            ].join('');
+
+            $('stTopRoutes').innerHTML = stList(r.topRoutes, x => String(x.key).replace('-', ' → '));
+            $('stTopAircraft').innerHTML = stList(r.topAircraft, x => x.key);
+            $('stTopPilots').innerHTML = stList(r.topPilots, x => x.key);
+
+            $('stLegs').innerHTML = (d.legs && d.legs.length)
+                ? d.legs.map(l => `
+                    <div class="flex items-center justify-between gap-3 text-xs rounded-lg bg-zinc-50 dark:bg-zinc-800/60 px-3 py-2">
+                        <span class="truncate">
+                            <span class="${l.kind === 'takeoff' ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'} font-semibold">${l.kind === 'takeoff' ? '↑' : '↓'}</span>
+                            <span class="font-semibold ml-1.5">${esc(l.callsign || l.pilot || '—')}</span>
+                            <span class="text-zinc-400 mx-1.5">${esc(l.dep || '????')} → ${esc(l.arr || '????')}</span>
+                            <span class="text-zinc-400">${esc(l.aircraft || '')}</span>
+                        </span>
+                        <span class="text-zinc-400 shrink-0 tabular-nums">${new Date(l.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                    </div>`).join('')
+                : `<p class="text-xs text-zinc-400 py-2">${esc(t('st.noMovements'))}</p>`;
+
+            drawIcons();
+        }
+
+        // A dependency-free bar chart: one column per day, height relative to the
+        // busiest day in the window. Bars carry a title so the exact figure is a
+        // hover away without needing a tooltip layer.
+        function renderStatsChart() {
+            const d = statsData;
+            if (!d) return;
+            const metric = $('stTrendMetric').value;
+            const rows = d.series || [];
+            const max = Math.max(1, ...rows.map(r => Number(r[metric] || 0)));
+            const bars = rows.map(r => {
+                const v = Number(r[metric] || 0);
+                const pct = Math.round((v / max) * 100);
+                const isToday = r.day === d.day;
+                return `<div class="flex-1 min-w-[6px] flex flex-col justify-end h-full" title="${esc(r.day)}: ${stNum(v)}">
+                    <div class="rounded-t ${isToday ? 'bg-emerald-500' : 'bg-blue-500/70 dark:bg-blue-400/60'}" style="height:${Math.max(pct, v ? 3 : 0)}%"></div>
+                </div>`;
+            }).join('');
+            $('stChart').innerHTML = `
+                <div class="flex items-end gap-[2px] h-32 min-w-full">${bars}</div>
+                <div class="flex justify-between text-[10px] text-zinc-400 mt-1.5">
+                    <span>${esc(rows.length ? rows[0].day : '')}</span>
+                    <span>${t('st.peakDay')} ${stNum(max)}</span>
+                    <span>${esc(rows.length ? rows[rows.length - 1].day : '')}</span>
+                </div>`;
+        }
+
+        async function previewDailyReport() {
+            const box = $('stPreview');
+            box.classList.remove('hidden');
+            box.textContent = t('st.loading');
+            try {
+                const out = await api('/api/va-portal/stats/preview');
+                const embed = out.report && out.report.embed;
+                if (!embed) { box.textContent = t('st.noPreview'); return; }
+                box.innerHTML = `
+                    <p class="font-semibold text-sm mb-1">${esc(embed.title || '')}</p>
+                    <p class="text-zinc-500 dark:text-zinc-400 mb-3">${esc((embed.description || '').replace(/\*\*/g, ''))}</p>
+                    ${(embed.fields || []).map(f => `
+                        <div class="mb-2">
+                            <p class="font-semibold">${esc(f.name)}</p>
+                            <p class="text-zinc-500 dark:text-zinc-400 whitespace-pre-line">${esc(f.value.replace(/\*\*/g, ''))}</p>
+                        </div>`).join('')}
+                    <p class="text-[11px] text-zinc-400 mt-3">${esc(out.report.deliverable ? t('st.willSend') : t('st.wontSend'))}</p>`;
+            } catch (e) {
+                box.textContent = e.message;
+            }
         }
 
         // ---------- VA profile + hero ----------
@@ -1237,6 +1504,13 @@
                 loadPfPilots();
             } catch (err) { flash('pfPilotMsg', err.message, false); }
         }
+        // Statistics panel controls. Changing the window re-fetches (the server
+        // decides how long a series to build); changing the metric only re-paints.
+        $('stRefresh').addEventListener('click', () => loadStats(true));
+        $('stRange').addEventListener('change', () => loadStats(true));
+        $('stTrendMetric').addEventListener('change', () => { renderStatsChart(); });
+        $('stPreviewBtn').addEventListener('click', previewDailyReport);
+
         $('pfPilotAddBtn').addEventListener('click', addPfPilots);
         $('pfPilotClearBtn').addEventListener('click', clearPfPilots);
         $('pfPilotSearch').addEventListener('input', () => {

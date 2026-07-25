@@ -245,6 +245,52 @@
                 </div>
             </section>
 
+            <!-- VA statistics — the persisted daily numbers behind the live feed
+                 above. Raw takeoff/landing rows are erased after each end-of-day
+                 report; the per-day totals stay. -->
+            <section data-roles="admin,staff,va_rep" class="pt-10 fade-in">
+                <div class="flex items-center justify-between mb-4 gap-3 flex-wrap">
+                    <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">VA Statistics</h2>
+                    <div class="flex items-center gap-2">
+                        <input id="vsDay" type="date" class="text-xs px-2.5 py-1.5 rounded-lg bg-zinc-100 dark:bg-zinc-800 border-0 text-zinc-600 dark:text-zinc-300">
+                        <button onclick="loadVaStats()" class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition">Refresh</button>
+                        <button onclick="previewVaDailyReport()" class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition">Preview report</button>
+                        <button data-roles="admin" onclick="runVaDailyReport()" class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-amber-500/15 text-amber-600 dark:text-amber-400 hover:bg-amber-500/25 transition">Send &amp; erase now</button>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-4" id="vsTiles"></div>
+
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                    <div class="surface rounded-2xl overflow-hidden lg:col-span-2">
+                        <div class="px-5 py-3.5 border-b border-zinc-100 dark:border-zinc-800/80 flex items-center justify-between gap-3">
+                            <p class="text-sm font-semibold">Per-VA leaderboard</p>
+                            <select id="vsSort" onchange="loadVaStats()" class="text-xs px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 border-0 text-zinc-600 dark:text-zinc-300">
+                                <option value="flights">Completed flights</option>
+                                <option value="takeoffs">Takeoffs</option>
+                                <option value="landings">Landings</option>
+                                <option value="adImpressions">Impressions</option>
+                                <option value="adClicks">Clicks</option>
+                                <option value="profileViews">Profile views</option>
+                                <option value="applications">Applications</option>
+                            </select>
+                        </div>
+                        <div id="vsBoard" class="divide-y divide-zinc-100 dark:divide-zinc-800/80 max-h-[26rem] overflow-y-auto">
+                            <div class="px-5 py-10 text-center text-sm text-zinc-400">Loading…</div>
+                        </div>
+                    </div>
+                    <div class="surface rounded-2xl overflow-hidden">
+                        <div class="px-5 py-3.5 border-b border-zinc-100 dark:border-zinc-800/80">
+                            <p class="text-sm font-semibold">Airborne now</p>
+                        </div>
+                        <div id="vsLive" class="divide-y divide-zinc-100 dark:divide-zinc-800/80 max-h-[26rem] overflow-y-auto">
+                            <div class="px-5 py-10 text-center text-sm text-zinc-400">Loading…</div>
+                        </div>
+                    </div>
+                </div>
+                <pre id="vsOut" class="hidden mt-4 surface rounded-2xl p-4 text-[11px] leading-relaxed overflow-x-auto max-h-80"></pre>
+            </section>
+
             <!-- Tools -->
             <section class="pt-10 fade-in">
                 <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mb-4">Tools</h2>
@@ -796,10 +842,114 @@
         function startVaEventsFeed() {
             if (!['admin', 'staff', 'va_rep'].includes(currentUser.role)) return;
             loadVaEvents();
+            loadVaStats();
             if (vaEvTimer) clearInterval(vaEvTimer);
             vaEvTimer = setInterval(() => {
                 if (document.visibilityState === 'visible') { loadVaEvents(); loadStaffInbox(); }
             }, 20000);
+        }
+
+        // ---- VA statistics ----
+        // The persisted counterpart to the live feed above: one request returns
+        // the network totals for a day, the per-VA leaderboard, what's airborne
+        // right now, and how many raw movement rows are still waiting to be
+        // erased by tonight's report.
+        const vsNum = (n) => Number(n || 0).toLocaleString();
+        const vsDur = (mins) => {
+            const m = Math.max(0, Math.round(Number(mins) || 0));
+            const h = Math.floor(m / 60);
+            return h ? h + 'h ' + String(m % 60).padStart(2, '0') + 'm' : m + 'm';
+        };
+        const vsTile = (label, value, sub) =>
+            '<div class="surface rounded-2xl p-4">' +
+                '<p class="text-[11px] font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-500">' + esc(label) + '</p>' +
+                '<p class="text-2xl font-bold tracking-tight mt-1">' + esc(String(value)) + '</p>' +
+                '<p class="text-[11px] text-zinc-400 dark:text-zinc-600 mt-0.5">' + esc(sub || '') + '</p>' +
+            '</div>';
+
+        async function loadVaStats() {
+            const board = document.getElementById('vsBoard');
+            if (!board) return;
+            const day = (document.getElementById('vsDay').value || '').trim();
+            const sort = document.getElementById('vsSort').value || 'flights';
+            const q = '?sort=' + encodeURIComponent(sort) + (day ? '&day=' + encodeURIComponent(day) : '');
+            const { ok, data } = await api('/api/admin/va-stats' + q);
+            if (!ok || !data) {
+                board.innerHTML = '<div class="px-5 py-10 text-center text-sm text-zinc-400">Could not load statistics.</div>';
+                return;
+            }
+            // Pin the picker to the day the server actually reported on, so the
+            // control and the numbers can never disagree.
+            document.getElementById('vsDay').value = data.day;
+
+            const n = data.network, live = data.live;
+            document.getElementById('vsTiles').innerHTML = [
+                vsTile('Airborne now', vsNum(live.airborne), vsNum(live.pilots) + ' pilots'),
+                vsTile('Takeoffs', vsNum(n.takeoffs), 'landings ' + vsNum(n.landings)),
+                vsTile('Completed flights', vsNum(n.flights), vsDur(n.flightMinutes) + ' air time'),
+                vsTile('Pilots flew', vsNum(n.uniquePilots), 'peak ' + vsNum(n.peakAirborne) + ' airborne'),
+                vsTile('Impressions', vsNum(n.adImpressions), n.clickRate + '% CTR · ' + vsNum(n.adClicks) + ' clicks'),
+                vsTile('Pending erase', vsNum(data.pendingLegs), data.reportsEnabled ? 'cleared after the report' : 'daily reports OFF'),
+            ].join('');
+
+            const rows = data.leaderboard || [];
+            board.innerHTML = rows.length
+                ? rows.map((r, i) =>
+                    '<div class="flex items-center gap-3.5 px-5 py-3 hover:bg-zinc-50/60 dark:hover:bg-zinc-800/30 transition">' +
+                        '<span class="text-xs tabular-nums text-zinc-400 w-5 shrink-0">' + (i + 1) + '</span>' +
+                        '<div class="min-w-0 flex-1">' +
+                            '<p class="font-semibold text-sm truncate">' + esc(r.vaName || 'Unknown VA') + '</p>' +
+                            '<p class="text-xs text-zinc-500 dark:text-zinc-400 truncate">' +
+                                vsNum(r.takeoffs) + ' dep · ' + vsNum(r.landings) + ' arr · ' + vsNum(r.uniquePilots) + ' pilots · ' +
+                                vsNum(r.adImpressions) + ' impressions · ' + vsNum(r.adClicks) + ' clicks' +
+                            '</p>' +
+                        '</div>' +
+                        '<span class="text-sm font-bold tabular-nums shrink-0">' + vsNum(r[sort]) + '</span>' +
+                    '</div>').join('')
+                : '<div class="px-5 py-10 text-center text-sm text-zinc-400">No VA activity recorded for ' + esc(data.day) + '.</div>';
+
+            const flights = (live.flights || []).slice(0, 30);
+            document.getElementById('vsLive').innerHTML = flights.length
+                ? flights.map(f =>
+                    '<div class="px-5 py-2.5">' +
+                        '<p class="text-sm font-semibold truncate">' + esc(f.callsign || f.pilot || '—') + '</p>' +
+                        '<p class="text-xs text-zinc-500 dark:text-zinc-400 truncate">' +
+                            esc(f.vaName || 'Unattributed') + ' · ' + esc(f.dep || '????') + ' → ' + esc(f.arr || '????') + ' · ' + vsDur(f.minutesAirborne) +
+                        '</p>' +
+                    '</div>').join('')
+                : '<div class="px-5 py-10 text-center text-sm text-zinc-400">Nothing airborne right now.</div>';
+
+            drawIcons();
+        }
+
+        // Build the reports for a day WITHOUT posting or erasing anything.
+        async function previewVaDailyReport() {
+            const out = document.getElementById('vsOut');
+            out.classList.remove('hidden');
+            out.textContent = 'Building preview…';
+            const day = (document.getElementById('vsDay').value || '').trim();
+            const { ok, data } = await api('/api/admin/va-stats/run-daily', {
+                method: 'POST',
+                body: JSON.stringify({ day: day || undefined, dryRun: true }),
+            });
+            out.textContent = ok ? JSON.stringify(data, null, 2) : ((data && data.error) || 'Preview failed.');
+        }
+
+        // The real thing: posts every VA's report to their webhook, posts the
+        // network report to the central feed, and DELETES that day's raw movement
+        // rows. Irreversible, so it asks first.
+        async function runVaDailyReport() {
+            const day = (document.getElementById('vsDay').value || '').trim();
+            if (!confirm('Send the daily reports for ' + (day || 'yesterday') + ' and erase that day\'s takeoff/landing records?\n\nThe per-day totals are kept; the raw movement rows are not.')) return;
+            const out = document.getElementById('vsOut');
+            out.classList.remove('hidden');
+            out.textContent = 'Running…';
+            const { ok, data } = await api('/api/admin/va-stats/run-daily', {
+                method: 'POST',
+                body: JSON.stringify({ day: day || undefined, force: true }),
+            });
+            out.textContent = ok ? JSON.stringify(data, null, 2) : ((data && data.error) || 'Run failed.');
+            loadVaStats();
         }
 
         // ---- Change own password ----

@@ -176,6 +176,10 @@ const VaEventSchema = new mongoose.Schema({
     departureIcao: { type: String, default: '', uppercase: true, trim: true, maxlength: 4 },
     // Optional hero banner (S3 URL) shown large on the event card.
     bannerUrl: { type: String, default: '' },
+    // Optional group-flight code (see vaGroupFlights.js). Set once the event's
+    // formation is airborne and the owner has minted a link — the tracker's
+    // event list then offers "watch live" on the card instead of just a date.
+    groupCode: { type: String, default: '', trim: true, maxlength: 16 },
     startsAt: { type: Date, required: true },
     createdAt: { type: Date, default: Date.now },
 }, { minimize: true });
@@ -192,6 +196,7 @@ function publicEvent(e) {
         id: e._id, vaAdId: e.vaAdId, vaName: e.vaName,
         title: e.title, description: e.description || '', link: e.link || '',
         departureIcao: e.departureIcao || '', bannerUrl: e.bannerUrl || '',
+        groupCode: e.groupCode || '',
         startsAt: e.startsAt, createdByName: e.createdByName, createdAt: e.createdAt,
     };
 }
@@ -2145,6 +2150,10 @@ module.exports = {
     deactivateRepAccount,
     purgeVaData,
     requirePortalPage,
+    // The portal API guard, exported so modules registering their own
+    // partner-facing routes (e.g. vaStats) gate them on the same session
+    // instead of re-implementing the cookie/JWT check.
+    requirePortal,
     SUBMISSION_CATEGORIES,
     SUBMISSION_STATUSES,
 };
