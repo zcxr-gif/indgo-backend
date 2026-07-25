@@ -29,11 +29,17 @@ const {
     purgeVaData,
     VaSubmission,
     VaEvent,
+    requirePortal: requireVaPortalSession,
 } = require('./vaPortal');
 
 // Crew Center sign-in (inflight.info/crew/<slug>) — cascades our existing
 // accounts (VA portal accounts + Inflight staff) and routes to the right view.
 const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps } = require('./crewAuth');
+
+// VA statistics engine — reach/engagement counters from the tracker plus flight
+// operations derived from the ACARS takeoff/landing feed, summarised per day,
+// reported to each VA's webhook at end of day and then erased. See vaStats.js.
+const vaStats = require('./vaStats');
 
 const express = require('express');
 const mongoose = require('mongoose');
@@ -1496,6 +1502,7 @@ app.post('/api/crew/:slug/roster', async (req, res) => {
         const va = await resolveCrewVa(req.params.slug);
         if (!va) return res.status(404).json({ error: 'Crew center not found.' });
         const m = await CrewMember.create({ vaAdId: va._id, ...cleanMember(req.body) });
+        vaStats.recordEngagement(va._id, 'crewJoin', 1, va.name);
         res.status(201).json({ member: publicMember(m) });
     } catch (err) { console.error('roster add error:', err); res.status(500).json({ error: 'Could not add the pilot.' }); }
 });
@@ -1720,6 +1727,7 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
             inFleet, source: 'manual', status: 'pending',
             flownAt: b.flownAt ? new Date(b.flownAt) : new Date(),
         });
+        vaStats.recordEngagement(va._id, 'pirep', 1, va.name);
         res.status(201).json({
             pirep: publicPirep(doc),
             routeMatched: !!route,
@@ -1787,6 +1795,7 @@ app.post('/api/crew/:slug/pireps/sync', async (req, res) => {
                     });
                 } catch { continue; } // a concurrent sync may have inserted the same flight
                 created++;
+                vaStats.recordEngagement(va._id, 'pirep', 1, va.name);
                 if (willApprove) { await applyPirepHours(doc); approved++; }
             }
         }
@@ -1904,12 +1913,14 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
             ifVerified, ifUserId, answers, statusToken,
             status, reviewedAt: status === 'accepted' ? new Date() : null,
         });
+        vaStats.recordEngagement(ad._id, 'application', 1, ad.name);
         if (status === 'accepted') {
             await CrewMember.create({
                 vaAdId: ad._id, name: ifcName, callsign: (prefix + number).trim(),
                 hours: 0, role: '', aircraft: [], status: 'active',
                 ifUserId: ifUserId || '', ifcName,
             });
+            vaStats.recordEngagement(ad._id, 'crewJoin', 1, ad.name);
         }
         // Notify the VA's Discord (fire-and-forget). Free-mode joins and
         // pending applications both post so staff see activity in real time.
@@ -2025,6 +2036,7 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
                     hours: 0, role: '', aircraft: [], status: 'active',
                     ifUserId: appDoc.ifUserId || '', ifcName: appDoc.ifcName || '',
                 });
+                vaStats.recordEngagement(va._id, 'crewJoin', 1, va.name);
             }
             appDoc.status = 'accepted';
         } else if (action === 'decline') {
@@ -3797,6 +3809,11 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             if (cfg) accent = (Array.isArray(cfg.accent) && cfg.accent[0]) || cfg.brandColor || '';
         }
 
+        // Daily statistics: one Crew Center load. Cached for 5 minutes below, so
+        // this under-counts repeat visits from the same browser — it's a floor,
+        // which is the honest read for a cached endpoint.
+        vaStats.recordEngagement(ad._id, 'crewCenter', 1, ad.name);
+
         res.set('Cache-Control', 'public, max-age=300'); // 5 min — branding rarely changes
         res.json({
             slug: ad.slug || null,
@@ -3928,6 +3945,9 @@ app.get('/api/va-ads/:id', async (req, res) => {
             : await VirtualAirlineAd.findById(req.params.id).lean();
 
         if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+        // A tracked fetch is the VA's detail panel being opened — the same event
+        // the daily report calls a "profile view".
+        if (req.query.track === 'view') vaStats.recordEngagement(ad._id, 'profile', 1, ad.name);
         res.json(ad);
     } catch (error) {
         console.error('VA Ad Fetch Error:', error);
@@ -4459,12 +4479,20 @@ app.get('/api/public/va/:id/events', async (req, res) => {
 
 // POST: Track a click-through (e.g. on the join/apply link). Returns the target
 // URL so the frontend can redirect after recording the click.
+//   ?type=apply|website|discord  attribute the click to a specific destination
+//                                in the daily statistics (defaults to "apply",
+//                                which is what the join link has always been).
 app.post('/api/va-ads/:id/click', async (req, res) => {
     try {
         const ad = await VirtualAirlineAd.findByIdAndUpdate(
             req.params.id, { $inc: { clicks: 1 } }, { new: true }
-        ).select('applicationUrl websiteUrl discordUrl clicks').lean();
+        ).select('applicationUrl websiteUrl discordUrl clicks name').lean();
         if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+        // Daily statistics: an outbound click-through, plus the generic click
+        // counter that the reach/CTR figures are computed from.
+        const kind = ['apply', 'website', 'discord'].includes(String(req.query.type)) ? String(req.query.type) : 'apply';
+        vaStats.recordEngagement(ad._id, kind, 1, ad.name);
+        vaStats.recordEngagement(ad._id, 'click', 1, ad.name);
         res.json({
             success: true,
             clicks: ad.clicks,
@@ -4971,6 +4999,49 @@ const resolveVaEventPartner = async (e) => {
     return null;
 };
 
+// Attribute an event to a VA listing for STATISTICS. Deliberately looser than
+// resolveVaEventPartner: a VA that never asked for a webhook (or is still
+// waiting on staff approval) should still accumulate its own numbers, so this
+// drops the opted-in gate and matches on the same code/name signals. Cached for
+// a few minutes because every takeoff and landing hits it, and the answer only
+// changes when a listing is renamed. Returns { _id, name } or null; never throws.
+const VA_STATS_RESOLVE_TTL = 5 * 60 * 1000;
+const vaStatsResolveCache = new Map(); // signature -> { at, va }
+
+const resolveVaAdForStats = async (e) => {
+    const codeBases = [...new Set([
+        normalizeCallsignBase(e.va?.code),
+        callsignAirlineBase(e.va?.code),
+        normalizeCallsignBase(e.callsign),
+        callsignAirlineBase(e.callsign),
+    ].filter(Boolean))];
+    const names = [...new Set([e.va?.name, e.va?.code]
+        .map(s => String(s || '').trim()).filter(Boolean))];
+    if (!codeBases.length && !names.length) return null;
+
+    const sig = `${codeBases.join('|')}::${names.join('|').toLowerCase()}`;
+    const hit = vaStatsResolveCache.get(sig);
+    if (hit && Date.now() - hit.at < VA_STATS_RESOLVE_TTL) return hit.va;
+
+    const or = [];
+    if (codeBases.length) or.push({ callsigns: { $in: callsignQueryVariants(codeBases) } });
+    for (const n of names) or.push({ name: new RegExp('^' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
+
+    let va = null;
+    try {
+        va = await VirtualAirlineAd.findOne({ $or: or }).select('_id name').lean();
+    } catch (err) {
+        console.warn('[va-stats] listing lookup failed:', err.message);
+        return null;
+    }
+    // Cache misses too — an unknown callsign shouldn't re-query on every event.
+    vaStatsResolveCache.set(sig, { at: Date.now(), va });
+    if (vaStatsResolveCache.size > 500) {
+        vaStatsResolveCache.delete(vaStatsResolveCache.keys().next().value);
+    }
+    return va;
+};
+
 // Slow-path handler, run after we've already acked the sender. Anything that
 // can throw lives here so the route handler stays synchronous and fast.
 //
@@ -4999,6 +5070,19 @@ const handleVaEvent = async (e) => {
     if (centralWebhook) targets.push('central');
     if (partnerAd) targets.push(partnerAd.name);
     recordVaEventForFeed(e, targets);
+
+    // Statistics. Runs for EVERY event, hooked or not — a VA's takeoff/landing
+    // counts, airborne time and "who's flying right now" shouldn't depend on
+    // whether it has a Discord webhook. Prefer the delivery partner we already
+    // resolved (no second query in the common case) and fall back to the looser
+    // listing lookup so non-partner VAs still get their numbers. Best-effort:
+    // stats can never break or delay delivery.
+    try {
+        const statsAd = partnerAd || await resolveVaAdForStats(e);
+        vaStats.recordFlightEvent(e, statsAd);
+    } catch (err) {
+        console.warn('[va-stats] flight event not recorded:', err.message);
+    }
 
     // Nothing is hooked to this event — it still lives in the feed for 10 minutes,
     // but there's no delivery to do, so skip all the expensive work.
@@ -5230,6 +5314,9 @@ app.get('/api/embed/resolve', async (req, res) => {
             { _id: cfg._id },
             { $inc: { resolveCount: 1 }, $set: { lastResolvedAt: new Date() } }
         ).catch(() => {});
+        // Same event in the VA's daily statistics: their widget loaded on their
+        // own site. Only counted when the embed is linked to a VA listing.
+        if (cfg.vaAdId) vaStats.recordEngagement(cfg.vaAdId, 'embed', 1, (cfg.va && cfg.va.name) || '');
 
         return res.json(toResolvePayload(cfg));
     } catch (error) {
@@ -5663,6 +5750,16 @@ app.get('/api/va-terms', (req, res) => {
 // with billed Mapbox GL or the free MapLibre + OpenFreeMap engine, so we never bill
 // past Mapbox's free tier. Sends Access-Control-Allow-Origin: * itself (browser call).
 app.use(mapLoadsGuard);
+
+// VA statistics — the public tracking beacon + live "who's airborne" feed, the
+// partner-facing dashboard behind the portal session, and the staff console.
+// Registered here, BEFORE the static handler and the SPA catch-all below, so the
+// /api paths resolve instead of falling through to index.html.
+vaStats.registerVaStatsRoutes(app, { requireAuth, requireAdmin, requirePortal: requireVaPortalSession });
+// Boot the day-boundary scheduler: at the end of each stats day it posts every
+// VA's daily report to their Discord webhook, posts the network report to the
+// central feed, and then ERASES that day's raw takeoff/landing records.
+vaStats.start();
 
 // 1. Serve static files from the root directory
 // This allows the browser to find airports.js, images, and CSS

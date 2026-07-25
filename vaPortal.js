@@ -2145,6 +2145,10 @@ module.exports = {
     deactivateRepAccount,
     purgeVaData,
     requirePortalPage,
+    // The portal API guard, exported so modules registering their own
+    // partner-facing routes (e.g. vaStats) gate them on the same session
+    // instead of re-implementing the cookie/JWT check.
+    requirePortal,
     SUBMISSION_CATEGORIES,
     SUBMISSION_STATUSES,
 };

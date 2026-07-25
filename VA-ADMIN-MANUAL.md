@@ -650,6 +650,55 @@ featuring. Contact details a VA supplies are used **solely** to administer the
 Program. We make **no guarantee** of visibility, traffic, or recruitment
 (Terms §11) — never promise a VA results.
 
+### 13B. Daily VA statistics
+
+Beyond the two lifetime counters above, the platform keeps a **per-day
+scorecard** for every VA in the directory — not just partners with a webhook.
+
+**What is measured**
+
+| Group | Figures |
+| --- | --- |
+| Operations | takeoffs, landings, completed flights (a landing paired to its takeoff), total and average air time, peak aircraft airborne at once, busiest hour, top routes / aircraft / pilots, servers |
+| People | unique pilots who flew, how many departed, how many landed, who is airborne **right now** |
+| Reach | card/banner impressions, profile views, clicks, click-through rate |
+| Outbound | apply, website and Discord click-throughs, Crew Centre loads, embed widget loads |
+| Crew funnel | applications received, PIREPs filed, new crew added |
+
+Operations come from the same ACARS takeoff/landing feed as the flight cards
+(§ VA flight events). Reach and outbound come from the tracker itself.
+
+**What is stored, and for how long — this matters**
+
+* Each takeoff and landing is written as a **raw row** so the report can name the
+  busiest route and total the air time.
+* At the **end of every day** those raw rows are **deleted**, right after the
+  reports go out. We do not keep a flight history.
+* What survives is the small **per-day summary** (the counters above), kept for
+  `VA_STATS_RETENTION_DAYS` (default 120 days) so the portal can draw a trend.
+
+**Where it shows up**
+
+* **VA Partnership Portal → Statistics** — the VA's own live and daily numbers,
+  a 30-day trend, and a preview of tonight's report.
+* **Staff Hub → VA Statistics** — network totals, a per-VA leaderboard for any
+  day, what's airborne now, and how many raw rows are still pending erase.
+* **Discord** — at end of day each VA whose flight-events webhook is
+  **staff-approved and enabled** gets its own report posted there; a network-wide
+  report goes to the central VA-events feed.
+
+**Two staff buttons, and the difference between them**
+
+* *Preview report* — builds the reports for the selected day and shows them.
+  Posts nothing, erases nothing. Safe at any time.
+* *Send & erase now* (admin only) — actually posts every report for that day
+  **and deletes that day's raw takeoff/landing rows**. Irreversible. Only use it
+  when the scheduler missed a day; the per-day totals are kept either way.
+
+A VA with no approved webhook still accumulates statistics and still sees them in
+the portal — it just doesn't get the Discord post. Point a VA asking for the
+report at the Flight events tab first.
+
 ---
 
 ## 14. Quick Reference Card
