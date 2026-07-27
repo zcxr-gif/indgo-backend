@@ -403,8 +403,11 @@ VirtualAirlineAdSchema.pre('save', function (next) {
 // uniqueness by appending -2, -3, … on the rare collision, so a save never fails
 // on the unique index. Kept separate from the callsign hook for readability.
 //
-// The rules live in vaSlug.js so the backfill script derives handles identically
-// — see scripts/backfill-crew-slugs.js.
+// KNOWN ISSUE: deriving from the name means every VA that is ever saved gets a
+// handle, and a handle is what the directory reads as "this VA has a crew
+// center" (see crewButtonHTML in the tracker's vaAds.js). Crew centers are
+// opt-in, so this hook currently opens one for VAs that never asked. The rules
+// live in vaSlug.js, which is where that changes.
 VirtualAirlineAdSchema.pre('save', async function (next) {
     try {
         const Model = this.constructor;
@@ -4121,14 +4124,15 @@ app.patch('/api/va-ads/:id/status', requireAuth, async (req, res) => {
         if (!VA_AD_STATUSES.includes(status)) {
             return res.status(400).json({ message: `Status must be one of: ${VA_AD_STATUSES.join(', ')}.` });
         }
-        // findById + save() rather than findByIdAndUpdate: the update helpers
-        // bypass the pre-save hooks, and approving a VA is exactly when it needs
-        // the crew center slug those hooks derive. Approving through here used to
-        // leave a live VA with slug:null, so its /crew/<slug> link never resolved.
-        const ad = await VirtualAirlineAd.findById(req.params.id);
+        // Deliberately findByIdAndUpdate, NOT findById + save(): the update
+        // helpers bypass the pre-save hooks, and the slug hook currently invents
+        // a crew center handle from the VA name for any VA that lacks one. A
+        // crew center is opt-in, so approving a VA must not silently open one.
+        // Revisit once the handle is only ever set explicitly.
+        const ad = await VirtualAirlineAd.findByIdAndUpdate(
+            req.params.id, { status }, { new: true }
+        );
         if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
-        ad.status = status;
-        await ad.save();
         res.json({ message: `VA advertisement ${status}.`, data: ad });
     } catch (error) {
         console.error('VA Ad Status Error:', error);
