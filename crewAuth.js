@@ -179,18 +179,50 @@ function getBearer(req) {
     return null;
 }
 
-// Resolve the VA for a crew slug (slug first, callsign fallback), approved only.
-async function resolveVa(slug) {
-    const VirtualAirlineAd = mongoose.model('VirtualAirlineAd');
-    const raw = String(slug || '').trim().toLowerCase();
+// A crew center answers to its slug OR to any callsign its VA flies under (the
+// directory lets a VA register several — `callsign` is only the primary). The
+// old lookup checked the primary alone, so a link built from a sub-fleet
+// callsign 404'd on a VA that was perfectly live.
+function crewHandleQuery(handle) {
+    const raw = String(handle || '').trim().toLowerCase();
     if (!raw) return null;
-    const sel = '_id name slug callsign staffRoles staffAssignments';
-    let va = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
-        .select(sel).lean();
-    if (!va) {
-        va = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' })
-            .select(sel).lean();
-    }
+    const code = raw.toUpperCase();
+    return { $or: [{ slug: raw }, { callsign: code }, { callsigns: code }] };
+}
+
+/**
+ * Resolve a crew center handle to its VA.
+ *
+ * Queries WITHOUT the status filter and applies it here on purpose: a caller
+ * that only gets `null` cannot tell "no VA answers to this address" from "the
+ * VA exists but isn't approved yet", and the second is the case that leaves an
+ * owner staring at a link that will never work. Only an approved VA is ever
+ * returned — the reason is what changes.
+ *
+ * @param {string} handle  the slug (or callsign) from /crew/<handle>
+ * @param {string} select  mongoose projection for the fields the caller needs
+ * @returns {Promise<{va: object|null, reason: 'unknown'|'not-approved'|null, status?: string}>}
+ */
+async function lookupCrewVa(handle, select) {
+    const query = crewHandleQuery(handle);
+    if (!query) return { va: null, reason: 'unknown' };
+    const VirtualAirlineAd = mongoose.model('VirtualAirlineAd');
+    const raw = String(handle).trim().toLowerCase();
+    const found = await VirtualAirlineAd.find(query)
+        .select(`${select} status slug`).limit(10).lean();
+    if (!found.length) return { va: null, reason: 'unknown' };
+    // A slug is unique and exact; a callsign can be shared with a pending or
+    // rejected duplicate of the same brand, so an exact slug match wins the tie.
+    const exact = found.filter(v => v.slug === raw);
+    const pool = exact.length ? exact : found;
+    const va = pool.find(v => v.status === 'approved');
+    if (!va) return { va: null, reason: 'not-approved', status: pool[0].status };
+    return { va, reason: null };
+}
+
+// Resolve the VA for a crew slug, approved only.
+async function resolveVa(slug) {
+    const { va } = await lookupCrewVa(slug, '_id name slug callsign staffRoles staffAssignments');
     return va;
 }
 
@@ -452,4 +484,4 @@ function registerCrewAuthRoutes(app) {
     });
 }
 
-module.exports = { registerCrewAuthRoutes, viewForRole, verifyCrewRequest, effectiveCaps, CREW_CAPABILITIES, CREW_CAP_IDS };
+module.exports = { registerCrewAuthRoutes, viewForRole, verifyCrewRequest, effectiveCaps, lookupCrewVa, CREW_CAPABILITIES, CREW_CAP_IDS };

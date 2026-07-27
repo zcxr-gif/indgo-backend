@@ -34,7 +34,7 @@ const {
 
 // Crew Center sign-in (inflight.info/crew/<slug>) — cascades our existing
 // accounts (VA portal accounts + Inflight staff) and routes to the right view.
-const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps } = require('./crewAuth');
+const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps, lookupCrewVa } = require('./crewAuth');
 
 // VA statistics engine — reach/engagement counters from the tracker plus flight
 // operations derived from the ACARS takeoff/landing feed, summarised per day,
@@ -1450,12 +1450,11 @@ app.get('/api/crew/aircraft-metadata', async (req, res) => {
 });
 
 // ---- Crew roster (managed storage) ----
+// Slug or any of the VA's callsigns, approved only. See lookupCrewVa in
+// crewAuth.js — one resolver so the login, the branding endpoint and every crew
+// API agree on which addresses reach a given crew center.
 async function resolveCrewVa(slug) {
-    const raw = String(slug || '').trim().toLowerCase();
-    if (!raw) return null;
-    const sel = '_id slug callsign name contactEmail crewAccent';
-    let va = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' }).select(sel).lean();
-    if (!va) va = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' }).select(sel).lean();
+    const { va } = await lookupCrewVa(slug, '_id slug callsign name contactEmail crewAccent');
     return va;
 }
 function cleanMember(b) {
@@ -3797,24 +3796,28 @@ app.get('/api/va-ads/banner/:icao', async (req, res) => {
 // GET: Crew Center branding by slug — powers the branded login served at
 // inflight.info/crew/<slug>. Public + CORS-open (global cors() sends
 // Access-Control-Allow-Origin: *), returns ONLY presentational fields (never any
-// secret). Resolves by slug first, then falls back to callsign so existing VAs
-// work before their slugs are backfilled (e.g. /crew/aca). Accent comes from the
-// VA's embed config (its brand colour) when present, else empty so the login can
-// derive one from the logo. Registered before /api/va-ads/:id — matched by the
-// two-segment path, so it never collides with the id route.
+// secret). Resolves by slug first, then falls back to any of the VA's callsigns
+// so existing VAs work before their slugs are backfilled (e.g. /crew/aca).
+// Accent comes from the VA's embed config (its brand colour) when present, else
+// empty so the login can derive one from the logo. Registered before
+// /api/va-ads/:id — matched by the two-segment path, so it never collides with
+// the id route.
+//
+// A 404 carries a `reason` so the login page can say something useful:
+// 'not-approved' means the VA is real but still pending/rejected, which is the
+// difference between "check the address" and "wait for approval".
 app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
     try {
-        const raw = String(req.params.slug || '').trim().toLowerCase();
-        if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
-
         const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles crewFleet crewPirepAutoApprove joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured supabaseUrl supabaseAnonKey';
-        let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
-            .select(fields).lean();
+        const { va: ad, reason } = await lookupCrewVa(req.params.slug, fields);
         if (!ad) {
-            ad = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' })
-                .select(fields).lean();
+            return res.status(404).json({
+                message: reason === 'not-approved'
+                    ? 'This crew center is not live yet.'
+                    : 'Unknown crew center.',
+                reason,
+            });
         }
-        if (!ad) return res.status(404).json({ message: 'Unknown crew center.' });
 
         // Brand accent: the VA's own crewAccent wins; otherwise the embed-config
         // accent's first stop, then the legacy brandColor; '' means "decide".
@@ -4132,10 +4135,14 @@ app.patch('/api/va-ads/:id/status', requireAuth, async (req, res) => {
         if (!VA_AD_STATUSES.includes(status)) {
             return res.status(400).json({ message: `Status must be one of: ${VA_AD_STATUSES.join(', ')}.` });
         }
-        const ad = await VirtualAirlineAd.findByIdAndUpdate(
-            req.params.id, { status }, { new: true }
-        );
+        // findById + save() rather than findByIdAndUpdate: the update helpers
+        // bypass the pre-save hooks, and approving a VA is exactly when it needs
+        // the crew center slug those hooks derive. Approving through here used to
+        // leave a live VA with slug:null, so its /crew/<slug> link never resolved.
+        const ad = await VirtualAirlineAd.findById(req.params.id);
         if (!ad) return res.status(404).json({ message: 'VA advertisement not found.' });
+        ad.status = status;
+        await ad.save();
         res.json({ message: `VA advertisement ${status}.`, data: ad });
     } catch (error) {
         console.error('VA Ad Status Error:', error);
