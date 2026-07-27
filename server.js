@@ -34,7 +34,7 @@ const {
 
 // Crew Center sign-in (inflight.info/crew/<slug>) — cascades our existing
 // accounts (VA portal accounts + Inflight staff) and routes to the right view.
-const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps, lookupCrewVa } = require('./crewAuth');
+const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps, lookupCrewVa, crewCenterOpen } = require('./crewAuth');
 
 // VA statistics engine — reach/engagement counters from the tracker plus flight
 // operations derived from the ACARS takeoff/landing feed, summarised per day,
@@ -192,7 +192,22 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // pre-save hook + slugifyVaName), and overridable by staff in the Crew
     // Centers manager. Stored lowercase; sparse-unique so legacy docs without a
     // slug don't collide on null.
+    //
+    // Having a handle does NOT mean the crew center is open — see
+    // crewCenterEnabled. The handle is just the address it would live at.
     slug: { type: String, trim: true, lowercase: true, default: null },
+
+    // Is this VA's Crew Center open? A crew center is opt-in: plenty of VAs
+    // don't want one, so it stays shut until Inflight staff flip this in the
+    // Crew Centers tool. Staff-only by design — a VA cannot open its own.
+    //
+    // The default grandfathers the VAs that predate this flag: they had no
+    // switch, so a handle was what made a crew center live, and they keep the
+    // state they already had. New VAs are constructed before the slug hook
+    // runs, so they have no handle yet and correctly default to closed.
+    // crewCenterOpen() in crewAuth.js applies the same rule to lean reads,
+    // which is what every crew lookup actually uses.
+    crewCenterEnabled: { type: Boolean, default: function () { return !!this.slug; } },
 
     // Crew Center layout the VA lands on, and the presets staff permit them to
     // choose from. The VA picks from allowedLayouts in their crew center settings;
@@ -3800,12 +3815,10 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles crewFleet crewPirepAutoApprove joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured supabaseUrl supabaseAnonKey';
         const { va: ad, reason } = await lookupCrewVa(req.params.slug, fields);
         if (!ad) {
-            return res.status(404).json({
-                message: reason === 'not-approved'
-                    ? 'This crew center is not live yet.'
-                    : 'Unknown crew center.',
-                reason,
-            });
+            const message = reason === 'not-approved' ? 'This crew center is not live yet.'
+                : reason === 'not-open' ? 'This VA does not have a crew center.'
+                : 'Unknown crew center.';
+            return res.status(404).json({ message, reason });
         }
 
         // Brand accent: the VA's own crewAccent wins; otherwise the embed-config
@@ -3875,7 +3888,7 @@ app.get('/api/crew-admin/vas', requireAuth, async (req, res) => {
             ];
         }
         const ads = await VirtualAirlineAd.find(query)
-            .select('name callsign slug logoUrl bannerUrl status layout allowedLayouts')
+            .select('name callsign slug crewCenterEnabled logoUrl bannerUrl status layout allowedLayouts')
             .sort({ name: 1 }).limit(limit).lean();
 
         // Portal-account counts per VA, grouped by role (owner/staff/pilot).
@@ -3894,6 +3907,7 @@ app.get('/api/crew-admin/vas', requireAuth, async (req, res) => {
         res.json({
             vas: ads.map(a => ({
                 id: a._id, name: a.name, code: a.callsign || null, slug: a.slug || null,
+                crewCenterEnabled: crewCenterOpen(a),
                 logo: a.logoUrl || '', banner: a.bannerUrl || '', status: a.status,
                 layout: a.layout || 'editorial',
                 allowedLayouts: (a.allowedLayouts && a.allowedLayouts.length) ? a.allowedLayouts : ['editorial','console','split','classic'],
@@ -3916,6 +3930,12 @@ app.patch('/api/crew-admin/vas/:id', requireAuth, async (req, res) => {
         if (typeof req.body.slug === 'string') {
             ad.slug = req.body.slug.trim() || null;
         }
+        // Open or close the crew center. Staff-only: this route is behind
+        // requireAuth (Inflight staff), and there is deliberately no equivalent
+        // on the VA-facing portal — a VA cannot open its own crew center.
+        if (typeof req.body.crewCenterEnabled === 'boolean') {
+            ad.crewCenterEnabled = req.body.crewCenterEnabled;
+        }
         // Which layout presets this VA may choose from (staff allow-list).
         const CREW_LAYOUTS = ['editorial', 'console', 'split', 'classic'];
         if (Array.isArray(req.body.allowedLayouts)) {
@@ -3932,6 +3952,7 @@ app.patch('/api/crew-admin/vas/:id', requireAuth, async (req, res) => {
         await ad.save();
         res.json({
             id: ad._id, name: ad.name, code: ad.callsign || null, slug: ad.slug || null,
+            crewCenterEnabled: crewCenterOpen(ad),
             layout: ad.layout || 'editorial',
             allowedLayouts: (ad.allowedLayouts && ad.allowedLayouts.length) ? ad.allowedLayouts : CREW_LAYOUTS,
         });
