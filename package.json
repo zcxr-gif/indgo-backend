@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node --expose-gc server.js",
     "build": "node scripts/build-va-terms-pdf.js",
-    "build:terms": "node scripts/build-va-terms-pdf.js"
+    "build:terms": "node scripts/build-va-terms-pdf.js",
+    "backfill:crew-slugs": "node scripts/backfill-crew-slugs.js"
   },
   "keywords": [],
   "author": "Antony",

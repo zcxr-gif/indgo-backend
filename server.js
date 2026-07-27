@@ -41,6 +41,10 @@ const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps, lookupCrewVa }
 // reported to each VA's webhook at end of day and then erased. See vaStats.js.
 const vaStats = require('./vaStats');
 
+// Crew Center handle rules, shared with scripts/backfill-crew-slugs.js so the
+// model hook and the backfill can never derive different addresses.
+const { deriveUniqueVaSlug } = require('./vaSlug');
+
 // Group flights — a VA owner selects the aircraft flying their event and mints
 // one short link to share. Ownership is claimed with the contact email already
 // on file for the partnership. See vaGroupFlights.js.
@@ -394,37 +398,19 @@ VirtualAirlineAdSchema.pre('save', function (next) {
     next();
 });
 
-// Turn a VA name (or a staff-typed handle) into a URL-safe Crew Center slug:
-// lowercase, accents stripped, non-alphanumerics collapsed to single hyphens.
-// "Air Canada Virtual" -> "air-canada-virtual".
-function slugifyVaName(s) {
-    return String(s || '')
-        .normalize('NFKD').replace(/[\u0300-\u036f]/g, '') // strip diacritics
-        .toLowerCase()
-        .replace(/[’'".]/g, '')        // drop apostrophes / quotes / dots outright
-        .replace(/[^a-z0-9]+/g, '-')   // any other run of non-alnum -> one hyphen
-        .replace(/^-+|-+$/g, '')       // trim leading/trailing hyphens
-        .slice(0, 40);
-}
-
 // Fill in / normalise the Crew Center slug before save. A staff-set slug is
 // slugified as-is; otherwise it's derived from the VA name. Either way we ensure
 // uniqueness by appending -2, -3, … on the rare collision, so a save never fails
 // on the unique index. Kept separate from the callsign hook for readability.
+//
+// The rules live in vaSlug.js so the backfill script derives handles identically
+// — see scripts/backfill-crew-slugs.js.
 VirtualAirlineAdSchema.pre('save', async function (next) {
     try {
         const Model = this.constructor;
-        let slug = this.slug ? slugifyVaName(this.slug) : '';
-        if (!slug && this.name) slug = slugifyVaName(this.name);
-        if (slug) {
-            let candidate = slug, n = 2;
-            while (await Model.exists({ slug: candidate, _id: { $ne: this._id } })) {
-                candidate = `${slug}-${n++}`;
-            }
-            this.slug = candidate;
-        } else {
-            this.slug = null; // nothing usable -> stay null (sparse index skips it)
-        }
+        // null when nothing usable -> the sparse unique index skips it
+        this.slug = await deriveUniqueVaSlug(this.slug || '', this.name,
+            (s) => Model.exists({ slug: s, _id: { $ne: this._id } }));
         next();
     } catch (err) { next(err); }
 });
