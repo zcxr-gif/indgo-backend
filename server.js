@@ -1463,6 +1463,28 @@ app.get('/api/crew/aircraft-metadata', async (req, res) => {
     }
 });
 
+// ---- The crew center setup script ----
+// The SQL a VA runs in their own Supabase project, served from the one copy in
+// this repo. The crew dashboard's "Copy setup SQL" button fetches it rather
+// than carrying its own inline duplicate — two copies of a schema in two repos
+// drift, and the failure mode is a VA whose tables are subtly the wrong shape.
+//
+// Public: it is a schema, not a secret, and the VA is about to paste it into
+// their own SQL editor.
+let _setupSqlCache = null;
+app.get('/api/crew/setup-sql', (req, res) => {
+    try {
+        if (!_setupSqlCache) {
+            _setupSqlCache = fs.readFileSync(path.join(__dirname, 'supabase', 'crew-center-schema.sql'), 'utf8');
+        }
+        res.set('Cache-Control', 'public, max-age=600');
+        res.type('text/plain; charset=utf-8').send(_setupSqlCache);
+    } catch (err) {
+        console.error('setup-sql read error:', err);
+        res.status(500).type('text/plain').send('-- The setup script could not be read. Contact Inflight support.');
+    }
+});
+
 // ---- Crew data ----
 // Resolve the VA behind a crew-center slug. The selection includes the VA's
 // data-store connection (crewStore.SELECT pulls in the secret service key) so
@@ -2135,14 +2157,32 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
 const CREW_STATS_TTL_MS = 60 * 1000;
 const _crewStatsCache = new Map();   // slug -> { at, payload }
 
+// How many people are queued up to join is the VA's business, not the public's:
+// it says something about a private queue that no public page needs. The cache
+// holds the full snapshot and these are dropped on the way out to anyone who
+// can't review applications, so one cached entry serves both audiences.
+const MANAGER_ONLY_STATS = ['applicationsPending', 'applicationsAccepted', 'applications30d'];
+function scopeStats(payload, isManager) {
+    if (isManager || !payload || !payload.stats) return payload;
+    const stats = { ...payload.stats };
+    MANAGER_ONLY_STATS.forEach((k) => delete stats[k]);
+    return { ...payload, stats };
+}
+
 app.get('/api/crew/:slug/stats', async (req, res) => {
     const slug = String(req.params.slug || '').trim().toLowerCase();
     try {
+        // A signed-in reviewer additionally gets the application counters. The
+        // gate is best-effort: an absent or invalid token just means "public".
+        let isManager = false;
+        try { isManager = !(await requireCap(req, slug, 'applications.review')).error; } catch { /* public */ }
+
         const fresh = String(req.query.fresh || '') === '1';
         const hit = _crewStatsCache.get(slug);
         if (!fresh && hit && (Date.now() - hit.at) < CREW_STATS_TTL_MS) {
-            res.set('Cache-Control', 'public, max-age=60');
-            return res.json({ ...hit.payload, cached: true });
+            // Only the anonymous form is safe in a shared cache.
+            res.set('Cache-Control', isManager ? 'no-store' : 'public, max-age=60');
+            return res.json({ ...scopeStats(hit.payload, isManager), cached: true });
         }
 
         const va = await resolveCrewVa(slug);
@@ -2173,13 +2213,13 @@ app.get('/api/crew/:slug/stats', async (req, res) => {
             stats,
         };
         _crewStatsCache.set(slug, { at: Date.now(), payload });
-        res.set('Cache-Control', 'public, max-age=60');
-        res.json(payload);
+        res.set('Cache-Control', isManager ? 'no-store' : 'public, max-age=60');
+        res.json(scopeStats(payload, isManager));
     } catch (err) {
         // Serve a stale snapshot rather than breaking a VA's homepage because
         // their database blipped.
         const hit = _crewStatsCache.get(slug);
-        if (hit) return res.json({ ...hit.payload, cached: true, stale: true });
+        if (hit) return res.json({ ...scopeStats(hit.payload, false), cached: true, stale: true });
         crewFail(res, err, { log: 'crew stats error', message: 'Could not load statistics.' });
     }
 });
