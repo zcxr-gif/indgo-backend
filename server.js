@@ -25,6 +25,7 @@ const {
     registerVaPortalRoutes,
     provisionOwnerAccount,
     provisionRepAccount,
+    provisionPilotAccount,
     deactivateRepAccount,
     purgeVaData,
     VaSubmission,
@@ -34,7 +35,7 @@ const {
 
 // Crew Center sign-in (inflight.info/crew/<slug>) — cascades our existing
 // accounts (VA portal accounts + Inflight staff) and routes to the right view.
-const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps } = require('./crewAuth');
+const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps, cleanDiscordInvite } = require('./crewAuth');
 
 // VA statistics engine — reach/engagement counters from the tracker plus flight
 // operations derived from the ACARS takeoff/landing feed, summarised per day,
@@ -245,6 +246,14 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // accept / decline decisions + the staff's message) is posted to their
     // server. Secret (contains a token) → select:false, never echoed back.
     crewWebhookUrl: { type: String, trim: true, default: null, select: false },
+
+    // The VA's Discord INVITE (not the webhook above — this one is public and
+    // shareable). Handed to a pilot when their application is accepted, so
+    // "you're in" and "here's where the crew talks" arrive together. Set once
+    // here; the accept dialog pre-fills from it and can override per pilot
+    // (a one-time or role-specific invite). Validated as a real Discord invite
+    // link — see isDiscordInviteUrl.
+    crewDiscordInvite: { type: String, trim: true, default: '' },
 
     // --- Bring-your-own email provider (applicant notifications) ---
     // When set, applicant emails go through the VA's OWN provider/account so
@@ -474,6 +483,10 @@ const CrewApplicationSchema = new mongoose.Schema({
     // Opaque token the applicant is handed so they can check their status
     // without an account or email. Indexed so lookups are cheap.
     statusToken: { type: String, trim: true, default: '', index: true },
+    // The Discord invite sent on acceptance, so the status page can show it
+    // again — an emailed invite is easy to lose, and an applicant who gave no
+    // email has the status link as their only copy.
+    discordInvite: { type: String, trim: true, default: '' },
     reviewedAt: { type: Date, default: null },
 }, { timestamps: true });
 const CrewApplication = mongoose.models.CrewApplication || mongoose.model('CrewApplication', CrewApplicationSchema);
@@ -1043,6 +1056,7 @@ const isDiscordWebhookUrl = (url) => {
         || host === 'canary.discord.com' || host === 'ptb.discord.com';
     return allowedHost && /^\/api\/(v\d+\/)?webhooks\/\d+\/[\w-]+$/.test(u.pathname);
 };
+
 
 // A safe, non-secret hint for a stored Discord webhook — mirrors the masking in
 // vaPortal.js so staff surfaces (inbox, embed manager) can show "a webhook is on
@@ -2066,6 +2080,9 @@ app.get('/api/crew/:slug/application-status/:token', async (req, res) => {
             message: appDoc.staffMessage || '',
             ifcName: appDoc.ifcName || '',
             callsign: ((appDoc.callsignPrefix || '') + (appDoc.callsignNumber || '')).trim(),
+            // Only meaningful once accepted, and only ever set by the accept
+            // handler from a validated invite.
+            discordInvite: appDoc.status === 'accepted' ? (appDoc.discordInvite || '') : '',
             reviewedAt: appDoc.reviewedAt || null,
             submittedAt: appDoc.createdAt || null,
         });
@@ -2095,7 +2112,29 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
         const action = String(req.body?.action || '');
         const message = String(req.body?.message || '').trim().slice(0, 2000);
         const patch = { reviewedAt: new Date() };
+
+        // What the pilot gets handed along with the decision. `credentials` is
+        // returned to the reviewing staff member exactly once — see below.
+        let credentials = null;
+        let invite = '';
+
         if (action === 'accept') {
+            // The invite the pilot is sent: whatever the reviewer typed, else
+            // the VA's stored default. Rejected outright if it isn't a real
+            // Discord invite — we are about to put it in an email with our name
+            // on it (see isDiscordInviteUrl).
+            if (req.body?.discordInvite !== undefined) {
+                invite = cleanDiscordInvite(req.body.discordInvite);
+                if (invite === null) {
+                    return res.status(400).json({ error: 'That is not a Discord invite link. Use a discord.gg or discord.com/invite address.' });
+                }
+            }
+            if (!invite) {
+                const withInvite = await VirtualAirlineAd.findById(va._id).select('crewDiscordInvite').lean();
+                invite = (withInvite && withInvite.crewDiscordInvite) || '';
+            }
+            if (invite) patch.discordInvite = invite;
+
             // Only mint the pilot on the transition into 'accepted', so
             // re-accepting an already-accepted application can't duplicate them.
             if (appDoc.status !== 'accepted') {
@@ -2105,6 +2144,25 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
                     ifUserId: appDoc.ifUserId || '', ifcName: appDoc.ifcName || '',
                 });
                 vaStats.recordEngagement(va._id, 'crewJoin', 1, va.name);
+            }
+
+            // A crew center login, when the reviewer asked for one. Best-effort:
+            // a pilot who is on the roster but could not be given an account is
+            // a fixable annoyance, whereas failing the whole acceptance over it
+            // would leave the application pending after we already added them.
+            if (req.body?.createAccount) {
+                try {
+                    const r = await provisionPilotAccount({ _id: va._id, name: va.name }, {
+                        displayName: appDoc.ifcName || '',
+                        createdByName: gate.p?.name || 'Crew Center',
+                    });
+                    // A password comes back only on first creation; re-accepting
+                    // someone who already has a login yields username-only.
+                    credentials = { username: r.username, password: r.password, created: r.created };
+                } catch (err) {
+                    console.error('pilot account provision error:', err?.message || err);
+                    credentials = { error: 'The pilot was accepted, but their crew center account could not be created.' };
+                }
             }
             patch.status = 'accepted';
         } else if (action === 'decline') {
@@ -2131,17 +2189,39 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
             const slug = va.slug || req.params.slug;
             const statusUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}/status?id=${appDoc.statusToken}`;
             const centerUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}`;
-            const body = (accepted
+            let body = (accepted
                 ? `Great news — welcome to <b>${escHtml(va.name || 'the crew')}</b>${cs ? `, flying as <b>${escHtml(cs)}</b>` : ''}.`
                 : `Thanks for applying to <b>${escHtml(va.name || 'the VA')}</b>. Unfortunately they weren’t able to accept your application this time.`)
                 + (message ? `<br><br><b>Message from the team:</b><br>${escHtml(message).replace(/\n/g, '<br>')}` : '');
+            // The two things a new pilot needs next: how to sign in, and where
+            // the crew actually talks. The password is printed here because this
+            // is the only copy — nothing stores it (see provisionPilotAccount).
+            if (accepted && credentials && credentials.password) {
+                body += `<br><br><b>Your crew center sign-in</b><br>`
+                    + `Username: <b>${escHtml(credentials.username)}</b><br>`
+                    + `Temporary password: <b>${escHtml(credentials.password)}</b><br>`
+                    + `<span style="color:#6b7280">Please change it after you sign in for the first time.</span>`;
+            }
+            if (accepted && invite) {
+                body += `<br><br><b>Join the crew on Discord</b><br><a href="${escHtml(invite)}">${escHtml(invite)}</a>`;
+            }
             sendCrewEmail(emailCfg, { to: appDoc.email,
                 subject: accepted ? `You’re in — ${va.name || 'Crew Center'}` : `Update on your application — ${va.name || 'Crew Center'}`,
                 html: crewEmailHtml({ vaName: va.name, accent: va.crewAccent, heading: accepted ? 'You’re in! 🎉' : 'Application update',
                     bodyHtml: body,
                     button: accepted ? { label: 'Open the crew center', url: centerUrl } : { label: 'View your application', url: statusUrl } }) }).catch(() => {});
         }
-        res.json({ status: appDoc.status, message: appDoc.staffMessage || '' });
+        // `credentials` carries the ONLY copy of the temporary password. It is
+        // returned here so the reviewer can pass it on when the applicant left
+        // no email address — the dashboard shows it once and warns that it will
+        // not be shown again.
+        res.json({
+            status: appDoc.status,
+            message: appDoc.staffMessage || '',
+            discordInvite: accepted ? (invite || '') : '',
+            emailed: !!(accepted && appDoc.email),
+            account: credentials,
+        });
     } catch (err) { crewFail(res, err, { log: 'application review error', message: 'Could not update the application.' }); }
 });
 
@@ -4116,7 +4196,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles crewFleet crewPirepAutoApprove joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles crewFleet crewPirepAutoApprove joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -4163,6 +4243,10 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
                 form: Array.isArray(ad.applicationForm) ? ad.applicationForm : [],
                 requirements: Array.isArray(ad.joinRequirements) ? ad.joinRequirements : [],
                 emailEnabled: !!ad.crewEmailConfigured,
+                // The VA's default Discord invite. Public by nature (it is
+                // meant to be shared) and read by the dashboard so the accept
+                // dialog can pre-fill it.
+                discordInvite: ad.crewDiscordInvite || '',
             },
             // Public Supabase connection (never the secret service key).
             supabase: {

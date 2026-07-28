@@ -93,11 +93,41 @@ Only ever add nullable columns or new tables. A VA runs this script by hand
 against their own production data, and there is no way to coordinate a
 breaking change across every project at once.
 
+## Accepting a pilot
+
+Accepting an application (`PATCH /api/crew/:slug/applications/:id` with
+`action: "accept"`) can do three things beyond flipping the status:
+
+- **Adds them to the roster** — always, in the VA's project.
+- **Creates a crew center login** when `createAccount` is set. A `pilot`-role
+  account (see `PORTAL_ROLES` in `vaPortal.js`) is provisioned centrally, since
+  logins are the one thing we do keep. The generated password is returned in the
+  response **once** and is never stored — only its bcrypt hash is. It is emailed
+  to the applicant when they gave an address, and shown to the reviewing staff
+  member either way, because an applicant without an email has no other route to
+  it. Accepting the same person twice returns their existing account rather than
+  minting a second login.
+- **Sends a Discord invite** — `discordInvite` on the request, falling back to
+  the VA's stored `crewDiscordInvite`. It goes into the acceptance email and is
+  saved on the application so the applicant's status page can show it again.
+
+The invite is validated by `cleanDiscordInvite` in `crewAuth.js` and it is a
+security boundary, not a formatting nicety: that string lands in an email we
+send under our own name, and as a link on a page we serve. Anything that is not
+literally a `discord.gg` or `discord.com/invite` URL is rejected outright rather
+than sanitised, and what is stored is rebuilt from the parsed URL so a pilot is
+never shown a path-traversal or a tracking query as their invite link.
+
 ## Tests
 
 `node scratchpad/test-crew-store.js` drives the Supabase adapter against an
 in-process PostgREST impersonator — mapping, slug scoping, flight-id dedupe,
 hours credit/reverse and the error taxonomy. No network, no database.
+
+`node scratchpad/test-discord-invite.js` covers the invite validator: the real
+formats, lookalike hosts, non-invite Discord paths, scheme downgrades, and the
+three-way `'' / url / null` contract that lets a handler tell "clear this" from
+"the caller sent junk".
 
 The schema itself is worth checking against a real Postgres when it changes:
 create the `anon` and `authenticated` roles (Supabase provides them; a bare

@@ -110,10 +110,17 @@ create table if not exists crew_applications (
     status          text not null default 'pending' check (status in ('pending','accepted','declined')),
     staff_message   text not null default '',
     status_token    text not null default '',
+    -- The Discord invite this pilot was sent when they were accepted. Kept so
+    -- their status page can show it again: an emailed invite is easy to lose,
+    -- and an applicant who gave no email has the status link as their only copy.
+    discord_invite  text not null default '',
     reviewed_at     timestamptz,
     created_at      timestamptz not null default now(),
     updated_at      timestamptz not null default now()
 );
+-- v2. Added separately so a project provisioned at v1 picks it up on re-run
+-- rather than needing the table dropped.
+alter table crew_applications add column if not exists discord_invite text not null default '';
 create index if not exists crew_applications_va_idx     on crew_applications (va_slug, status, created_at desc);
 -- The status link must resolve to exactly one application.
 create unique index if not exists crew_applications_token_idx
@@ -365,5 +372,5 @@ grant execute on function crew_stats(text) to anon, authenticated;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 1)
+insert into crew_schema_info (id, version) values (1, 2)
 on conflict (id) do update set version = excluded.version, updated_at = now();

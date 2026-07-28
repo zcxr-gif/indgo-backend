@@ -49,7 +49,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // The schema version this code is written against. A project reporting an older
 // version still works — every column we read has existed since v1 — but the
 // health endpoint flags it so the VA knows to re-run the SQL.
-const EXPECTED_SCHEMA_VERSION = 1;
+const EXPECTED_SCHEMA_VERSION = 2;
 
 // Mongo models, injected by server.js so this module doesn't reach into the
 // app's DB wiring. Only the legacy adapter touches them.
@@ -227,6 +227,10 @@ const applicationFromRow = (r) => r && {
     status: r.status || 'pending',
     staffMessage: r.staff_message || '',
     statusToken: r.status_token || '',
+    // The Discord invite the pilot was sent on acceptance, kept so their status
+    // page can show it again — an emailed invite is easy to lose, and an
+    // applicant with no email has the status link as their only copy.
+    discordInvite: r.discord_invite || '',
     reviewedAt: date(r.reviewed_at),
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
@@ -245,6 +249,7 @@ const applicationToRow = (a) => {
     pick(a, out, 'status', 'status', (v) => (['pending', 'accepted', 'declined'].includes(v) ? v : 'pending'));
     pick(a, out, 'staffMessage', 'staff_message', (v) => str(v, 2000));
     pick(a, out, 'statusToken', 'status_token', (v) => str(v, 64));
+    pick(a, out, 'discordInvite', 'discord_invite', (v) => str(v, 200));
     pick(a, out, 'reviewedAt', 'reviewed_at', (v) => (date(v) ? date(v).toISOString() : null));
     return out;
 };

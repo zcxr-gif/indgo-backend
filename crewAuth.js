@@ -28,6 +28,51 @@ const isHexColor = (c) => /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(c || '');
 const clampStr = (s, n) => String(s == null ? '' : s).trim().slice(0, n);
 const cleanImageUrl = (u) => { const s = clampStr(u, 600); return /^https:\/\//i.test(s) ? s : ''; };
 
+// A Discord INVITE link — discord.gg/abc123, or discord.com/invite/abc123.
+// NOT the webhook URL the VA sets for notifications; that one is a secret and
+// lives elsewhere. This one is public and is handed to accepted pilots.
+//
+// Validated strictly, and not as a formality: this string goes into an
+// acceptance email that WE send, with our name on it. An unvalidated "invite"
+// field is a phishing vector — a VA could point it anywhere and the message
+// would still read as coming from Inflight. Anything that is not literally a
+// Discord invite is rejected rather than sanitised into something plausible.
+const isDiscordInviteUrl = (url) => {
+    if (!url || typeof url !== 'string') return false;
+    let u;
+    try { u = new URL(url.trim()); } catch { return false; }
+    if (u.protocol !== 'https:') return false;
+    const host = u.hostname.toLowerCase();
+    // Discord's own codes are alphanumeric; vanity URLs add hyphens. No slashes
+    // in the pattern, so an extra path segment can't be smuggled through.
+    const code = '[A-Za-z0-9-]{2,64}';
+    const known = ['discord.gg', 'discord.com', 'discordapp.com', 'canary.discord.com', 'ptb.discord.com'];
+    if (!known.includes(host)) return false;
+    if (!new RegExp(`^/(invite/)?${code}/?$`).test(u.pathname)) return false;
+    // Only discord.gg may use the bare /code form; on the full domains an
+    // invite always lives under /invite/.
+    return host === 'discord.gg' || u.pathname.startsWith('/invite/');
+};
+
+// '' when nothing was supplied (a meaningful value — it clears a stored
+// invite), the CANONICAL url when it is a real invite, and null when the caller
+// sent something that is not one, so a handler can tell "cleared" from
+// "rejected".
+//
+// Canonical, not merely trimmed: the returned string is rebuilt from the parsed
+// URL, so what we store and later show a pilot is always origin + clean path.
+// The parser resolves "/abc/../../x" to "/x" before the host check, so such a
+// URL is on discord.gg either way and is safe — but echoing the traversal back
+// to a pilot as their invite link would look like an attack. Rebuilding drops
+// it, along with any query string or fragment an invite has no use for.
+const cleanDiscordInvite = (url) => {
+    const s = String(url == null ? '' : url).trim();
+    if (!s) return '';
+    if (!isDiscordInviteUrl(s)) return null;
+    const u = new URL(s);
+    return (u.origin + u.pathname).replace(/\/+$/, '');
+};
+
 // Verify a crew Bearer token on a request (used by routes registered outside
 // this module, e.g. the badge-image upload in server.js). Returns the crew
 // payload or null.
@@ -285,7 +330,7 @@ function registerCrewAuthRoutes(app) {
             const can = (c) => caps.includes(c);
             const body = req.body || {};
             const touchesBranding = ['layout', 'accent', 'loginLook', 'ranks', 'roles', 'fleet'].some(f => body[f] !== undefined);
-            const touchesRecruit = ['joinMode', 'minGrade', 'callsignPrefix', 'applicationForm', 'joinRequirements'].some(f => body[f] !== undefined);
+            const touchesRecruit = ['joinMode', 'minGrade', 'callsignPrefix', 'discordInvite', 'applicationForm', 'joinRequirements'].some(f => body[f] !== undefined);
             const touchesTeam = body.staffRoles !== undefined || body.staffAssignments !== undefined;
             const touchesOps = body.pirepAutoApprove !== undefined;
             if (touchesBranding && !can('settings.branding')) return res.status(403).json({ error: 'You don’t have permission to change appearance.' });
@@ -337,6 +382,15 @@ function registerCrewAuthRoutes(app) {
             if (typeof req.body?.callsignPrefix === 'string') {
                 ad.callsignPrefix = req.body.callsignPrefix.trim().slice(0, 10);
             }
+            // The VA's Discord invite, offered to every pilot they accept. The
+            // accept dialog pre-fills from this and can override it per pilot.
+            if (req.body?.discordInvite !== undefined) {
+                const inv = cleanDiscordInvite(req.body.discordInvite);
+                if (inv === null) {
+                    return res.status(400).json({ error: 'That is not a Discord invite link. Use a discord.gg or discord.com/invite address.' });
+                }
+                ad.crewDiscordInvite = inv;
+            }
             if (req.body?.applicationForm !== undefined) {
                 const f = sanitizeForm(req.body.applicationForm);
                 if (f) ad.applicationForm = f;
@@ -362,6 +416,7 @@ function registerCrewAuthRoutes(app) {
                 layout: ad.layout, allowedLayouts: ad.allowedLayouts, accent: ad.crewAccent || '',
                 loginLook: ad.loginLook || 'center', ranks: ad.ranks || [], roles: ad.roles || [], fleet: ad.crewFleet || [],
                 joinMode: ad.joinMode, minGrade: ad.minGrade, callsignPrefix: ad.callsignPrefix || '',
+                discordInvite: ad.crewDiscordInvite || '',
                 applicationForm: ad.applicationForm || [], joinRequirements: ad.joinRequirements || [],
                 staffRoles: ad.staffRoles || [], staffAssignments: ad.staffAssignments || [],
                 pirepAutoApprove: !!ad.crewPirepAutoApprove,
@@ -452,4 +507,8 @@ function registerCrewAuthRoutes(app) {
     });
 }
 
-module.exports = { registerCrewAuthRoutes, viewForRole, verifyCrewRequest, effectiveCaps, CREW_CAPABILITIES, CREW_CAP_IDS };
+module.exports = {
+    registerCrewAuthRoutes, viewForRole, verifyCrewRequest, effectiveCaps,
+    isDiscordInviteUrl, cleanDiscordInvite,
+    CREW_CAPABILITIES, CREW_CAP_IDS,
+};
