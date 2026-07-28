@@ -25,6 +25,7 @@ const {
     registerVaPortalRoutes,
     provisionOwnerAccount,
     provisionRepAccount,
+    provisionPilotAccount,
     deactivateRepAccount,
     purgeVaData,
     VaSubmission,
@@ -34,12 +35,19 @@ const {
 
 // Crew Center sign-in (inflight.info/crew/<slug>) — cascades our existing
 // accounts (VA portal accounts + Inflight staff) and routes to the right view.
-const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps } = require('./crewAuth');
+const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps, cleanDiscordInvite } = require('./crewAuth');
 
 // VA statistics engine — reach/engagement counters from the tracker plus flight
 // operations derived from the ACARS takeoff/landing feed, summarised per day,
 // reported to each VA's webhook at end of day and then erased. See vaStats.js.
 const vaStats = require('./vaStats');
+
+// Where a VA's crew data lives. Rosters, flight reports and applications belong
+// to the VA and are stored in the VA's OWN Supabase project; we keep only their
+// staff logins and their directory/branding metadata. crewStore hides which of
+// the two backends (their Postgres, or our legacy managed collections for VAs
+// that have not migrated yet) is answering. See crewStore.js.
+const crewStore = require('./crewStore');
 
 // Group flights — a VA owner selects the aircraft flying their event and mints
 // one short link to share. Ownership is claimed with the contact email already
@@ -238,6 +246,14 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // accept / decline decisions + the staff's message) is posted to their
     // server. Secret (contains a token) → select:false, never echoed back.
     crewWebhookUrl: { type: String, trim: true, default: null, select: false },
+
+    // The VA's Discord INVITE (not the webhook above — this one is public and
+    // shareable). Handed to a pilot when their application is accepted, so
+    // "you're in" and "here's where the crew talks" arrive together. Set once
+    // here; the accept dialog pre-fills from it and can override per pilot
+    // (a one-time or role-specific invite). Validated as a real Discord invite
+    // link — see isDiscordInviteUrl.
+    crewDiscordInvite: { type: String, trim: true, default: '' },
 
     // --- Bring-your-own email provider (applicant notifications) ---
     // When set, applicant emails go through the VA's OWN provider/account so
@@ -467,6 +483,10 @@ const CrewApplicationSchema = new mongoose.Schema({
     // Opaque token the applicant is handed so they can check their status
     // without an account or email. Indexed so lookups are cheap.
     statusToken: { type: String, trim: true, default: '', index: true },
+    // The Discord invite sent on acceptance, so the status page can show it
+    // again — an emailed invite is easy to lose, and an applicant who gave no
+    // email has the status link as their only copy.
+    discordInvite: { type: String, trim: true, default: '' },
     reviewedAt: { type: Date, default: null },
 }, { timestamps: true });
 const CrewApplication = mongoose.models.CrewApplication || mongoose.model('CrewApplication', CrewApplicationSchema);
@@ -520,6 +540,13 @@ const CrewPirepSchema = new mongoose.Schema({
 CrewPirepSchema.index({ vaAdId: 1, flightId: 1 });
 CrewPirepSchema.index({ vaAdId: 1, status: 1, flownAt: -1 });
 const CrewPirep = mongoose.models.CrewPirep || mongoose.model('CrewPirep', CrewPirepSchema);
+
+// The four collections above are LEGACY. New crew data is written to the VA's
+// own Supabase project; these remain only so VAs onboarded before that keep
+// working until they run the migration (POST /api/crew/:slug/store/migrate).
+// Handing them to crewStore keeps that fallback in one place instead of spread
+// through the route handlers.
+crewStore.configure({ CrewMember, CrewApplication, CrewRoute, CrewPirep });
 
 // ---- Infinite Flight identity verification ----
 // We already run an acars backend that proxies the official IF API. It resolves
@@ -1030,6 +1057,7 @@ const isDiscordWebhookUrl = (url) => {
     return allowedHost && /^\/api\/(v\d+\/)?webhooks\/\d+\/[\w-]+$/.test(u.pathname);
 };
 
+
 // A safe, non-secret hint for a stored Discord webhook — mirrors the masking in
 // vaPortal.js so staff surfaces (inbox, embed manager) can show "a webhook is on
 // file" without ever echoing the token back. Returns '' when nothing is set.
@@ -1449,14 +1477,62 @@ app.get('/api/crew/aircraft-metadata', async (req, res) => {
     }
 });
 
-// ---- Crew roster (managed storage) ----
+// ---- The crew center setup script ----
+// The SQL a VA runs in their own Supabase project, served from the one copy in
+// this repo. The crew dashboard's "Copy setup SQL" button fetches it rather
+// than carrying its own inline duplicate — two copies of a schema in two repos
+// drift, and the failure mode is a VA whose tables are subtly the wrong shape.
+//
+// Public: it is a schema, not a secret, and the VA is about to paste it into
+// their own SQL editor.
+let _setupSqlCache = null;
+app.get('/api/crew/setup-sql', (req, res) => {
+    try {
+        if (!_setupSqlCache) {
+            _setupSqlCache = fs.readFileSync(path.join(__dirname, 'supabase', 'crew-center-schema.sql'), 'utf8');
+        }
+        res.set('Cache-Control', 'public, max-age=600');
+        res.type('text/plain; charset=utf-8').send(_setupSqlCache);
+    } catch (err) {
+        console.error('setup-sql read error:', err);
+        res.status(500).type('text/plain').send('-- The setup script could not be read. Contact Inflight support.');
+    }
+});
+
+// ---- Crew data ----
+// Resolve the VA behind a crew-center slug. The selection includes the VA's
+// data-store connection (crewStore.SELECT pulls in the secret service key) so
+// the caller can immediately open a store against the VA's own project.
 async function resolveCrewVa(slug) {
     const raw = String(slug || '').trim().toLowerCase();
     if (!raw) return null;
-    const sel = '_id slug callsign name contactEmail crewAccent';
+    const sel = crewStore.SELECT;
     let va = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' }).select(sel).lean();
     if (!va) va = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' }).select(sel).lean();
     return va;
+}
+
+// Resolve the VA *and* open its store in one step. Throws a CrewStoreError
+// (404 for an unknown slug, 409 when the VA has not connected a project) which
+// crewFail below turns into the right reply.
+async function resolveCrewStore(slug) {
+    const va = await resolveCrewVa(slug);
+    if (!va) throw new crewStore.CrewStoreError('Crew center not found.', { status: 404, code: 'va_not_found' });
+    return { va, store: await crewStore.forVa(va) };
+}
+
+// One error shape for every crew handler. A fault inside the VA's own database
+// is the VA's to fix, so its status and message are passed through verbatim
+// (with the machine-readable code) instead of being flattened to "500 something
+// went wrong" — which would read as our outage. Anything else is ours: log it
+// and say so generically.
+function crewFail(res, err, fallback) {
+    if (err instanceof crewStore.CrewStoreError) {
+        if (err.detail) console.warn(`crew store [${err.code}]:`, err.detail);
+        return res.status(err.status).json({ error: err.message, code: err.code });
+    }
+    console.error(`${fallback.log}:`, err);
+    return res.status(500).json({ error: fallback.message });
 }
 function cleanMember(b) {
     b = b || {};
@@ -1503,48 +1579,46 @@ async function requireCap(req, slug, capability) {
 // Public read — the roster is shown on the crew center.
 app.get('/api/crew/:slug/roster', async (req, res) => {
     try {
-        const va = await resolveCrewVa(req.params.slug);
-        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
-        const members = await CrewMember.find({ vaAdId: va._id }).sort({ hours: -1, name: 1 }).limit(2000).lean();
+        const { store } = await resolveCrewStore(req.params.slug);
+        const members = await store.listMembers();
         res.json({ roster: members.map(publicMember) });
-    } catch (err) { console.error('roster list error:', err); res.status(500).json({ error: 'Could not load the roster.' }); }
+    } catch (err) { crewFail(res, err, { log: 'roster list error', message: 'Could not load the roster.' }); }
 });
 // Add a member.
 app.post('/api/crew/:slug/roster', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'roster.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const va = await resolveCrewVa(req.params.slug);
-        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
-        const m = await CrewMember.create({ vaAdId: va._id, ...cleanMember(req.body) });
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const m = await store.createMember(cleanMember(req.body));
         vaStats.recordEngagement(va._id, 'crewJoin', 1, va.name);
         res.status(201).json({ member: publicMember(m) });
-    } catch (err) { console.error('roster add error:', err); res.status(500).json({ error: 'Could not add the pilot.' }); }
+    } catch (err) { crewFail(res, err, { log: 'roster add error', message: 'Could not add the pilot.' }); }
 });
 // Edit a member.
 app.patch('/api/crew/:slug/roster/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'roster.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const va = await resolveCrewVa(req.params.slug);
-        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
-        const m = await CrewMember.findOne({ _id: req.params.id, vaAdId: va._id });
-        if (!m) return res.status(404).json({ error: 'Pilot not found.' });
-        Object.assign(m, cleanMember({ ...m.toObject(), ...req.body }));
-        await m.save();
+        const { store } = await resolveCrewStore(req.params.slug);
+        const existing = await store.getMember(req.params.id);
+        if (!existing) return res.status(404).json({ error: 'Pilot not found.' });
+        // Merge over the current record before cleaning so a partial PATCH keeps
+        // the fields it didn't mention (notably the IF link, which the roster
+        // editor never sends back).
+        const m = await store.updateMember(req.params.id, cleanMember({ ...existing, ...req.body }));
         res.json({ member: publicMember(m) });
-    } catch (err) { console.error('roster edit error:', err); res.status(500).json({ error: 'Could not update the pilot.' }); }
+    } catch (err) { crewFail(res, err, { log: 'roster edit error', message: 'Could not update the pilot.' }); }
 });
 // Remove a member.
 app.delete('/api/crew/:slug/roster/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'roster.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const va = await resolveCrewVa(req.params.slug);
-        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
-        await CrewMember.deleteOne({ _id: req.params.id, vaAdId: va._id });
+        const { store } = await resolveCrewStore(req.params.slug);
+        await store.deleteMember(req.params.id);
         res.json({ ok: true });
-    } catch (err) { console.error('roster delete error:', err); res.status(500).json({ error: 'Could not remove the pilot.' }); }
+    } catch (err) { crewFail(res, err, { log: 'roster delete error', message: 'Could not remove the pilot.' }); }
 });
 
 // ---- Route network ----
@@ -1569,44 +1643,39 @@ const publicRoute = (r) => ({
 // here we return all so managers see drafts too — the list isn't sensitive).
 app.get('/api/crew/:slug/routes', async (req, res) => {
     try {
-        const va = await resolveCrewVa(req.params.slug);
-        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
-        const routes = await CrewRoute.find({ vaAdId: va._id }).sort({ flightNumber: 1, createdAt: -1 }).limit(3000).lean();
+        const { store } = await resolveCrewStore(req.params.slug);
+        const routes = await store.listRoutes();
         res.json({ routes: routes.map(publicRoute) });
-    } catch (err) { console.error('routes list error:', err); res.status(500).json({ error: 'Could not load routes.' }); }
+    } catch (err) { crewFail(res, err, { log: 'routes list error', message: 'Could not load routes.' }); }
 });
 app.post('/api/crew/:slug/routes', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'routes.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const va = await resolveCrewVa(req.params.slug);
-        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
-        const r = await CrewRoute.create({ vaAdId: va._id, ...cleanRoute(req.body) });
+        const { store } = await resolveCrewStore(req.params.slug);
+        const r = await store.createRoute(cleanRoute(req.body));
         res.status(201).json({ route: publicRoute(r) });
-    } catch (err) { console.error('route add error:', err); res.status(500).json({ error: 'Could not add the route.' }); }
+    } catch (err) { crewFail(res, err, { log: 'route add error', message: 'Could not add the route.' }); }
 });
 app.patch('/api/crew/:slug/routes/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'routes.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const va = await resolveCrewVa(req.params.slug);
-        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
-        const r = await CrewRoute.findOne({ _id: req.params.id, vaAdId: va._id });
-        if (!r) return res.status(404).json({ error: 'Route not found.' });
-        Object.assign(r, cleanRoute({ ...r.toObject(), ...req.body }));
-        await r.save();
+        const { store } = await resolveCrewStore(req.params.slug);
+        const existing = await store.getRoute(req.params.id);
+        if (!existing) return res.status(404).json({ error: 'Route not found.' });
+        const r = await store.updateRoute(req.params.id, cleanRoute({ ...existing, ...req.body }));
         res.json({ route: publicRoute(r) });
-    } catch (err) { console.error('route edit error:', err); res.status(500).json({ error: 'Could not update the route.' }); }
+    } catch (err) { crewFail(res, err, { log: 'route edit error', message: 'Could not update the route.' }); }
 });
 app.delete('/api/crew/:slug/routes/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'routes.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const va = await resolveCrewVa(req.params.slug);
-        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
-        await CrewRoute.deleteOne({ _id: req.params.id, vaAdId: va._id });
+        const { store } = await resolveCrewStore(req.params.slug);
+        await store.deleteRoute(req.params.id);
         res.json({ ok: true });
-    } catch (err) { console.error('route delete error:', err); res.status(500).json({ error: 'Could not remove the route.' }); }
+    } catch (err) { crewFail(res, err, { log: 'route delete error', message: 'Could not remove the route.' }); }
 });
 
 // ---- Flight reports (PIREPs) — auto-captured from real IF history ----
@@ -1644,23 +1713,23 @@ function resolveFlightNames(flight, meta) {
     }
     return { aircraftName, liveryName };
 }
-// Credit a PIREP's hours to its pilot exactly once.
-async function applyPirepHours(pirep) {
-    if (!pirep || pirep.hoursApplied || !pirep.memberId) return;
+// Credit a PIREP's hours to its pilot exactly once. `hoursApplied` is the guard:
+// it is flipped in the same store the hours landed in, so approving an
+// already-approved report is a no-op rather than a double credit. Returns the
+// updated report.
+async function applyPirepHours(store, pirep) {
+    if (!pirep || pirep.hoursApplied || !pirep.memberId) return pirep;
     const hrs = (Number(pirep.durationMin) || 0) / 60;
-    if (hrs > 0) await CrewMember.updateOne({ _id: pirep.memberId }, { $inc: { hours: hrs } });
-    pirep.hoursApplied = true;
-    await pirep.save();
+    if (hrs > 0) await store.addMemberHours(pirep.memberId, hrs);
+    return (await store.updatePirep(pirep._id, { hoursApplied: true })) || { ...pirep, hoursApplied: true };
 }
-// Roll a PIREP's credited hours back off its pilot (on reject/delete), clamped at 0.
-async function reversePirepHours(pirep) {
-    if (!pirep || !pirep.hoursApplied || !pirep.memberId) return;
+// Roll a PIREP's credited hours back off its pilot (on reject/delete), clamped
+// at 0 by the store.
+async function reversePirepHours(store, pirep) {
+    if (!pirep || !pirep.hoursApplied || !pirep.memberId) return pirep;
     const hrs = (Number(pirep.durationMin) || 0) / 60;
-    if (hrs > 0) {
-        const m = await CrewMember.findById(pirep.memberId).select('hours');
-        if (m) { m.hours = Math.max(0, (Number(m.hours) || 0) - hrs); await m.save(); }
-    }
-    pirep.hoursApplied = false;
+    if (hrs > 0) await store.addMemberHours(pirep.memberId, -hrs);
+    return (await store.updatePirep(pirep._id, { hoursApplied: false })) || { ...pirep, hoursApplied: false };
 }
 const publicPirep = (p) => ({
     id: p._id, memberId: p.memberId, routeId: p.routeId,
@@ -1677,20 +1746,17 @@ const publicPirep = (p) => ({
 // everyone else sees the approved flights only — a public flight log.
 app.get('/api/crew/:slug/pireps', async (req, res) => {
     try {
-        const va = await resolveCrewVa(req.params.slug);
-        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const { store } = await resolveCrewStore(req.params.slug);
         const gate = await requireCap(req, req.params.slug, 'flights.review');
         const isManager = !gate.error;
-        const q = { vaAdId: va._id };
+        let status = 'approved';   // non-managers see the public flight log only
         if (isManager) {
             const s = String(req.query.status || '');
-            if (['pending', 'approved', 'rejected'].includes(s)) q.status = s;
-        } else {
-            q.status = 'approved';
+            status = ['pending', 'approved', 'rejected'].includes(s) ? s : '';
         }
-        const pireps = await CrewPirep.find(q).sort({ flownAt: -1, createdAt: -1 }).limit(500).lean();
+        const pireps = await store.listPireps({ status });
         res.json({ pireps: pireps.map(publicPirep), canReview: isManager });
-    } catch (err) { console.error('pireps list error:', err); res.status(500).json({ error: 'Could not load flights.' }); }
+    } catch (err) { crewFail(res, err, { log: 'pireps list error', message: 'Could not load flights.' }); }
 });
 
 // File a PIREP by hand. Any signed-in crew member of this VA can submit one.
@@ -1706,8 +1772,7 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
         return res.status(403).json({ error: 'Wrong crew center.' });
     }
     try {
-        const va = await resolveCrewVa(req.params.slug);
-        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const { va, store } = await resolveCrewStore(req.params.slug);
         const b = req.body || {};
         const icao = (v) => String(v || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
         const origin = icao(b.origin), destination = icao(b.destination);
@@ -1722,19 +1787,19 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
 
         // Optional: attribute to a roster pilot (so approving can credit hours).
         let member = null;
-        if (b.memberId) member = await CrewMember.findOne({ _id: b.memberId, vaAdId: va._id }).lean();
+        if (b.memberId) member = await store.getMember(b.memberId);
 
         // Compare against the current network to judge whether the route is real.
         const vaFull = await VirtualAirlineAd.findById(va._id).select('crewFleet').lean();
-        const routes = await CrewRoute.find({ vaAdId: va._id, active: true }).limit(3000).lean();
+        const routes = await store.listRoutes({ activeOnly: true });
         const route = matchRoute(routes, origin, destination, aircraftName);
         const inFleet = pirepInFleet((vaFull && vaFull.crewFleet) || [], aircraftName);
         // If the pilot typed a flight number, note when it disagrees with the route's.
         const claimedFlight = String(b.flightNumber || '').trim().slice(0, 12);
         const flightNumberMismatch = !!(route && route.flightNumber && claimedFlight && _norm(route.flightNumber) !== _norm(claimedFlight));
 
-        const doc = await CrewPirep.create({
-            vaAdId: va._id, memberId: (member && member._id) || null, routeId: (route && route._id) || null,
+        const doc = await store.createPirep({
+            memberId: (member && member._id) || null, routeId: (route && route._id) || null,
             pilotName: (member && member.name) || p.name || '', callsign: String(b.callsign || (member && member.callsign) || '').slice(0, 20),
             flightNumber: (route && route.flightNumber) || claimedFlight, ifUserId: (member && member.ifUserId) || '',
             origin, destination, aircraftName, liveryName,
@@ -1749,7 +1814,7 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
             flightNumberMismatch,
             route: route ? { id: route._id, flightNumber: route.flightNumber, origin: route.origin, destination: route.destination, aircraft: route.aircraft } : null,
         });
-    } catch (err) { console.error('pirep file error:', err); res.status(500).json({ error: 'Could not file the flight.' }); }
+    } catch (err) { crewFail(res, err, { log: 'pirep file error', message: 'Could not file the flight.' }); }
 });
 
 // Auto-capture: pull each linked pilot's recent IF flights and turn any we
@@ -1759,15 +1824,14 @@ app.post('/api/crew/:slug/pireps/sync', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'flights.review');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const va = await resolveCrewVa(req.params.slug);
-        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const { va, store } = await resolveCrewStore(req.params.slug);
         const vaFull = await VirtualAirlineAd.findById(va._id).select('crewFleet crewPirepAutoApprove').lean();
         const autoApprove = !!(vaFull && vaFull.crewPirepAutoApprove);
         const fleet = (vaFull && vaFull.crewFleet) || [];
-        const routes = await CrewRoute.find({ vaAdId: va._id, active: true }).limit(3000).lean();
+        const routes = await store.listRoutes({ activeOnly: true });
         // Only active pilots linked to an IF account can be auto-tracked. Cap the
         // batch so one sync can't run unbounded.
-        const members = await CrewMember.find({ vaAdId: va._id, status: 'active', ifUserId: { $exists: true, $ne: '' } }).limit(300).lean();
+        const members = await store.listActiveLinkedMembers();
         let meta;
         try { meta = await loadAircraftMetadata(); } catch { meta = { acById: new Map(), livById: new Map() }; }
 
@@ -1780,7 +1844,7 @@ app.post('/api/crew/:slug/pireps/sync', async (req, res) => {
             } catch { continue; }
             if (!flights.length) continue;
             const ids = flights.map(f => String(f.id || '')).filter(Boolean);
-            const seen = new Set((await CrewPirep.find({ vaAdId: va._id, flightId: { $in: ids } }).select('flightId').lean()).map(p => p.flightId));
+            const seen = await store.seenFlightIds(ids);
             for (const f of flights) {
                 scanned++;
                 const flightId = String(f.id || '');
@@ -1796,8 +1860,8 @@ app.post('/api/crew/:slug/pireps/sync', async (req, res) => {
                 const willApprove = autoApprove && inFleet;
                 let doc;
                 try {
-                    doc = await CrewPirep.create({
-                        vaAdId: va._id, memberId: m._id, routeId: (route && route._id) || null,
+                    doc = await store.createPirep({
+                        memberId: m._id, routeId: (route && route._id) || null,
                         pilotName: m.name || m.ifcName || '', callsign: String(f.callsign || m.callsign || '').slice(0, 20),
                         flightNumber: (route && route.flightNumber) || '', ifUserId: m.ifUserId, flightId,
                         origin, destination, aircraftName, liveryName,
@@ -1811,11 +1875,11 @@ app.post('/api/crew/:slug/pireps/sync', async (req, res) => {
                 } catch { continue; } // a concurrent sync may have inserted the same flight
                 created++;
                 vaStats.recordEngagement(va._id, 'pirep', 1, va.name);
-                if (willApprove) { await applyPirepHours(doc); approved++; }
+                if (willApprove) { await applyPirepHours(store, doc); approved++; }
             }
         }
         res.json({ ok: true, created, approved, scanned, pilots: members.length });
-    } catch (err) { console.error('pirep sync error:', err); res.status(500).json({ error: 'Sync failed.' }); }
+    } catch (err) { crewFail(res, err, { log: 'pirep sync error', message: 'Sync failed.' }); }
 });
 
 // Approve / reject a PIREP. Approving credits the pilot's hours; rejecting an
@@ -1824,19 +1888,21 @@ app.patch('/api/crew/:slug/pireps/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'flights.review');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const va = await resolveCrewVa(req.params.slug);
-        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
-        const p = await CrewPirep.findOne({ _id: req.params.id, vaAdId: va._id });
+        const { store } = await resolveCrewStore(req.params.slug);
+        let p = await store.getPirep(req.params.id);
         if (!p) return res.status(404).json({ error: 'Flight not found.' });
         const action = String(req.body && req.body.action || '');
         if (action === 'approve') {
-            if (p.status !== 'approved') { p.status = 'approved'; p.reviewedAt = new Date(); await p.save(); await applyPirepHours(p); }
+            if (p.status !== 'approved') {
+                p = await store.updatePirep(p._id, { status: 'approved', reviewedAt: new Date() });
+                p = await applyPirepHours(store, p);
+            }
         } else if (action === 'reject') {
-            await reversePirepHours(p);
-            p.status = 'rejected'; p.reviewedAt = new Date(); await p.save();
+            p = await reversePirepHours(store, p);
+            p = await store.updatePirep(p._id, { status: 'rejected', reviewedAt: new Date() });
         } else return res.status(400).json({ error: 'Unknown action.' });
         res.json({ pirep: publicPirep(p) });
-    } catch (err) { console.error('pirep review error:', err); res.status(500).json({ error: 'Could not update the flight.' }); }
+    } catch (err) { crewFail(res, err, { log: 'pirep review error', message: 'Could not update the flight.' }); }
 });
 
 // Remove a PIREP (rolling back its hours if they were credited).
@@ -1844,14 +1910,13 @@ app.delete('/api/crew/:slug/pireps/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'flights.review');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const va = await resolveCrewVa(req.params.slug);
-        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
-        const p = await CrewPirep.findOne({ _id: req.params.id, vaAdId: va._id });
+        const { store } = await resolveCrewStore(req.params.slug);
+        const p = await store.getPirep(req.params.id);
         if (!p) return res.status(404).json({ error: 'Flight not found.' });
-        await reversePirepHours(p);
-        await CrewPirep.deleteOne({ _id: p._id });
+        await reversePirepHours(store, p);
+        await store.deletePirep(p._id);
         res.json({ ok: true });
-    } catch (err) { console.error('pirep delete error:', err); res.status(500).json({ error: 'Could not remove the flight.' }); }
+    } catch (err) { crewFail(res, err, { log: 'pirep delete error', message: 'Could not remove the flight.' }); }
 });
 
 // ---- Recruitment: applications ----
@@ -1861,12 +1926,16 @@ app.delete('/api/crew/:slug/pireps/:id', async (req, res) => {
 app.post('/api/crew/:slug/apply', async (req, res) => {
     try {
         const raw = String(req.params.slug || '').trim().toLowerCase();
-        const applyFields = '_id slug joinMode minGrade callsignPrefix callsign name contactEmail crewAccent applicationForm joinRequirements +crewWebhookUrl';
+        // crewStore.SELECT carries the VA's data-store connection: the
+        // application (and the pilot record a 'free' join creates) is written to
+        // the VA's own project, not ours.
+        const applyFields = `${crewStore.SELECT} joinMode minGrade callsignPrefix applicationForm joinRequirements +crewWebhookUrl`;
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(applyFields).lean();
         if (!ad) ad = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' })
             .select(applyFields).lean();
         if (!ad) return res.status(404).json({ error: 'Crew center not found.' });
+        const store = await crewStore.forVa(ad);
 
         const b = req.body || {};
         let ifcName = String(b.ifcName || '').trim().slice(0, 60);
@@ -1923,15 +1992,15 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
 
         const statusToken = crypto.randomBytes(16).toString('hex');
         const status = ad.joinMode === 'free' ? 'accepted' : 'pending';
-        const appDoc = await CrewApplication.create({
-            vaAdId: ad._id, ifcName, email, callsignPrefix: prefix, callsignNumber: number, grade,
+        const appDoc = await store.createApplication({
+            ifcName, email, callsignPrefix: prefix, callsignNumber: number, grade,
             ifVerified, ifUserId, answers, statusToken,
             status, reviewedAt: status === 'accepted' ? new Date() : null,
         });
         vaStats.recordEngagement(ad._id, 'application', 1, ad.name);
         if (status === 'accepted') {
-            await CrewMember.create({
-                vaAdId: ad._id, name: ifcName, callsign: (prefix + number).trim(),
+            await store.createMember({
+                name: ifcName, callsign: (prefix + number).trim(),
                 hours: 0, role: '', aircraft: [], status: 'active',
                 ifUserId: ifUserId || '', ifcName,
             });
@@ -1979,7 +2048,7 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
             }
         }
         res.json({ status, callsign: cs, applicationId: appDoc._id, statusToken, ifVerified, grade, emailed: !!email });
-    } catch (err) { console.error('apply error:', err); res.status(500).json({ error: 'Could not submit your application.' }); }
+    } catch (err) { crewFail(res, err, { log: 'apply error', message: 'Could not submit your application.' }); }
 });
 // Public: verify an Infinite Flight Community name in real time so the join
 // form can show a "✓ verified" badge and lock in the true grade before the
@@ -2001,22 +2070,23 @@ app.post('/api/crew/:slug/verify-if', async (req, res) => {
 // any message staff left when they reviewed it.
 app.get('/api/crew/:slug/application-status/:token', async (req, res) => {
     try {
-        const va = await resolveCrewVa(req.params.slug);
-        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
         const token = String(req.params.token || '').trim();
         if (!token) return res.status(400).json({ error: 'Missing status token.' });
-        const appDoc = await CrewApplication.findOne({ vaAdId: va._id, statusToken: token })
-            .select('status staffMessage ifcName callsignPrefix callsignNumber reviewedAt createdAt').lean();
+        const { store } = await resolveCrewStore(req.params.slug);
+        const appDoc = await store.getApplicationByToken(token);
         if (!appDoc) return res.status(404).json({ error: 'We could not find that application.' });
         res.json({
             status: appDoc.status,
             message: appDoc.staffMessage || '',
             ifcName: appDoc.ifcName || '',
             callsign: ((appDoc.callsignPrefix || '') + (appDoc.callsignNumber || '')).trim(),
+            // Only meaningful once accepted, and only ever set by the accept
+            // handler from a validated invite.
+            discordInvite: appDoc.status === 'accepted' ? (appDoc.discordInvite || '') : '',
             reviewedAt: appDoc.reviewedAt || null,
             submittedAt: appDoc.createdAt || null,
         });
-    } catch (err) { console.error('application-status error:', err); res.status(500).json({ error: 'Could not load that application.' }); }
+    } catch (err) { crewFail(res, err, { log: 'application-status error', message: 'Could not load that application.' }); }
 });
 
 // Staff: list applications (default pending).
@@ -2024,42 +2094,82 @@ app.get('/api/crew/:slug/applications', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'applications.review');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const va = await resolveCrewVa(req.params.slug);
-        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
-        const q = { vaAdId: va._id };
-        if (req.query.status && ['pending', 'accepted', 'declined'].includes(req.query.status)) q.status = req.query.status;
-        else q.status = 'pending';
-        const apps = await CrewApplication.find(q).sort({ createdAt: -1 }).limit(500).lean();
-        res.json({ applications: apps });
-    } catch (err) { console.error('applications list error:', err); res.status(500).json({ error: 'Could not load applications.' }); }
+        const { store } = await resolveCrewStore(req.params.slug);
+        const wanted = String(req.query.status || '');
+        const status = ['pending', 'accepted', 'declined'].includes(wanted) ? wanted : 'pending';
+        const applications = await store.listApplications({ status });
+        res.json({ applications });
+    } catch (err) { crewFail(res, err, { log: 'applications list error', message: 'Could not load applications.' }); }
 });
 // Staff: accept / decline an application. Accept creates the pilot.
 app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'applications.review');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const va = await resolveCrewVa(req.params.slug);
-        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
-        const appDoc = await CrewApplication.findOne({ _id: req.params.id, vaAdId: va._id });
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        let appDoc = await store.getApplication(req.params.id);
         if (!appDoc) return res.status(404).json({ error: 'Application not found.' });
         const action = String(req.body?.action || '');
         const message = String(req.body?.message || '').trim().slice(0, 2000);
+        const patch = { reviewedAt: new Date() };
+
+        // What the pilot gets handed along with the decision. `credentials` is
+        // returned to the reviewing staff member exactly once — see below.
+        let credentials = null;
+        let invite = '';
+
         if (action === 'accept') {
+            // The invite the pilot is sent: whatever the reviewer typed, else
+            // the VA's stored default. Rejected outright if it isn't a real
+            // Discord invite — we are about to put it in an email with our name
+            // on it (see isDiscordInviteUrl).
+            if (req.body?.discordInvite !== undefined) {
+                invite = cleanDiscordInvite(req.body.discordInvite);
+                if (invite === null) {
+                    return res.status(400).json({ error: 'That is not a Discord invite link. Use a discord.gg or discord.com/invite address.' });
+                }
+            }
+            if (!invite) {
+                const withInvite = await VirtualAirlineAd.findById(va._id).select('crewDiscordInvite').lean();
+                invite = (withInvite && withInvite.crewDiscordInvite) || '';
+            }
+            if (invite) patch.discordInvite = invite;
+
+            // Only mint the pilot on the transition into 'accepted', so
+            // re-accepting an already-accepted application can't duplicate them.
             if (appDoc.status !== 'accepted') {
-                await CrewMember.create({
-                    vaAdId: va._id, name: appDoc.ifcName, callsign: (appDoc.callsignPrefix + appDoc.callsignNumber).trim(),
+                await store.createMember({
+                    name: appDoc.ifcName, callsign: (appDoc.callsignPrefix + appDoc.callsignNumber).trim(),
                     hours: 0, role: '', aircraft: [], status: 'active',
                     ifUserId: appDoc.ifUserId || '', ifcName: appDoc.ifcName || '',
                 });
                 vaStats.recordEngagement(va._id, 'crewJoin', 1, va.name);
             }
-            appDoc.status = 'accepted';
+
+            // A crew center login, when the reviewer asked for one. Best-effort:
+            // a pilot who is on the roster but could not be given an account is
+            // a fixable annoyance, whereas failing the whole acceptance over it
+            // would leave the application pending after we already added them.
+            if (req.body?.createAccount) {
+                try {
+                    const r = await provisionPilotAccount({ _id: va._id, name: va.name }, {
+                        displayName: appDoc.ifcName || '',
+                        createdByName: gate.p?.name || 'Crew Center',
+                    });
+                    // A password comes back only on first creation; re-accepting
+                    // someone who already has a login yields username-only.
+                    credentials = { username: r.username, password: r.password, created: r.created };
+                } catch (err) {
+                    console.error('pilot account provision error:', err?.message || err);
+                    credentials = { error: 'The pilot was accepted, but their crew center account could not be created.' };
+                }
+            }
+            patch.status = 'accepted';
         } else if (action === 'decline') {
-            appDoc.status = 'declined';
+            patch.status = 'declined';
         } else return res.status(400).json({ error: 'Unknown action.' });
-        if (message) appDoc.staffMessage = message;
-        appDoc.reviewedAt = new Date();
-        await appDoc.save();
+        if (message) patch.staffMessage = message;
+        appDoc = (await store.updateApplication(appDoc._id, patch)) || { ...appDoc, ...patch };
 
         const cs = (appDoc.callsignPrefix + appDoc.callsignNumber).trim();
         const accepted = appDoc.status === 'accepted';
@@ -2079,18 +2189,297 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
             const slug = va.slug || req.params.slug;
             const statusUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}/status?id=${appDoc.statusToken}`;
             const centerUrl = `${SITE_ORIGIN}/crew/${encodeURIComponent(slug)}`;
-            const body = (accepted
+            let body = (accepted
                 ? `Great news — welcome to <b>${escHtml(va.name || 'the crew')}</b>${cs ? `, flying as <b>${escHtml(cs)}</b>` : ''}.`
                 : `Thanks for applying to <b>${escHtml(va.name || 'the VA')}</b>. Unfortunately they weren’t able to accept your application this time.`)
                 + (message ? `<br><br><b>Message from the team:</b><br>${escHtml(message).replace(/\n/g, '<br>')}` : '');
+            // The two things a new pilot needs next: how to sign in, and where
+            // the crew actually talks. The password is printed here because this
+            // is the only copy — nothing stores it (see provisionPilotAccount).
+            if (accepted && credentials && credentials.password) {
+                body += `<br><br><b>Your crew center sign-in</b><br>`
+                    + `Username: <b>${escHtml(credentials.username)}</b><br>`
+                    + `Temporary password: <b>${escHtml(credentials.password)}</b><br>`
+                    + `<span style="color:#6b7280">Please change it after you sign in for the first time.</span>`;
+            }
+            if (accepted && invite) {
+                body += `<br><br><b>Join the crew on Discord</b><br><a href="${escHtml(invite)}">${escHtml(invite)}</a>`;
+            }
             sendCrewEmail(emailCfg, { to: appDoc.email,
                 subject: accepted ? `You’re in — ${va.name || 'Crew Center'}` : `Update on your application — ${va.name || 'Crew Center'}`,
                 html: crewEmailHtml({ vaName: va.name, accent: va.crewAccent, heading: accepted ? 'You’re in! 🎉' : 'Application update',
                     bodyHtml: body,
                     button: accepted ? { label: 'Open the crew center', url: centerUrl } : { label: 'View your application', url: statusUrl } }) }).catch(() => {});
         }
-        res.json({ status: appDoc.status, message: appDoc.staffMessage || '' });
-    } catch (err) { console.error('application review error:', err); res.status(500).json({ error: 'Could not update the application.' }); }
+        // `credentials` carries the ONLY copy of the temporary password. It is
+        // returned here so the reviewer can pass it on when the applicant left
+        // no email address — the dashboard shows it once and warns that it will
+        // not be shown again.
+        res.json({
+            status: appDoc.status,
+            message: appDoc.staffMessage || '',
+            discordInvite: accepted ? (invite || '') : '',
+            emailed: !!(accepted && appDoc.email),
+            account: credentials,
+        });
+    } catch (err) { crewFail(res, err, { log: 'application review error', message: 'Could not update the application.' }); }
+});
+
+// ---- Public statistics ----
+// "How many pilots, how many hours, how many flights?" — the figures a VA wants
+// on their own homepage, and the ones the crew center dashboard leads with.
+//
+// Deliberately public and CORS-open (the global cors() sends
+// Access-Control-Allow-Origin: *) so a VA can fetch it straight from their own
+// site with no key and no proxy. It returns aggregates plus a small
+// hours leaderboard — never an email address, never an application, never a
+// status token. Everything is computed inside the VA's own database.
+const CREW_STATS_TTL_MS = 60 * 1000;
+const _crewStatsCache = new Map();   // slug -> { at, payload }
+
+// How many people are queued up to join is the VA's business, not the public's:
+// it says something about a private queue that no public page needs. The cache
+// holds the full snapshot and these are dropped on the way out to anyone who
+// can't review applications, so one cached entry serves both audiences.
+const MANAGER_ONLY_STATS = ['applicationsPending', 'applicationsAccepted', 'applications30d'];
+function scopeStats(payload, isManager) {
+    if (isManager || !payload || !payload.stats) return payload;
+    const stats = { ...payload.stats };
+    MANAGER_ONLY_STATS.forEach((k) => delete stats[k]);
+    return { ...payload, stats };
+}
+
+app.get('/api/crew/:slug/stats', async (req, res) => {
+    const slug = String(req.params.slug || '').trim().toLowerCase();
+    try {
+        // A signed-in reviewer additionally gets the application counters. The
+        // gate is best-effort: an absent or invalid token just means "public".
+        let isManager = false;
+        try { isManager = !(await requireCap(req, slug, 'applications.review')).error; } catch { /* public */ }
+
+        const fresh = String(req.query.fresh || '') === '1';
+        const hit = _crewStatsCache.get(slug);
+        if (!fresh && hit && (Date.now() - hit.at) < CREW_STATS_TTL_MS) {
+            // Only the anonymous form is safe in a shared cache.
+            res.set('Cache-Control', isManager ? 'no-store' : 'public, max-age=60');
+            return res.json({ ...scopeStats(hit.payload, isManager), cached: true });
+        }
+
+        const va = await resolveCrewVa(slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+
+        // A VA that hasn't connected a store yet is not an error on a public
+        // page — it is a VA with no figures. Say so and let the page hide them.
+        const store = await crewStore.forVaOrNull(va);
+        if (!store) {
+            return res.json({
+                ok: true, slug: va.slug || slug, name: va.name || '', callsign: va.callsign || '',
+                connected: false, stats: null,
+            });
+        }
+
+        const stats = await store.stats();
+        const payload = {
+            ok: true,
+            slug: va.slug || slug,
+            name: va.name || '',
+            callsign: va.callsign || '',
+            connected: true,
+            // Which backend answered. 'supabase' = the VA's own project (the
+            // destination); 'managed' = our legacy collections, i.e. this VA
+            // still needs to migrate.
+            store: store.kind,
+            selfHosted: !!store.owned,
+            stats,
+        };
+        _crewStatsCache.set(slug, { at: Date.now(), payload });
+        res.set('Cache-Control', isManager ? 'no-store' : 'public, max-age=60');
+        res.json(scopeStats(payload, isManager));
+    } catch (err) {
+        // Serve a stale snapshot rather than breaking a VA's homepage because
+        // their database blipped.
+        const hit = _crewStatsCache.get(slug);
+        if (hit) return res.json({ ...scopeStats(hit.payload, false), cached: true, stale: true });
+        crewFail(res, err, { log: 'crew stats error', message: 'Could not load statistics.' });
+    }
+});
+
+// ---- The VA's data store: health + migration ----
+// Is the VA's project reachable, provisioned and on the current schema? Backs
+// the tick (or the fix-this instruction) on the Settings → Data store screen.
+app.get('/api/crew/:slug/store', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'settings.notifications');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const connected = crewStore.isConnected(va);
+        const store = await crewStore.forVaOrNull(va);
+        const health = store ? await store.health() : { ok: false, provisioned: false, code: 'store_not_connected' };
+        // How much is still sitting in our managed collections? A non-zero count
+        // is what the migrate button acts on.
+        const pending = {
+            members: await CrewMember.countDocuments({ vaAdId: va._id }),
+            routes: await CrewRoute.countDocuments({ vaAdId: va._id }),
+            pireps: await CrewPirep.countDocuments({ vaAdId: va._id }),
+            applications: await CrewApplication.countDocuments({ vaAdId: va._id }),
+        };
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            connected,
+            url: va.supabaseUrl || '',
+            hasServiceKey: !!va.supabaseServiceKey,
+            kind: store ? store.kind : 'none',
+            selfHosted: !!(store && store.owned),
+            health,
+            legacyRows: pending,
+            legacyTotal: pending.members + pending.routes + pending.pireps + pending.applications,
+            schemaVersion: crewStore.EXPECTED_SCHEMA_VERSION,
+        });
+    } catch (err) { crewFail(res, err, { log: 'crew store health error', message: 'Could not check the data store.' }); }
+});
+
+// Move a VA's remaining managed data into their own project. Owner (or
+// Inflight) only — this is the one-way door out of our storage.
+//
+// Idempotent by construction: it copies in dependency order (members and routes
+// first, so a PIREP can point at the ids they were given), and skips anything
+// already present on the far side. Nothing is deleted from managed storage here
+// — the VA verifies the copy first, then calls DELETE to release it.
+app.post('/api/crew/:slug/store/migrate', async (req, res) => {
+    const p = verifyCrewRequest(req);
+    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+    if (!(p.kind === 'inflight' || p.role === 'owner')) {
+        return res.status(403).json({ error: 'Only the VA owner can migrate the data store.' });
+    }
+    if (p.kind !== 'inflight' && p.slug && p.slug !== String(req.params.slug).toLowerCase()) {
+        return res.status(403).json({ error: 'Wrong crew center.' });
+    }
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        if (!crewStore.isConnected(va)) {
+            return res.status(409).json({
+                error: 'Connect your Supabase project first (Settings → Data store), then run the migration.',
+                code: 'store_not_connected',
+            });
+        }
+        const target = new crewStore.SupabaseStore(va);
+        const health = await target.health();
+        if (!health.provisioned) {
+            return res.status(409).json({
+                error: 'Your project is reachable but the crew center tables are missing. Run supabase/crew-center-schema.sql in the Supabase SQL editor first.',
+                code: 'store_schema_missing', health,
+            });
+        }
+
+        const source = new crewStore.LegacyStore(va);
+        const moved = { members: 0, routes: 0, pireps: 0, applications: 0, skipped: 0 };
+
+        // 1) Roster. Keyed on callsign+name so a re-run doesn't duplicate.
+        const existingMembers = await target.listMembers({ limit: 5000 });
+        const memberKey = (m) => `${String(m.callsign || '').toLowerCase()}|${String(m.name || '').toLowerCase()}`;
+        const seenMembers = new Map(existingMembers.map((m) => [memberKey(m), m._id]));
+        const idMap = new Map();   // old Mongo _id -> new uuid
+        for (const m of await source.listMembers({ limit: 5000 })) {
+            const key = memberKey(m);
+            if (seenMembers.has(key)) { idMap.set(String(m._id), seenMembers.get(key)); moved.skipped++; continue; }
+            const created = await target.createMember(m);
+            idMap.set(String(m._id), created._id);
+            seenMembers.set(key, created._id);
+            moved.members++;
+        }
+
+        // 2) Routes. Keyed on flight number + city pair.
+        const existingRoutes = await target.listRoutes({ limit: 5000 });
+        const routeKey = (r) => `${String(r.flightNumber || '').toLowerCase()}|${r.origin}|${r.destination}`;
+        const seenRoutes = new Map(existingRoutes.map((r) => [routeKey(r), r._id]));
+        const routeMap = new Map();
+        for (const r of await source.listRoutes({ limit: 5000 })) {
+            const key = routeKey(r);
+            if (seenRoutes.has(key)) { routeMap.set(String(r._id), seenRoutes.get(key)); moved.skipped++; continue; }
+            const created = await target.createRoute(r);
+            routeMap.set(String(r._id), created._id);
+            seenRoutes.set(key, created._id);
+            moved.routes++;
+        }
+
+        // 3) Flight reports, re-pointed at the ids the roster and network just
+        // got. A report whose pilot didn't come across keeps its denormalised
+        // name and simply loses the link.
+        const legacyPireps = await source.listPireps({ limit: 20000 });
+        const seenFlights = await target.seenFlightIds(legacyPireps.map((x) => x.flightId).filter(Boolean));
+        for (const x of legacyPireps) {
+            if (x.flightId && seenFlights.has(x.flightId)) { moved.skipped++; continue; }
+            await target.createPirep({
+                ...x,
+                memberId: idMap.get(String(x.memberId)) || null,
+                routeId: routeMap.get(String(x.routeId)) || null,
+            });
+            moved.pireps++;
+        }
+
+        // 4) Applications, including decided ones — the status links handed to
+        // applicants must keep resolving after the move.
+        for (const status of ['pending', 'accepted', 'declined']) {
+            for (const a of await source.listApplications({ status, limit: 5000 })) {
+                if (a.statusToken && await target.getApplicationByToken(a.statusToken)) { moved.skipped++; continue; }
+                await target.createApplication(a);
+                moved.applications++;
+            }
+        }
+
+        _crewStatsCache.delete(String(va.slug || req.params.slug).toLowerCase());
+        res.json({ ok: true, moved, stats: await target.stats() });
+    } catch (err) { crewFail(res, err, { log: 'crew store migrate error', message: 'Could not migrate the data store.' }); }
+});
+
+// Release the managed copy once the VA has verified the migration. Separate
+// from the migration itself on purpose: copying is safe and repeatable, and
+// deleting is neither, so the VA has to ask for it explicitly.
+app.delete('/api/crew/:slug/store/legacy', async (req, res) => {
+    const p = verifyCrewRequest(req);
+    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+    if (!(p.kind === 'inflight' || p.role === 'owner')) {
+        return res.status(403).json({ error: 'Only the VA owner can release managed storage.' });
+    }
+    if (p.kind !== 'inflight' && p.slug && p.slug !== String(req.params.slug).toLowerCase()) {
+        return res.status(403).json({ error: 'Wrong crew center.' });
+    }
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        if (!crewStore.isConnected(va)) {
+            return res.status(409).json({ error: 'No connected project to keep the data in.', code: 'store_not_connected' });
+        }
+        // Refuse to delete into a void: the VA's own project must hold at least
+        // as many pilots and reports as we are about to drop.
+        const target = new crewStore.SupabaseStore(va);
+        const theirs = await target.stats();
+        const ours = {
+            members: await CrewMember.countDocuments({ vaAdId: va._id }),
+            pireps: await CrewPirep.countDocuments({ vaAdId: va._id }),
+        };
+        if (theirs.pilots < ours.members || theirs.pireps < ours.pireps) {
+            return res.status(409).json({
+                error: 'Your project holds fewer records than managed storage does. Run the migration again and re-check before releasing.',
+                code: 'migration_incomplete',
+                yours: { pilots: theirs.pilots, pireps: theirs.pireps }, managed: ours,
+            });
+        }
+        const q = { vaAdId: va._id };
+        const [pireps, members, routes, applications] = await Promise.all([
+            CrewPirep.deleteMany(q), CrewMember.deleteMany(q), CrewRoute.deleteMany(q), CrewApplication.deleteMany(q),
+        ]);
+        crewStore.forgetLegacyData(va._id);   // the "has legacy rows?" probe is now stale
+        res.json({
+            ok: true,
+            deleted: {
+                pireps: pireps.deletedCount || 0, members: members.deletedCount || 0,
+                routes: routes.deletedCount || 0, applications: applications.deletedCount || 0,
+            },
+        });
+    } catch (err) { crewFail(res, err, { log: 'crew store release error', message: 'Could not release managed storage.' }); }
 });
 
 // Staff: read the crew webhook state (never the secret URL itself, just a hint).
@@ -3807,7 +4196,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles crewFleet crewPirepAutoApprove joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles crewFleet crewPirepAutoApprove joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -3854,6 +4243,10 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
                 form: Array.isArray(ad.applicationForm) ? ad.applicationForm : [],
                 requirements: Array.isArray(ad.joinRequirements) ? ad.joinRequirements : [],
                 emailEnabled: !!ad.crewEmailConfigured,
+                // The VA's default Discord invite. Public by nature (it is
+                // meant to be shared) and read by the dashboard so the accept
+                // dialog can pre-fill it.
+                discordInvite: ad.crewDiscordInvite || '',
             },
             // Public Supabase connection (never the secret service key).
             supabase: {
