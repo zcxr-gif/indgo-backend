@@ -71,6 +71,68 @@ function sanitizeFleet(arr) {
         image: cleanImageUrl(a && a.image),
     })).filter(a => a.type || a.name);
 }
+// --- Crew Center brand theme ---
+// Design tokens, not CSS. Everything is validated to a narrow shape so a VA can
+// restyle its crew center without being able to inject styling the crew center
+// doesn't already support. See CrewThemeSchema in server.js for the rationale.
+const THEME_MODES = ['auto', 'light', 'dark'];
+const PALETTE_KEYS = ['bg', 'surface', 'surface2', 'line', 'lineSoft',
+                      'ink', 'muted', 'faint', 'accent', 'accentInk'];
+
+// A font FAMILY NAME only — letters, digits, spaces and hyphens. No quotes, no
+// commas, no url(), so it can't break out of the `font-family:` value it lands in.
+const isFontName = (s) => /^[a-z0-9][a-z0-9 \-]{0,39}$/i.test(s || '');
+
+// The arguments to linear-gradient(): an optional angle/side, then colour stops.
+// Hex colours, percentages, degrees, commas and spaces — nothing else. This is
+// what keeps `gradient` from carrying a url(), an expression, or a second
+// declaration into the stylesheet.
+const isGradientArgs = (s) => {
+    const v = String(s || '').trim();
+    if (!v || v.length > 240) return false;
+    if (!/^[#a-z0-9%.,\s-]+$/i.test(v)) return false;          // charset gate
+    if (/url|expression|javascript|import|\/\*|\\/i.test(v)) return false;
+    if (!/#([0-9a-f]{3}|[0-9a-f]{6})/i.test(v)) return false;   // must carry a colour
+    return true;
+};
+
+function sanitizePalette(p) {
+    if (!p || typeof p !== 'object') return null;
+    const out = {};
+    for (const k of PALETTE_KEYS) {
+        if (isHexColor(p[k])) out[k] = p[k];
+    }
+    return Object.keys(out).length ? out : null;
+}
+
+function sanitizeTheme(t) {
+    // null / '' explicitly clears the theme and returns the VA to the stock look.
+    if (t === null || t === '') return null;
+    if (!t || typeof t !== 'object') return undefined;   // undefined = "leave alone"
+
+    const out = {};
+    out.mode = THEME_MODES.includes(t.mode) ? t.mode : 'auto';
+    if (isFontName(t.font)) out.font = String(t.font).trim();
+    if (isFontName(t.displayFont)) out.displayFont = String(t.displayFont).trim();
+    if (isFontName(t.monoFont)) out.monoFont = String(t.monoFont).trim();
+    if (t.radius !== undefined) {
+        const r = Number(t.radius);
+        if (Number.isFinite(r)) out.radius = Math.max(0, Math.min(32, Math.round(r)));
+    }
+    if (isGradientArgs(t.gradient)) out.gradient = String(t.gradient).trim();
+
+    const light = sanitizePalette(t.light);
+    const dark = sanitizePalette(t.dark);
+    if (light) out.light = light;
+    if (dark) out.dark = dark;
+
+    // A theme with no palette and no type is not a theme — treat it as a clear
+    // rather than storing an empty object the crew center would have to defend
+    // against on every read.
+    if (!light && !dark && !out.font && !out.displayFont && !out.gradient) return null;
+    return out;
+}
+
 function sanitizeForm(arr) {
     if (!Array.isArray(arr)) return null;
     return arr.slice(0, 30).map(q => ({
@@ -284,7 +346,7 @@ function registerCrewAuthRoutes(app) {
             const caps = effectiveCaps(ad, p);
             const can = (c) => caps.includes(c);
             const body = req.body || {};
-            const touchesBranding = ['layout', 'accent', 'loginLook', 'ranks', 'roles', 'fleet'].some(f => body[f] !== undefined);
+            const touchesBranding = ['layout', 'accent', 'theme', 'loginLook', 'ranks', 'roles', 'fleet'].some(f => body[f] !== undefined);
             const touchesRecruit = ['joinMode', 'minGrade', 'callsignPrefix', 'applicationForm', 'joinRequirements'].some(f => body[f] !== undefined);
             const touchesTeam = body.staffRoles !== undefined || body.staffAssignments !== undefined;
             const touchesOps = body.pirepAutoApprove !== undefined;
@@ -308,6 +370,12 @@ function registerCrewAuthRoutes(app) {
                     return res.status(400).json({ error: 'Enter a valid hex colour like #1c1a16.' });
                 }
                 ad.crewAccent = a; // '' clears it (falls back to the derived accent)
+            }
+            if (req.body?.theme !== undefined) {
+                const t = sanitizeTheme(req.body.theme);
+                // undefined = the payload wasn't a theme at all, leave it be;
+                // null = an explicit clear back to the stock crew center look.
+                if (t !== undefined) ad.crewTheme = t === null ? undefined : t;
             }
             if (typeof req.body?.loginLook === 'string') {
                 const look = req.body.loginLook.toLowerCase();
@@ -360,6 +428,7 @@ function registerCrewAuthRoutes(app) {
             res.set('Cache-Control', 'no-store');
             res.json({
                 layout: ad.layout, allowedLayouts: ad.allowedLayouts, accent: ad.crewAccent || '',
+                theme: ad.crewTheme || null,
                 loginLook: ad.loginLook || 'center', ranks: ad.ranks || [], roles: ad.roles || [], fleet: ad.crewFleet || [],
                 joinMode: ad.joinMode, minGrade: ad.minGrade, callsignPrefix: ad.callsignPrefix || '',
                 applicationForm: ad.applicationForm || [], joinRequirements: ad.joinRequirements || [],

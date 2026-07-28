@@ -171,6 +171,42 @@ const AirportGate = mongoose.model('AirportGate', AirportGateSchema);
 const VA_AD_STATUSES = ['pending', 'approved', 'rejected'];
 const VA_AD_TYPES = ['VA', 'VO']; // Virtual Airline vs Virtual Organization (IF terminology)
 
+/* -------------------------------------------------------------------------
+ * Crew Center brand theme.
+ *
+ * `crewAccent` gives the crew center ONE colour, which is as far as branding
+ * went while every crew center shared the same warm-neutral shell. A VA with
+ * its own website wants the whole surface to match — paper colour, hairlines,
+ * text greys, corner radius, typeface — so that walking from the VA's site into
+ * inflight.info/crew/<slug> reads as one product rather than two.
+ *
+ * These are DESIGN TOKENS, deliberately not CSS. The crew center maps each key
+ * onto the custom property it already uses (--bg, --surface, --line, --ink …),
+ * so nothing here can inject styling the crew center doesn't already support.
+ * Values are sanitised on write (see sanitizeTheme in crewAuth.js): colours
+ * must be hex, fonts must be a plain family name, and `gradient` holds only the
+ * ARGUMENTS to linear-gradient() — colours, angles and stops, never a full
+ * function call or a url().
+ * ----------------------------------------------------------------------- */
+const CrewPaletteSchema = new mongoose.Schema({
+    bg: String, surface: String, surface2: String,
+    line: String, lineSoft: String,
+    ink: String, muted: String, faint: String,
+    accent: String, accentInk: String,
+}, { _id: false });
+
+const CrewThemeSchema = new mongoose.Schema({
+    // 'auto' follows the pilot's own light/dark choice; light|dark pins it.
+    mode: { type: String, enum: ['auto', 'light', 'dark'], default: 'auto' },
+    font: String,          // body typeface family name
+    displayFont: String,   // headings
+    monoFont: String,      // flight numbers, times, distances
+    radius: Number,        // corner radius in px (0–32)
+    gradient: String,      // arguments to linear-gradient(), e.g. "115deg, #0C2C64 0%, #E5417E 100%"
+    light: { type: CrewPaletteSchema, default: undefined },
+    dark: { type: CrewPaletteSchema, default: undefined },
+}, { _id: false });
+
 const VirtualAirlineAdSchema = new mongoose.Schema({
     // --- Identity ---
     name: { type: String, required: true, unique: true, trim: true },
@@ -200,6 +236,10 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // Owner/staff-chosen accent for the crew center + login. Overrides the accent
     // otherwise derived from the VA's embed config. '' = fall back to that.
     crewAccent: { type: String, trim: true, default: '' },
+    // Full design-token theme for the crew center (see CrewThemeSchema above).
+    // Unset = the stock crew center look, with crewAccent applied as before, so
+    // every VA that hasn't set one is completely unaffected.
+    crewTheme: { type: CrewThemeSchema, default: undefined },
 
     // Crew structure the VA defines (all optional): a rank ladder + roles, each
     // carrying a badge (colour + icon). These are the DEFINITIONS; per-pilot
@@ -3807,7 +3847,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles crewFleet crewPirepAutoApprove joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent crewTheme ranks roles crewFleet crewPirepAutoApprove joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -3816,9 +3856,10 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         }
         if (!ad) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        // Brand accent: the VA's own crewAccent wins; otherwise the embed-config
-        // accent's first stop, then the legacy brandColor; '' means "decide".
-        let accent = ad.crewAccent || '';
+        // Brand accent: the VA's own crewAccent wins; otherwise the theme's own
+        // light accent, then the embed-config accent's first stop, then the
+        // legacy brandColor; '' means "decide".
+        let accent = ad.crewAccent || (ad.crewTheme && ad.crewTheme.light && ad.crewTheme.light.accent) || '';
         if (!accent) {
             const cfg = await EmbedConfig.findOne({ vaAdId: ad._id }).select('accent brandColor').lean();
             if (cfg) accent = (Array.isArray(cfg.accent) && cfg.accent[0]) || cfg.brandColor || '';
@@ -3839,6 +3880,10 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             banner: ad.bannerUrl || '',
             website: ad.websiteUrl || '',
             accent,
+            // Full design-token theme, or null for the stock crew center look.
+            // crewBrand.js on the tracker maps this onto the crew center's CSS
+            // custom properties; every VA without one renders exactly as before.
+            theme: ad.crewTheme || null,
             layout: ad.layout || 'editorial',
             allowedLayouts: (Array.isArray(ad.allowedLayouts) && ad.allowedLayouts.length)
                 ? ad.allowedLayouts : ['editorial', 'console', 'split', 'classic'],
