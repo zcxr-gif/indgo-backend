@@ -1,10 +1,16 @@
 // crewAuth.js
 // Sign-in for the Crew Center (inflight.info/crew/<slug>).
 //
-// One cascading login that authenticates against OUR existing accounts — never
-// the VA's Supabase — so the whole VA team plus Inflight can get in:
-//   1. VaPortalAccount scoped to THIS crew center's VA  (owner | staff | pilot)
-//   2. StaffUser (Inflight staff)                       (oversight into any VA)
+// One cascading login, tried in this order:
+//   1. a PILOT account in the VA's OWN data store   (crew_accounts, their project)
+//   2. VaPortalAccount scoped to THIS crew center's VA  (owner | staff)
+//   3. StaffUser (Inflight staff)                       (oversight into any VA)
+//
+// Step 1 is the one that moved. A pilot's account belongs to the VA in the same
+// way their hours do, so it is stored in the VA's project and read back through
+// crewStore — Inflight holds no pilot credentials for any VA. Steps 2 and 3 are
+// our own accounts: the VA's staff administer their partnership with us, and
+// Inflight staff have oversight, so those stay central.
 //
 // Owner/staff/Inflight land on the management dashboard; pilots land on the pilot
 // home. The static login page stores the returned Bearer token itself (no
@@ -16,6 +22,9 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+
+const crewStore = require('./crewStore');
+const crewAccounts = require('./crewAccounts');
 
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString('hex');
 const TOKEN_TTL = '7d';
@@ -225,11 +234,17 @@ function getBearer(req) {
 }
 
 // Resolve the VA for a crew slug (slug first, callsign fallback), approved only.
+//
+// The selection carries the VA's data-store connection (crewStore.SELECT pulls
+// in the select:false service key) because the login below has to open the VA's
+// project to check a pilot's password. Nothing in this module returns the `va`
+// object itself — every response is assembled field by field — so the key does
+// not escape by being along for the ride.
 async function resolveVa(slug) {
     const VirtualAirlineAd = mongoose.model('VirtualAirlineAd');
     const raw = String(slug || '').trim().toLowerCase();
     if (!raw) return null;
-    const sel = '_id name slug callsign staffRoles staffAssignments';
+    const sel = `${crewStore.SELECT} staffRoles staffAssignments`;
     let va = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
         .select(sel).lean();
     if (!va) {
@@ -257,16 +272,45 @@ function registerCrewAuthRoutes(app) {
 
             let identity = null;
 
-            // 1) A VA account that belongs to THIS crew center's VA.
-            const acct = await VaPortalAccount.findOne({ username });
-            if (acct && acct.active && String(acct.vaAdId) === String(va._id)
-                && await bcrypt.compare(password, acct.passwordHash)) {
-                acct.lastLoginAt = new Date();
-                await acct.save();
-                identity = { sub: String(acct._id), kind: 'va', role: acct.role, name: acct.displayName || acct.username };
+            // 1) A pilot account in the VA's OWN data store.
+            //
+            // Deliberately tolerant of a store that cannot answer: a VA
+            // half-way through connecting a project, or one whose project is
+            // briefly unreachable, must not lock its own staff out of the
+            // dashboard they would use to fix it. A failure here means "not
+            // this identity" and the cascade continues.
+            try {
+                const store = await crewStore.forVa(va);
+                const pilot = await crewAccounts.authenticate(store, username, password);
+                if (pilot) {
+                    identity = {
+                        sub: String(pilot._id), kind: 'crew', role: pilot.role || 'pilot',
+                        name: pilot.displayName || pilot.username,
+                        mustChangePassword: !!pilot.mustChangePassword,
+                    };
+                }
+            } catch (err) {
+                if (err && err.code !== 'store_not_connected') {
+                    console.warn('crew login: pilot store lookup failed —', err.message || err);
+                }
             }
 
-            // 2) Otherwise an Inflight staff member (oversight into any crew center).
+            // 2) A VA staff account that belongs to THIS crew center's VA.
+            if (!identity) {
+                const acct = await VaPortalAccount.findOne({ username });
+                if (acct && acct.active && String(acct.vaAdId) === String(va._id)
+                    && await bcrypt.compare(password, acct.passwordHash)) {
+                    acct.lastLoginAt = new Date();
+                    await acct.save();
+                    identity = {
+                        sub: String(acct._id), kind: 'va', role: acct.role,
+                        name: acct.displayName || acct.username,
+                        mustChangePassword: !!acct.mustChangePassword,
+                    };
+                }
+            }
+
+            // 3) Otherwise an Inflight staff member (oversight into any crew center).
             if (!identity) {
                 const staff = await StaffUser.findOne({ username });
                 if (staff && staff.active && await bcrypt.compare(password, staff.passwordHash)) {
@@ -291,6 +335,15 @@ function registerCrewAuthRoutes(app) {
             res.set('Cache-Control', 'no-store');
             res.json({
                 token, view, role: identity.role, oversight: identity.kind === 'inflight', name: identity.name,
+                username,
+                // The password this account was issued was generated for them and
+                // has been seen by whoever handed it over, so the crew center
+                // asks for a new one before it lets them do anything else. Only
+                // a store-backed account can change it here (see
+                // POST /api/crew/:slug/account/password); central accounts are
+                // told to use the portal.
+                mustChangePassword: !!identity.mustChangePassword,
+                canChangePassword: identity.kind === 'crew',
                 caps, capabilities: CREW_CAPABILITIES,
                 va: { name: va.name, slug: va.slug || null, code: va.callsign || null },
             });
@@ -497,9 +550,23 @@ function registerCrewAuthRoutes(app) {
         const va = await resolveVa(slug || p.slug);
         const caps = effectiveCaps(va, p);
         const isOwner = p.kind === 'inflight' || p.role === 'owner';
+        // Re-read the "you still owe us a password change" flag from the store
+        // rather than trusting the token: the flag clears mid-session, and a
+        // stale claim in a 7-day token would either nag someone who has already
+        // changed it or stop nagging someone who reloaded before doing so.
+        let mustChangePassword = false;
+        if (p.kind === 'crew' && va) {
+            try {
+                const account = await (await crewStore.forVa(va)).getAccount(p.sub);
+                mustChangePassword = !!(account && account.mustChangePassword);
+            } catch { /* unreachable store — don't block "who am I" on it */ }
+        }
         res.set('Cache-Control', 'no-store');
         res.json({
             role: p.role, view: p.view, name: p.name, oversight: p.kind === 'inflight',
+            username: p.uname || '',
+            mustChangePassword,
+            canChangePassword: p.kind === 'crew',
             caps, capabilities: CREW_CAPABILITIES,
             staffRoles: (isOwner && va && va.staffRoles) || [],
             staffAssignments: (isOwner && va && va.staffAssignments) || [],

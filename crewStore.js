@@ -8,10 +8,10 @@
  * --------------------------------------
  * A VA's operational data belongs to the VA and is stored in the VA's own
  * Supabase project — never in ours. Inflight keeps only what it needs to run
- * the platform: staff logins, and the VA's directory/branding metadata (name,
- * slug, colours, fleet definitions, rank ladder, join requirements). Rosters,
- * flight reports, applications and applicant emails are created in, read from
- * and deleted from the VA's project.
+ * the platform: the VA's *staff* logins, and the VA's directory/branding
+ * metadata (name, slug, colours, fleet definitions, rank ladder, join
+ * requirements). Rosters, flight reports, applications, applicant emails and
+ * pilot accounts are created in, read from and deleted from the VA's project.
  *
  * Two adapters implement one interface:
  *
@@ -47,9 +47,14 @@ const TIMEOUT_MS = parseInt(process.env.CREW_STORE_TIMEOUT_MS, 10) || 8000;
 const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').toLowerCase() !== 'false';
 
 // The schema version this code is written against. A project reporting an older
-// version still works — every column we read has existed since v1 — but the
-// health endpoint flags it so the VA knows to re-run the SQL.
-const EXPECTED_SCHEMA_VERSION = 2;
+// version still works for everything that existed then — every column we read
+// has existed since v1 — but the health endpoint flags it so the VA knows to
+// re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
+// feature that genuinely needs the newer schema; see accountsSupported().
+const EXPECTED_SCHEMA_VERSION = 3;
+
+// The version that introduced crew_accounts.
+const ACCOUNTS_SCHEMA_VERSION = 3;
 
 // Mongo models, injected by server.js so this module doesn't reach into the
 // app's DB wiring. Only the legacy adapter touches them.
@@ -131,6 +136,41 @@ const memberToRow = (m) => {
     pick(m, out, 'status', 'status', (v) => (['active', 'loa', 'inactive'].includes(v) ? v : 'active'));
     pick(m, out, 'ifUserId', 'if_user_id', (v) => str(v, 40));
     pick(m, out, 'ifcName', 'ifc_name', (v) => str(v, 60));
+    return out;
+};
+
+// A crew center login. `passwordHash` is carried in the document shape because
+// the caller that compares a password needs it — nothing else may read it, and
+// no serialiser in the app emits it (see publicAccount in crewAccounts.js).
+const accountFromRow = (r) => r && {
+    _id: r.id,
+    username: r.username || '',
+    displayName: r.display_name || '',
+    passwordHash: r.password_hash || '',
+    role: r.role || 'pilot',
+    memberId: r.member_id || null,
+    email: r.email || '',
+    active: r.active !== false,
+    mustChangePassword: !!r.must_change_password,
+    createdVia: r.created_via || '',
+    createdByName: r.created_by_name || '',
+    lastLoginAt: date(r.last_login_at),
+    createdAt: date(r.created_at),
+    updatedAt: date(r.updated_at),
+};
+const accountToRow = (a) => {
+    const out = {};
+    pick(a, out, 'username', 'username', (v) => str(v, 60).toLowerCase());
+    pick(a, out, 'displayName', 'display_name', (v) => str(v, 80));
+    pick(a, out, 'passwordHash', 'password_hash', (v) => str(v, 120));
+    pick(a, out, 'role', 'role', (v) => (['pilot', 'staff', 'owner'].includes(v) ? v : 'pilot'));
+    pick(a, out, 'memberId', 'member_id', (v) => v || null);
+    pick(a, out, 'email', 'email', (v) => str(v, 120).toLowerCase());
+    pick(a, out, 'active', 'active', (v) => !!v);
+    pick(a, out, 'mustChangePassword', 'must_change_password', (v) => !!v);
+    pick(a, out, 'createdVia', 'created_via', (v) => str(v, 40));
+    pick(a, out, 'createdByName', 'created_by_name', (v) => str(v, 80));
+    pick(a, out, 'lastLoginAt', 'last_login_at', (v) => (date(v) ? date(v).toISOString() : null));
     return out;
 };
 
@@ -395,6 +435,59 @@ class SupabaseStore {
         return this.updateMember(id, { hours: next });
     }
 
+    // --- Crew center logins ---
+    //
+    // These are the VA's pilots' accounts, and they live in the VA's project
+    // like the rest of their data. A project still on a pre-v3 schema has no
+    // crew_accounts table; rather than let a missing table surface as the
+    // generic "run the SQL" error, upgrade() names the one thing that is
+    // actually missing, because everything ELSE on that project works fine and
+    // "your tables are missing" would read as a lie.
+    async accounts(fn) {
+        try { return await fn(); } catch (err) {
+            if (err instanceof CrewStoreError && err.code === 'store_schema_missing') {
+                throw new CrewStoreError(
+                    'This crew center’s project does not have the pilot-logins table yet. Re-run the setup SQL (Settings → Data store) to add it.',
+                    { status: 409, code: 'store_accounts_missing', detail: err.detail });
+            }
+            throw err;
+        }
+    }
+
+    listAccounts({ limit = 2000 } = {}) {
+        return this.accounts(async () => {
+            const rows = await this.db.select('crew_accounts', { ...this.scope, order: 'username.asc', limit });
+            return (rows || []).map(accountFromRow);
+        });
+    }
+    getAccount(id) { return this.accounts(() => this.one('crew_accounts', this.ident(id), accountFromRow)); }
+    // Usernames are stored lower-cased, so an equality match is the whole
+    // lookup — no ilike, and the unique index answers it directly.
+    getAccountByUsername(username) {
+        const u = str(username, 60).toLowerCase();
+        if (!u) return Promise.resolve(null);
+        return this.accounts(() => this.one('crew_accounts', { ...this.scope, username: `eq.${u}` }, accountFromRow));
+    }
+    getAccountByMember(memberId) {
+        if (!memberId) return Promise.resolve(null);
+        return this.accounts(() => this.one('crew_accounts', { ...this.scope, member_id: `eq.${memberId}` }, accountFromRow));
+    }
+    createAccount(data) {
+        return this.accounts(async () => {
+            const [row] = await this.db.insert('crew_accounts', { va_slug: this.slug, ...accountToRow(data) });
+            return accountFromRow(row);
+        });
+    }
+    updateAccount(id, patch) {
+        return this.accounts(async () => {
+            const [row] = await this.db.update('crew_accounts', this.ident(id), accountToRow(patch));
+            return row ? accountFromRow(row) : null;
+        });
+    }
+    deleteAccount(id) {
+        return this.accounts(async () => { await this.db.remove('crew_accounts', this.ident(id)); return true; });
+    }
+
     // --- Routes ---
     async listRoutes({ activeOnly = false, limit = 3000 } = {}) {
         const params = { ...this.scope, order: 'flight_number.asc,created_at.desc', limit };
@@ -500,6 +593,10 @@ class SupabaseStore {
                 version,
                 expectedVersion: EXPECTED_SCHEMA_VERSION,
                 outdated: version > 0 && version < EXPECTED_SCHEMA_VERSION,
+                // Can this project hold pilot logins? Reported separately from
+                // `outdated` because it is the one capability an older schema
+                // actually lacks, and the dashboard says so in those terms.
+                accounts: version >= ACCOUNTS_SCHEMA_VERSION,
                 installedAt: (rows && rows[0] && rows[0].installed_at) || null,
             };
         } catch (err) {
@@ -508,6 +605,7 @@ class SupabaseStore {
                 provisioned: false,
                 version: 0,
                 expectedVersion: EXPECTED_SCHEMA_VERSION,
+                accounts: false,
                 code: err.code || 'store_error',
                 error: err.message,
                 detail: err.detail || '',
@@ -565,6 +663,79 @@ class LegacyStore {
             await m.save();
         }
         return this.getMember(id);
+    }
+
+    // --- Crew center logins ---
+    //
+    // A not-yet-migrated VA's pilot logins are still rows in our central
+    // VaPortalAccount collection, which is exactly what this adapter exists to
+    // paper over: same interface, same document shape, so the login path and
+    // the account provisioner never learn which side answered. The migration
+    // copies these into the VA's project and then they stop being ours.
+    accountQ() { return { vaAdId: this.vaAdId, role: 'pilot' }; }
+    portalToAccount(a) {
+        if (!a) return null;
+        const d = this.lean(a);
+        return {
+            _id: d._id,
+            username: d.username || '',
+            displayName: d.displayName || '',
+            passwordHash: d.passwordHash || '',
+            role: 'pilot',
+            memberId: null,          // the central table never linked to a roster row
+            email: '',
+            active: d.active !== false,
+            mustChangePassword: !!d.mustChangePassword,
+            createdVia: d.createdVia || '',
+            createdByName: d.createdByName || '',
+            lastLoginAt: d.lastLoginAt || null,
+            createdAt: d.createdAt || null,
+            updatedAt: d.updatedAt || null,
+        };
+    }
+    async listAccounts({ limit = 2000 } = {}) {
+        const rows = await models.VaPortalAccount.find(this.accountQ()).sort({ username: 1 }).limit(limit).lean();
+        return rows.map((r) => this.portalToAccount(r));
+    }
+    async getAccount(id) {
+        return this.portalToAccount(await models.VaPortalAccount.findOne({ ...this.accountQ(), _id: id }).lean());
+    }
+    async getAccountByUsername(username) {
+        const u = str(username, 60).toLowerCase();
+        if (!u) return null;
+        return this.portalToAccount(await models.VaPortalAccount.findOne({ ...this.accountQ(), username: u }).lean());
+    }
+    async getAccountByMember() { return null; }
+    async createAccount(data) {
+        const doc = await models.VaPortalAccount.create({
+            username: str(data.username, 60).toLowerCase(),
+            displayName: str(data.displayName, 80),
+            passwordHash: data.passwordHash,
+            role: 'pilot',
+            vaAdId: this.vaAdId,
+            vaName: data.vaName || '',
+            createdVia: 'owner',
+            createdByName: str(data.createdByName, 80),
+            mustChangePassword: data.mustChangePassword !== false,
+            active: data.active !== false,
+        });
+        return this.portalToAccount(doc);
+    }
+    async updateAccount(id, patch) {
+        const a = await models.VaPortalAccount.findOne({ ...this.accountQ(), _id: id });
+        if (!a) return null;
+        // Only the fields this interface owns — memberId and email have no
+        // column on the central account and are dropped rather than stored
+        // somewhere they would be missed by the migration.
+        for (const k of ['username', 'displayName', 'passwordHash', 'active', 'mustChangePassword', 'lastLoginAt']) {
+            if (patch[k] !== undefined) a[k] = k === 'username' ? String(patch[k]).toLowerCase() : patch[k];
+        }
+        await a.save();
+        return this.portalToAccount(a);
+    }
+    async deleteAccount(id) {
+        await models.VaPortalAccount.deleteOne({ ...this.accountQ(), _id: id });
+        return true;
     }
 
     listRoutes({ activeOnly = false, limit = 3000 } = {}) {
@@ -629,7 +800,12 @@ class LegacyStore {
     }
 
     async health() {
-        return { ok: true, provisioned: true, managed: true, version: 0, expectedVersion: EXPECTED_SCHEMA_VERSION };
+        // `accounts: true` — managed pilot logins work, they just work in our
+        // database instead of the VA's, which is the thing the migration fixes.
+        return {
+            ok: true, provisioned: true, managed: true, accounts: true,
+            version: 0, expectedVersion: EXPECTED_SCHEMA_VERSION,
+        };
     }
 
     // Does this VA actually have anything in managed storage? forVa asks this on
@@ -758,5 +934,6 @@ module.exports = {
     LegacyStore,
     SELECT,
     EXPECTED_SCHEMA_VERSION,
+    ACCOUNTS_SCHEMA_VERSION,
     REQUIRE_OWN_STORE,
 };

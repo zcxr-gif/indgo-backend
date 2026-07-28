@@ -710,68 +710,24 @@ async function provisionRepAccount(ad, opts = {}) {
     return { account, created: true, reactivated: false, username, password };
 }
 
-/**
- * Provision a Crew Center login for a pilot the VA has just accepted.
+/*
+ * PILOT ACCOUNTS ARE NOT PROVISIONED HERE ANY MORE.
  *
- * A 'pilot' account signs in ONLY at the VA's crew center (never the
- * partnership portal) and lands on the pilot home — see PORTAL_ROLES. It lives
- * in the same account table as the VA's owner and staff so a VA has one set of
- * people, which is also why this is here rather than in the crew code.
+ * They used to be: a 'pilot' row in the table above, created when a VA accepted
+ * an application. That made Inflight the custodian of every pilot's credentials
+ * for every VA on the platform, which is precisely what the crew center's
+ * bring-your-own-database model exists to avoid — a pilot's account is the VA's
+ * data in the same way their hours are.
  *
- * THE PASSWORD IS RETURNED ONCE AND NEVER STORED. Only its bcrypt hash is kept,
- * so there is no "resend my password" — the caller has exactly one chance to
- * put it in front of the pilot (an email, or on screen for the staff member who
- * accepted them). `mustChangePassword` marks it as the temporary credential it
- * is.
+ * A pilot login is now a row in the VA's OWN Supabase project. See
+ * crewAccounts.js for provisioning, authentication and password changes, and
+ * supabase/crew-center-schema.sql for the table.
  *
- * Idempotent on the name it is given: accepting the same person twice returns
- * the existing account with `created: false` and no password, rather than
- * minting them a second login.
- *
- * @param {Object} ad                 a VirtualAirlineAd document (needs _id and name)
- * @param {Object} opts
- * @param {string} opts.displayName   the pilot's name (their IFC name)
- * @param {string} [opts.createdByName]  which staff member accepted them
- * @returns {{account: Object, created: boolean, username: string, password: string|null}}
+ * 'pilot' stays in PORTAL_ROLES and pilot rows stay readable here because VAs
+ * that have not run the migration yet still have theirs in this collection;
+ * crewStore's legacy adapter serves those through the same interface until
+ * POST /api/crew/:slug/store/migrate moves them across.
  */
-async function provisionPilotAccount(ad, opts = {}) {
-    if (!ad || !ad._id) throw new Error('provisionPilotAccount requires a VA ad with an _id.');
-    const { displayName = '', createdByName = 'Crew Center' } = opts;
-    const name = String(displayName || '').trim();
-    if (!name) throw new Error('provisionPilotAccount requires the pilot\'s name.');
-
-    // Same VA + same person = the same login. Matched on displayName because a
-    // pilot has no Discord id here; the applicant's IFC name is the identity
-    // the whole join flow already runs on.
-    const existing = await VaPortalAccount.findOne({
-        vaAdId: ad._id, role: 'pilot',
-        displayName: new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i'),
-    });
-    if (existing) {
-        return { account: existing, created: false, username: existing.username, password: null };
-    }
-
-    const username = await uniqueUsernameFrom(name);
-    const password = generatePassword();
-    const passwordHash = await bcrypt.hash(password, 12);
-    const account = await VaPortalAccount.create({
-        username,
-        displayName: name,
-        passwordHash,
-        role: 'pilot',
-        vaAdId: ad._id,
-        vaName: ad.name || '',
-        createdVia: 'owner',      // the VA created it, not Inflight
-        createdByName,
-        mustChangePassword: true,
-        active: true,
-    });
-    logActivity({
-        vaAdId: ad._id, vaName: ad.name, actorName: createdByName, actorRole: 'owner',
-        action: 'account.provision', detail: `Pilot account @${username} created for ${name}`,
-    });
-    return { account, created: true, username, password };
-}
 
 /**
  * Pause the portal account(s) the bot provisioned for a Discord rep of a VA —
@@ -2210,7 +2166,6 @@ module.exports = {
     registerVaPortalRoutes,
     provisionOwnerAccount,
     provisionRepAccount,
-    provisionPilotAccount,
     deactivateRepAccount,
     purgeVaData,
     requirePortalPage,

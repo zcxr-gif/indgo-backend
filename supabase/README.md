@@ -5,7 +5,9 @@ Inflight does not keep a copy.
 
 What we store centrally, and all we store centrally:
 
-- **staff logins** — usernames and bcrypt password hashes, so people can sign in
+- **the VA's staff logins** — the owner and their team: usernames and bcrypt
+  password hashes, so the people who administer the partnership can sign in.
+  Pilots are not in this list; see below.
 - **the VA's directory and branding metadata** — name, slug, callsigns, colours,
   layout, fleet definitions, the rank ladder, join requirements, the connection
   details for the project below
@@ -13,21 +15,40 @@ What we store centrally, and all we store centrally:
 What lives in the VA's project:
 
 - the roster, and every pilot's credited hours
+- **every pilot's crew center login** — username, bcrypt hash, and whether they
+  still owe us a password change
 - the route network
 - every flight report
 - every membership application, including the applicant's email address and the
   opaque token that lets them check their own status
 
 If a VA leaves the platform they keep all of it, and we have nothing to hand
-back because we never held it.
+back because we never held it. That now includes their pilots' accounts: we
+cannot sign in as anyone's pilot, and a pilot's password is not ours to reset.
 
 ## Setting one up
 
+The crew dashboard does it: **Settings → Data store → Set it up for me**. The
+VA pastes a Supabase [access token](https://supabase.com/dashboard/account/tokens),
+picks a project (or asks for a new one), and the backend installs the schema,
+reads the project's API keys back and stores the connection itself. About a
+minute, one paste, nothing to copy.
+
+**The access token is never stored.** It is used for the duration of that
+request and dropped — not written to the database, not logged, not returned to
+the browser. A Supabase personal access token is not scoped to one project, so
+holding one at rest would make us a far more attractive target than the service
+key we do keep, and nothing at run time needs it. The setup screen says so and
+tells the VA to delete the token afterwards.
+
+By hand, if a VA would rather (still supported, under "I'll do it myself"):
+
 1. The VA creates a Supabase project.
 2. SQL Editor → paste `crew-center-schema.sql` → Run. It is idempotent; running
-   it again upgrades in place and changes no data. The crew dashboard's **Copy
-   setup SQL** button fetches this exact file from `GET /api/crew/setup-sql`, so
-   there is only ever one copy of the schema.
+   it again upgrades in place and changes no data. The **Copy setup SQL** button
+   fetches this exact file from `GET /api/crew/setup-sql`, and the automatic
+   path above executes those same bytes, so there is only ever one copy of the
+   schema.
 3. Settings → API → copy the Project URL, the `anon` key and the `service_role`
    key into Crew Center → Settings → Data store.
 
@@ -37,24 +58,73 @@ back because we never held it.
 |---|---|---|
 | `anon` | any browser | read the roster, active routes and approved flight reports; call `crew_stats()`. Nothing else, and no writes. |
 | `service_role` | the Inflight backend only | everything. Bypasses RLS. Never sent to a browser. |
+| access token | nobody, after setup | used once to install the schema and read the two keys above. Not stored. |
 
 Row-level security is default-deny. Note what has no public policy at all:
-`crew_applications`. Applicant emails and status tokens are unreachable with a
-browser key even if that key leaks.
+`crew_applications` and `crew_accounts`. Applicant emails, status tokens and
+password hashes are unreachable with a browser key even if that key leaks — and
+the `grant` is revoked as well, so such a request is refused at the door rather
+than at the row.
 
 ## Endpoints
 
 | endpoint | auth | what it does |
 |---|---|---|
 | `GET /api/crew/setup-sql` | public | the schema, served from the copy in this repo |
+| `POST /api/crew/:slug/store/projects` | owner | list the Supabase projects a pasted access token can see |
+| `POST /api/crew/:slug/store/provision` | owner | install the schema, fetch the keys, connect and verify |
 | `GET /api/crew/:slug/stats` | public | aggregate figures. Application counters are added only for a caller who can review applications. |
 | `GET /api/crew/:slug/store` | staff | is the project reachable, provisioned, on the current schema — and how much is still in managed storage |
 | `POST /api/crew/:slug/store/migrate` | owner | copy managed rows into the VA's project |
 | `DELETE /api/crew/:slug/store/legacy` | owner | delete our copy afterwards |
+| `GET/POST /api/crew/:slug/accounts` | staff | list pilot logins / issue one for a pilot already on the roster |
+| `PATCH /api/crew/:slug/accounts/:id` | staff | suspend or restore a login |
+| `POST /api/crew/:slug/accounts/:id/reset-password` | staff | mint a new one-time password |
+| `POST /api/crew/:slug/account/password` | the pilot | change their own, current password required |
 
 Everything else under `/api/crew/:slug/*` (roster, routes, pireps,
 applications) reads and writes through `crewStore.js`, which hides which
 backend is answering.
+
+`/store/provision` is resumable, not long-running: a project Supabase has just
+created takes a minute or two to boot, so the call returns `ready: false` with a
+`projectRef` and the dashboard polls with the same token until it is up. Every
+stage is safe to repeat.
+
+## Pilot accounts
+
+A pilot's login is a `crew_accounts` row in the VA's project. `crewAccounts.js`
+owns provisioning, authentication, password changes and staff resets; the schema
+table carries a unique index on `(va_slug, lower(username))`, so a username is
+one-per-crew-center and two VAs may each have a `j.smith`.
+
+**The password is generated, shown once, and stored nowhere.** Only the bcrypt
+hash reaches the VA's project, so there is no "resend my password" anywhere in
+the system — the routes back in are a staff reset or nothing. A pilot is issued
+one when they are accepted (or immediately, at a VA that accepts everyone), it
+arrives by email with a sign-in link when they gave an address and on the
+reviewer's screen when they did not, and `must_change_password` makes the crew
+center demand a replacement before it shows them anything.
+
+Sign-in (`POST /api/crew/:slug/login`) tries the VA's store first, then our
+central staff accounts, then Inflight staff. A store that cannot answer is
+treated as "not this identity" rather than an error, so a VA mid-setup — or one
+whose project is briefly unreachable — can still get into the dashboard they
+would use to fix it.
+
+### Migrating existing pilot accounts
+
+`store/migrate` brings them across with everything else, copying the bcrypt
+**hash** rather than a password nobody has. Pilots keep signing in with what
+they already use; there is nothing to re-issue and nothing for them to notice.
+
+Logins need a v3 project. Against an older one the rest of the migration still
+completes and the response carries an `accountsNote` telling the VA to re-run
+the SQL and repeat the (idempotent) migration.
+
+`store/legacy` refuses to release our copy while the VA's project holds fewer
+logins than we do — deleting a credential that did not make it across would lock
+a pilot out with no way back.
 
 ## Migrating an existing VA
 
@@ -68,15 +138,18 @@ Decided applications come across too, because the status links already handed
 to applicants must keep resolving.
 
 `store/legacy` then releases our copy. It refuses if the VA's project holds
-fewer pilots or reports than we do, so a half-finished migration cannot delete
-the original.
+fewer pilots, reports or logins than we do, so a half-finished migration cannot
+delete the original. Owner and staff accounts are deliberately untouched: those
+are ours to keep.
 
 ## The legacy path
 
-`crewStore.LegacyStore` still reads and writes our old Mongo collections. It
-exists only for VAs onboarded before this, and is handed out only to a VA that
-already has rows there — a VA with no connection and no legacy rows gets a
-`409 store_not_connected` telling them to connect a project.
+`crewStore.LegacyStore` still reads and writes our old Mongo collections —
+including pilot logins, which for a not-yet-migrated VA are still
+`VaPortalAccount` rows with `role: 'pilot'`. It exists only for VAs onboarded
+before this, and is handed out only to a VA that already has rows there — a VA
+with no connection and no legacy rows gets a `409 store_not_connected` telling
+them to connect a project.
 
 Setting `CREW_STORE_REQUIRE_OWN=false` reopens managed storage to everyone.
 That is an escape hatch for an incident, not a supported configuration.
@@ -93,23 +166,34 @@ Only ever add nullable columns or new tables. A VA runs this script by hand
 against their own production data, and there is no way to coordinate a
 breaking change across every project at once.
 
+Version history:
+
+- **v1** — roster, routes, flight reports, applications, `crew_stats()`
+- **v2** — `crew_applications.discord_invite`
+- **v3** — `crew_accounts`: pilot logins move out of our database into the VA's
+
 ## Accepting a pilot
 
 Accepting an application (`PATCH /api/crew/:slug/applications/:id` with
 `action: "accept"`) can do three things beyond flipping the status:
 
 - **Adds them to the roster** — always, in the VA's project.
-- **Creates a crew center login** when `createAccount` is set. A `pilot`-role
-  account (see `PORTAL_ROLES` in `vaPortal.js`) is provisioned centrally, since
-  logins are the one thing we do keep. The generated password is returned in the
-  response **once** and is never stored — only its bcrypt hash is. It is emailed
-  to the applicant when they gave an address, and shown to the reviewing staff
-  member either way, because an applicant without an email has no other route to
-  it. Accepting the same person twice returns their existing account rather than
-  minting a second login.
+- **Creates a crew center login** when `createAccount` is set, in the VA's
+  project, linked to the roster row it was created alongside. The generated
+  password is returned in the response **once** and is never stored — only its
+  bcrypt hash is. It is emailed to the applicant when they gave an address, and
+  shown to the reviewing staff member either way, because an applicant without
+  an email has no other route to it. Accepting the same person twice returns
+  their existing account rather than minting a second login.
 - **Sends a Discord invite** — `discordInvite` on the request, falling back to
   the VA's stored `crewDiscordInvite`. It goes into the acceptance email and is
   saved on the application so the applicant's status page can show it again.
+
+The reviewer may also supply an `email` for an applicant who left the field
+blank, so the credentials can be sent rather than read out. It only ever fills a
+gap: an address the applicant gave themselves is never overwritten from the
+review screen, because that would let staff redirect someone else's credentials
+to an inbox of their choosing.
 
 The invite is validated by `cleanDiscordInvite` in `crewAuth.js` and it is a
 security boundary, not a formatting nicety: that string lands in an email we
@@ -124,6 +208,19 @@ never shown a path-traversal or a tracking query as their invite link.
 in-process PostgREST impersonator — mapping, slug scoping, flight-id dedupe,
 hours credit/reverse and the error taxonomy. No network, no database.
 
+`node scratchpad/test-crew-accounts.js` drives the pilot-login module against
+the same kind of impersonator: that a password survives a round trip and its
+plaintext never lands in a row, that provisioning twice yields one account,
+that usernames are unique per crew center and only per crew center, that wrong
+password / unknown user / disabled account are indistinguishable, and that a
+pre-v3 project fails with something the VA can act on.
+
+`node scratchpad/test-supabase-setup.js` drives the guided setup against a
+Management API impersonator — that the access token reaches Supabase and
+nothing else, that a project still booting parks the flow instead of failing it,
+that the SQL executed is this repo's own file, and that the service key reaches
+storage but never the reply.
+
 `node scratchpad/test-discord-invite.js` covers the invite validator: the real
 formats, lookalike hosts, non-invite Discord paths, scheme downgrades, and the
 three-way `'' / url / null` contract that lets a handler tell "clear this" from
@@ -132,4 +229,5 @@ three-way `'' / url / null` contract that lets a handler tell "clear this" from
 The schema itself is worth checking against a real Postgres when it changes:
 create the `anon` and `authenticated` roles (Supabase provides them; a bare
 cluster does not), run the file twice to confirm idempotency, then check
-`crew_stats()` and the RLS boundaries as `anon`.
+`crew_stats()` and the RLS boundaries as `anon` — including that
+`crew_accounts` is unreadable.
