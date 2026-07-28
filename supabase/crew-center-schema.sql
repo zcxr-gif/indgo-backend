@@ -6,19 +6,25 @@
 -- A VA's operational data is the VA's property and lives in the VA's own
 -- Postgres. Inflight does NOT keep a copy. What we keep centrally is only:
 --
---     * the VA's staff logins (usernames + bcrypt password hashes),
+--     * the VA's *staff* logins (owner + team — usernames and bcrypt hashes),
 --     * the VA's directory/branding metadata (name, slug, colours, fleet
 --       definitions, rank ladder, join requirements),
 --     * the connection details for the project defined below.
 --
 -- Everything with operational weight — who flies for the VA, how many hours
--- they have logged, every flight report, every membership application and the
--- applicant's email address — is created here, in this file's tables, inside
--- the VA's project. If the VA leaves the platform they keep the lot and we
--- have nothing to hand back, because we never held it.
+-- they have logged, every flight report, every membership application, the
+-- applicant's email address, and every PILOT ACCOUNT (see crew_accounts) — is
+-- created here, in this file's tables, inside the VA's project. If the VA
+-- leaves the platform they keep the lot and we have nothing to hand back,
+-- because we never held it.
 --
 -- HOW TO INSTALL
 -- --------------
+-- The crew dashboard installs this for you: Settings → Data store → Set up
+-- automatically, paste a Supabase access token, pick a project. It runs this
+-- exact file against the project and copies the keys back itself.
+--
+-- By hand, if you would rather:
 -- 1. Supabase dashboard → SQL Editor → New query.
 -- 2. Paste this whole file and Run. It is idempotent: running it again on an
 --    already-provisioned project upgrades it in place and changes no data.
@@ -85,6 +91,53 @@ create table if not exists crew_members (
 create index if not exists crew_members_va_idx      on crew_members (va_slug);
 create index if not exists crew_members_hours_idx   on crew_members (va_slug, hours desc);
 create index if not exists crew_members_if_idx      on crew_members (va_slug, if_user_id) where if_user_id <> '';
+
+-- ----------------------------------------------------------------------------
+-- Crew center logins. v3.
+--
+-- A pilot's ACCOUNT — the thing they sign in with — is the VA's data like
+-- everything else here, so it lives in the VA's project rather than in ours.
+-- Accepting an application writes the row below; signing in at the crew center
+-- reads it. Inflight holds no copy, which means a VA that leaves takes their
+-- pilots' logins with them and we cannot sign in as anyone's pilot.
+--
+-- SECURITY: this table holds bcrypt password hashes. Like crew_applications it
+-- has NO anon policy and NO grant — it is unreachable with a browser key, and
+-- the RLS block at the bottom of this file is what enforces that. Passwords
+-- themselves are never stored anywhere, in any form: a generated password is
+-- shown to the pilot once and only its hash lands here.
+--
+-- `role` is constrained to the three crew center roles rather than to 'pilot'
+-- alone, so a VA that later brings its staff logins over needs no migration —
+-- only pilot rows are written today.
+-- ----------------------------------------------------------------------------
+create table if not exists crew_accounts (
+    id            uuid primary key default gen_random_uuid(),
+    va_slug       text not null,
+    -- Lower-cased on write; the unique index below is what makes a username
+    -- one-per-crew-center rather than one-per-project.
+    username      text not null,
+    display_name  text not null default '',
+    password_hash text not null,
+    role          text not null default 'pilot' check (role in ('pilot','staff','owner')),
+    -- The roster row this login belongs to. `on delete set null`: removing a
+    -- pilot from the roster leaves their account behind for staff to deal with
+    -- deliberately, rather than deleting a credential as a side effect.
+    member_id     uuid references crew_members (id) on delete set null,
+    email         text not null default '',
+    active        boolean not null default true,
+    -- Set when we generated the password. The crew center nags until it is
+    -- cleared by a password change.
+    must_change_password boolean not null default false,
+    created_via   text not null default 'crew-center',
+    created_by_name text not null default '',
+    last_login_at timestamptz,
+    created_at    timestamptz not null default now(),
+    updated_at    timestamptz not null default now()
+);
+create unique index if not exists crew_accounts_username_idx
+    on crew_accounts (va_slug, lower(username));
+create index if not exists crew_accounts_member_idx on crew_accounts (va_slug, member_id);
 
 -- ----------------------------------------------------------------------------
 -- Membership applications submitted through the crew center's join form.
@@ -207,7 +260,7 @@ $$;
 do $$
 declare t text;
 begin
-    foreach t in array array['crew_members','crew_applications','crew_routes','crew_pireps','crew_schema_info']
+    foreach t in array array['crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps','crew_schema_info']
     loop
         execute format('drop trigger if exists %I on %I', t || '_touch', t);
         execute format(
@@ -326,14 +379,16 @@ $$;
 --
 -- Default deny on every table. The anon key then gets back exactly the three
 -- public reads a crew center needs, and nothing else. Note what is absent:
--- there is no anon policy on crew_applications at all, so applicant emails and
--- status tokens are unreachable with a browser key even if it leaks.
+-- there is no anon policy on crew_applications or crew_accounts at all, so
+-- applicant emails, status tokens and password hashes are unreachable with a
+-- browser key even if it leaks.
 --
 -- Writes have no policy for any role. They happen through the service key,
 -- which bypasses RLS — so every mutation goes through the Inflight backend and
 -- its permission checks rather than straight from a page.
 -- ============================================================================
 alter table crew_members      enable row level security;
+alter table crew_accounts     enable row level security;
 alter table crew_applications enable row level security;
 alter table crew_routes       enable row level security;
 alter table crew_pireps       enable row level security;
@@ -359,8 +414,12 @@ create policy crew_schema_info_public_read on crew_schema_info
 
 grant usage on schema public to anon, authenticated;
 grant select on crew_members, crew_routes, crew_pireps, crew_schema_info to anon, authenticated;
--- Deliberately NOT granted on crew_applications.
+-- Deliberately NOT granted on crew_applications or crew_accounts. The first
+-- holds applicant emails, the second holds password hashes; neither has a
+-- policy above, and revoking the grant means a browser key is refused at the
+-- door rather than at the row.
 revoke all on crew_applications from anon, authenticated;
+revoke all on crew_accounts     from anon, authenticated;
 
 -- crew_stats is security definer so it can aggregate rows the caller cannot
 -- read row-by-row (pending reports feed the "awaiting review" counter). It
@@ -372,5 +431,5 @@ grant execute on function crew_stats(text) to anon, authenticated;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 2)
+insert into crew_schema_info (id, version) values (1, 3)
 on conflict (id) do update set version = excluded.version, updated_at = now();

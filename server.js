@@ -25,9 +25,9 @@ const {
     registerVaPortalRoutes,
     provisionOwnerAccount,
     provisionRepAccount,
-    provisionPilotAccount,
     deactivateRepAccount,
     purgeVaData,
+    VaPortalAccount,
     VaSubmission,
     VaEvent,
     requirePortal: requireVaPortalSession,
@@ -48,6 +48,17 @@ const vaStats = require('./vaStats');
 // the two backends (their Postgres, or our legacy managed collections for VAs
 // that have not migrated yet) is answering. See crewStore.js.
 const crewStore = require('./crewStore');
+
+// Pilot logins. A pilot's account is the VA's data like their hours are, so it
+// is created in and read from the VA's own project through crewStore — Inflight
+// keeps only the VA's staff logins. See crewAccounts.js.
+const crewAccounts = require('./crewAccounts');
+
+// One-paste setup for a VA's Supabase project: given a Supabase access token we
+// install the schema, read the project's keys back and store the connection
+// ourselves, so nobody has to hand-copy three values between two dashboards.
+// The token is used for the request and never stored. See crewSetup.js.
+const crewSetup = require('./crewSetup');
 
 // Group flights — a VA owner selects the aircraft flying their event and mints
 // one short link to share. Ownership is claimed with the contact email already
@@ -546,7 +557,11 @@ const CrewPirep = mongoose.models.CrewPirep || mongoose.model('CrewPirep', CrewP
 // working until they run the migration (POST /api/crew/:slug/store/migrate).
 // Handing them to crewStore keeps that fallback in one place instead of spread
 // through the route handlers.
-crewStore.configure({ CrewMember, CrewApplication, CrewRoute, CrewPirep });
+//
+// VaPortalAccount is in the list for the same reason: a not-yet-migrated VA's
+// pilot logins are still rows there, and the legacy adapter serves them through
+// the same account interface the VA's own project answers.
+crewStore.configure({ CrewMember, CrewApplication, CrewRoute, CrewPirep, VaPortalAccount });
 
 // ---- Infinite Flight identity verification ----
 // We already run an acars backend that proxies the official IF API. It resolves
@@ -723,6 +738,27 @@ function crewEmailHtml({ vaName, heading, accent, bodyHtml, button }) {
           <tr><td style="padding:14px 28px;border-top:1px solid #F0ECE4;font-size:11px;color:#A8A296">Sent by ${esc(vaName || 'this VA')} via Inflight · Crew Center</td></tr>
         </table>
       </td></tr></table></body></html>`;
+}
+
+// The "here is how you get in" block of a welcome email.
+//
+// This is the ONLY copy of the password that will ever exist: it was generated,
+// hashed into the VA's project, and handed back to us once (see
+// crewAccounts.provisionPilotAccount). So the email has to carry everything the
+// pilot needs in one go — where to sign in, the username, the password, and the
+// fact that they will be asked to replace it immediately — because there is no
+// second email to fall back on and nothing to look it up from later.
+//
+// Shared by the free-join path and the accept-an-application path so a pilot
+// gets the same instructions however they joined.
+function crewCredentialsHtml({ username, password, signInUrl }) {
+    if (!username || !password) return '';
+    return `<br><br><b>Your crew center sign-in</b>`
+        + `<br>Username: <b>${escHtml(username)}</b>`
+        + `<br>One-time password: <b>${escHtml(password)}</b>`
+        + `<br><span style="color:#6b7280">You’ll be asked to choose your own password the first time you sign in. `
+        + `This one only works until you do, and it isn’t stored anywhere — keep this email until you’ve changed it.</span>`
+        + (signInUrl ? `<br><br>Sign in: <a href="${escHtml(signInUrl)}">${escHtml(signInUrl)}</a>` : '');
 }
 
 // Load a VA's (secret) crew webhook url by id. Returns '' when unset/invalid.
@@ -1485,14 +1521,21 @@ app.get('/api/crew/aircraft-metadata', async (req, res) => {
 //
 // Public: it is a schema, not a secret, and the VA is about to paste it into
 // their own SQL editor.
+//
+// Read here rather than in each caller: the automatic setup path runs this very
+// file against the VA's project (see /store/provision), so the script we hand
+// out to copy and the script we execute are the same bytes by construction.
 let _setupSqlCache = null;
+function readSetupSql() {
+    if (!_setupSqlCache) {
+        _setupSqlCache = fs.readFileSync(path.join(__dirname, 'supabase', 'crew-center-schema.sql'), 'utf8');
+    }
+    return _setupSqlCache;
+}
 app.get('/api/crew/setup-sql', (req, res) => {
     try {
-        if (!_setupSqlCache) {
-            _setupSqlCache = fs.readFileSync(path.join(__dirname, 'supabase', 'crew-center-schema.sql'), 'utf8');
-        }
         res.set('Cache-Control', 'public, max-age=600');
-        res.type('text/plain; charset=utf-8').send(_setupSqlCache);
+        res.type('text/plain; charset=utf-8').send(readSetupSql());
     } catch (err) {
         console.error('setup-sql read error:', err);
         res.status(500).type('text/plain').send('-- The setup script could not be read. Contact Inflight support.');
@@ -1998,13 +2041,31 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
             status, reviewedAt: status === 'accepted' ? new Date() : null,
         });
         vaStats.recordEngagement(ad._id, 'application', 1, ad.name);
+        // A free-join VA accepts on the spot, so this is the moment that pilot
+        // becomes crew — roster row and crew center login together. `credentials`
+        // carries the one-time password: emailed below when they gave an address,
+        // and returned in the response either way so the join page can show it
+        // once to someone who didn't.
+        let credentials = null;
         if (status === 'accepted') {
-            await store.createMember({
+            const member = await store.createMember({
                 name: ifcName, callsign: (prefix + number).trim(),
                 hours: 0, role: '', aircraft: [], status: 'active',
                 ifUserId: ifUserId || '', ifcName,
             });
             vaStats.recordEngagement(ad._id, 'crewJoin', 1, ad.name);
+            // Best-effort, like the accept path: a pilot who is on the roster
+            // but could not be issued a login is fixable from the dashboard,
+            // and failing the join over it would be worse.
+            try {
+                const r = await crewAccounts.provisionPilotAccount(store, {
+                    displayName: ifcName, memberId: member ? member._id : null,
+                    email, createdByName: 'Join form', vaName: ad.name || '',
+                });
+                credentials = { username: r.username, password: r.password, created: r.created };
+            } catch (err) {
+                console.error('join account provision error:', err?.message || err);
+            }
         }
         // Notify the VA's Discord (fire-and-forget). Free-mode joins and
         // pending applications both post so staff see activity in real time.
@@ -2038,8 +2099,9 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
             if (status === 'accepted') {
                 sendCrewEmail(emailCfg, { to: email, subject: `Welcome to ${ad.name || 'the crew'}!`,
                     html: crewEmailHtml({ vaName: ad.name, accent: ad.crewAccent, heading: 'Welcome aboard! 🎉',
-                        bodyHtml: `You’re now flying with <b>${escHtml(ad.name || 'the crew')}</b>${cs ? `, as <b>${escHtml(cs)}</b>` : ''}.`,
-                        button: { label: 'Open the crew center', url: centerUrl } }) }).catch(() => {});
+                        bodyHtml: `You’re now flying with <b>${escHtml(ad.name || 'the crew')}</b>${cs ? `, as <b>${escHtml(cs)}</b>` : ''}.`
+                            + crewCredentialsHtml({ ...(credentials || {}), signInUrl: centerUrl }),
+                        button: { label: credentials && credentials.password ? 'Sign in to the crew center' : 'Open the crew center', url: centerUrl } }) }).catch(() => {});
             } else {
                 sendCrewEmail(emailCfg, { to: email, subject: `Application received — ${ad.name || 'Crew Center'}`,
                     html: crewEmailHtml({ vaName: ad.name, accent: ad.crewAccent, heading: 'Application received',
@@ -2047,7 +2109,14 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
                         button: { label: 'Check your status', url: statusUrl } }) }).catch(() => {});
             }
         }
-        res.json({ status, callsign: cs, applicationId: appDoc._id, statusToken, ifVerified, grade, emailed: !!email });
+        res.json({
+            status, callsign: cs, applicationId: appDoc._id, statusToken, ifVerified, grade,
+            emailed: !!email,
+            // Only ever populated on a free-mode join, and only the first time —
+            // this is the sole copy of that password, and the join page shows it
+            // once with a "write this down" warning.
+            account: credentials,
+        });
     } catch (err) { crewFail(res, err, { log: 'apply error', message: 'Could not submit your application.' }); }
 });
 // Public: verify an Infinite Flight Community name in real time so the join
@@ -2113,6 +2182,22 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
         const message = String(req.body?.message || '').trim().slice(0, 2000);
         const patch = { reviewedAt: new Date() };
 
+        // An address the reviewer typed in, for an applicant who left the email
+        // field blank. It is the difference between a pilot receiving their
+        // one-time password and a staff member having to read it out, so the
+        // accept dialog asks for one whenever the application has none.
+        //
+        // It only ever FILLS a gap: an address the applicant gave themselves is
+        // never overwritten from the review screen, because that would let staff
+        // redirect someone else's credentials to an inbox of their choosing.
+        if (!appDoc.email && req.body?.email !== undefined) {
+            const typed = String(req.body.email || '').trim().toLowerCase().slice(0, 120);
+            if (typed && !isEmail(typed)) {
+                return res.status(400).json({ error: 'That doesn’t look like an email address.' });
+            }
+            if (typed) { patch.email = typed; appDoc = { ...appDoc, email: typed }; }
+        }
+
         // What the pilot gets handed along with the decision. `credentials` is
         // returned to the reviewing staff member exactly once — see below.
         let credentials = null;
@@ -2137,8 +2222,9 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
 
             // Only mint the pilot on the transition into 'accepted', so
             // re-accepting an already-accepted application can't duplicate them.
+            let member = null;
             if (appDoc.status !== 'accepted') {
-                await store.createMember({
+                member = await store.createMember({
                     name: appDoc.ifcName, callsign: (appDoc.callsignPrefix + appDoc.callsignNumber).trim(),
                     hours: 0, role: '', aircraft: [], status: 'active',
                     ifUserId: appDoc.ifUserId || '', ifcName: appDoc.ifcName || '',
@@ -2146,22 +2232,35 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
                 vaStats.recordEngagement(va._id, 'crewJoin', 1, va.name);
             }
 
-            // A crew center login, when the reviewer asked for one. Best-effort:
-            // a pilot who is on the roster but could not be given an account is
-            // a fixable annoyance, whereas failing the whole acceptance over it
-            // would leave the application pending after we already added them.
+            // A crew center login, when the reviewer asked for one. It is
+            // written into the VA's OWN data store next to the roster row it
+            // belongs to — Inflight never holds a pilot's credentials.
+            //
+            // Best-effort: a pilot who is on the roster but could not be given
+            // an account is a fixable annoyance, whereas failing the whole
+            // acceptance over it would leave the application pending after we
+            // already added them.
             if (req.body?.createAccount) {
                 try {
-                    const r = await provisionPilotAccount({ _id: va._id, name: va.name }, {
+                    const r = await crewAccounts.provisionPilotAccount(store, {
                         displayName: appDoc.ifcName || '',
+                        memberId: member ? member._id : null,
+                        email: appDoc.email || '',
                         createdByName: gate.p?.name || 'Crew Center',
+                        vaName: va.name || '',
                     });
                     // A password comes back only on first creation; re-accepting
                     // someone who already has a login yields username-only.
                     credentials = { username: r.username, password: r.password, created: r.created };
                 } catch (err) {
                     console.error('pilot account provision error:', err?.message || err);
-                    credentials = { error: 'The pilot was accepted, but their crew center account could not be created.' };
+                    // An older schema is the one failure the VA can act on, so
+                    // say that rather than the generic line.
+                    credentials = {
+                        error: err && err.code === 'store_accounts_missing'
+                            ? 'The pilot was accepted, but your project needs the updated setup SQL before it can hold pilot logins (Settings → Data store).'
+                            : 'The pilot was accepted, but their crew center account could not be created.',
+                    };
                 }
             }
             patch.status = 'accepted';
@@ -2195,21 +2294,22 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
                 + (message ? `<br><br><b>Message from the team:</b><br>${escHtml(message).replace(/\n/g, '<br>')}` : '');
             // The two things a new pilot needs next: how to sign in, and where
             // the crew actually talks. The password is printed here because this
-            // is the only copy — nothing stores it (see provisionPilotAccount).
+            // is the only copy — nothing stores it, here or in the VA's project
+            // (see crewAccounts.provisionPilotAccount).
             if (accepted && credentials && credentials.password) {
-                body += `<br><br><b>Your crew center sign-in</b><br>`
-                    + `Username: <b>${escHtml(credentials.username)}</b><br>`
-                    + `Temporary password: <b>${escHtml(credentials.password)}</b><br>`
-                    + `<span style="color:#6b7280">Please change it after you sign in for the first time.</span>`;
+                body += crewCredentialsHtml({ ...credentials, signInUrl: centerUrl });
             }
             if (accepted && invite) {
                 body += `<br><br><b>Join the crew on Discord</b><br><a href="${escHtml(invite)}">${escHtml(invite)}</a>`;
             }
+            const signInEmail = accepted && credentials && credentials.password;
             sendCrewEmail(emailCfg, { to: appDoc.email,
                 subject: accepted ? `You’re in — ${va.name || 'Crew Center'}` : `Update on your application — ${va.name || 'Crew Center'}`,
                 html: crewEmailHtml({ vaName: va.name, accent: va.crewAccent, heading: accepted ? 'You’re in! 🎉' : 'Application update',
                     bodyHtml: body,
-                    button: accepted ? { label: 'Open the crew center', url: centerUrl } : { label: 'View your application', url: statusUrl } }) }).catch(() => {});
+                    button: accepted
+                        ? { label: signInEmail ? 'Sign in to the crew center' : 'Open the crew center', url: centerUrl }
+                        : { label: 'View your application', url: statusUrl } }) }).catch(() => {});
         }
         // `credentials` carries the ONLY copy of the temporary password. It is
         // returned here so the reviewer can pass it on when the applicant left
@@ -2220,6 +2320,10 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
             message: appDoc.staffMessage || '',
             discordInvite: accepted ? (invite || '') : '',
             emailed: !!(accepted && appDoc.email),
+            email: accepted ? (appDoc.email || '') : '',
+            // Where the pilot signs in, so the reviewer can pass on a working
+            // link with the credentials when there was no email to send them to.
+            signInUrl: accepted ? `${SITE_ORIGIN}/crew/${encodeURIComponent(va.slug || req.params.slug)}` : '',
             account: credentials,
         });
     } catch (err) { crewFail(res, err, { log: 'application review error', message: 'Could not update the application.' }); }
@@ -2323,6 +2427,10 @@ app.get('/api/crew/:slug/store', async (req, res) => {
             routes: await CrewRoute.countDocuments({ vaAdId: va._id }),
             pireps: await CrewPirep.countDocuments({ vaAdId: va._id }),
             applications: await CrewApplication.countDocuments({ vaAdId: va._id }),
+            // Pilot logins we are still holding centrally. They move across with
+            // everything else, and until they do, this VA's pilots are signing
+            // in against our database rather than their own.
+            accounts: await VaPortalAccount.countDocuments({ vaAdId: va._id, role: 'pilot' }),
         };
         res.set('Cache-Control', 'no-store');
         res.json({
@@ -2333,8 +2441,9 @@ app.get('/api/crew/:slug/store', async (req, res) => {
             selfHosted: !!(store && store.owned),
             health,
             legacyRows: pending,
-            legacyTotal: pending.members + pending.routes + pending.pireps + pending.applications,
+            legacyTotal: pending.members + pending.routes + pending.pireps + pending.applications + pending.accounts,
             schemaVersion: crewStore.EXPECTED_SCHEMA_VERSION,
+            accountsSchemaVersion: crewStore.ACCOUNTS_SCHEMA_VERSION,
         });
     } catch (err) { crewFail(res, err, { log: 'crew store health error', message: 'Could not check the data store.' }); }
 });
@@ -2374,7 +2483,7 @@ app.post('/api/crew/:slug/store/migrate', async (req, res) => {
         }
 
         const source = new crewStore.LegacyStore(va);
-        const moved = { members: 0, routes: 0, pireps: 0, applications: 0, skipped: 0 };
+        const moved = { members: 0, routes: 0, pireps: 0, applications: 0, accounts: 0, skipped: 0 };
 
         // 1) Roster. Keyed on callsign+name so a re-run doesn't duplicate.
         const existingMembers = await target.listMembers({ limit: 5000 });
@@ -2429,8 +2538,45 @@ app.post('/api/crew/:slug/store/migrate', async (req, res) => {
             }
         }
 
+        // 5) Pilot logins. The bcrypt HASH is copied, not the password — nobody
+        // has the password, us included — so a pilot's existing credentials keep
+        // working against the VA's project with nothing to re-issue and nothing
+        // for the pilot to notice. Re-pointed at the roster row that came across
+        // above where the names match, so the account and the pilot are linked
+        // by id from here on.
+        //
+        // This step needs a v3 project. An older one is not a failure: the rest
+        // of the migration is done and valid, and the VA is told to re-run the
+        // SQL and repeat the (idempotent) migration to pick logins up.
+        let accountsNote = '';
+        try {
+            const membersByName = new Map(
+                (await target.listMembers({ limit: 5000 }))
+                    .map((m) => [String(m.name || '').toLowerCase(), m._id]));
+            for (const a of await source.listAccounts({ limit: 5000 })) {
+                if (await target.getAccountByUsername(a.username)) { moved.skipped++; continue; }
+                await target.createAccount({
+                    username: a.username,
+                    displayName: a.displayName,
+                    passwordHash: a.passwordHash,
+                    role: 'pilot',
+                    memberId: membersByName.get(String(a.displayName || '').toLowerCase()) || null,
+                    active: a.active,
+                    mustChangePassword: a.mustChangePassword,
+                    createdVia: a.createdVia || 'migrated',
+                    createdByName: a.createdByName || '',
+                    lastLoginAt: a.lastLoginAt || null,
+                });
+                moved.accounts++;
+            }
+        } catch (err) {
+            if (err && err.code === 'store_accounts_missing') {
+                accountsNote = 'Everything else moved across. Your project is on an older version of the setup SQL, which has no table for pilot logins — re-run it from Settings → Data store, then run this again to bring the logins over.';
+            } else throw err;
+        }
+
         _crewStatsCache.delete(String(va.slug || req.params.slug).toLowerCase());
-        res.json({ ok: true, moved, stats: await target.stats() });
+        res.json({ ok: true, moved, accountsNote, stats: await target.stats() });
     } catch (err) { crewFail(res, err, { log: 'crew store migrate error', message: 'Could not migrate the data store.' }); }
 });
 
@@ -2459,6 +2605,7 @@ app.delete('/api/crew/:slug/store/legacy', async (req, res) => {
         const ours = {
             members: await CrewMember.countDocuments({ vaAdId: va._id }),
             pireps: await CrewPirep.countDocuments({ vaAdId: va._id }),
+            accounts: await VaPortalAccount.countDocuments({ vaAdId: va._id, role: 'pilot' }),
         };
         if (theirs.pilots < ours.members || theirs.pireps < ours.pireps) {
             return res.status(409).json({
@@ -2467,9 +2614,26 @@ app.delete('/api/crew/:slug/store/legacy', async (req, res) => {
                 yours: { pilots: theirs.pilots, pireps: theirs.pireps }, managed: ours,
             });
         }
+        // Pilot logins get their own check, against the account table rather
+        // than the stats snapshot. Deleting a credential that did not make it
+        // across locks a pilot out of their crew center with no way back, so
+        // this refuses on a shortfall exactly like the records above do.
+        if (ours.accounts) {
+            const theirAccounts = (await target.listAccounts({ limit: 5000 }).catch(() => null));
+            if (!theirAccounts || theirAccounts.length < ours.accounts) {
+                return res.status(409).json({
+                    error: 'Your project holds fewer pilot logins than we do. Run the migration again before releasing — deleting a login we still hold would lock that pilot out.',
+                    code: 'migration_incomplete',
+                    yours: { accounts: theirAccounts ? theirAccounts.length : 0 }, managed: { accounts: ours.accounts },
+                });
+            }
+        }
         const q = { vaAdId: va._id };
-        const [pireps, members, routes, applications] = await Promise.all([
+        const [pireps, members, routes, applications, accounts] = await Promise.all([
             CrewPirep.deleteMany(q), CrewMember.deleteMany(q), CrewRoute.deleteMany(q), CrewApplication.deleteMany(q),
+            // Pilot logins only. The VA's owner and staff accounts are how they
+            // administer the partnership with us and stay exactly where they are.
+            VaPortalAccount.deleteMany({ ...q, role: 'pilot' }),
         ]);
         crewStore.forgetLegacyData(va._id);   // the "has legacy rows?" probe is now stale
         res.json({
@@ -2477,9 +2641,257 @@ app.delete('/api/crew/:slug/store/legacy', async (req, res) => {
             deleted: {
                 pireps: pireps.deletedCount || 0, members: members.deletedCount || 0,
                 routes: routes.deletedCount || 0, applications: applications.deletedCount || 0,
+                accounts: accounts.deletedCount || 0,
             },
         });
     } catch (err) { crewFail(res, err, { log: 'crew store release error', message: 'Could not release managed storage.' }); }
+});
+
+// ---- Guided Supabase setup ----
+//
+// The manual path — create a project, find the SQL editor, paste the schema,
+// then copy three values out of Settings → API without mixing up which is
+// which — is the single biggest thing standing between a new VA and a working
+// crew center. These two endpoints do it instead, given one Supabase access
+// token.
+//
+// THE TOKEN IS NEVER STORED. It is read from the request body, used for the
+// duration of the call, and dropped. It is not written to the database, not
+// logged, and not echoed back. A Supabase personal access token is not scoped
+// to one project — it can do anything to the account that issued it — so
+// keeping one at rest would make us a far better target than the service key we
+// do keep, and nothing at run time needs it.
+
+// Owner (or Inflight) gate, shared by the setup routes. Connecting a data store
+// is deliberately not delegable to staff: it is the VA's data and their
+// Supabase account.
+function crewOwnerGate(req, slug) {
+    const p = verifyCrewRequest(req);
+    if (!p) return { error: 401, message: 'Not authenticated.' };
+    if (!(p.kind === 'inflight' || p.role === 'owner')) {
+        return { error: 403, message: 'Only the VA owner can set up the data store.' };
+    }
+    if (p.kind !== 'inflight' && p.slug && p.slug !== String(slug || '').toLowerCase()) {
+        return { error: 403, message: 'Wrong crew center.' };
+    }
+    return { p };
+}
+
+function setupFail(res, err, log) {
+    if (err instanceof crewSetup.SetupError) {
+        if (err.detail) console.warn(`crew setup [${err.code}]:`, err.detail);
+        return res.status(err.status).json({ error: err.message, code: err.code });
+    }
+    if (err instanceof crewStore.CrewStoreError) {
+        return res.status(err.status).json({ error: err.message, code: err.code });
+    }
+    console.error(`${log}:`, err && err.message ? err.message : err);
+    return res.status(500).json({ error: 'Setup could not be completed.' });
+}
+
+// What the VA can see with the token they just pasted: their projects, and the
+// organizations a new project could go in. POST, not GET, so the token travels
+// in a body rather than in a URL that would land in every access log between
+// here and there.
+app.post('/api/crew/:slug/store/projects', async (req, res) => {
+    const gate = crewOwnerGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    const accessToken = String(req.body?.accessToken || '').trim();
+    if (!accessToken) return res.status(400).json({ error: 'Paste a Supabase access token first.', code: 'no_token' });
+    try {
+        const mgmt = new crewSetup.Management(accessToken);
+        // Organizations are a nice-to-have (they only matter for creating a new
+        // project); a token that cannot list them still lists projects fine.
+        const [projects, organizations] = await Promise.all([
+            mgmt.listProjects(),
+            mgmt.listOrganizations().catch(() => []),
+        ]);
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            projects: (Array.isArray(projects) ? projects : []).map(crewSetup.publicProject),
+            organizations: (Array.isArray(organizations) ? organizations : [])
+                .map((o) => ({ id: o.id || o.slug || '', name: o.name || '' })).filter((o) => o.id),
+            regions: CREW_SUPABASE_REGIONS,
+        });
+    } catch (err) { setupFail(res, err, 'crew setup projects error'); }
+});
+
+// Regions offered when we create a project for a VA. Supabase has more; this is
+// a short, geographically spread list, because a VA picking where their
+// database lives wants "near my pilots", not a catalogue.
+const CREW_SUPABASE_REGIONS = [
+    { id: 'us-east-1',      label: 'United States · East' },
+    { id: 'us-west-1',      label: 'United States · West' },
+    { id: 'ca-central-1',   label: 'Canada' },
+    { id: 'eu-west-2',      label: 'United Kingdom' },
+    { id: 'eu-central-1',   label: 'Europe · Frankfurt' },
+    { id: 'ap-south-1',     label: 'India · Mumbai' },
+    { id: 'ap-southeast-1', label: 'Singapore' },
+    { id: 'ap-northeast-1', label: 'Japan · Tokyo' },
+    { id: 'ap-southeast-2', label: 'Australia · Sydney' },
+    { id: 'sa-east-1',      label: 'Brazil · São Paulo' },
+];
+
+// Do the setup: install the schema into the chosen project, read its keys back,
+// store the connection and verify it over the path real writes take.
+//
+// Resumable rather than long-running. Creating a Supabase project takes a
+// minute or two, so when the project is not up yet this answers
+// { ready: false, projectRef } and the dashboard polls with the same token and
+// ref until it is. Every stage is safe to repeat.
+app.post('/api/crew/:slug/store/provision', async (req, res) => {
+    const gate = crewOwnerGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    const accessToken = String(req.body?.accessToken || '').trim();
+    if (!accessToken) return res.status(400).json({ error: 'Paste a Supabase access token first.', code: 'no_token' });
+
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const slug = String(va.slug || req.params.slug).toLowerCase();
+
+        const create = req.body?.create ? {
+            name: String(req.body.create.name || `${slug}-crew-center`).slice(0, 60),
+            organizationId: String(req.body.create.organizationId || ''),
+            region: CREW_SUPABASE_REGIONS.some((r) => r.id === req.body.create.region)
+                ? req.body.create.region : 'us-east-1',
+        } : null;
+
+        const out = await crewSetup.provision({
+            accessToken,
+            projectRef: String(req.body?.projectRef || '').trim(),
+            create,
+            sql: readSetupSql(),
+            // Store what setup produced. The service key is written to the
+            // select:false field and, as everywhere else, never comes back out
+            // to a browser — the reply below reports only that we have one.
+            save: async ({ url, anonKey, serviceKey }) => {
+                const ad = await VirtualAirlineAd.findById(va._id).select('+supabaseServiceKey');
+                if (!ad) throw new crewSetup.SetupError('Crew center not found.', { status: 404, code: 'va_not_found' });
+                ad.supabaseUrl = url;
+                if (anonKey) ad.supabaseAnonKey = anonKey;
+                ad.supabaseServiceKey = serviceKey;
+                await ad.save();
+            },
+            verify: ({ url, serviceKey }) => new crewStore.SupabaseStore({
+                slug, supabaseUrl: url, supabaseServiceKey: serviceKey,
+            }).health(),
+        });
+
+        // A VA that had been on managed storage is now on their own project, so
+        // the cached "does this VA have legacy rows?" answer is stale.
+        crewStore.forgetLegacyData(va._id);
+        _crewStatsCache.delete(slug);
+
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            ...out,
+            projectRef: out.project ? out.project.ref : '',
+            connected: !!out.ready,
+            hasServiceKey: !!out.ready,
+        });
+    } catch (err) { setupFail(res, err, 'crew setup provision error'); }
+});
+
+// ---- Pilot logins ----
+// Every one of these reads and writes the VA's OWN store (crew_accounts in
+// their project), so a pilot's credentials never exist on our side. Passwords
+// are never returned except the one time they are generated.
+
+// Staff: the VA's pilot logins. Never a hash — publicAccount is the only shape
+// that leaves this file.
+app.get('/api/crew/:slug/accounts', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const accounts = await store.listAccounts();
+        res.set('Cache-Control', 'no-store');
+        res.json({ accounts: accounts.map(crewAccounts.publicAccount) });
+    } catch (err) { crewFail(res, err, { log: 'crew accounts list error', message: 'Could not load pilot logins.' }); }
+});
+
+// Staff: create a login for a pilot already on the roster — the counterpart to
+// ticking "create an account" while accepting someone.
+app.post('/api/crew/:slug/accounts', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const memberId = String(req.body?.memberId || '').trim();
+        const member = memberId ? await store.getMember(memberId) : null;
+        if (memberId && !member) return res.status(404).json({ error: 'That pilot is not on the roster.' });
+        const displayName = String(req.body?.displayName || (member && member.name) || '').trim();
+        if (!displayName) return res.status(400).json({ error: 'Which pilot is this login for?' });
+
+        const r = await crewAccounts.provisionPilotAccount(store, {
+            displayName,
+            memberId: member ? member._id : null,
+            email: String(req.body?.email || '').trim(),
+            createdByName: gate.p?.name || 'Crew Center',
+            vaName: va.name || '',
+        });
+        // The password is here once and nowhere else, exactly as when a pilot is
+        // accepted. `created: false` means they already had a login and this
+        // reply carries no password to show.
+        res.status(r.created ? 201 : 200).json({
+            account: crewAccounts.publicAccount(r.account),
+            created: r.created,
+            username: r.username,
+            password: r.password,
+        });
+    } catch (err) { crewFail(res, err, { log: 'crew account create error', message: 'Could not create the login.' }); }
+});
+
+// Staff: suspend or restore a login. Deactivating is how you take someone's
+// access away without deleting the account and its history.
+app.patch('/api/crew/:slug/accounts/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        if (req.body?.active === undefined) return res.status(400).json({ error: 'Nothing to change.' });
+        const account = await store.updateAccount(req.params.id, { active: !!req.body.active });
+        if (!account) return res.status(404).json({ error: 'Login not found.' });
+        res.json({ account: crewAccounts.publicAccount(account) });
+    } catch (err) { crewFail(res, err, { log: 'crew account update error', message: 'Could not update the login.' }); }
+});
+
+// Staff: mint a new password for a pilot who has lost theirs. There is no
+// recovery — nothing anywhere holds the old one — so a reset is the only route
+// back in, and the new password is shown once.
+app.post('/api/crew/:slug/accounts/:id/reset-password', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const out = await crewAccounts.resetPassword(store, req.params.id);
+        if (!out) return res.status(404).json({ error: 'Login not found.' });
+        res.json({ username: out.username, password: out.password });
+    } catch (err) { crewFail(res, err, { log: 'crew account reset error', message: 'Could not reset the password.' }); }
+});
+
+// A pilot changing their own password — which every pilot must, since the one
+// they were given was generated for them. Requires the current password: a live
+// session is not proof enough to replace the credential that recovers it.
+app.post('/api/crew/:slug/account/password', async (req, res) => {
+    const p = verifyCrewRequest(req);
+    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+    // Only accounts that live in the VA's store. An owner/staff/Inflight login
+    // is a central account and changes its password through the partnership
+    // portal, which is where it lives.
+    if (p.kind !== 'crew') {
+        return res.status(400).json({ error: 'Change this account’s password in the partnership portal.', code: 'not_a_crew_account' });
+    }
+    if (p.slug && p.slug !== String(req.params.slug).toLowerCase()) {
+        return res.status(403).json({ error: 'Wrong crew center.' });
+    }
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const out = await crewAccounts.changePassword(store, p.sub, req.body?.currentPassword, req.body?.newPassword);
+        if (out.error) return res.status(out.status).json({ error: out.error });
+        res.json({ ok: true });
+    } catch (err) { crewFail(res, err, { log: 'crew password change error', message: 'Could not change the password.' }); }
 });
 
 // Staff: read the crew webhook state (never the secret URL itself, just a hint).
