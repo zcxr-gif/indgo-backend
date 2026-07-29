@@ -187,8 +187,8 @@ const CREW_CAPABILITIES = [
     { id: 'settings.notifications', group: 'Notifications',  label: 'Manage Discord & email notifications' },
     { id: 'routes.manage',          group: 'Operations',    label: 'Create & manage the route network' },
     { id: 'flights.review',         group: 'Operations',    label: 'Review flights (PIREPs) & auto-tracking' },
+    { id: 'events.manage',          group: 'Operations',    label: 'Create & manage events and the gate board' },
     // Room to grow, e.g.:
-    // { id: 'events.manage',     group: 'Operations', label: 'Create & manage events' },
     // { id: 'schedules.manage',  group: 'Operations', label: 'Manage schedules & bookings' },
     // { id: 'members.message',   group: 'Roster',     label: 'Message crew members' },
 ];

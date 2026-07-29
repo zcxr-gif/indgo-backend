@@ -24,6 +24,9 @@ Module._load = function (req, ...rest) {
 };
 
 const crewStore = require(path.join('..', 'crewStore.js'));
+// The events decisions live next door; the store only keeps their rows. Pulled
+// in here so the gate-board checks can assert on both halves at once.
+const crewEvents = require(path.join('..', 'crewEvents.js'));
 
 let failures = 0;
 const T = (label, got, expected) => {
@@ -41,7 +44,28 @@ const OK = (label, cond, note) => {
 // ---------------------------------------------------------------------------
 // The fake project: four tables of plain rows, filtered the way PostgREST does.
 // ---------------------------------------------------------------------------
-const tables = { crew_members: [], crew_routes: [], crew_pireps: [], crew_applications: [], crew_schema_info: [{ version: 1, installed_at: '2026-01-01T00:00:00Z' }] };
+const tables = { crew_members: [], crew_routes: [], crew_pireps: [], crew_applications: [], crew_events: [], crew_event_signups: [], crew_schema_info: [{ version: 1, installed_at: '2026-01-01T00:00:00Z' }] };
+
+// The unique indexes the schema relies on, reproduced here because they are not
+// decoration: crew_event_signups_gate_idx is the whole mechanism that makes a
+// gate belong to one pilot, and a test suite that lets two inserts both succeed
+// would be testing a database we do not ship. Returns the violated constraint's
+// name, or '' when the row is fine.
+function uniqueViolation(name, row) {
+    if (name !== 'crew_event_signups') return '';
+    const live = tables.crew_event_signups;
+    const gate = String(row.gate || '').toUpperCase();
+    if (gate && live.some((r) => r.event_id === row.event_id && String(r.gate || '').toUpperCase() === gate)) {
+        return 'crew_event_signups_gate_idx';
+    }
+    if (row.account_id && live.some((r) => r.event_id === row.event_id && r.account_id === row.account_id)) {
+        return 'crew_event_signups_account_idx';
+    }
+    if (row.member_id && live.some((r) => r.event_id === row.event_id && r.member_id === row.member_id)) {
+        return 'crew_event_signups_member_idx';
+    }
+    return '';
+}
 let seq = 0;
 const uuid = () => `id-${++seq}`;
 const requests = [];   // every path+query we were asked for, so tests can assert on scoping
@@ -59,6 +83,8 @@ function matches(row, params) {
             if (!list.includes(String(row[col] ?? ''))) return false;
             continue;
         }
+        // Timestamp window on the events list ("starting later than 12h ago").
+        if (v.startsWith('gte.')) { if (!(String(row[col] ?? '') >= v.slice(4))) return false; continue; }
         throw new Error(`fake postgrest: unsupported filter ${col}=${v}`);
     }
     return true;
@@ -121,6 +147,15 @@ const server = http.createServer((req, res) => {
             const rows = (Array.isArray(data) ? data : [data]).map((r) => ({
                 id: uuid(), created_at: new Date().toISOString(), updated_at: new Date().toISOString(), ...r,
             }));
+            for (const row of rows) {
+                const hit = uniqueViolation(name, row);
+                if (hit) {
+                    return send(409, {
+                        code: '23505',
+                        message: `duplicate key value violates unique constraint "${hit}"`,
+                    });
+                }
+            }
             table.push(...rows);
             return send(201, rows);
         }
@@ -203,6 +238,59 @@ const server = http.createServer((req, res) => {
     T('answers survive as jsonb', app1.answers, [{ q: 'Why?', a: 'Eagles.' }]);
     T('token lookup finds it', (await store.getApplicationByToken('tok-1')).ifcName, 'NewPilot');
     T('a sibling VA cannot read that token', await other.getApplicationByToken('tok-1'), null);
+
+    console.log('• events');
+    const ev = await store.createEvent({
+        title: 'Águila Transatlántica', origin: 'mmmx', destination: 'lemd',
+        startsAt: new Date('2026-08-15T19:00:00Z'), slots: 40, status: 'published',
+    });
+    T('ICAOs normalise, status survives', [ev.origin, ev.destination, ev.status], ['MMMX', 'LEMD', 'published']);
+    T('gates are open unless a VA turns them off', [ev.gatesOpen, ev.gatesLocked], [true, false]);
+    T('the board falls back to the origin', crewEvents.gateAirport(ev), 'MMMX');
+    T('…and to what the VA set, when they set one',
+        crewEvents.gateAirport({ ...ev, gateIcao: 'LEMD' }), 'LEMD');
+
+    const draft = await store.createEvent({ title: 'Not ready yet' });
+    T('an event starts as a draft', draft.status, 'draft');
+    T('status filter separates the two', (await store.listEvents({ status: 'published' })).map((e) => e.title), ['Águila Transatlántica']);
+    await other.createEvent({ title: 'Someone else’s fly-in', status: 'published' });
+    T('a sibling VA’s calendar is invisible', (await store.listEvents()).length, 2);
+
+    console.log('• the gate board is claimed in the database');
+    const mine = await store.createSignup({
+        eventId: ev._id, memberId: pilot._id, accountId: 'acct-1',
+        pilotName: 'Antony', callsign: 'AMX101', gate: 'b24', gateLat: 19.43, gateLon: -99.07, gateKind: 'gate',
+    });
+    T('the stand is stored upper-cased, the way the index reads it', mine.gate, 'B24');
+    T('its position rides along so the board draws without OSM', [mine.gateLat, mine.gateLon], [19.43, -99.07]);
+
+    try {
+        await store.createSignup({ eventId: ev._id, accountId: 'acct-2', pilotName: 'Someone', gate: 'B24' });
+        failures++; console.log('  ❌ a taken gate should have been refused');
+    } catch (err) {
+        OK('a second pilot cannot take a claimed stand', err.code === 'store_conflict', `got ${err.code}`);
+        T('…and the handler is told which rule bit', err.constraint, 'crew_event_signups_gate_idx');
+    }
+    try {
+        await store.createSignup({ eventId: ev._id, accountId: 'acct-2', pilotName: 'Someone', gate: 'b24' });
+        failures++; console.log('  ❌ lower case should not dodge the gate index');
+    } catch (err) {
+        T('case is not a way around it', err.constraint, 'crew_event_signups_gate_idx');
+    }
+    try {
+        await store.createSignup({ eventId: ev._id, accountId: 'acct-1', pilotName: 'Antony', gate: 'C7' });
+        failures++; console.log('  ❌ signing up twice should have been refused');
+    } catch (err) {
+        T('one signup per pilot per event', err.constraint, 'crew_event_signups_account_idx');
+    }
+
+    T('the board finds a pilot’s own row', (await store.getSignupFor(ev._id, { accountId: 'acct-1' }))._id, mine._id);
+    T('…and has nothing to find for a pilot who has not signed up',
+        await store.getSignupFor(ev._id, { accountId: 'acct-nobody' }), null);
+    await store.updateSignup(mine._id, { gate: 'c7', aircraft: 'B789' });
+    T('changing stands keeps the upper-casing', (await store.getSignup(mine._id)).gate, 'C7');
+    await store.deleteSignup(mine._id);
+    T('withdrawing removes the row, freeing the stand', (await store.listSignups(ev._id)).length, 0);
 
     console.log('• stats');
     const stats = await store.stats();
