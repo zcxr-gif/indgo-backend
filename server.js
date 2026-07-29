@@ -1793,6 +1793,25 @@ function crewFail(res, err, fallback) {
     console.error(`${fallback.log}:`, err);
     return res.status(500).json({ error: fallback.message });
 }
+
+// A write that succeeded, but did less than it was asked to because the VA's
+// project is on an older schema than this code (see LATE_COLUMNS in
+// crewStore.js). Returned alongside the saved row rather than as an error: the
+// route IS in the network, it just is not marked as a codeshare yet, and a VA
+// who is told that will go and press the update button.
+function driftWarning(store) {
+    const lost = (store && typeof store.drift === 'function') ? store.drift() : [];
+    if (!lost.length) return '';
+    return `Saved — but your database is on an older version and doesn’t support ${lost.join(' or ')} yet. `
+        + 'Update it in Settings → Data store to keep those.';
+}
+// Attach the warning only when there is one, so an up-to-date VA's responses
+// are byte-for-byte what they were.
+const withDrift = (store, payload) => {
+    const warning = driftWarning(store);
+    return warning ? { ...payload, warning, code: 'store_schema_outdated' } : payload;
+};
+
 function cleanMember(b) {
     b = b || {};
     return {
@@ -1988,7 +2007,7 @@ app.post('/api/crew/:slug/routes', async (req, res) => {
         const { va, store } = await resolveCrewStore(req.params.slug);
         const r = await store.createRoute(cleanRoute(req.body));
         postRouteNotice(va, 'added', r, gate.p);
-        res.status(201).json({ route: publicRoute(r, va.ranks, null) });
+        res.status(201).json(withDrift(store, { route: publicRoute(r, va.ranks, null) }));
     } catch (err) { crewFail(res, err, { log: 'route add error', message: 'Could not add the route.' }); }
 });
 app.patch('/api/crew/:slug/routes/:id', async (req, res) => {
@@ -2000,7 +2019,7 @@ app.patch('/api/crew/:slug/routes/:id', async (req, res) => {
         if (!existing) return res.status(404).json({ error: 'Route not found.' });
         const r = await store.updateRoute(req.params.id, cleanRoute({ ...existing, ...req.body }));
         postRouteNotice(va, 'updated', r, gate.p, existing);
-        res.json({ route: publicRoute(r, va.ranks, null) });
+        res.json(withDrift(store, { route: publicRoute(r, va.ranks, null) }));
     } catch (err) { crewFail(res, err, { log: 'route edit error', message: 'Could not update the route.' }); }
 });
 app.delete('/api/crew/:slug/routes/:id', async (req, res) => {
@@ -2044,7 +2063,7 @@ function sendCsv(res, slug, kind, spec, rows) {
 // The dry run is not an optimisation, it is the point — the dashboard shows a
 // VA what an upload would do before it touches a live roster, and the commit
 // replays that same plan rather than re-deciding.
-async function runCsvImport({ req, res, spec, kind, existing, create, update, onDone }) {
+async function runCsvImport({ req, res, spec, kind, existing, create, update, onDone, store }) {
     const csvText = String(req.body?.csv || '');
     if (!csvText.trim()) return res.status(400).json({ error: 'Attach a CSV file first.' });
 
@@ -2094,7 +2113,7 @@ async function runCsvImport({ req, res, spec, kind, existing, create, update, on
         }
     }
     if (onDone) { try { onDone({ ...summary, created, updated }); } catch { /* never fail an import over a notice */ } }
-    res.json({ dryRun: false, ...summary, created, updated, failures });
+    res.json(withDrift(store, { dryRun: false, ...summary, created, updated, failures }));
 }
 
 app.get('/api/crew/:slug/roster.csv', async (req, res) => {
@@ -2120,7 +2139,7 @@ app.post('/api/crew/:slug/roster/import', async (req, res) => {
         const { store } = await resolveCrewStore(req.params.slug);
         const members = await store.listMembers();
         await runCsvImport({
-            req, res, kind: 'roster', spec: crewCsv.ROSTER_SPEC,
+            req, res, store, kind: 'roster', spec: crewCsv.ROSTER_SPEC,
             existing: (members || []).map((m) => ({
                 id: m._id, name: m.name, callsign: m.callsign, hours: m.hours, role: m.role,
                 aircraft: m.aircraft || [], status: m.status, ifcName: m.ifcName || '', ifUserId: m.ifUserId || '',
@@ -2140,9 +2159,16 @@ app.get('/api/crew/:slug/routes.csv', async (req, res) => {
     try {
         const { store } = await resolveCrewStore(req.params.slug);
         const routes = await store.listRoutes();
+        // Every column the spec defines, including the v5 ones. Leaving them out
+        // wrote a file whose `kind` and `minRank` cells were blank, and blank is
+        // a value on the way back in — a VA who exported their network and
+        // re-imported it unedited would have turned every codeshare into an own
+        // route and dropped every rank gate. Export what import reads.
         sendCsv(res, req.params.slug, 'routes', crewCsv.ROUTES_SPEC, (routes || []).map((r) => ({
             id: r._id, flightNumber: r.flightNumber, origin: r.origin, destination: r.destination,
             aircraft: r.aircraft, distanceNm: r.distanceNm, notes: r.notes, active: r.active,
+            kind: r.kind || 'own', partnerName: r.partnerName || '',
+            partnerLogo: r.partnerLogo || '', minRank: r.minRank || '',
         })));
     } catch (err) { crewFail(res, err, { log: 'routes export error', message: 'Could not export the routes.' }); }
 });
@@ -2154,7 +2180,7 @@ app.post('/api/crew/:slug/routes/import', async (req, res) => {
         const { va, store } = await resolveCrewStore(req.params.slug);
         const routes = await store.listRoutes();
         await runCsvImport({
-            req, res, kind: 'routes', spec: crewCsv.ROUTES_SPEC,
+            req, res, store, kind: 'routes', spec: crewCsv.ROUTES_SPEC,
             existing: (routes || []).map((r) => ({
                 id: r._id, flightNumber: r.flightNumber, origin: r.origin, destination: r.destination,
                 aircraft: r.aircraft, distanceNm: r.distanceNm, notes: r.notes, active: r.active,
@@ -3424,6 +3450,10 @@ app.post('/api/crew/:slug/store/provision', async (req, res) => {
         // A VA that had been on managed storage is now on their own project, so
         // the cached "does this VA have legacy rows?" answer is stale.
         crewStore.forgetLegacyData(va._id);
+        // The schema we just ran is the current one, so whatever we had learned
+        // about this project's missing columns is now wrong. Clearing it here
+        // means the first write after a setup carries the full row again.
+        crewStore.forgetSchemaDrift(out && out.url);
         _crewStatsCache.delete(slug);
 
         res.set('Cache-Control', 'no-store');
@@ -3434,6 +3464,84 @@ app.post('/api/crew/:slug/store/provision', async (req, res) => {
             hasServiceKey: !!out.ready,
         });
     } catch (err) { setupFail(res, err, 'crew setup provision error'); }
+});
+
+// Push the current schema to a project that is ALREADY connected.
+//
+// WHY THIS IS A SEPARATE THING FROM SETUP
+// ---------------------------------------
+// A VA sets their database up once. The code then keeps moving — v4 gave
+// applications an invitation, v5 split the network into own and codeshare and
+// gated routes on rank — and every one of those releases added columns the VA's
+// project has never heard of. Until now the only way to catch up was to walk
+// the whole setup wizard again, which reads as "connect a database" to someone
+// who already has one, so nobody did it, and the first they heard about the gap
+// was a write failing.
+//
+// This is that upgrade as its own action: same token, same idempotent script,
+// no project picking and no keys touched. The connection the VA already has
+// keeps working throughout — the script only ever adds.
+//
+// The token is used for this request and forgotten, exactly as in setup. See
+// the note at the top of crewSetup.js for why we will not store one.
+app.post('/api/crew/:slug/store/upgrade', async (req, res) => {
+    const gate = crewOwnerGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    const accessToken = String(req.body?.accessToken || '').trim();
+    if (!accessToken) return res.status(400).json({ error: 'Paste a Supabase access token first.', code: 'no_token' });
+
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        if (!crewStore.isConnected(va)) {
+            return res.status(409).json({
+                error: 'Connect a Supabase project first — there is nothing to update yet.',
+                code: 'store_not_connected',
+            });
+        }
+        // The project to run against is the one we are already talking to, read
+        // from the stored URL rather than taken from the request: this endpoint
+        // updates THIS crew center's database and must not be steerable into
+        // running our DDL against some other project on the account.
+        const ref = crewSetup.refFromUrl(va.supabaseUrl);
+        if (!ref) {
+            return res.status(409).json({
+                error: 'Your stored project URL doesn’t look like a Supabase project. Re-connect it under “Set up automatically”.',
+                code: 'bad_project_url',
+            });
+        }
+
+        const mgmt = new crewSetup.Management(accessToken);
+        // Fails with a clear message if the token belongs to a different
+        // Supabase account than the project does — the single likeliest thing
+        // to go wrong here, since the VA made that token months after setup.
+        const project = await mgmt.getProject(ref);
+        if (project && project.status && project.status !== crewSetup.HEALTHY) {
+            return res.status(409).json({
+                error: 'That project is paused or still starting up. Resume it in Supabase, then try again.',
+                code: 'project_not_ready',
+                project: crewSetup.publicProject(project),
+            });
+        }
+
+        await crewSetup.installSchema(mgmt, ref, readSetupSql());
+
+        // The columns are there now, so stop leaving them out of writes.
+        crewStore.forgetSchemaDrift(va.supabaseUrl);
+        _crewStatsCache.delete(String(va.slug || req.params.slug).toLowerCase());
+
+        // Report the version the project now answers with, over the same path
+        // real writes take — "we ran the script" is not the same claim as "your
+        // database is now on v5", and only the second one is worth showing.
+        const health = await (await crewStore.forVa(va)).health();
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            ok: true,
+            project: crewSetup.publicProject(project || { id: ref }),
+            health,
+            schemaVersion: crewStore.EXPECTED_SCHEMA_VERSION,
+        });
+    } catch (err) { setupFail(res, err, 'crew store upgrade error'); }
 });
 
 // ---- Pilot logins ----

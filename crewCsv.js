@@ -279,11 +279,31 @@ function planImport(spec, csvText, existing) {
             errors.push({ line, message: `No pilot or route here with id ${id}. Clear the id column to add it as new.` });
             return;
         }
+        // A row this same file already asked us to create. It has no id yet —
+        // it does not exist — so it cannot be an update; fold the later line's
+        // values into the pending create instead. Emitting an update against an
+        // empty id was the old behaviour, and it failed at commit time and
+        // reported the VA's own file back to them as a broken row.
         if (!target) {
             for (const rule of spec.matchOn) {
                 const k = matchKey(rule, values);
                 if (!k) continue;
-                const hit = staged.get(rule).get(k) || byRule.get(rule).get(k);
+                const pending = staged.get(rule).get(k);
+                if (!pending) continue;
+                Object.assign(pending.values, values);
+                for (const r2 of spec.matchOn) {
+                    const k2 = matchKey(r2, pending.values);
+                    if (k2 && !staged.get(r2).has(k2)) staged.get(r2).set(k2, pending);
+                }
+                return;
+            }
+        }
+
+        if (!target) {
+            for (const rule of spec.matchOn) {
+                const k = matchKey(rule, values);
+                if (!k) continue;
+                const hit = byRule.get(rule).get(k);
                 if (hit) { target = hit; matchedOn = rule; break; }
             }
         }
@@ -319,10 +339,12 @@ function planImport(spec, csvText, existing) {
             }
             const row = { line, values };
             create.push(row);
-            // Register it so a later duplicate line in the same file updates it.
+            // Register the create row ITSELF, not a copy of its values, so a
+            // later duplicate line merges into the thing that will actually be
+            // written rather than into a snapshot nobody reads again.
             for (const rule of spec.matchOn) {
                 const k = matchKey(rule, values);
-                if (k && !staged.get(rule).has(k)) staged.get(rule).set(k, { ...values, id: '' });
+                if (k && !staged.get(rule).has(k)) staged.get(rule).set(k, row);
             }
         }
     });

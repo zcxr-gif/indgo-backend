@@ -56,6 +56,85 @@ const EXPECTED_SCHEMA_VERSION = 5;
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
 
+// ---------------------------------------------------------------------------
+// Columns that arrived after the first release
+//
+// A VA installs the schema once and, unless something tells them to, never
+// thinks about it again. The code moves on: v4 gave an application an
+// invitation, v5 split the network into own/codeshare and gated routes on rank.
+// A project still on v3 has none of those columns, and PostgREST refuses a
+// write that mentions one — it fails the WHOLE row rather than the column, so
+// "add a route" returned a bare 502 on every VA who had not re-run the SQL.
+// That is our schema drift, showing up as their outage.
+//
+// So writes degrade instead of failing: a column the project has not got is
+// dropped and the write is retried, the store records that it did so, and the
+// handler tells the VA what did not make it (see `drift` below and the
+// database-update banner in the dashboard). The pilot still gets added; the
+// codeshare flag is what waits for the upgrade.
+//
+// ONLY columns listed here may be dropped. Every one of them is additive and
+// carries a default, so a row written without it is a valid row on the old
+// shape — which is precisely what makes dropping it safe. Anything else that
+// goes missing is a real fault and still fails loudly.
+//
+// This is the mirror of the `alter table ... add column if not exists` block in
+// supabase/crew-center-schema.sql. Add a column there, add it here.
+// ---------------------------------------------------------------------------
+const LATE_COLUMNS = {
+    crew_routes: new Set(['kind', 'partner_name', 'partner_logo', 'min_rank']),
+    crew_applications: new Set([
+        'discord_invite', 'invite_username', 'invite_password',
+        'invite_issued_at', 'invite_claimed_at', 'invite_revoked_at', 'invite_account_id',
+    ]),
+};
+
+// What each dropped column costs, in words a VA reads rather than column names.
+const DRIFT_LABELS = {
+    'crew_routes.kind': 'codeshare routes',
+    'crew_routes.partner_name': 'codeshare partner names',
+    'crew_routes.partner_logo': 'codeshare partner logos',
+    'crew_routes.min_rank': 'rank-gated routes',
+    'crew_applications.discord_invite': 'Discord invites on acceptances',
+    'crew_applications.invite_username': 'saved pilot invitations',
+    'crew_applications.invite_password': 'saved pilot invitations',
+    'crew_applications.invite_issued_at': 'saved pilot invitations',
+    'crew_applications.invite_claimed_at': 'saved pilot invitations',
+    'crew_applications.invite_revoked_at': 'saved pilot invitations',
+    'crew_applications.invite_account_id': 'saved pilot invitations',
+};
+
+const isLateColumn = (table, col) => !!(LATE_COLUMNS[table] && LATE_COLUMNS[table].has(col));
+
+// Remembered per project, not per request: a VA on an old schema would
+// otherwise spend one wasted round trip per missing column on every single
+// write. The TTL is what lets an upgrade take effect on its own — and
+// forgetSchemaDrift() below clears it the moment we install a schema ourselves,
+// so the dashboard's "Update database" button never leaves the VA looking at
+// stale degradation.
+const MISSING_TTL_MS = 10 * 60 * 1000;
+const _missingColumns = new Map();   // `${base}|${table}` -> { at, cols:Set }
+
+function missingFor(base, table) {
+    const hit = _missingColumns.get(`${base}|${table}`);
+    if (!hit) return null;
+    if (Date.now() - hit.at > MISSING_TTL_MS) { _missingColumns.delete(`${base}|${table}`); return null; }
+    return hit.cols;
+}
+function noteMissing(base, table, col) {
+    const cols = missingFor(base, table);
+    if (cols) { cols.add(col); return; }
+    _missingColumns.set(`${base}|${table}`, { at: Date.now(), cols: new Set([col]) });
+}
+/** Forget what a project was missing — call after installing a schema on it. */
+function forgetSchemaDrift(url) {
+    const base = String(url || '').replace(/\/+$/, '');
+    if (!base) { _missingColumns.clear(); return; }
+    for (const key of [..._missingColumns.keys()]) {
+        if (key.startsWith(`${base}/rest/v1|`)) _missingColumns.delete(key);
+    }
+}
+
 // Mongo models, injected by server.js so this module doesn't reach into the
 // app's DB wiring. Only the legacy adapter touches them.
 let models = null;
@@ -336,10 +415,34 @@ const applicationToRow = (a) => {
 // dependency (and an auth/realtime stack) for what is, at this level, four HTTP
 // verbs against one host. axios is already the backend's HTTP client.
 // ---------------------------------------------------------------------------
+// Which column did the project not have? PostgREST says
+//   Could not find the 'kind' column of 'crew_routes' in the schema cache
+// and Postgres itself says
+//   column "kind" of relation "crew_routes" does not exist
+// Both are matched because a filter or a select produces the second one where a
+// write produces the first.
+//
+// Narrowly, though: plenty of Postgres errors name a column ("null value in
+// column \"name\" violates …") and reading one of those as a schema-version
+// problem would drop the VA's data on the floor and call it an upgrade. Only
+// the two "this column is not there" phrasings count; everything else gets ''.
+function missingColumnFrom(body) {
+    const text = [body && body.message, body && body.details, body && body.hint]
+        .filter(Boolean).join(' ');
+    if (!/schema cache|does not exist/i.test(text)) return '';
+    const m = text.match(/could not find the\s+['"]([a-z0-9_]+)['"]\s+column/i)
+        || text.match(/column\s+['"]?([a-z0-9_]+)['"]?\s+(?:of relation\s+['"]?[a-z0-9_.]+['"]?\s+)?does not exist/i);
+    return m ? m[1] : '';
+}
+
 class Postgrest {
     constructor(url, serviceKey) {
         this.base = String(url).replace(/\/+$/, '') + '/rest/v1';
         this.key = serviceKey;
+        // Columns this request had to drop because the project has not got
+        // them. Per-instance (one store per request) so a handler can tell the
+        // VA what its write did not include — see SupabaseStore.drift.
+        this.dropped = new Set();
     }
 
     get headers() {
@@ -391,6 +494,25 @@ class Postgrest {
                 'The VA’s data store is missing the crew center tables. Run supabase/crew-center-schema.sql in the project’s SQL editor.',
                 { status: 502, code: 'store_schema_missing', detail });
         }
+        // A column we write that the project has not got: the project is on an
+        // older schema than this code. PGRST204 is PostgREST's schema-cache
+        // miss; 42703 is Postgres' own undefined_column, which is what comes
+        // back when a filter or a select names it.
+        //
+        // 409, not 502: nothing is broken and nothing is unreachable — the
+        // VA's database is simply behind, and the fix is one button in
+        // Settings → Data store. A 502 said "our end fell over", which sent
+        // people to us instead of to the thing that fixes it.
+        const column = missingColumnFrom(body);
+        if (column || body.code === 'PGRST204' || body.code === '42703') {
+            const err = new CrewStoreError(
+                column
+                    ? `The VA’s data store is on an older schema and has no “${column}” column. Update it in Crew Center → Settings → Data store.`
+                    : 'The VA’s data store is on an older schema than this crew center. Update it in Crew Center → Settings → Data store.',
+                { status: 409, code: 'store_schema_outdated', detail });
+            err.column = column;
+            return err;
+        }
         if (res.status === 409 || body.code === '23505') {
             return new CrewStoreError('That record already exists.', { status: 409, code: 'store_conflict', detail });
         }
@@ -400,14 +522,58 @@ class Postgrest {
 
     select(table, params) { return this.request('get', `/${table}`, { params }); }
 
-    async insert(table, rows) {
-        const out = await this.request('post', `/${table}`, { data: rows, prefer: 'return=representation' });
-        return Array.isArray(out) ? out : [out];
+    insert(table, rows) {
+        return this.write(table, rows, (data) => this.request('post', `/${table}`, { data, prefer: 'return=representation' }));
     }
 
-    async update(table, params, patch) {
-        const out = await this.request('patch', `/${table}`, { params, data: patch, prefer: 'return=representation' });
-        return Array.isArray(out) ? out : [out];
+    update(table, params, patch) {
+        return this.write(table, patch, (data) => this.request('patch', `/${table}`, { params, data, prefer: 'return=representation' }));
+    }
+
+    /**
+     * A write that survives a project on an older schema.
+     *
+     * Columns already known to be missing are left out before the first
+     * attempt; one the project turns out not to have is dropped and the write
+     * retried. Only columns in LATE_COLUMNS are ever dropped — see the note
+     * there for why that is the safe set — so a genuinely wrong column name
+     * still fails, loudly, on the first attempt.
+     */
+    async write(table, payload, run) {
+        let data = this.strip(table, payload);
+        // Bounded by the number of droppable columns: each pass removes one, so
+        // this cannot spin even if the project answers oddly.
+        const limit = (LATE_COLUMNS[table] ? LATE_COLUMNS[table].size : 0) + 1;
+        for (let attempt = 0; ; attempt++) {
+            try {
+                const out = await run(data);
+                return Array.isArray(out) ? out : [out];
+            } catch (err) {
+                const col = err && err.code === 'store_schema_outdated' ? err.column : '';
+                if (!col || !isLateColumn(table, col) || attempt >= limit) throw err;
+                noteMissing(this.base, table, col);
+                const next = this.strip(table, payload);
+                // Nothing came off — retrying would send the same body again.
+                if (JSON.stringify(next) === JSON.stringify(data)) throw err;
+                data = next;
+            }
+        }
+    }
+
+    /** The payload without the columns this project is known to lack. */
+    strip(table, payload) {
+        const missing = missingFor(this.base, table);
+        if (!missing || !missing.size) return payload;
+        const one = (row) => {
+            if (!row || typeof row !== 'object') return row;
+            const out = {};
+            for (const [k, v] of Object.entries(row)) {
+                if (missing.has(k)) { this.dropped.add(`${table}.${k}`); continue; }
+                out[k] = v;
+            }
+            return out;
+        };
+        return Array.isArray(payload) ? payload.map(one) : one(payload);
     }
 
     remove(table, params) { return this.request('delete', `/${table}`, { params }); }
@@ -424,6 +590,24 @@ class SupabaseStore {
         this.owned = true;              // the VA owns this data
         this.slug = String(va.slug || '').toLowerCase();
         this.db = new Postgrest(va.supabaseUrl, va.supabaseServiceKey);
+    }
+
+    /**
+     * What this request could not store because the project is on an older
+     * schema — in the VA's words, not column names. Empty on a project that is
+     * up to date, which is every project that has re-run the SQL.
+     *
+     * Handlers put this on the response so a write that quietly did less than
+     * it was asked to says so, rather than looking like a success and losing a
+     * codeshare flag. Nothing here is an error: the row was written.
+     */
+    drift() {
+        const out = [];
+        for (const key of this.db.dropped) {
+            const label = DRIFT_LABELS[key] || key.split('.')[1];
+            if (!out.includes(label)) out.push(label);
+        }
+        return out;
     }
 
     // Every query is scoped to this crew center's slug so one Supabase project
@@ -675,6 +859,11 @@ class LegacyStore {
 
     get q() { return { vaAdId: this.vaAdId }; }
     lean(doc) { return doc ? (doc.toObject ? doc.toObject() : doc) : null; }
+
+    // Our own collections are never behind the code, so there is nothing to
+    // report. Present so a handler can ask any store without checking which
+    // kind it holds.
+    drift() { return []; }
 
     listMembers({ limit = 2000 } = {}) {
         return models.CrewMember.find(this.q).sort({ hours: -1, name: 1 }).limit(limit).lean();
@@ -978,6 +1167,7 @@ module.exports = {
     forVa,
     forVaOrNull,
     forgetLegacyData,
+    forgetSchemaDrift,
     isConnected,
     computeStats,
     CrewStoreError,

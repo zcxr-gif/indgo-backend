@@ -31,6 +31,19 @@
 -- 3. Settings → API: copy the Project URL, the `anon` key and the
 --    `service_role` key into Crew Center → Settings → Data store.
 --
+-- HOW TO UPDATE, LATER
+-- --------------------
+-- This file gains columns as the crew center gains features, and a project set
+-- up a year ago has not got them. Crew dashboard → Settings → Data store →
+-- Update my database runs the current version against the project you are
+-- already connected to: your keys do not change, your data is not touched, and
+-- it is safe to run as often as you like. Re-running the SQL by hand does the
+-- same thing.
+--
+-- Until then the crew center keeps working and simply cannot store what your
+-- project has no column for — it says so at the time rather than failing the
+-- write.
+--
 -- WHICH KEY DOES WHAT
 -- -------------------
 --   anon key          Public, safe in a browser. RLS (below) limits it to the

@@ -73,6 +73,7 @@ than at the row.
 | `GET /api/crew/setup-sql` | public | the schema, served from the copy in this repo |
 | `POST /api/crew/:slug/store/projects` | owner | list the Supabase projects a pasted access token can see |
 | `POST /api/crew/:slug/store/provision` | owner | install the schema, fetch the keys, connect and verify |
+| `POST /api/crew/:slug/store/upgrade` | owner | re-run the current schema on the project already connected. Keys untouched |
 | `GET /api/crew/:slug/stats` | public | aggregate figures. Application counters are added only for a caller who can review applications. |
 | `GET /api/crew/:slug/store` | staff | is the project reachable, provisioned, on the current schema — and how much is still in managed storage |
 | `POST /api/crew/:slug/store/migrate` | owner | copy managed rows into the VA's project |
@@ -312,15 +313,61 @@ count before anything is written.
 
 ## Changing the schema
 
-Bump `version` in the final `insert` of `crew-center-schema.sql` **and**
-`EXPECTED_SCHEMA_VERSION` in `crewStore.js`. A project on an older version keeps
-working — every column the code reads has existed since v1 — but
-`GET /api/crew/:slug/store` reports `outdated: true` and the dashboard tells the
-VA to re-run the SQL.
+Every VA is on their own Postgres, so a release that needs a column is a release
+that has to reach every one of those databases. Four steps, and none of them is
+optional:
 
-Only ever add nullable columns or new tables. A VA runs this script by hand
-against their own production data, and there is no way to coordinate a
-breaking change across every project at once.
+1. Add the column to its `create table` **and** to the
+   `alter table … add column if not exists` block below it, so a project
+   provisioned at any earlier version picks it up on a re-run.
+2. Bump `version` in the final `insert` of `crew-center-schema.sql` **and**
+   `EXPECTED_SCHEMA_VERSION` in `crewStore.js`.
+3. Add the column to `LATE_COLUMNS` in `crewStore.js` — the set of columns a
+   write may drop when the project has not got them (below).
+4. Add a line to the version history at the end of this section.
+
+Only ever add nullable columns or new tables. A VA runs this script against
+their own production data and there is no way to coordinate a breaking change
+across every project at once.
+
+### Getting the change onto the VA's database
+
+**Settings → Data store → Update my database.** The VA pastes an access token
+and `POST /api/crew/:slug/store/upgrade` runs this file against the project they
+are already connected to — no project picking, no keys touched, nothing to copy.
+The token is used for that request and dropped, exactly as in setup.
+
+The project it runs against is read from the stored `supabaseUrl`
+(`crewSetup.refFromUrl`) rather than taken from the request, so the endpoint
+updates *this* crew center's database and cannot be steered into running our DDL
+against some other project on the account.
+
+The button appears on its own when `GET /api/crew/:slug/store` reports
+`outdated: true`, and whenever a write has just had to leave a column out.
+
+### Until they press it
+
+A project on an older version keeps working, and specifically it keeps working
+for writes, which it did not used to. PostgREST rejects the **whole row** when it
+names a column the project has not got, so before this a VA who had not re-run
+the SQL got a bare `502` from "add a route" — our error code for their upgrade.
+
+`LATE_COLUMNS` in `crewStore.js` is the set of columns added after v1. A write
+naming one the project lacks has that column dropped and is retried; the row
+lands, the store records what it left out, and the handler returns the row with
+a `warning` and `code: 'store_schema_outdated'` so the dashboard can say *"saved
+— but your database can't hold codeshare routes yet"* and offer the button. What
+the project is missing is remembered for ten minutes, so this costs one wasted
+round trip rather than one per write, and installing a schema clears it
+immediately (`crewStore.forgetSchemaDrift`).
+
+**Only columns in `LATE_COLUMNS` are ever dropped.** Each one is additive with a
+default, so a row written without it is a valid row on the old shape — that is
+what makes dropping it safe rather than lossy. A column that is in no schema at
+all, and a genuine constraint violation, both still fail loudly.
+
+A missing *table* is still a hard failure (`store_schema_missing`): a project
+with no `crew_routes` has nothing to degrade to.
 
 Version history:
 
@@ -401,6 +448,14 @@ rows match on the fallback fields, that a partial file leaves unmentioned
 columns alone, that nothing is ever deleted, that duplicate lines collapse, and
 that the messy realities survive — quoted commas, semicolon lists, CRLF, a BOM,
 and header spellings that have been through three spreadsheet apps.
+
+`node scratchpad/test-crew-schema-drift.js` puts the adapter in front of a
+project stuck on v4 — the "502 when I add a route" case. It asserts that the
+route is written rather than refused, that only the columns the project lacks
+are dropped and the store names them in words a VA reads, that the second write
+does not re-learn the same thing, that a schema upgrade restores the full row —
+and, in the other direction, that a column belonging to no schema and a
+not-null violation both still fail.
 
 `node scratchpad/test-discord-invite.js` covers the invite validator: the real
 formats, lookalike hosts, non-invite Discord paths, scheme downgrades, and the

@@ -148,6 +148,22 @@ const publicProject = (p) => p && {
 
 const projectUrl = (ref) => `https://${ref}.supabase.co`;
 
+// The other direction: which project is a stored connection pointing at?
+//
+// Needed by the upgrade path, which has to run DDL against the project the crew
+// center is ALREADY connected to and must not take that project's identity from
+// the request. Supabase project URLs are https://<ref>.supabase.co and a ref is
+// a twenty-character opaque id. The host has to be exactly that — not a
+// subdomain of it and not a lookalike — so a self-hosted PostgREST, a proxy, or
+// anything else returns '' and the caller says so rather than guessing a ref
+// and running our DDL somewhere unintended.
+const refFromUrl = (url) => {
+    let host;
+    try { host = new URL(String(url || '')).hostname.toLowerCase(); } catch { return ''; }
+    const m = host.match(/^([a-z0-9]{16,32})\.supabase\.(co|in|red)$/);
+    return m ? m[1] : '';
+};
+
 // A database password for a project we create. The VA never needs it (nothing
 // here connects to Postgres directly — everything goes through PostgREST with
 // the service key), so it is generated, used once and forgotten. If they ever
@@ -286,6 +302,7 @@ module.exports = {
     extractKeys,
     publicProject,
     projectUrl,
+    refFromUrl,
     generateDbPassword,
     HEALTHY,
     API_URL,
