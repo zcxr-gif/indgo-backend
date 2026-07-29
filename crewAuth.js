@@ -195,8 +195,8 @@ const CREW_CAPABILITIES = [
     { id: 'routes.manage',          group: 'Operations',    label: 'Create & manage the route network' },
     { id: 'flights.review',         group: 'Operations',    label: 'Review flights (PIREPs) & auto-tracking' },
     { id: 'events.manage',          group: 'Operations',    label: 'Create & manage events and the gate board' },
+    { id: 'schedules.manage',       group: 'Operations',    label: 'Build the schedule & assign bookings' },
     // Room to grow, e.g.:
-    // { id: 'schedules.manage',  group: 'Operations', label: 'Manage schedules & bookings' },
     // { id: 'members.message',   group: 'Roster',     label: 'Message crew members' },
 ];
 const CREW_CAP_IDS = CREW_CAPABILITIES.map(c => c.id);

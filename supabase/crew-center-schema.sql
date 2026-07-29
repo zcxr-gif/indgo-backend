@@ -13,7 +13,8 @@
 --
 -- Everything with operational weight — who flies for the VA, how many hours
 -- they have logged, every flight report, every membership application, the
--- applicant's email address, every EVENT and who signed up for it, and every
+-- applicant's email address, every EVENT and who signed up for it, every
+-- SCHEDULED DEPARTURE and who booked it, and every
 -- PILOT ACCOUNT (see crew_accounts) — is
 -- created here, in this file's tables, inside the VA's project. If the VA
 -- leaves the platform they keep the lot and we have nothing to hand back,
@@ -334,6 +335,11 @@ create table if not exists crew_pireps (
     -- yet fails a FRESH install while looking fine on an upgrade. The column is
     -- declared bare here and constrained there.
     event_id      uuid,
+    -- v8. The scheduled departure this report was filed against, when it was
+    -- flown off the schedule rather than freely. Declared bare here and
+    -- constrained below crew_schedules, for the same file-ordering reason as
+    -- event_id above.
+    schedule_id   uuid,
     -- Denormalised so a report still reads correctly after the pilot or route
     -- it points at has been deleted.
     pilot_name    text not null default '',
@@ -572,6 +578,157 @@ create table if not exists crew_announcements (
 );
 create index if not exists crew_announcements_va_idx
     on crew_announcements (va_slug, pinned desc, created_at desc);
+-- v8. 'schedule' joins the list: a fortnight of flying going up is exactly the
+-- kind of thing the board exists to tell the crew about. Replaced rather than
+-- widened in place because the constraint is an inline column check, and a
+-- project provisioned at v7 carries the old five-value version — a row it has
+-- never heard of is refused, and the notice would vanish with no explanation.
+do $$
+begin
+    alter table crew_announcements drop constraint if exists crew_announcements_kind_check;
+    alter table crew_announcements add constraint crew_announcements_kind_check
+        check (kind in ('notice','promotion','join','event','checkride','schedule'));
+end $$;
+
+-- ----------------------------------------------------------------------------
+-- The schedule. v8.
+--
+-- A route says the airline flies LHR–JFK. A schedule says it flies at 18:40 on
+-- Thursday, in a 787, and one pilot can put their name against it. That gap is
+-- why this table exists and is not a column on crew_routes: the network is what
+-- the VA operates, the schedule is when, and the same leg appears in it as many
+-- times as it is flown.
+--
+-- HOW IT RELATES TO EVENTS. An event is everyone at once — twenty pilots, one
+-- departure, a gate board to keep them off each other. A schedule is the
+-- ordinary week: many departures, each flown by one pilot (or a small crew),
+-- nobody gathering. They stay separate tables because the questions asked of
+-- them are different — "who is coming?" versus "is this leg covered?" — and
+-- collapsing them would mean every ordinary Tuesday departure carrying an
+-- attendee list it never uses.
+--
+-- `route_id` is optional and the leg details are kept alongside it rather than
+-- read through it, exactly as crew_events does: picking a route fills the
+-- fields in, but a schedule may be built for a leg the network does not
+-- publish, and retiring a route must not blank a departure pilots have already
+-- booked.
+--
+-- `seats` is how many pilots may fly this departure. One is the common case and
+-- the default; a VA running two-crew long-hauls sets two. Unlike an event's
+-- `slots` there is no waitlist and no zero-means-uncapped: a departure with
+-- nobody assignable is not a schedule entry, and a pilot who cannot have the
+-- leg needs to be told now so they can book another.
+-- ----------------------------------------------------------------------------
+create table if not exists crew_schedules (
+    id            uuid primary key default gen_random_uuid(),
+    va_slug       text not null,
+    route_id      uuid references crew_routes (id) on delete set null,
+    flight_number text not null default '',
+    origin        text not null default '',
+    destination   text not null default '',
+    aircraft      text not null default '',
+    -- Both stored, both optional after the departure. An arrival time is what
+    -- makes the schedule readable as a day of flying rather than a list of
+    -- start times, but plenty of VAs publish only the push-back.
+    departs_at    timestamptz,
+    arrives_at    timestamptz,
+    seats         int not null default 1 check (seats > 0),
+    -- Names a rung on the VA's ladder, as crew_routes.min_rank and
+    -- crew_events.min_rank do. Set on the schedule rather than inherited from
+    -- the route, because the same leg can be open to everyone midweek and
+    -- captain-only on the Friday night rotation.
+    min_rank      text not null default '',
+    notes         text not null default '',
+    -- Draft is the default for the reason it is on events: a schedule is built
+    -- a fortnight at a time and must not appear in a pilot's list until staff
+    -- say so. Cancelled is kept rather than deleted — a pilot who booked the
+    -- leg is owed the notice, and a row that vanished tells them nothing.
+    status        text not null default 'draft' check (status in ('draft','published','cancelled')),
+    created_by    text not null default '',
+    created_at    timestamptz not null default now(),
+    updated_at    timestamptz not null default now()
+);
+create index if not exists crew_schedules_va_idx     on crew_schedules (va_slug, departs_at);
+create index if not exists crew_schedules_public_idx on crew_schedules (va_slug, departs_at) where status = 'published';
+-- Which departures a route is carrying — read when a route is retired, and by
+-- the route panel's "next departure" line. Partial: an ad-hoc leg has no route.
+create index if not exists crew_schedules_route_idx  on crew_schedules (va_slug, route_id) where route_id is not null;
+
+-- ----------------------------------------------------------------------------
+-- Bookings. v8.
+--
+-- One row per pilot per departure they have taken. Cancelling DELETES the row,
+-- for the reason withdrawing from an event does: the seat is the thing being
+-- held, and a cancelled booking that still occupies one is the bug this table
+-- exists to prevent.
+--
+-- THE SEAT IS CLAIMED IN THE DATABASE, NOT IN THE BROWSER. `seat` is a small
+-- integer, 1..seats, and the unique index below is what makes it exclusive. Two
+-- pilots tapping "book" on the last seat of a popular leg at the same moment is
+-- not a rare case — it is what happens the minute a schedule is published — and
+-- any count taken before the insert loses that race. The backend picks the
+-- lowest free seat and inserts; the loser's insert fails, is retried against
+-- what is now free, and is told the leg is full only when it genuinely is.
+--
+-- That is the same mechanism as the event gate board, deliberately. A seat is a
+-- stand with the map taken away.
+--
+-- `member_id` links to the roster where there is one and is nullable so staff
+-- can assign a leg to a guest crew. `account_id` is the login that booked and
+-- is deliberately NOT a foreign key onto crew_accounts, because deleting an
+-- account must not cascade a pilot off a departure the week has been planned
+-- around.
+-- ----------------------------------------------------------------------------
+create table if not exists crew_bookings (
+    id          uuid primary key default gen_random_uuid(),
+    va_slug     text not null,
+    -- Cascade: a departure that is gone has no bookings. Same reasoning as
+    -- event signups — these rows have no meaning apart from their schedule.
+    schedule_id uuid not null references crew_schedules (id) on delete cascade,
+    member_id   uuid references crew_members (id) on delete set null,
+    account_id  uuid,
+    -- Denormalised so the schedule still reads correctly after the pilot's
+    -- roster row has been removed, the same way a PIREP keeps its pilot's name.
+    pilot_name  text not null default '',
+    callsign    text not null default '',
+    seat        int not null default 1 check (seat > 0),
+    note        text not null default '',
+    -- 'flown' is set when a flight report is matched to the booking, which is
+    -- what lets a schedule show coverage — booked, flown, or nobody — instead
+    -- of only intent.
+    status      text not null default 'booked' check (status in ('booked','flown')),
+    created_at  timestamptz not null default now(),
+    updated_at  timestamptz not null default now()
+);
+create index if not exists crew_bookings_schedule_idx on crew_bookings (va_slug, schedule_id, seat);
+create index if not exists crew_bookings_member_idx   on crew_bookings (va_slug, member_id) where member_id is not null;
+-- One seat, one pilot. The claim that makes the race above safe.
+create unique index if not exists crew_bookings_seat_idx
+    on crew_bookings (schedule_id, seat);
+-- One booking per pilot per departure, whichever way we know them. Both are
+-- partial so a staff-assigned guest — no account, no roster row — is never
+-- blocked by another guest.
+create unique index if not exists crew_bookings_account_idx
+    on crew_bookings (schedule_id, account_id) where account_id is not null;
+create unique index if not exists crew_bookings_pilot_idx
+    on crew_bookings (schedule_id, member_id) where member_id is not null;
+
+-- v8. crew_pireps.schedule_id points at the departure a report was filed
+-- against, and can only say so once crew_schedules exists — which, in file
+-- order, is here. `on delete set null` for the same reason event_id uses it: a
+-- flight that was flown was still flown after the schedule it belonged to has
+-- been torn up.
+alter table crew_pireps add column if not exists schedule_id uuid;
+do $$
+begin
+    alter table crew_pireps
+        add constraint crew_pireps_schedule_fk
+        foreign key (schedule_id) references crew_schedules (id) on delete set null;
+exception
+    when duplicate_object then null;
+end $$;
+create index if not exists crew_pireps_schedule_idx
+    on crew_pireps (va_slug, schedule_id) where schedule_id is not null;
 
 -- ----------------------------------------------------------------------------
 -- updated_at maintenance
@@ -587,7 +744,7 @@ $$;
 do $$
 declare t text;
 begin
-    foreach t in array array['crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps','crew_events','crew_event_signups','crew_announcements','crew_schema_info']
+    foreach t in array array['crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps','crew_events','crew_event_signups','crew_announcements','crew_schedules','crew_bookings','crew_schema_info']
     loop
         execute format('drop trigger if exists %I on %I', t || '_touch', t);
         execute format(
@@ -669,6 +826,26 @@ as $$
                              and starts_at > now())                        as next_event_at
         from crew_events where va_slug = p_va_slug
     ),
+    -- v8. The schedule, answered the way staff ask about it: how much of what
+    -- we published is actually covered? `seats_open` is the figure that sends
+    -- someone to the schedule panel — legs nobody has taken, on published
+    -- departures that have not left yet.
+    sch as (
+        select
+            count(*) filter (where status = 'published'
+                             and departs_at > now())                       as schedules_upcoming,
+            min(departs_at) filter (where status = 'published'
+                             and departs_at > now())                       as next_departure_at,
+            coalesce(sum(seats) filter (where status = 'published'
+                             and departs_at > now()), 0)                   as seats_upcoming
+        from crew_schedules where va_slug = p_va_slug
+    ),
+    bk as (
+        select count(*) as booked_upcoming
+        from crew_bookings b
+        join crew_schedules s on s.id = b.schedule_id
+        where b.va_slug = p_va_slug and s.status = 'published' and s.departs_at > now()
+    ),
     -- A small "top pilots by hours" board. Names only, and only pilots who have
     -- actually flown, so an empty roster doesn't produce a wall of zeroes.
     top as (
@@ -709,10 +886,14 @@ as $$
         'events',               ev.events,
         'eventsUpcoming',       ev.events_upcoming,
         'nextEventAt',          ev.next_event_at,
+        'schedulesUpcoming',    sch.schedules_upcoming,
+        'nextDepartureAt',      sch.next_departure_at,
+        'seatsOpen',            greatest(sch.seats_upcoming - bk.booked_upcoming, 0),
+        'seatsBooked',          bk.booked_upcoming,
         'topPilots',            top.top_pilots,
         'generatedAt',          now()
     )
-    from m, p, r, a, ev, top;
+    from m, p, r, a, ev, sch, bk, top;
 $$;
 
 -- ============================================================================
@@ -736,6 +917,8 @@ alter table crew_pireps        enable row level security;
 alter table crew_events        enable row level security;
 alter table crew_event_signups enable row level security;
 alter table crew_announcements enable row level security;
+alter table crew_schedules     enable row level security;
+alter table crew_bookings      enable row level security;
 alter table crew_schema_info   enable row level security;
 
 drop policy if exists crew_members_public_read on crew_members;
@@ -781,13 +964,34 @@ drop policy if exists crew_announcements_public_read on crew_announcements;
 create policy crew_announcements_public_read on crew_announcements
     for select to anon, authenticated using (true);
 
+-- Published and cancelled departures, matching the events rule exactly: a
+-- draft schedule is staff's working copy, and a cancelled leg stays readable
+-- because the pilot who booked it is owed the notice.
+drop policy if exists crew_schedules_public_read on crew_schedules;
+create policy crew_schedules_public_read on crew_schedules
+    for select to anon, authenticated using (status in ('published','cancelled'));
+
+-- Who is flying what, but only for departures that are actually public. Tying
+-- the policy to the schedule rather than granting the table outright keeps a
+-- draft's bookings from leaking both the draft's existence and who staff had
+-- pencilled in — the same reasoning as crew_event_signups_public_read.
+drop policy if exists crew_bookings_public_read on crew_bookings;
+create policy crew_bookings_public_read on crew_bookings
+    for select to anon, authenticated using (
+        exists (
+            select 1 from crew_schedules s
+            where s.id = crew_bookings.schedule_id
+              and s.status in ('published','cancelled')
+        )
+    );
+
 drop policy if exists crew_schema_info_public_read on crew_schema_info;
 create policy crew_schema_info_public_read on crew_schema_info
     for select to anon, authenticated using (true);
 
 grant usage on schema public to anon, authenticated;
 grant select on crew_members, crew_routes, crew_pireps, crew_events, crew_event_signups,
-    crew_announcements, crew_schema_info to anon, authenticated;
+    crew_announcements, crew_schedules, crew_bookings, crew_schema_info to anon, authenticated;
 -- Deliberately NOT granted on crew_applications or crew_accounts. The first
 -- holds applicant emails and unclaimed invitation passwords, the second holds
 -- password hashes; neither has a policy above, and revoking the grant means a
@@ -805,5 +1009,5 @@ grant execute on function crew_stats(text) to anon, authenticated;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 7)
+insert into crew_schema_info (id, version) values (1, 8)
 on conflict (id) do update set version = excluded.version, updated_at = now();

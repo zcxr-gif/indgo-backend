@@ -30,6 +30,7 @@ const {
     VaPortalAccount,
     VaSubmission,
     VaEvent,
+    VaWarning,
     requirePortal: requireVaPortalSession,
 } = require('./vaPortal');
 
@@ -73,6 +74,12 @@ const crewRanks = require('./crewRanks');
 // stand. Everything that is a decision rather than a database write lives
 // there — including where the stands themselves come from. See crewEvents.js.
 const crewEvents = require('./crewEvents');
+
+// The airline's ordinary week: which legs are flown when, and who has taken
+// them. Events gather everyone at one departure; a schedule is many departures
+// each flown by one pilot. Seat allocation, repetition and what a departure is
+// allowed to say live there. See crewSchedules.js.
+const crewSchedules = require('./crewSchedules');
 
 // One-paste setup for a VA's Supabase project: given a Supabase access token we
 // install the schema, read the project's keys back and store the connection
@@ -1122,6 +1129,56 @@ function postEventNotice(va, action, event, actor) {
                 event.server ? { name: 'Server', value: String(event.server).slice(0, 30), inline: true } : null,
                 event.slots ? { name: 'Slots', value: String(event.slots), inline: true } : null,
                 event.minRank ? { name: 'Opens at', value: String(event.minRank), inline: true } : null,
+            ].filter(Boolean),
+        }))
+        .catch(() => {});
+}
+
+// ---- Schedule notices ----
+const SCHEDULE_COLORS = { published: 0x16A34A, cancelled: 0xDC2626, removed: 0x6E685D };
+
+/**
+ * Post a schedule change to the VA's own Discord.
+ *
+ * Rides the events feed rather than asking VAs to configure a fourth webhook:
+ * "here is something to fly" is the same channel and the same audience, and a
+ * VA that has set up an events feed has already told us where that is.
+ *
+ * `count` is how many departures the batch created. It is the difference
+ * between a useful notice and sixty useless ones — publishing a fortnight of
+ * flying posts once, and says how much went up.
+ *
+ * Times go as Discord timestamps (<t:epoch:F>) for the reason event times do:
+ * every pilot then reads the departure in their OWN timezone, and a Z-time in
+ * prose is the single most misread thing a VA posts.
+ */
+function postScheduleNotice(va, action, schedule, actor, count = 1) {
+    if (!va || !schedule) return;
+    const who = (actor && actor.name) || '';
+    const leg = crewSchedules.describeLeg(schedule) || 'a departure';
+    const many = count > 1;
+    const title = {
+        published: many ? `🗓️ ${count} departures added to the schedule` : `🗓️ On the schedule — ${leg}`,
+        cancelled: `⚠️ Departure cancelled — ${leg}`,
+        removed: `🗑️ Departure removed — ${leg}`,
+    }[action];
+    if (!title) return;
+    const departsAt = schedule.departsAt ? new Date(schedule.departsAt) : null;
+    const stamp = departsAt && !Number.isNaN(departsAt.getTime())
+        ? `<t:${Math.floor(departsAt.getTime() / 1000)}:F>` : '';
+    crewWebhookUrlFor(va._id, 'events')
+        .then((hook) => hook && postCrewNotice(hook, {
+            title,
+            description: [
+                many ? `Starting with ${leg}.` : (schedule.notes ? String(schedule.notes).slice(0, 600) : ''),
+                who ? `By ${who}.` : '',
+            ].filter(Boolean).join('\n\n') || undefined,
+            color: SCHEDULE_COLORS[action],
+            fields: [
+                stamp ? { name: many ? 'First departure' : 'Departs', value: stamp, inline: false } : null,
+                schedule.aircraft ? { name: 'Aircraft', value: String(schedule.aircraft).slice(0, 60), inline: true } : null,
+                schedule.seats > 1 ? { name: 'Seats', value: String(schedule.seats), inline: true } : null,
+                schedule.minRank ? { name: 'Opens at', value: String(schedule.minRank), inline: true } : null,
             ].filter(Boolean),
         }))
         .catch(() => {});
@@ -2546,6 +2603,147 @@ app.delete('/api/crew/:slug/announcements/:id', async (req, res) => {
     } catch (err) { crewFail(res, err, { log: 'announcement delete error', message: 'Could not remove the notice.' }); }
 });
 
+// ---- The Inflight partnership, as the VA's own crew center sees it ----
+//
+// A partnered VA has a relationship with us that lives in three places they
+// have to go looking for: their directory listing, the Terms they accepted, and
+// any warnings we have issued. All three are administered in the VA Partnership
+// Portal, behind its own separate login (see vaPortal.js) — which is right,
+// because that is where the VA's side of the partnership is actually managed.
+//
+// What was wrong was that a VA owner sitting in their crew center had no way to
+// see ANY of it. Terms move, a warning gets issued, the flight-events feed is
+// approved — and the person running the airline finds out when they next happen
+// to sign into a different product.
+//
+// So this is a WINDOW, deliberately: it reads their standing and hands them a
+// link to the place each thing is changed. Nothing here writes. Bridging a crew
+// session into portal-authorised actions would mean one login quietly acquiring
+// another login's powers, and the partnership is not the crew center's to
+// administer.
+//
+// Owner-only (or Inflight oversight). A VA's staff run the airline; its
+// standing with us — warnings especially — is the owner's business.
+app.get('/api/crew/:slug/partnership', async (req, res) => {
+    const p = verifyCrewRequest(req);
+    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+    if (!(p.kind === 'inflight' || p.role === 'owner')) {
+        return res.status(403).json({ error: 'Only the VA owner can see the partnership.' });
+    }
+    if (p.kind !== 'inflight' && p.slug && p.slug !== String(req.params.slug).toLowerCase()) {
+        return res.status(403).json({ error: 'Wrong crew center.' });
+    }
+    try {
+        const { TOS_VERSION, TOS_EFFECTIVE_DATE, TOS_PAGE_PATH, TOS_PDF_PATH, getWarningLevel } = require('./vaTos');
+        // Resolved the way every other crew route resolves a VA, then re-read
+        // for the partnership fields specifically: crewStore.SELECT is the set
+        // the crew center needs to run an airline, and none of standing,
+        // featuring or the feed's approval state is in it.
+        const found = await resolveCrewVa(req.params.slug);
+        if (!found) return res.status(404).json({ error: 'Crew center not found.' });
+        const va = await VirtualAirlineAd.findById(found._id).select(
+            'name callsign status featured partnershipAnnouncedAt createdAt region hubs recruiting '
+            + 'logoUrl bannerUrl websiteUrl discordUrl '
+            + 'flightEventsApproved flightEventsEnabled flightEventsRequestedAt').lean();
+        if (!va) return res.status(404).json({ error: 'This crew center has no VA listing.' });
+
+        // Warnings and the acknowledging account are looked up together — both
+        // are one indexed read, and a partnership panel that rendered in two
+        // stages would show "in good standing" before correcting itself.
+        const [warnings, acked] = await Promise.all([
+            VaWarning.find({ vaAdId: va._id }).sort({ createdAt: -1 }).limit(50).lean().catch(() => []),
+            VaPortalAccount.findOne({ vaAdId: va._id, tosAckVersion: TOS_VERSION })
+                .sort({ tosAckAt: -1 }).select('tosAckVersion tosAckAt displayName username').lean().catch(() => null),
+        ]);
+
+        const active = (warnings || []).filter((w) => w.status === 'active');
+        // The highest active rung is what the standing badge reads. Same rule
+        // the portal uses, so the two cannot disagree about where a VA stands.
+        let peak = null;
+        for (const w of active) {
+            const lvl = getWarningLevel(w.level);
+            if (lvl && (!peak || lvl.order > peak.order)) peak = lvl;
+        }
+
+        res.json({
+            partnership: {
+                name: va.name || '',
+                code: va.callsign || '',
+                // 'approved' is the partnered state; anything else means the
+                // listing is still being looked at, or has been taken down.
+                status: va.status || '',
+                partnered: va.status === 'approved',
+                featured: !!va.featured,
+                // When we announced them publicly. Null until the bot posts it,
+                // which is also the VA's answer to "are we live yet?".
+                announcedAt: va.partnershipAnnouncedAt || null,
+                since: va.createdAt || null,
+                region: va.region || '',
+                hubs: Array.isArray(va.hubs) ? va.hubs : [],
+                recruiting: va.recruiting !== false,
+                logoUrl: va.logoUrl || null,
+                bannerUrl: va.bannerUrl || null,
+                websiteUrl: va.websiteUrl || null,
+                discordUrl: va.discordUrl || null,
+            },
+            standing: {
+                level: peak ? peak.key : 'clear',
+                label: peak ? peak.label : 'In good standing',
+                meaning: peak ? peak.meaning : '',
+                palette: peak ? peak.palette : '',
+                activeWarnings: active.length,
+                // A terminated partnership is not a badge colour — it is the
+                // headline, and the panel says so plainly rather than leaving
+                // an owner to read it off a rung name.
+                terminated: active.some((w) => w.level === 'termination'),
+            },
+            // Active warnings only, and only what the VA was told: the reason
+            // and when. Who issued it and our internal handling stay with us.
+            warnings: active.map((w) => ({
+                id: w._id,
+                level: w.level,
+                label: (getWarningLevel(w.level) || {}).label || w.level,
+                reason: w.reason || '',
+                issuedAt: w.createdAt,
+                termsVersion: w.termsVersion || '',
+                acknowledged: !!w.acknowledgedAt,
+                acknowledgedAt: w.acknowledgedAt || null,
+            })),
+            terms: {
+                version: TOS_VERSION,
+                effectiveDate: TOS_EFFECTIVE_DATE,
+                pageUrl: TOS_PAGE_PATH,
+                pdfUrl: TOS_PDF_PATH,
+                // Acknowledgement is recorded against a PORTAL ACCOUNT, not the
+                // VA — so the honest question here is "has anybody on this VA
+                // accepted the current version?", and the answer names them.
+                acknowledged: !!acked,
+                acknowledgedAt: (acked && acked.tosAckAt) || null,
+                acknowledgedBy: (acked && (acked.displayName || acked.username)) || '',
+            },
+            // The takeoff/landing feed into the VA's own Discord. Three states,
+            // not two: never asked for, asked for and waiting on us, running.
+            flightEvents: {
+                requested: !!va.flightEventsRequestedAt,
+                requestedAt: va.flightEventsRequestedAt || null,
+                approved: !!va.flightEventsApproved,
+                enabled: va.flightEventsEnabled !== false,
+            },
+            // Where each of these is actually changed. Sent rather than hardcoded
+            // in the browser so moving the portal does not strand a crew center.
+            portal: {
+                url: '/va-portal.html',
+                submissionsUrl: '/va-portal.html#submissions',
+                warningsUrl: '/va-portal.html#warnings',
+                termsUrl: '/va-portal.html#terms',
+            },
+        });
+    } catch (err) {
+        console.error('crew partnership error:', err);
+        res.status(500).json({ error: 'Could not load your partnership.' });
+    }
+});
+
 // ---- Events and the gate board ----
 //
 // An event is the thing a VA gathers around; the gate board is what stops
@@ -3031,6 +3229,389 @@ app.delete('/api/crew/:slug/events/:id/signups/:signupId', async (req, res) => {
     } catch (err) { crewFail(res, err, { log: 'event attendee remove error', message: 'Could not remove the attendee.' }); }
 });
 
+// ---- The schedule, and who is flying it ----
+//
+// A route says the airline flies LHR–JFK. A schedule says it flies at 18:40 on
+// Thursday, and one pilot puts their name against it. Staff build the week
+// (usually off the published network, sometimes ad hoc), pilots book a leg, and
+// a flight report filed against a booking is what turns "booked" into "flown".
+//
+// Where the authority sits, because it is the whole design:
+//   * WHICH SEAT IS WHOSE is a unique index on (schedule_id, seat). Not a count
+//     taken before the insert — publishing a fortnight of flying puts every
+//     pilot on the same page inside a minute, and that read loses the race. The
+//     backend proposes the lowest free seat, Postgres arbitrates, and a lost
+//     race is retried rather than reported.
+//   * WHAT A DEPARTURE SAYS is crewSchedules.sanitizeSchedule, so a draft and a
+//     published leg are cleaned by identical code.
+//   * WHO MAY BOOK is the VA's rank ladder, read exactly as routes and events
+//     read it — one place decides what a rank is worth.
+const canManageSchedules = async (req, slug) => !(await requireCap(req, slug, 'schedules.manage')).error;
+
+// Same treatment publicEvent gets, for the same reason: a pilot below the bar
+// sees the departure LOCKED with how much further they have to fly, not hidden.
+// `hoursUntilUnlock` is added here because it is the one field needing the
+// ladder maths, which crewSchedules deliberately does not carry.
+const publicSchedule = (s, opts = {}) => {
+    const out = crewSchedules.publicSchedule(s, { ...opts, meetsRank: crewRanks.meetsRank });
+    out.hoursUntilUnlock = out.locked
+        ? crewRanks.hoursUntilRank(opts.ranks, opts.viewer.hours, s.minRank)
+        : 0;
+    return out;
+};
+
+// A booking clash, in the words of the pilot who just lost the race. The store
+// tells us which uniqueness bit gave way (see Postgrest.explain), so "somebody
+// just took that seat" is never guessed — a pilot who is simply already booked
+// on the leg gets their own, different sentence.
+function bookingConflict(err, res) {
+    if (!(err instanceof crewStore.CrewStoreError) || err.code !== 'store_conflict') return false;
+    if (String(err.constraint || '').includes('seat')) {
+        res.status(409).json({
+            error: 'Somebody just took that seat — try again.',
+            code: 'seat_taken',
+        });
+        return true;
+    }
+    res.status(409).json({ error: 'You are already booked on this departure.', code: 'already_booked' });
+    return true;
+}
+
+/**
+ * Put a pilot on a departure, retrying the seat if the race is lost.
+ *
+ * The retry is the point. nextFreeSeat() reads the bookings as they were a
+ * moment ago; between that read and the insert another pilot may have taken the
+ * seat it proposed. Rather than tell them the leg is full — which would be a
+ * lie while other seats stand empty — the bookings are re-read and the next
+ * free seat attempted. Bounded by the seat count, because a departure whose
+ * every seat has genuinely gone must terminate with a plain "this leg is full"
+ * rather than spinning.
+ */
+async function claimSeat(store, schedule, booking) {
+    const seats = Math.max(1, Number(schedule.seats) || 1);
+    let lastErr = null;
+    for (let attempt = 0; attempt < seats; attempt += 1) {
+        const taken = await store.listBookings(schedule._id);
+        const seat = crewSchedules.nextFreeSeat(schedule, taken);
+        if (!seat) return { full: true, booking: null };
+        try {
+            return { full: false, booking: await store.createBooking({ ...booking, seat }) };
+        } catch (err) {
+            const raced = err instanceof crewStore.CrewStoreError
+                && err.code === 'store_conflict'
+                && String(err.constraint || '').includes('seat');
+            // Anything that is NOT two pilots meeting on one seat — already
+            // booked, a dead store, a project on an older schema — is the
+            // caller's to report. Only the seat race is ours to absorb.
+            if (!raced) throw err;
+            lastErr = err;
+        }
+    }
+    // Every seat was contended on every attempt. Rare, and honest: by now the
+    // leg really is full.
+    if (lastErr) return { full: true, booking: null };
+    return { full: true, booking: null };
+}
+
+// The schedule. Public: published and cancelled departures, because a pilot who
+// booked something that has been called off needs to see that it was. Drafts
+// are added only for a caller who can manage them.
+app.get('/api/crew/:slug/schedules', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const canManage = await canManageSchedules(req, req.params.slug);
+        const viewer = await crewPilot(req, store);
+        const upcomingOnly = String(req.query.upcoming || '') === '1';
+
+        const all = await store.listSchedules({ upcomingOnly });
+        const schedules = canManage ? all : all.filter((s) => s.status !== 'draft');
+
+        // Coverage for the whole page in ONE query rather than one per row. A
+        // fortnight of flying is hundreds of departures, and every row shows
+        // who has it — the same reasoning as the events calendar's counts.
+        const listed = schedules.slice(0, 400);
+        const allBookings = await store.listBookingsForSchedules(listed.map((s) => s._id)).catch(() => []);
+        const bySchedule = new Map(listed.map((s) => [String(s._id), []]));
+        for (const b of allBookings) {
+            const list = bySchedule.get(String(b.scheduleId));
+            if (list) list.push(b);
+        }
+        const isMine = (b) => (viewer.accountId && b.accountId === viewer.accountId)
+            || (viewer.memberId && b.memberId === viewer.memberId);
+
+        res.json({
+            schedules: listed.map((s) => publicSchedule(s, {
+                bookings: bySchedule.get(String(s._id)) || [],
+                ranks: va.ranks, viewer, canManage,
+            })),
+            canManage,
+            // So a pilot's own row can say "you have this one, seat 1" without a
+            // second request per departure.
+            mine: viewer
+                ? allBookings.filter(isMine).map((b) => ({ scheduleId: b.scheduleId, ...crewSchedules.publicBooking(b) }))
+                : [],
+            ranks: crewRanks.normalizeLadder(va.ranks).map((r) => ({ name: r.name, minHours: r.minHours })),
+        });
+    } catch (err) { crewFail(res, err, { log: 'schedules list error', message: 'Could not load the schedule.' }); }
+});
+
+// One departure, with who is flying it. The endpoint a booking page reads.
+app.get('/api/crew/:slug/schedules/:id', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const canManage = await canManageSchedules(req, req.params.slug);
+        const schedule = await store.getSchedule(req.params.id);
+        if (!schedule) return res.status(404).json({ error: 'Departure not found.' });
+        if (schedule.status === 'draft' && !canManage) return res.status(404).json({ error: 'Departure not found.' });
+
+        const viewer = await crewPilot(req, store);
+        const bookings = await store.listBookings(schedule._id);
+        const mine = viewer
+            ? bookings.find((b) => (viewer.accountId && b.accountId === viewer.accountId)
+                || (viewer.memberId && b.memberId === viewer.memberId))
+            : null;
+
+        // What was actually flown, as opposed to who said they would fly it.
+        // Best-effort: a project on an older schema has no schedule_id column,
+        // and a departure whose flights cannot be listed is still worth opening.
+        const flights = await store.listPirepsForSchedule(schedule._id).catch(() => []);
+
+        res.json({
+            schedule: publicSchedule(schedule, {
+                bookings, ranks: va.ranks, viewer, canManage,
+            }),
+            crew: bookings.map(crewSchedules.publicBooking),
+            mine: mine ? crewSchedules.publicBooking(mine) : null,
+            // Approved only for everyone but staff, matching the public flight
+            // log: a pending report is staff business until a decision is made.
+            flights: flights.filter((f) => canManage || f.status === 'approved').map(publicPirep),
+            canManage,
+        });
+    } catch (err) { crewFail(res, err, { log: 'schedule read error', message: 'Could not load the departure.' }); }
+});
+
+/**
+ * Publish departures.
+ *
+ * One body, one to sixty rows: `repeat` and `count` turn a template into a week
+ * or a fortnight of the same leg. That is not a convenience — a VA building
+ * their schedule a row at a time is a VA that stops after Tuesday — and it is
+ * done here rather than in the browser so the rows are created against one
+ * sanitised template instead of sixty separately-typed ones.
+ */
+app.post('/api/crew/:slug/schedules', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'schedules.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const b = req.body || {};
+        const template = crewSchedules.sanitizeSchedule(b);
+        if (!template.origin || !template.destination) {
+            return res.status(400).json({ error: 'A departure needs both a departure and an arrival airport.' });
+        }
+        const series = crewSchedules.expandSeries({
+            departsAt: template.departsAt, arrivesAt: template.arrivesAt,
+            repeat: b.repeat, count: b.count,
+        });
+        if (series.length > 1 && !template.departsAt) {
+            return res.status(400).json({ error: 'Give the first departure a time before repeating it.' });
+        }
+
+        const created = [];
+        for (const times of series) {
+            created.push(await store.createSchedule({
+                ...template, ...times, createdBy: (gate.p && gate.p.name) || '',
+            }));
+        }
+
+        // One notice for the batch, not sixty. A VA that published a fortnight
+        // of flying wants their crew told once that the schedule is up — a
+        // Discord channel with sixty identical embeds in it is the same thing
+        // as no notice at all.
+        if (template.status === 'published' && created.length) {
+            postScheduleNotice(va, 'published', created[0], gate.p, created.length);
+            postAnnouncement(va, {
+                kind: 'schedule',
+                title: created.length > 1
+                    ? `${created.length} departures added to the schedule`
+                    : `${crewSchedules.describeLeg(created[0]) || 'A departure'} is on the schedule`,
+                body: created.length > 1 ? `Starting with ${crewSchedules.describeLeg(created[0])}.` : (template.notes || ''),
+                refId: created[0]._id,
+                authorName: (gate.p && gate.p.name) || '',
+            });
+        }
+
+        res.status(201).json(withDrift(store, {
+            schedules: created.map((s) => publicSchedule(s, { canManage: true })),
+            created: created.length,
+        }));
+    } catch (err) { crewFail(res, err, { log: 'schedule add error', message: 'Could not add to the schedule.' }); }
+});
+
+app.patch('/api/crew/:slug/schedules/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'schedules.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const before = await store.getSchedule(req.params.id);
+        if (!before) return res.status(404).json({ error: 'Departure not found.' });
+
+        // Seats may not be cut below the pilots already on the leg. Doing so
+        // would leave bookings holding seat numbers the departure no longer
+        // has — nobody is bumped by an edit, and staff who need one gone remove
+        // that booking themselves.
+        const patch = crewSchedules.sanitizeSchedule({ ...before, ...req.body });
+        const booked = await store.listBookings(before._id).catch(() => []);
+        if (booked.length && patch.seats < booked.length) {
+            return res.status(409).json({
+                error: `${booked.length} pilot${booked.length === 1 ? ' is' : 's are'} already booked on this departure — remove a booking before cutting the seats.`,
+                code: 'seats_below_booked',
+            });
+        }
+
+        const s = await store.updateSchedule(before._id, patch);
+        // Told once, on the crossing. A staff member correcting a typo on an
+        // already-published leg must not re-announce it, and cancelling one
+        // people have booked has to reach them.
+        if (before.status !== 'published' && s.status === 'published') postScheduleNotice(va, 'published', s, gate.p, 1);
+        else if (before.status !== 'cancelled' && s.status === 'cancelled') postScheduleNotice(va, 'cancelled', s, gate.p, 1);
+        res.json(withDrift(store, { schedule: publicSchedule(s, { canManage: true }) }));
+    } catch (err) { crewFail(res, err, { log: 'schedule edit error', message: 'Could not update the departure.' }); }
+});
+
+app.delete('/api/crew/:slug/schedules/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'schedules.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const existing = await store.getSchedule(req.params.id);
+        if (!existing) return res.json({ ok: true });
+        await store.deleteSchedule(existing._id);
+        // Only worth announcing if anybody could see it. Deleting a draft is
+        // staff tidying up their own working copy.
+        if (existing.status === 'published') postScheduleNotice(va, 'removed', existing, gate.p, 1);
+        res.json({ ok: true });
+    } catch (err) { crewFail(res, err, { log: 'schedule remove error', message: 'Could not remove the departure.' }); }
+});
+
+// A pilot taking a leg. The seat is picked here, not sent by the browser — see
+// claimSeat for why, and for what happens when two pilots ask at once.
+app.post('/api/crew/:slug/schedules/:id/book', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const viewer = await crewPilot(req, store);
+        if (!viewer) return res.status(401).json({ error: 'Sign in to your crew center to book a flight.' });
+
+        const schedule = await store.getSchedule(req.params.id);
+        const closed = crewSchedules.bookingClosedReason(schedule);
+        if (closed === 'missing') return res.status(404).json({ error: 'Departure not found.' });
+        if (closed === 'cancelled') return res.status(409).json({ error: 'This departure has been cancelled.', code: 'cancelled' });
+        if (closed === 'departed') return res.status(409).json({ error: 'This departure has already gone.', code: 'departed' });
+
+        if (schedule.minRank && !crewRanks.meetsRank(va.ranks, viewer.hours, schedule.minRank)) {
+            return res.status(403).json({
+                error: `This departure opens at ${schedule.minRank}.`,
+                code: 'rank_locked',
+                hoursUntilUnlock: crewRanks.hoursUntilRank(va.ranks, viewer.hours, schedule.minRank),
+            });
+        }
+
+        const b = req.body || {};
+        const { full, booking } = await claimSeat(store, schedule, {
+            scheduleId: schedule._id,
+            memberId: viewer.memberId,
+            accountId: viewer.accountId,
+            pilotName: viewer.name,
+            callsign: String(b.callsign || viewer.callsign || '').trim().slice(0, 20),
+            note: String(b.note || '').trim().slice(0, 300),
+            status: 'booked',
+        });
+        // No waitlist, unlike an event. A pilot who cannot have this leg needs
+        // to know now so they can take another one — a queue for a single seat
+        // is a pilot who does not fly and does not know it yet.
+        if (full) return res.status(409).json({ error: 'Every seat on this departure has gone.', code: 'full' });
+
+        res.status(201).json(withDrift(store, { booking: crewSchedules.publicBooking(booking) }));
+    } catch (err) {
+        if (bookingConflict(err, res)) return;
+        crewFail(res, err, { log: 'schedule booking error', message: 'Could not book you onto that flight.' });
+    }
+});
+
+// Change your callsign or your note on a leg you hold. Not your seat — that is
+// the database's to arbitrate — and not your name, which is your roster row's.
+app.patch('/api/crew/:slug/schedules/:id/book', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const viewer = await crewPilot(req, store);
+        if (!viewer) return res.status(401).json({ error: 'Sign in to your crew center first.' });
+        const mine = await store.getBookingFor(req.params.id, { accountId: viewer.accountId, memberId: viewer.memberId });
+        if (!mine) return res.status(404).json({ error: 'You are not booked on this departure.' });
+        const saved = await store.updateBooking(mine._id, crewSchedules.sanitizeBookingPatch(req.body));
+        res.json(withDrift(store, { booking: crewSchedules.publicBooking(saved) }));
+    } catch (err) { crewFail(res, err, { log: 'schedule booking edit error', message: 'Could not update your booking.' }); }
+});
+
+// Give the leg back. Deletes the row rather than flagging it, which is what
+// frees the seat — the same reasoning as withdrawing from an event.
+app.delete('/api/crew/:slug/schedules/:id/book', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const viewer = await crewPilot(req, store);
+        if (!viewer) return res.status(401).json({ error: 'Sign in to your crew center first.' });
+        const mine = await store.getBookingFor(req.params.id, { accountId: viewer.accountId, memberId: viewer.memberId });
+        if (!mine) return res.json({ ok: true });   // not booked; nothing to undo
+        await store.deleteBooking(mine._id);
+        res.json({ ok: true });
+    } catch (err) { crewFail(res, err, { log: 'schedule cancel error', message: 'Could not cancel your booking.' }); }
+});
+
+// Staff assigning a leg by hand: cover for a pilot who asked in Discord, or a
+// guest crew from a partner VA. No account is invented for them — the booking
+// carries a name, which is all the schedule needs.
+app.post('/api/crew/:slug/schedules/:id/bookings', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'schedules.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const schedule = await store.getSchedule(req.params.id);
+        if (!schedule) return res.status(404).json({ error: 'Departure not found.' });
+
+        const b = req.body || {};
+        const member = b.memberId ? await store.getMember(b.memberId).catch(() => null) : null;
+        const name = String(b.pilotName || (member && member.name) || '').trim().slice(0, 80);
+        if (!name) return res.status(400).json({ error: 'Name the pilot flying this leg.' });
+
+        const { full, booking } = await claimSeat(store, schedule, {
+            scheduleId: schedule._id,
+            memberId: (member && member._id) || null,
+            accountId: null,
+            pilotName: name,
+            callsign: String(b.callsign || (member && member.callsign) || '').trim().slice(0, 20),
+            note: String(b.note || '').trim().slice(0, 300),
+            status: 'booked',
+        });
+        if (full) return res.status(409).json({ error: 'Every seat on this departure has gone.', code: 'full' });
+        res.status(201).json(withDrift(store, { booking: crewSchedules.publicBooking(booking) }));
+    } catch (err) {
+        if (bookingConflict(err, res)) return;
+        crewFail(res, err, { log: 'schedule assign error', message: 'Could not assign that pilot.' });
+    }
+});
+
+app.delete('/api/crew/:slug/schedules/:id/bookings/:bookingId', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'schedules.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const existing = await store.getBooking(req.params.bookingId);
+        if (!existing || existing.scheduleId !== req.params.id) return res.status(404).json({ error: 'Booking not found.' });
+        await store.deleteBooking(existing._id);
+        res.json({ ok: true });
+    } catch (err) { crewFail(res, err, { log: 'schedule booking remove error', message: 'Could not remove the booking.' }); }
+});
+
 // ---- Flight reports (PIREPs) — auto-captured from real IF history ----
 const _norm = (s) => String(s || '').trim().toLowerCase();
 // Loose aircraft-name match. Fleet types are the canonical IF names now, so an
@@ -3177,10 +3758,22 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
             }
         }
 
-        const origin = icao(b.origin) || (event ? event.origin : '');
-        const destination = icao(b.destination) || (event ? event.destination : '');
+        // Filing against a scheduled departure, for the same reasons and by the
+        // same route: the leg supplies what the pilot did not type, and the
+        // report is otherwise an ordinary report. This is also the one moment a
+        // booking can honestly become 'flown' — the pilot saying they flew it.
+        let schedule = null;
+        if (b.scheduleId) {
+            schedule = await store.getSchedule(b.scheduleId).catch(() => null);
+            if (!schedule || schedule.status === 'draft') {
+                return res.status(404).json({ error: 'That departure isn’t available.' });
+            }
+        }
+
+        const origin = icao(b.origin) || (event ? event.origin : '') || (schedule ? schedule.origin : '');
+        const destination = icao(b.destination) || (event ? event.destination : '') || (schedule ? schedule.destination : '');
         if (!origin || !destination) return res.status(400).json({ error: 'Enter both a departure and an arrival airport.' });
-        const aircraftName = String(b.aircraftName || b.aircraft || (event && event.aircraft) || '').trim().slice(0, 60);
+        const aircraftName = String(b.aircraftName || b.aircraft || (event && event.aircraft) || (schedule && schedule.aircraft) || '').trim().slice(0, 60);
         const liveryName = String(b.liveryName || b.livery || '').trim().slice(0, 80);
         // Duration accepts either a minutes number or hours+minutes fields.
         let durationMin = Math.round(Number(b.durationMin) || 0);
@@ -3198,7 +3791,7 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
         const route = matchRoute(routes, origin, destination, aircraftName);
         const inFleet = pirepInFleet((vaFull && vaFull.crewFleet) || [], aircraftName);
         // If the pilot typed a flight number, note when it disagrees with the route's.
-        const claimedFlight = String(b.flightNumber || (event && event.flightNumber) || '').trim().slice(0, 12);
+        const claimedFlight = String(b.flightNumber || (event && event.flightNumber) || (schedule && schedule.flightNumber) || '').trim().slice(0, 12);
         const flightNumberMismatch = !!(route && route.flightNumber && claimedFlight && _norm(route.flightNumber) !== _norm(claimedFlight));
 
         const doc = await store.createPirep({
@@ -3206,8 +3799,9 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
             // The route the LEG matched, falling back to the one the event was
             // built on. An event flown on a published route credits against it
             // even when the pilot's typed airports were the thing that matched.
-            routeId: (route && route._id) || (event && event.routeId) || null,
+            routeId: (route && route._id) || (event && event.routeId) || (schedule && schedule.routeId) || null,
             eventId: event ? event._id : null,
+            scheduleId: schedule ? schedule._id : null,
             pilotName: (member && member.name) || p.name || '', callsign: String(b.callsign || (member && member.callsign) || '').slice(0, 20),
             flightNumber: (route && route.flightNumber) || claimedFlight, ifUserId: (member && member.ifUserId) || '',
             origin, destination, aircraftName, liveryName,
@@ -3216,6 +3810,22 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
             flownAt: b.flownAt ? new Date(b.flownAt) : new Date(),
         });
         vaStats.recordEngagement(va._id, 'pirep', 1, va.name);
+        // The booking has been flown. Best-effort and deliberately after the
+        // report exists: a filed flight must not fail because the schedule row
+        // it belongs to could not be marked, and a pilot who filed without
+        // booking (they picked up the leg on the day) simply has nothing to
+        // mark. Left as-is if they were never on the departure.
+        if (schedule) {
+            store.getBookingFor(schedule._id, {
+                // A crew login's account id is its token subject; staff filing
+                // on someone's behalf have none, so the roster row is what
+                // finds the booking then.
+                accountId: p.kind === 'crew' ? p.sub : '',
+                memberId: (member && member._id) || '',
+            })
+                .then((bk) => bk && bk.status !== 'flown' && store.updateBooking(bk._id, { status: 'flown' }))
+                .catch((err) => console.warn('booking not marked flown —', err?.message || err));
+        }
         postPirepNotice(va, 'filed', doc, p);
         res.status(201).json({
             pirep: publicPirep(doc),

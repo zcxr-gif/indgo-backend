@@ -137,6 +137,17 @@ insert into crew_event_signups (va_slug,event_id,pilot_name,gate)
 insert into crew_accounts (va_slug,username,password_hash) values ('amv','jo','$2b$notarealhash');
 insert into crew_applications (va_slug,ifc_name,email,invite_password) values ('amv','Someone','a@b.c','TEMPORARY');
 insert into crew_announcements (va_slug,title,body) values ('amv','July schedule','New rotations.');
+-- v8. A published departure and a draft one, each with somebody on it. The
+-- draft's booking is the leak being checked for: it would give away both the
+-- draft's existence and who staff had pencilled in.
+insert into crew_schedules (va_slug,origin,destination,seats,status)
+    values ('amv','EGLL','KJFK',2,'published');
+insert into crew_schedules (va_slug,origin,destination,seats,status)
+    values ('amv','EGLL','LFPG',1,'draft');
+insert into crew_bookings (va_slug,schedule_id,pilot_name,seat)
+    select 'amv',id,'On the published one',1 from crew_schedules where destination='KJFK';
+insert into crew_bookings (va_slug,schedule_id,pilot_name,seat)
+    select 'amv',id,'Pencilled into the draft',1 from crew_schedules where destination='LFPG';
 SQL
 
 asanon() { $PSQL -d fresh -tAc "set role anon; $1" 2>/dev/null; }
@@ -158,10 +169,22 @@ is "the noticeboard is public"            "$(asanon 'select count(*) from crew_a
 is "only APPROVED flights are public"     "$(asanon 'select count(*) from crew_pireps')" "1"
 is "a draft event is invisible"           "$(asanon 'select count(*) from crew_events')" "1"
 is "…and so is who was penciled into it"  "$(asanon 'select count(*) from crew_event_signups')" "1"
+is "a draft departure is invisible"          "$(asanon 'select count(*) from crew_schedules')" "1"
+is "…and so is who was pencilled onto it"   "$(asanon 'select count(*) from crew_bookings')" "1"
 is "pilot logins are refused at the door" "$(saidno 'select 1 from crew_accounts')" "yes"
 is "so are applications (emails, invites)" "$(saidno 'select 1 from crew_applications')" "yes"
 is "anon cannot write, even to a public table" \
    "$(saidno "insert into crew_members (va_slug,name) values ('amv','Intruder')")" "yes"
+# The claim the whole booking design rests on: the seat is arbitrated by the
+# database, not by a count taken in the backend before the insert. Checked as
+# the owner, because this is not a permission boundary — it is the unique index.
+sold_twice() {
+    local out
+    out="$($PSQL -d fresh -tAc "insert into crew_bookings (va_slug,schedule_id,pilot_name,seat) select 'amv',id,'Second claimant',1 from crew_schedules where destination='KJFK'" 2>&1)"
+    case "$out" in *"duplicate key"*|*violates*) echo refused ;; *) echo allowed ;; esac
+}
+is "one seat cannot be sold twice" "$(sold_twice)" "refused"
+
 is "crew_stats is callable by anon (it is what a VA's homepage shows)" \
    "$(asanon "select (crew_stats('amv')->>'pilots')")" "1"
 

@@ -54,7 +54,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 7;
+const EXPECTED_SCHEMA_VERSION = 8;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -64,6 +64,12 @@ const ACCOUNTS_SCHEMA_VERSION = 3;
 // columns to degrade, so the crew center names the missing thing instead of
 // reporting a broken store over a VA whose roster and routes work fine.
 const EVENTS_SCHEMA_VERSION = 6;
+
+// The version that introduced crew_schedules + crew_bookings. Same story as
+// events: a pre-v8 project has no schedule tables at all, so the crew center
+// names the missing feature rather than reporting a broken store over a VA
+// whose roster, routes, flights and events are all answering.
+const SCHEDULES_SCHEMA_VERSION = 8;
 
 // ---------------------------------------------------------------------------
 // Columns that arrived after the first release
@@ -94,7 +100,7 @@ const LATE_COLUMNS = {
     crew_routes: new Set(['kind', 'partner_name', 'partner_logo', 'min_rank']),
     crew_members: new Set(['checks_passed']),
     crew_events: new Set(['route_id']),
-    crew_pireps: new Set(['event_id']),
+    crew_pireps: new Set(['event_id', 'schedule_id']),
     crew_applications: new Set([
         'discord_invite', 'invite_username', 'invite_password',
         'invite_issued_at', 'invite_claimed_at', 'invite_revoked_at', 'invite_account_id',
@@ -106,6 +112,7 @@ const DRIFT_LABELS = {
     'crew_members.checks_passed': 'check-ride sign-offs',
     'crew_events.route_id': 'events tied to a route',
     'crew_pireps.event_id': 'flights logged against an event',
+    'crew_pireps.schedule_id': 'flights logged against a scheduled departure',
     'crew_routes.kind': 'codeshare routes',
     'crew_routes.partner_name': 'codeshare partner names',
     'crew_routes.partner_logo': 'codeshare partner logos',
@@ -319,6 +326,9 @@ const pirepFromRow = (r) => r && {
     routeId: r.route_id || null,
     // v7. The event this flight was flown for, when it was flown for one.
     eventId: r.event_id || null,
+    // v8. The scheduled departure it was filed against, when it was flown off
+    // the schedule. What lets a departure read as flown rather than only booked.
+    scheduleId: r.schedule_id || null,
     pilotName: r.pilot_name || '',
     callsign: r.callsign || '',
     flightNumber: r.flight_number || '',
@@ -348,6 +358,7 @@ const pirepToRow = (p) => {
     pick(p, out, 'memberId', 'member_id', (v) => v || null);
     pick(p, out, 'routeId', 'route_id', (v) => v || null);
     pick(p, out, 'eventId', 'event_id', (v) => (str(v, 64) || null));
+    pick(p, out, 'scheduleId', 'schedule_id', (v) => (str(v, 64) || null));
     pick(p, out, 'pilotName', 'pilot_name', (v) => str(v, 60));
     pick(p, out, 'callsign', 'callsign', (v) => str(v, 20));
     pick(p, out, 'flightNumber', 'flight_number', (v) => str(v, 12));
@@ -532,6 +543,77 @@ const signupToRow = (s) => {
     return out;
 };
 
+// v8. A scheduled departure, and one pilot's booking on it.
+//
+// Deliberately close in shape to an event without being one: an event gathers
+// everybody at a single departure, a schedule entry is one leg of an ordinary
+// week that one pilot (or a small crew) puts their name against. See the schema
+// note above crew_schedules for why they are separate tables.
+const scheduleFromRow = (r) => r && {
+    _id: r.id,
+    routeId: r.route_id || null,
+    flightNumber: r.flight_number || '',
+    origin: r.origin || '',
+    destination: r.destination || '',
+    aircraft: r.aircraft || '',
+    departsAt: date(r.departs_at),
+    arrivesAt: date(r.arrives_at),
+    // Never 0: the column refuses it, and a departure nobody can fly is not a
+    // departure. A row that somehow arrives without one reads as single-crew.
+    seats: Number(r.seats) || 1,
+    minRank: r.min_rank || '',
+    notes: r.notes || '',
+    status: r.status || 'draft',
+    createdBy: r.created_by || '',
+    createdAt: date(r.created_at),
+    updatedAt: date(r.updated_at),
+};
+const scheduleToRow = (s) => {
+    const out = {};
+    // A uuid column: '' is not a valid uuid, so "no route" has to go as null.
+    pick(s, out, 'routeId', 'route_id', (v) => (str(v, 64) || null));
+    pick(s, out, 'flightNumber', 'flight_number', (v) => str(v, 12));
+    pick(s, out, 'origin', 'origin', icao);
+    pick(s, out, 'destination', 'destination', icao);
+    pick(s, out, 'aircraft', 'aircraft', (v) => str(v, 60));
+    pick(s, out, 'departsAt', 'departs_at', (v) => (date(v) ? date(v).toISOString() : null));
+    pick(s, out, 'arrivesAt', 'arrives_at', (v) => (date(v) ? date(v).toISOString() : null));
+    // Floored at 1 rather than 0: the check constraint would refuse a zero and
+    // fail the whole write, and what a caller sending one means is "one pilot".
+    pick(s, out, 'seats', 'seats', (v) => int(v, 1, 20));
+    pick(s, out, 'minRank', 'min_rank', (v) => str(v, 40));
+    pick(s, out, 'notes', 'notes', (v) => str(v, 2000));
+    pick(s, out, 'status', 'status', (v) => (['draft', 'published', 'cancelled'].includes(v) ? v : 'draft'));
+    pick(s, out, 'createdBy', 'created_by', (v) => str(v, 80));
+    return out;
+};
+
+const bookingFromRow = (r) => r && {
+    _id: r.id,
+    scheduleId: r.schedule_id || null,
+    memberId: r.member_id || null,
+    accountId: r.account_id || null,
+    pilotName: r.pilot_name || '',
+    callsign: r.callsign || '',
+    seat: Number(r.seat) || 1,
+    note: r.note || '',
+    status: r.status === 'flown' ? 'flown' : 'booked',
+    createdAt: date(r.created_at),
+    updatedAt: date(r.updated_at),
+};
+const bookingToRow = (b) => {
+    const out = {};
+    pick(b, out, 'scheduleId', 'schedule_id', (v) => (str(v, 64) || null));
+    pick(b, out, 'memberId', 'member_id', (v) => (str(v, 64) || null));
+    pick(b, out, 'accountId', 'account_id', (v) => (str(v, 64) || null));
+    pick(b, out, 'pilotName', 'pilot_name', (v) => str(v, 80));
+    pick(b, out, 'callsign', 'callsign', (v) => str(v, 20));
+    pick(b, out, 'seat', 'seat', (v) => int(v, 1, 20));
+    pick(b, out, 'note', 'note', (v) => str(v, 300));
+    pick(b, out, 'status', 'status', (v) => (v === 'flown' ? 'flown' : 'booked'));
+    return out;
+};
+
 // v7. A row on the VA's noticeboard. Two kinds of thing live here in one
 // shape: what staff write, and what the crew center writes for them when
 // something worth telling the crew happens.
@@ -547,7 +629,7 @@ const announcementFromRow = (r) => r && {
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
 };
-const ANNOUNCEMENT_KINDS = ['notice', 'promotion', 'join', 'event', 'checkride'];
+const ANNOUNCEMENT_KINDS = ['notice', 'promotion', 'join', 'event', 'checkride', 'schedule'];
 const announcementToRow = (a) => {
     const out = {};
     pick(a, out, 'title', 'title', (v) => str(v, 160));
@@ -1055,6 +1137,129 @@ class SupabaseStore {
         return this.events(async () => { await this.db.remove('crew_event_signups', this.ident(id)); return true; });
     }
 
+    // --- The schedule ---
+    //
+    // Wrapped exactly as events() is, and for the same reason: a project on a
+    // pre-v8 schema has no schedule tables, and "your tables are missing" would
+    // read as a lie on a crew center whose roster, routes, flights and events
+    // are all answering.
+    async schedules(fn) {
+        try { return await fn(); } catch (err) {
+            if (err instanceof CrewStoreError && err.code === 'store_schema_missing') {
+                throw new CrewStoreError(
+                    'This crew center’s project does not have the schedule tables yet. Re-run the setup SQL (Settings → Data store) to add them.',
+                    { status: 409, code: 'store_schedules_missing', detail: err.detail });
+            }
+            throw err;
+        }
+    }
+
+    // `upcomingOnly` uses the same twelve-hour grace as listEvents: a departure
+    // that pushed back an hour ago is exactly what a pilot opening the crew
+    // center mid-flight is looking for, and dropping it the moment the clock
+    // passes it would take the day's own flying off the day's schedule.
+    listSchedules({ status = '', upcomingOnly = false, limit = 500 } = {}) {
+        return this.schedules(async () => {
+            const params = { ...this.scope, order: 'departs_at.asc.nullslast,created_at.desc', limit };
+            if (status) params.status = `eq.${status}`;
+            if (upcomingOnly) params.departs_at = `gte.${new Date(Date.now() - 12 * 3600 * 1000).toISOString()}`;
+            const rows = await this.db.select('crew_schedules', params);
+            return (rows || []).map(scheduleFromRow);
+        });
+    }
+    getSchedule(id) { return this.schedules(() => this.one('crew_schedules', this.ident(id), scheduleFromRow)); }
+    createSchedule(data) {
+        return this.schedules(async () => {
+            const [row] = await this.db.insert('crew_schedules', { va_slug: this.slug, ...scheduleToRow(data) });
+            return scheduleFromRow(row);
+        });
+    }
+    updateSchedule(id, patch) {
+        return this.schedules(async () => {
+            const [row] = await this.db.update('crew_schedules', this.ident(id), scheduleToRow(patch));
+            return row ? scheduleFromRow(row) : null;
+        });
+    }
+    // The bookings go with it: crew_bookings.schedule_id cascades on delete.
+    deleteSchedule(id) {
+        return this.schedules(async () => { await this.db.remove('crew_schedules', this.ident(id)); return true; });
+    }
+
+    // --- Who is flying it ---
+    listBookings(scheduleId, { limit = 100 } = {}) {
+        return this.schedules(async () => {
+            const rows = await this.db.select('crew_bookings', {
+                ...this.scope, schedule_id: `eq.${scheduleId}`, order: 'seat.asc', limit,
+            });
+            return (rows || []).map(bookingFromRow);
+        });
+    }
+    // Every booking across several departures at once. The schedule panel shows
+    // coverage on every row, and asking per departure would be one round trip
+    // per leg — a fortnight of flying is hundreds of them. One `in.()` answers
+    // the lot, the same way listSignupsForEvents does for the calendar.
+    listBookingsForSchedules(scheduleIds, { limit = 5000 } = {}) {
+        const ids = (scheduleIds || []).map((i) => String(i)).filter(Boolean);
+        if (!ids.length) return Promise.resolve([]);
+        return this.schedules(async () => {
+            const rows = await this.db.select('crew_bookings', {
+                ...this.scope,
+                schedule_id: `in.(${ids.map((i) => `"${i.replace(/"/g, '')}"`).join(',')})`,
+                order: 'seat.asc',
+                limit,
+            });
+            return (rows || []).map(bookingFromRow);
+        });
+    }
+    getBooking(id) { return this.schedules(() => this.one('crew_bookings', this.ident(id), bookingFromRow)); }
+    // The row belonging to one pilot on one departure, however we know them.
+    // Answers "have I booked this?" and routes a cancellation to the right row.
+    getBookingFor(scheduleId, { accountId = '', memberId = '' } = {}) {
+        const key = accountId ? { account_id: `eq.${accountId}` } : memberId ? { member_id: `eq.${memberId}` } : null;
+        if (!key) return Promise.resolve(null);
+        return this.schedules(() => this.one('crew_bookings', {
+            ...this.scope, schedule_id: `eq.${scheduleId}`, ...key,
+        }, bookingFromRow));
+    }
+    // Every departure one pilot has booked, so their own page can show the week
+    // they are flying without walking the whole schedule.
+    listBookingsForPilot({ accountId = '', memberId = '' } = {}, { limit = 200 } = {}) {
+        const key = accountId ? { account_id: `eq.${accountId}` } : memberId ? { member_id: `eq.${memberId}` } : null;
+        if (!key) return Promise.resolve([]);
+        return this.schedules(async () => {
+            const rows = await this.db.select('crew_bookings', {
+                ...this.scope, ...key, order: 'created_at.desc', limit,
+            });
+            return (rows || []).map(bookingFromRow);
+        });
+    }
+    createBooking(data) {
+        return this.schedules(async () => {
+            const [row] = await this.db.insert('crew_bookings', { va_slug: this.slug, ...bookingToRow(data) });
+            return bookingFromRow(row);
+        });
+    }
+    updateBooking(id, patch) {
+        return this.schedules(async () => {
+            const [row] = await this.db.update('crew_bookings', this.ident(id), bookingToRow(patch));
+            return row ? bookingFromRow(row) : null;
+        });
+    }
+    deleteBooking(id) {
+        return this.schedules(async () => { await this.db.remove('crew_bookings', this.ident(id)); return true; });
+    }
+    // What has actually been flown against a departure. Best-effort at the call
+    // site for the same reason listPirepsForEvent is: a project on an older
+    // schema has no schedule_id column, and a departure whose flights cannot be
+    // listed is still a departure worth opening.
+    async listPirepsForSchedule(scheduleId, { limit = 100 } = {}) {
+        if (!scheduleId) return [];
+        const rows = await this.db.select('crew_pireps', {
+            ...this.scope, schedule_id: `eq.${scheduleId}`, order: 'flown_at.desc.nullslast,created_at.desc', limit,
+        });
+        return (rows || []).map(pirepFromRow);
+    }
+
     // --- The noticeboard ---
     //
     // Wrapped like events and accounts: a project on a pre-v7 schema has no
@@ -1143,6 +1348,10 @@ class SupabaseStore {
                 // update button on the events panel itself rather than sending
                 // a VA off to hunt for what "outdated" means for them.
                 events: version >= EVENTS_SCHEMA_VERSION,
+                // And for the schedule, so the schedule panel can offer the
+                // update button itself instead of sending a VA off to work out
+                // what "outdated" means for them.
+                schedules: version >= SCHEDULES_SCHEMA_VERSION,
                 installedAt: (rows && rows[0] && rows[0].installed_at) || null,
             };
         } catch (err) {
@@ -1153,6 +1362,7 @@ class SupabaseStore {
                 expectedVersion: EXPECTED_SCHEMA_VERSION,
                 accounts: false,
                 events: false,
+                schedules: false,
                 code: err.code || 'store_error',
                 error: err.message,
                 detail: err.detail || '',
@@ -1376,6 +1586,28 @@ class LegacyStore {
     updateSignup() { return this.events(); }
     deleteSignup() { return this.events(); }
 
+    // The schedule, like events, was never built on the retiring path. Same
+    // reasoning, same shape of refusal.
+    schedules() {
+        return Promise.reject(new CrewStoreError(
+            'The schedule needs your VA’s own database. Connect one in Crew Center → Settings → Data store.',
+            { status: 409, code: 'store_schedules_unsupported' }));
+    }
+    listSchedules() { return this.schedules(); }
+    getSchedule() { return this.schedules(); }
+    createSchedule() { return this.schedules(); }
+    updateSchedule() { return this.schedules(); }
+    deleteSchedule() { return this.schedules(); }
+    listBookings() { return this.schedules(); }
+    listBookingsForSchedules() { return this.schedules(); }
+    listBookingsForPilot() { return this.schedules(); }
+    getBooking() { return this.schedules(); }
+    getBookingFor() { return this.schedules(); }
+    createBooking() { return this.schedules(); }
+    updateBooking() { return this.schedules(); }
+    deleteBooking() { return this.schedules(); }
+    listPirepsForSchedule() { return this.schedules(); }
+
     // The noticeboard, like events, is not built on the retiring path. Same
     // reasoning, same shape of refusal.
     announcements() {
@@ -1542,5 +1774,6 @@ module.exports = {
     EXPECTED_SCHEMA_VERSION,
     ACCOUNTS_SCHEMA_VERSION,
     EVENTS_SCHEMA_VERSION,
+    SCHEDULES_SCHEMA_VERSION,
     REQUIRE_OWN_STORE,
 };
