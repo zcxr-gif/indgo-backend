@@ -51,7 +51,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 3;
+const EXPECTED_SCHEMA_VERSION = 5;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -183,6 +183,13 @@ const routeFromRow = (r) => r && {
     distanceNm: Number(r.distance_nm) || 0,
     notes: r.notes || '',
     active: r.active !== false,
+    // v5. `kind` defaults to 'own' rather than '' so a route read from a
+    // pre-v5 project sorts with the airline's own network instead of falling
+    // into a third, nonexistent category.
+    kind: r.kind === 'codeshare' ? 'codeshare' : 'own',
+    partnerName: r.partner_name || '',
+    partnerLogo: r.partner_logo || '',
+    minRank: r.min_rank || '',
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
 };
@@ -195,6 +202,15 @@ const routeToRow = (r) => {
     pick(r, out, 'distanceNm', 'distance_nm', (v) => int(v, 0, 20000));
     pick(r, out, 'notes', 'notes', (v) => str(v, 500));
     pick(r, out, 'active', 'active', (v) => !!v);
+    pick(r, out, 'kind', 'kind', (v) => (v === 'codeshare' ? 'codeshare' : 'own'));
+    pick(r, out, 'partnerName', 'partner_name', (v) => str(v, 60));
+    // A logo lands in an <img> on a public crew center page, so anything that
+    // is not plainly an https URL is dropped rather than rendered.
+    pick(r, out, 'partnerLogo', 'partner_logo', (v) => {
+        const s = str(v, 600);
+        return /^https:\/\//i.test(s) ? s : '';
+    });
+    pick(r, out, 'minRank', 'min_rank', (v) => str(v, 40));
     return out;
 };
 
@@ -271,6 +287,18 @@ const applicationFromRow = (r) => r && {
     // page can show it again — an emailed invite is easy to lose, and an
     // applicant with no email has the status link as their only copy.
     discordInvite: r.discord_invite || '',
+    // The invitation handed to an accepted applicant. `invitePassword` is a live
+    // credential for as long as it is non-empty — see crewInvite.js for the
+    // lifecycle, and the schema for why it is stored at all. Handlers must run
+    // it through crewInvite.inviteState() rather than reading it directly: a
+    // password that is still in the column but claimed, revoked or expired must
+    // not be shown to anyone.
+    inviteUsername: r.invite_username || '',
+    invitePassword: r.invite_password || '',
+    inviteIssuedAt: date(r.invite_issued_at),
+    inviteClaimedAt: date(r.invite_claimed_at),
+    inviteRevokedAt: date(r.invite_revoked_at),
+    inviteAccountId: r.invite_account_id || null,
     reviewedAt: date(r.reviewed_at),
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
@@ -290,6 +318,13 @@ const applicationToRow = (a) => {
     pick(a, out, 'staffMessage', 'staff_message', (v) => str(v, 2000));
     pick(a, out, 'statusToken', 'status_token', (v) => str(v, 64));
     pick(a, out, 'discordInvite', 'discord_invite', (v) => str(v, 200));
+    pick(a, out, 'inviteUsername', 'invite_username', (v) => str(v, 60));
+    pick(a, out, 'invitePassword', 'invite_password', (v) => str(v, 128));
+    pick(a, out, 'inviteIssuedAt', 'invite_issued_at', (v) => (date(v) ? date(v).toISOString() : null));
+    pick(a, out, 'inviteClaimedAt', 'invite_claimed_at', (v) => (date(v) ? date(v).toISOString() : null));
+    pick(a, out, 'inviteRevokedAt', 'invite_revoked_at', (v) => (date(v) ? date(v).toISOString() : null));
+    // A uuid column: '' is not a valid uuid, so an empty id has to go as null.
+    pick(a, out, 'inviteAccountId', 'invite_account_id', (v) => (str(v, 64) || null));
     pick(a, out, 'reviewedAt', 'reviewed_at', (v) => (date(v) ? date(v).toISOString() : null));
     return out;
 };
@@ -549,6 +584,15 @@ class SupabaseStore {
     getApplicationByToken(token) {
         return this.one('crew_applications', { ...this.scope, status_token: `eq.${token}` }, applicationFromRow);
     }
+    // The invitation belonging to an account, so signing in can clear it.
+    // Deliberately not filtered on a non-empty password: expressing "not the
+    // empty string" in a PostgREST query string is fragile, and the caller has
+    // to look at the row anyway. Cheap either way — this is one indexed lookup.
+    getApplicationByInviteAccount(accountId) {
+        return this.one('crew_applications', {
+            ...this.scope, invite_account_id: `eq.${accountId}`,
+        }, applicationFromRow);
+    }
     async createApplication(data) {
         const [row] = await this.db.insert('crew_applications', { va_slug: this.slug, ...applicationToRow(data) });
         return applicationFromRow(row);
@@ -780,6 +824,9 @@ class LegacyStore {
     }
     getApplication(id) { return models.CrewApplication.findOne({ ...this.q, _id: id }).lean(); }
     getApplicationByToken(token) { return models.CrewApplication.findOne({ ...this.q, statusToken: token }).lean(); }
+    getApplicationByInviteAccount(accountId) {
+        return models.CrewApplication.findOne({ ...this.q, inviteAccountId: String(accountId) }).lean();
+    }
     async createApplication(data) { return this.lean(await models.CrewApplication.create({ ...this.q, ...data })); }
     async updateApplication(id, patch) {
         const a = await models.CrewApplication.findOne({ ...this.q, _id: id });
@@ -897,7 +944,11 @@ function computeStats({ members = [], pireps = [], routes = [], applications = [
 // `va` must have been loaded with the secret service key selected — see
 // crewStore.SELECT, which every caller uses so nobody forgets a field.
 // ---------------------------------------------------------------------------
-const SELECT = '_id slug callsign name contactEmail crewAccent supabaseUrl supabaseAnonKey +supabaseServiceKey';
+// `ranks` rides along because rank is now resolved server-side on nearly every
+// crew route — the roster, the route network's gating, a promotion notice — and
+// fetching the same small array again in each handler would be a second query
+// per request for a field that is a few hundred bytes.
+const SELECT = '_id slug callsign name contactEmail crewAccent ranks supabaseUrl supabaseAnonKey +supabaseServiceKey';
 
 function isConnected(va) {
     return !!(va && va.supabaseUrl && va.supabaseServiceKey);

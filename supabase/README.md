@@ -81,6 +81,15 @@ than at the row.
 | `PATCH /api/crew/:slug/accounts/:id` | staff | suspend or restore a login |
 | `POST /api/crew/:slug/accounts/:id/reset-password` | staff | mint a new one-time password |
 | `POST /api/crew/:slug/account/password` | the pilot | change their own, current password required |
+| `GET /api/crew/:slug/applications/:id/invite` | staff | read the invitation back, message included |
+| `POST /api/crew/:slug/applications/:id/invite/regenerate` | staff | mint a fresh temporary password (resets the account's too) |
+| `DELETE /api/crew/:slug/applications/:id/invite` | staff | discard the invitation. Does **not** touch the account |
+| `GET /api/crew/:slug/routes` | public | the network, split into own/codeshare counts, with each route marked locked or open for the pilot asking |
+| `GET/POST /api/crew/:slug/webhook` | staff | read/set the main webhook, or one feed's override (`feed: recruitment\|pireps\|routes`) |
+| `GET /api/crew/:slug/roster.csv` | staff | the roster as a spreadsheet, every column |
+| `POST /api/crew/:slug/roster/import` | staff | upsert from CSV. `dryRun` defaults true |
+| `GET /api/crew/:slug/routes.csv` | staff | the route network as a spreadsheet |
+| `POST /api/crew/:slug/routes/import` | staff | upsert from CSV. `dryRun` defaults true |
 
 Everything else under `/api/crew/:slug/*` (roster, routes, pireps,
 applications) reads and writes through `crewStore.js`, which hides which
@@ -98,13 +107,51 @@ owns provisioning, authentication, password changes and staff resets; the schema
 table carries a unique index on `(va_slug, lower(username))`, so a username is
 one-per-crew-center and two VAs may each have a `j.smith`.
 
-**The password is generated, shown once, and stored nowhere.** Only the bcrypt
-hash reaches the VA's project, so there is no "resend my password" anywhere in
-the system — the routes back in are a staff reset or nothing. A pilot is issued
-one when they are accepted (or immediately, at a VA that accepts everyone), it
-arrives by email with a sign-in link when they gave an address and on the
-reviewer's screen when they did not, and `must_change_password` makes the crew
-center demand a replacement before it shows them anything.
+**The account's credential is a bcrypt hash and nothing else.** That is all
+`crew_accounts` ever holds. A pilot is issued a temporary password when they are
+accepted (or immediately, at a VA that accepts everyone), and
+`must_change_password` makes the crew center demand a replacement before it
+shows them anything.
+
+### The invitation
+
+The temporary password is also kept, readably, on the application row that
+produced it — `crew_applications.invite_password`. This is a deliberate
+exception to the rule above and it is worth being explicit about why.
+
+A password that exists only for the length of one HTTP response is the right
+shape for a password and the wrong shape for an invitation. Delivery does not
+happen at that moment: an applicant who gave no email address had one screenful
+before the dialog closed, most of these pilots are reached by hand on the IFC or
+Discord some time later, and the answer to every miss was to reset the password
+and try again — which teaches staff that credentials are disposable and leaves a
+trail of live ones behind.
+
+So the invitation is a small state machine (`crewInvite.js`) instead:
+
+| state | what it means | is the password readable? |
+|---|---|---|
+| `live` | issued, not yet used | yes — to staff, and to whoever holds the status link |
+| `claimed` | the pilot signed in | no. Cleared at that moment |
+| `revoked` | staff discarded it | no. Cleared |
+| `expired` | unused past `CREW_INVITE_TTL_DAYS` (default 30) | no. Cleared on the next read |
+
+What keeps this bounded: it covers one account that must change its password on
+first use, it is bounded in time, and it deletes itself at the first sign it is
+no longer needed. Nothing may read `invite_password` directly — every path goes
+through `crewInvite.inviteState()`, because a password still physically present
+but claimed, revoked or expired must not be shown to anyone.
+
+**It is not encrypted, on purpose.** Encrypting a VA's own data with a key
+Inflight holds would mean the VA no longer owns the contents of their own
+database, which is the single thing this schema exists to guarantee. The
+protection is the same one covering applicant emails and password hashes in this
+table: no anon policy *and* no grant, so a browser key is refused at the door.
+
+Where an invitation shows up: the acceptance email, the applicant's own status
+link, and **Crew Center → Roster → Invitations**, where it stays until the pilot
+signs in or a staff member throws it away. All three render from one message
+builder, so a pilot cannot be told two different stories about their own login.
 
 Sign-in (`POST /api/crew/:slug/login`) tries the VA's store first, then our
 central staff accounts, then Inflight staff. A store that cannot answer is
@@ -154,6 +201,115 @@ them to connect a project.
 Setting `CREW_STORE_REQUIRE_OWN=false` reopens managed storage to everyone.
 That is an escape hatch for an incident, not a supported configuration.
 
+## Ranks
+
+`crewRanks.js`. A VA defines a ladder — a name and a minimum hours figure per
+rung — in crew center settings. That has existed for a while; what is new is
+that the **server** resolves it.
+
+**Rank is derived from hours, never stored.** There is no `rank` column on
+`crew_members` and there should not be one: the moment a rank is stored it can
+disagree with the hours printed next to it, and it would — on every approved
+flight, every rolled-back rejection, and every time a VA moves a threshold.
+Moving a threshold would need a migration. A derived rank is simply correct.
+
+Two rules worth knowing:
+
+- **The lowest rung is the entry rank, whatever number is next to it.** A VA
+  whose ladder starts at "Second Officer, 25h" would otherwise leave a brand-new
+  pilot with no rank at all, on the day they are most likely to be looking at
+  their own profile. `rankForHours` floors it; every rung above still requires
+  its hours.
+- **A gate naming a rank that no longer exists lapses open.** A VA who renames
+  or deletes a rank gets an open route, never a network that quietly shrank.
+
+Promotions are detected where hours actually move (`applyPirepHours`, and a
+staff edit of the hours field) by comparing the rank held before against the
+rank held after. That makes it immune to how the hours moved: one long flight
+clearing two rungs reports the rung reached. **A rollback announces nothing** —
+an admin correcting a mistyped figure must never publish "Jo has been demoted"
+to a Discord channel.
+
+## Codeshares and rank-gated routes
+
+`crew_routes.kind` is `own` or `codeshare`. The split is not decoration: a
+network map that draws someone else's metal identically to your own overstates
+what the airline operates, which is the one thing that map is for. Codeshares
+are listed under their own filter, drawn dashed and muted on the map, excluded
+from the map's glow layer, and counted separately so "our network is 120 routes"
+cannot quietly mean "40 of ours and 80 of somebody else's". A partner name and
+an optional https logo ride along.
+
+`min_rank` names a rung on the VA's ladder rather than storing an hours figure,
+so the VA sets what a rank is worth in one place and every route gated on it
+moves with the threshold. It is a **name, not an index** — a VA reordering their
+ladder would otherwise silently re-gate their whole network.
+
+A pilot below the bar sees the route **locked, not hidden**, with how much
+further they have to fly. A route you can see and are working toward is the
+point of a ladder; a route that simply is not there is indistinguishable from a
+network smaller than advertised. Staff and the public are never marked locked —
+the gate is about what a pilot may fly.
+
+## Notification feeds
+
+A VA sets one Discord webhook and everything posts to that channel. That is the
+default and it is what most VAs want.
+
+Three feeds can each be pointed somewhere else instead:
+
+| feed | what posts |
+|---|---|
+| `recruitment` | new applications, accept / decline decisions |
+| `pireps` | flight reports **filed, approved and rejected** — one feed — plus promotions |
+| `routes` | routes added, edited, removed, or imported |
+
+Each is an override, not a switch: an empty value means "use the main webhook",
+never "off", so tidying up in the UI cannot silently mute a VA's notifications.
+Every existing VA keeps receiving everything on the hook they already set,
+because `crewWebhookUrlFor` falls back to it.
+
+Filed / approved / rejected deliberately share one feed. They are three moments
+in the same conversation and splitting them across channels means nobody can
+follow a report end to end; the colour and the verb carry the difference. Two
+noise rules are enforced: re-approving an already-approved report posts nothing,
+and a CSV import posts **one** summary rather than one embed per row — a VA
+pasting a 200-route network would otherwise rate-limit themselves.
+
+## Taking it out as a spreadsheet
+
+`crewCsv.js`, behind the four CSV endpoints above and the **CSV** button on the
+roster and route panels.
+
+"Your data is yours" is only worth something if you can pick it up and carry it,
+and a Postgres table is not a form a volunteer airline manager can use. Most VAs
+here were running on a spreadsheet the day before they signed up.
+
+The design is one property: **export writes exactly what import accepts**, so a
+file that goes out and comes back unedited is a no-op. That is why the `id`
+column is exported — a row carrying its id updates precisely, with no guessing.
+A file typed from scratch has no ids, so rows are matched on callsign then name
+(roster) or flight number then the airport pair (routes). Nothing matches on a
+field a VA is likely to bulk-edit, because a match that breaks when someone
+fixes a typo silently duplicates the whole roster.
+
+**Import never deletes.** A row in the crew center and absent from the file is
+left alone: a VA uploading the twelve pilots they recruited this month must not
+lose the other two hundred, and nothing distinguishes that file from a complete
+one. Removing a pilot is its own action on the roster screen.
+
+Two other rules worth keeping:
+
+- `required` means "required to create a new row", not "this column must be in
+  the file" — a VA correcting hours sends two columns and should not be told to
+  add a name column.
+- A file with any unreadable row applies **none** of itself. A partial import is
+  the worst available outcome: the VA cannot tell what landed, and re-uploading
+  the fixed file re-applies whatever did.
+
+Uploads are planned first (`dryRun`, the default) and the dashboard shows the
+count before anything is written.
+
 ## Changing the schema
 
 Bump `version` in the final `insert` of `crew-center-schema.sql` **and**
@@ -171,6 +327,11 @@ Version history:
 - **v1** — roster, routes, flight reports, applications, `crew_stats()`
 - **v2** — `crew_applications.discord_invite`
 - **v3** — `crew_accounts`: pilot logins move out of our database into the VA's
+- **v4** — `crew_applications.invite_*`: the temporary password an accepted
+  applicant is handed now outlives the request that created it
+- **v5** — `crew_routes.kind` / `partner_name` / `partner_logo` / `min_rank`:
+  codeshares are separated from the airline's own metal, and a route can open at
+  a rank
 
 ## Accepting a pilot
 
@@ -220,6 +381,26 @@ Management API impersonator — that the access token reaches Supabase and
 nothing else, that a project still booting parks the flow instead of failing it,
 that the SQL executed is this repo's own file, and that the service key reaches
 storage but never the reply.
+
+`node scratchpad/test-crew-invite.js` drives the invitation lifecycle: that a
+claimed, revoked or expired invitation never yields its password to staff or to
+the status link even while the column still holds one, that claiming and
+revoking actually blank the value rather than only flagging it, that a reissue
+clears the previous outcome, that the applicant's view is strictly narrower than
+the staff view, and that every channel renders the same message.
+
+`node scratchpad/test-crew-ranks.js` drives the ladder: that a pilot at zero
+hours holds a rank even when the ladder starts at 25, that a gate on a rank that
+no longer exists lapses open rather than shrinking the network, that a promotion
+reports the rung actually reached and a rollback reports nothing at all, and
+that normalising a ladder never mutates the caller's array.
+
+`node scratchpad/test-crew-csv.js` drives the spreadsheet round trip: that an
+untouched export re-imports as a no-op, that ids update precisely and hand-typed
+rows match on the fallback fields, that a partial file leaves unmentioned
+columns alone, that nothing is ever deleted, that duplicate lines collapse, and
+that the messy realities survive — quoted commas, semicolon lists, CRLF, a BOM,
+and header spellings that have been through three spreadsheet apps.
 
 `node scratchpad/test-discord-invite.js` covers the invite validator: the real
 formats, lookalike hosts, non-invite Discord paths, scheme downgrades, and the
