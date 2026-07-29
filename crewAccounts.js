@@ -21,12 +21,23 @@
  *
  * PASSWORDS
  * ---------
- * A generated password is returned by provisionPilotAccount ONCE and is stored
- * nowhere, in no form — only its bcrypt hash reaches the VA's project. There is
- * deliberately no "resend my password": the caller has one chance to put it in
- * front of the pilot (the acceptance email, or on screen for the staff member
- * who accepted them), after which the only route back in is a reset that mints
- * a new one.
+ * Nothing in THIS module stores a password. provisionPilotAccount and
+ * resetPassword each generate one, return it once, and write only its bcrypt
+ * hash to the VA's project. That remains true and is the property to protect
+ * when changing anything here: the account's credential is the hash, and the
+ * hash is all that lives on crew_accounts.
+ *
+ * What did change: the caller may now keep the returned password for a while.
+ * An acceptance records it on the application row as an INVITATION, so a staff
+ * member can still hand it over an hour later on the IFC and the applicant can
+ * read it off their own status link. That copy is deliberately short-lived and
+ * self-deleting — it is cleared the moment the pilot signs in, when staff
+ * discard it, or when it ages out. crewInvite.js owns that lifecycle and
+ * explains the trade; the schema file explains why it is not encrypted.
+ *
+ * So "there is no resend my password" is no longer quite the rule. There is a
+ * window in which the invitation can be re-read, and after it closes the only
+ * route back in is still a reset that mints a new one.
  *
  * The bcrypt cost (12) matches vaPortal/staffAuth, so a login costs the same
  * wherever the account lives.

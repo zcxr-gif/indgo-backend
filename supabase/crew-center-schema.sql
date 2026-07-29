@@ -167,6 +167,39 @@ create table if not exists crew_applications (
     -- their status page can show it again: an emailed invite is easy to lose,
     -- and an applicant who gave no email has the status link as their only copy.
     discord_invite  text not null default '',
+    -- ------------------------------------------------------------------------
+    -- The invitation. v4.
+    --
+    -- An accepted applicant is handed a temporary password. It is kept HERE, in
+    -- readable form, which is a deliberate reversal of the rule the rest of this
+    -- file follows for credentials — crew_accounts stores only a bcrypt hash and
+    -- nothing anywhere stores a password. The reason is that a temporary
+    -- password nobody can read again is a temporary password that only works if
+    -- the applicant catches it on first sight: an applicant who gave no email
+    -- had one screenful, and staff passing it on by hand (IFC DM, Discord) had
+    -- one screenful too. Reissuing on every miss trains everyone to reissue.
+    --
+    -- So the trade is stated plainly rather than hidden: this column holds a
+    -- live credential until it is used. What keeps that bounded is that it
+    -- deletes itself — cleared the moment the pilot signs in (invite_claimed_at),
+    -- when staff throw the invitation away (invite_revoked_at), or when it ages
+    -- out. It is never a permanent store of anyone's password, because the
+    -- account's real password is the bcrypt hash in crew_accounts and this one
+    -- must be changed on first use (must_change_password).
+    --
+    -- It is not encrypted, on purpose. Encrypting a VA's own data with a key
+    -- Inflight holds would mean the VA no longer owns the contents of their own
+    -- database, which is the one thing this whole schema exists to guarantee.
+    -- The protection is the same one that covers applicant emails and password
+    -- hashes in this table: no anon policy AND no grant, so a browser key is
+    -- refused at the door (see the RLS block at the foot of this file).
+    -- ------------------------------------------------------------------------
+    invite_username   text not null default '',
+    invite_password   text not null default '',
+    invite_issued_at  timestamptz,
+    invite_claimed_at timestamptz,
+    invite_revoked_at timestamptz,
+    invite_account_id uuid,
     reviewed_at     timestamptz,
     created_at      timestamptz not null default now(),
     updated_at      timestamptz not null default now()
@@ -174,6 +207,17 @@ create table if not exists crew_applications (
 -- v2. Added separately so a project provisioned at v1 picks it up on re-run
 -- rather than needing the table dropped.
 alter table crew_applications add column if not exists discord_invite text not null default '';
+-- v4. Same reasoning: a project provisioned at v1–v3 picks these up on re-run.
+alter table crew_applications add column if not exists invite_username   text not null default '';
+alter table crew_applications add column if not exists invite_password   text not null default '';
+alter table crew_applications add column if not exists invite_issued_at  timestamptz;
+alter table crew_applications add column if not exists invite_claimed_at timestamptz;
+alter table crew_applications add column if not exists invite_revoked_at timestamptz;
+alter table crew_applications add column if not exists invite_account_id uuid;
+-- Finding the invitation belonging to an account that has just signed in, so it
+-- can be cleared. This runs on every pilot sign-in, so it is not optional.
+create index if not exists crew_applications_invite_idx
+    on crew_applications (va_slug, invite_account_id) where invite_account_id is not null;
 create index if not exists crew_applications_va_idx     on crew_applications (va_slug, status, created_at desc);
 -- The status link must resolve to exactly one application.
 create unique index if not exists crew_applications_token_idx
@@ -415,9 +459,9 @@ create policy crew_schema_info_public_read on crew_schema_info
 grant usage on schema public to anon, authenticated;
 grant select on crew_members, crew_routes, crew_pireps, crew_schema_info to anon, authenticated;
 -- Deliberately NOT granted on crew_applications or crew_accounts. The first
--- holds applicant emails, the second holds password hashes; neither has a
--- policy above, and revoking the grant means a browser key is refused at the
--- door rather than at the row.
+-- holds applicant emails and unclaimed invitation passwords, the second holds
+-- password hashes; neither has a policy above, and revoking the grant means a
+-- browser key is refused at the door rather than at the row.
 revoke all on crew_applications from anon, authenticated;
 revoke all on crew_accounts     from anon, authenticated;
 
@@ -431,5 +475,5 @@ grant execute on function crew_stats(text) to anon, authenticated;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 3)
+insert into crew_schema_info (id, version) values (1, 4)
 on conflict (id) do update set version = excluded.version, updated_at = now();

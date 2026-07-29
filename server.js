@@ -54,6 +54,16 @@ const crewStore = require('./crewStore');
 // keeps only the VA's staff logins. See crewAccounts.js.
 const crewAccounts = require('./crewAccounts');
 
+// The invitation an accepted applicant is handed — the temporary password, the
+// message staff paste to them on the IFC, and the lifecycle that clears the
+// credential once it has been used, thrown away or left to age out. Nothing
+// outside this module may read the stored password directly. See crewInvite.js.
+const crewInvite = require('./crewInvite');
+
+// Roster and route network in and out as CSV — the same columns both ways, so a
+// VA can take their data to a spreadsheet and bring it back. See crewCsv.js.
+const crewCsv = require('./crewCsv');
+
 // One-paste setup for a VA's Supabase project: given a Supabase access token we
 // install the schema, read the project's keys back and store the connection
 // ourselves, so nobody has to hand-copy three values between two dashboards.
@@ -498,6 +508,17 @@ const CrewApplicationSchema = new mongoose.Schema({
     // again — an emailed invite is easy to lose, and an applicant who gave no
     // email has the status link as their only copy.
     discordInvite: { type: String, trim: true, default: '' },
+    // The invitation handed to an accepted applicant — the legacy mirror of the
+    // invite_* columns in supabase/crew-center-schema.sql. `invitePassword` holds
+    // a live credential until the pilot signs in, staff throw it away, or it
+    // ages out, at which point it is blanked. See crewInvite.js for the
+    // lifecycle and the schema file for why it is kept in readable form.
+    inviteUsername: { type: String, trim: true, default: '' },
+    invitePassword: { type: String, trim: true, default: '' },
+    inviteIssuedAt: { type: Date, default: null },
+    inviteClaimedAt: { type: Date, default: null },
+    inviteRevokedAt: { type: Date, default: null },
+    inviteAccountId: { type: String, trim: true, default: '', index: true },
     reviewedAt: { type: Date, default: null },
 }, { timestamps: true });
 const CrewApplication = mongoose.models.CrewApplication || mongoose.model('CrewApplication', CrewApplicationSchema);
@@ -1721,6 +1742,153 @@ app.delete('/api/crew/:slug/routes/:id', async (req, res) => {
     } catch (err) { crewFail(res, err, { log: 'route delete error', message: 'Could not remove the route.' }); }
 });
 
+// ---- Roster and routes as CSV ----
+//
+// A VA's data being in the VA's own database settles who owns it; being able to
+// carry it out in a form a person can open settles whether that ownership is
+// worth anything. These four endpoints are the same file in both directions —
+// what export writes, import accepts — so a file that goes out and comes back
+// untouched changes nothing.
+//
+// Import never deletes. A row that is in the crew center and not in the file is
+// left where it is: a VA uploading the twelve pilots they recruited this month
+// must not lose the other two hundred, and no amount of inspection tells that
+// file apart from a complete one. See crewCsv.js.
+
+const csvFilename = (slug, kind) => `${String(slug || 'crew').replace(/[^a-z0-9-]/gi, '')}-${kind}-${new Date().toISOString().slice(0, 10)}.csv`;
+
+function sendCsv(res, slug, kind, spec, rows) {
+    res.set('Content-Type', 'text/csv; charset=utf-8');
+    res.set('Content-Disposition', `attachment; filename="${csvFilename(slug, kind)}"`);
+    res.set('Cache-Control', 'no-store');
+    res.send(crewCsv.toCsv(spec, rows));
+}
+
+// Shared by both importers: plan it, and either report the plan or carry it out.
+//
+// The dry run is not an optimisation, it is the point — the dashboard shows a
+// VA what an upload would do before it touches a live roster, and the commit
+// replays that same plan rather than re-deciding.
+async function runCsvImport({ req, res, spec, kind, existing, create, update }) {
+    const csvText = String(req.body?.csv || '');
+    if (!csvText.trim()) return res.status(400).json({ error: 'Attach a CSV file first.' });
+
+    const plan = crewCsv.planImport(spec, csvText, existing);
+    if (plan.error) return res.status(400).json({ error: plan.error });
+
+    const summary = {
+        kind,
+        create: plan.create.length,
+        update: plan.update.length,
+        unchanged: plan.unchanged,
+        errors: plan.errors.slice(0, 50),
+        errorCount: plan.errors.length,
+        matchedOn: plan.matchedOn,
+        columns: plan.columns,
+        missing: plan.missing,
+        // A preview of what would change, so the confirm step can show the
+        // first few rows rather than only a count.
+        sample: {
+            create: plan.create.slice(0, 5).map((r) => r.values),
+            update: plan.update.slice(0, 5).map((r) => ({ id: r.id, before: r.before, values: r.values })),
+        },
+    };
+
+    if (req.body?.dryRun !== false) return res.json({ dryRun: true, ...summary });
+
+    // Refuse a file we could not fully read rather than applying the good half.
+    // A partial import is the worst outcome available: the VA cannot tell what
+    // landed, and re-uploading the fixed file re-applies everything that did.
+    if (plan.errors.length) {
+        return res.status(400).json({
+            error: `Fix the ${plan.errors.length} problem row${plan.errors.length === 1 ? '' : 's'} and import again — nothing has been changed.`,
+            ...summary,
+        });
+    }
+
+    let created = 0; let updated = 0;
+    const failures = [];
+    for (const row of plan.create) {
+        try { await create(row.values); created++; } catch (err) {
+            failures.push({ line: row.line, message: err?.message || 'Could not add this row.' });
+        }
+    }
+    for (const row of plan.update) {
+        try { await update(row.id, row.values, row.before); updated++; } catch (err) {
+            failures.push({ line: row.line, message: err?.message || 'Could not update this row.' });
+        }
+    }
+    res.json({ dryRun: false, ...summary, created, updated, failures });
+}
+
+app.get('/api/crew/:slug/roster.csv', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const members = await store.listMembers();
+        // Exported from the stored row, not from publicMember: the point of an
+        // export is to hand back everything, including the Infinite Flight link
+        // that the roster screen never shows.
+        sendCsv(res, req.params.slug, 'roster', crewCsv.ROSTER_SPEC, (members || []).map((m) => ({
+            id: m._id, name: m.name, callsign: m.callsign, hours: m.hours, role: m.role,
+            aircraft: m.aircraft || [], status: m.status, ifcName: m.ifcName || '', ifUserId: m.ifUserId || '',
+        })));
+    } catch (err) { crewFail(res, err, { log: 'roster export error', message: 'Could not export the roster.' }); }
+});
+
+app.post('/api/crew/:slug/roster/import', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const members = await store.listMembers();
+        await runCsvImport({
+            req, res, kind: 'roster', spec: crewCsv.ROSTER_SPEC,
+            existing: (members || []).map((m) => ({
+                id: m._id, name: m.name, callsign: m.callsign, hours: m.hours, role: m.role,
+                aircraft: m.aircraft || [], status: m.status, ifcName: m.ifcName || '', ifUserId: m.ifUserId || '',
+            })),
+            create: (values) => store.createMember(cleanMember(values)),
+            // Merge over what is already there before cleaning, exactly as the
+            // roster editor's PATCH does — a file with six columns must not
+            // blank the three it never mentioned.
+            update: (id, values, before) => store.updateMember(id, cleanMember({ ...before, ...values })),
+        });
+    } catch (err) { crewFail(res, err, { log: 'roster import error', message: 'Could not import the roster.' }); }
+});
+
+app.get('/api/crew/:slug/routes.csv', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const routes = await store.listRoutes();
+        sendCsv(res, req.params.slug, 'routes', crewCsv.ROUTES_SPEC, (routes || []).map((r) => ({
+            id: r._id, flightNumber: r.flightNumber, origin: r.origin, destination: r.destination,
+            aircraft: r.aircraft, distanceNm: r.distanceNm, notes: r.notes, active: r.active,
+        })));
+    } catch (err) { crewFail(res, err, { log: 'routes export error', message: 'Could not export the routes.' }); }
+});
+
+app.post('/api/crew/:slug/routes/import', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'routes.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const routes = await store.listRoutes();
+        await runCsvImport({
+            req, res, kind: 'routes', spec: crewCsv.ROUTES_SPEC,
+            existing: (routes || []).map((r) => ({
+                id: r._id, flightNumber: r.flightNumber, origin: r.origin, destination: r.destination,
+                aircraft: r.aircraft, distanceNm: r.distanceNm, notes: r.notes, active: r.active,
+            })),
+            create: (values) => store.createRoute(cleanRoute(values)),
+            update: (id, values, before) => store.updateRoute(id, cleanRoute({ ...before, ...values })),
+        });
+    } catch (err) { crewFail(res, err, { log: 'routes import error', message: 'Could not import the routes.' }); }
+});
+
 // ---- Flight reports (PIREPs) — auto-captured from real IF history ----
 const _norm = (s) => String(s || '').trim().toLowerCase();
 // Loose aircraft-name match. Fleet types are the canonical IF names now, so an
@@ -2063,6 +2231,15 @@ app.post('/api/crew/:slug/apply', async (req, res) => {
                     email, createdByName: 'Join form', vaName: ad.name || '',
                 });
                 credentials = { username: r.username, password: r.password, created: r.created };
+                // Keep the invitation on the application row as well as in this
+                // response. The status link handed back below is the only
+                // channel that still reaches an applicant who gave no email and
+                // closed this page before writing the password down.
+                if (r.created && r.password) {
+                    await store.updateApplication(appDoc._id, crewInvite.issuePatch({
+                        username: r.username, password: r.password, accountId: r.account && r.account._id,
+                    })).catch((e) => console.error('join invite persist error:', e?.message || e));
+                }
             } catch (err) {
                 console.error('join account provision error:', err?.message || err);
             }
@@ -2134,16 +2311,44 @@ app.post('/api/crew/:slug/verify-if', async (req, res) => {
     } catch (err) { console.error('verify-if error:', err); res.status(500).json({ error: 'Verification is unavailable right now.' }); }
 });
 
+// Everything a rendering of an invitation needs to know. One builder, used by
+// the acceptance response, the applicant's status page and the staff clipboard,
+// so the three cannot drift into saying different things about the same login.
+function inviteContext(va, appDoc, slug) {
+    return {
+        vaName: (va && va.name) || '',
+        ifcName: (appDoc && appDoc.ifcName) || '',
+        callsign: (((appDoc && appDoc.callsignPrefix) || '') + ((appDoc && appDoc.callsignNumber) || '')).trim(),
+        signInUrl: `${SITE_ORIGIN}/crew/${encodeURIComponent((va && va.slug) || slug)}`,
+        discordInvite: (appDoc && appDoc.discordInvite) || '',
+        staffMessage: (appDoc && appDoc.staffMessage) || '',
+    };
+}
+
+// An invitation that has aged out still has a live password sitting in the row
+// until something notices. Reads are where we notice, so drop it there — a
+// best-effort write that must never fail the read it is riding on.
+function sweepExpiredInvite(store, appDoc) {
+    if (crewInvite.inviteState(appDoc) !== 'expired') return;
+    Promise.resolve(store.updateApplication(appDoc._id, crewInvite.expirePatch()))
+        .catch((e) => console.error('invite expiry sweep error:', e?.message || e));
+}
+
 // Public: an applicant checks the state of their application with the opaque
 // token they were handed at submit time. No account or email needed. Includes
-// any message staff left when they reviewed it.
+// any message staff left when they reviewed it, and — while the invitation is
+// live — the login they were issued.
 app.get('/api/crew/:slug/application-status/:token', async (req, res) => {
     try {
         const token = String(req.params.token || '').trim();
         if (!token) return res.status(400).json({ error: 'Missing status token.' });
-        const { store } = await resolveCrewStore(req.params.slug);
+        const { va, store } = await resolveCrewStore(req.params.slug);
         const appDoc = await store.getApplicationByToken(token);
         if (!appDoc) return res.status(404).json({ error: 'We could not find that application.' });
+        sweepExpiredInvite(store, appDoc);
+        // This response can carry a credential, so it must not be stored by a
+        // browser cache or by anything between here and the applicant.
+        res.set('Cache-Control', 'no-store');
         res.json({
             status: appDoc.status,
             message: appDoc.staffMessage || '',
@@ -2152,22 +2357,45 @@ app.get('/api/crew/:slug/application-status/:token', async (req, res) => {
             // Only meaningful once accepted, and only ever set by the accept
             // handler from a validated invite.
             discordInvite: appDoc.status === 'accepted' ? (appDoc.discordInvite || '') : '',
+            // The login they were issued, for as long as the invitation is live.
+            // null once they have signed in, once staff have thrown it away, and
+            // once it has aged out — the status link stops being a way in the
+            // moment it stops needing to be one.
+            credentials: appDoc.status === 'accepted'
+                ? crewInvite.applicantCredentials(appDoc, inviteContext(va, appDoc, req.params.slug))
+                : null,
             reviewedAt: appDoc.reviewedAt || null,
             submittedAt: appDoc.createdAt || null,
         });
     } catch (err) { crewFail(res, err, { log: 'application-status error', message: 'Could not load that application.' }); }
 });
 
+// An application on its way out to staff. The raw row carries the invitation's
+// stored password, and handing that straight to the browser would show one that
+// has quietly aged out — so the invite fields are replaced wholesale by the
+// accessor that knows the difference. There is one shape, so there is one place
+// to get this wrong.
+function staffApplication(appDoc, va, slug) {
+    const {
+        inviteUsername, invitePassword, inviteIssuedAt, inviteClaimedAt,
+        inviteRevokedAt, inviteAccountId, ...rest
+    } = appDoc || {};
+    return { ...rest, invite: crewInvite.staffInvite(appDoc, inviteContext(va, appDoc, slug)) };
+}
+
 // Staff: list applications (default pending).
 app.get('/api/crew/:slug/applications', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'applications.review');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
+        const { va, store } = await resolveCrewStore(req.params.slug);
         const wanted = String(req.query.status || '');
         const status = ['pending', 'accepted', 'declined'].includes(wanted) ? wanted : 'pending';
-        const applications = await store.listApplications({ status });
-        res.json({ applications });
+        const rows = await store.listApplications({ status });
+        (rows || []).forEach((a) => sweepExpiredInvite(store, a));
+        // Live passwords may be in here, so keep it out of every cache.
+        res.set('Cache-Control', 'no-store');
+        res.json({ applications: (rows || []).map((a) => staffApplication(a, va, req.params.slug)) });
     } catch (err) { crewFail(res, err, { log: 'applications list error', message: 'Could not load applications.' }); }
 });
 // Staff: accept / decline an application. Accept creates the pilot.
@@ -2252,6 +2480,16 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
                     // A password comes back only on first creation; re-accepting
                     // someone who already has a login yields username-only.
                     credentials = { username: r.username, password: r.password, created: r.created };
+                    // Fold the invitation into the same patch that records the
+                    // decision, so the acceptance and the credential it produced
+                    // are one write. It stays readable — to staff, and to the
+                    // holder of the status link — until the pilot signs in, a
+                    // staff member throws it away, or it ages out.
+                    if (r.created && r.password) {
+                        Object.assign(patch, crewInvite.issuePatch({
+                            username: r.username, password: r.password, accountId: r.account && r.account._id,
+                        }));
+                    }
                 } catch (err) {
                     console.error('pilot account provision error:', err?.message || err);
                     // An older schema is the one failure the VA can act on, so
@@ -2311,10 +2549,11 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
                         ? { label: signInEmail ? 'Sign in to the crew center' : 'Open the crew center', url: centerUrl }
                         : { label: 'View your application', url: statusUrl } }) }).catch(() => {});
         }
-        // `credentials` carries the ONLY copy of the temporary password. It is
-        // returned here so the reviewer can pass it on when the applicant left
-        // no email address — the dashboard shows it once and warns that it will
-        // not be shown again.
+        // `account` is the credential as it was just minted; `invite` is the
+        // same thing as it will look on every later read, message included, so
+        // the dashboard renders one card here and after a reload. This response
+        // can carry a password, so it is not cacheable.
+        res.set('Cache-Control', 'no-store');
         res.json({
             status: appDoc.status,
             message: appDoc.staffMessage || '',
@@ -2325,8 +2564,99 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
             // link with the credentials when there was no email to send them to.
             signInUrl: accepted ? `${SITE_ORIGIN}/crew/${encodeURIComponent(va.slug || req.params.slug)}` : '',
             account: credentials,
+            invite: accepted
+                ? crewInvite.staffInvite(appDoc, inviteContext(va, appDoc, req.params.slug))
+                : null,
         });
     } catch (err) { crewFail(res, err, { log: 'application review error', message: 'Could not update the application.' }); }
+});
+
+// ---- The invitation on an accepted application ----
+//
+// An acceptance produces a login that somebody still has to deliver, usually by
+// hand and usually later — an IFC message, a Discord DM. These three endpoints
+// are that gap: read the invitation back (with the message ready to paste),
+// mint a fresh one when the first never arrived, or throw it away.
+//
+// All three are gated on applications.review rather than owner-only. Whoever is
+// trusted to accept a pilot is by definition trusted to hand them their login;
+// making this owner-only would mean the person who did the accepting cannot
+// finish the job.
+
+// Locate the account an invitation belongs to. The id is recorded when the
+// invitation is issued, but an invitation written before that (or one whose
+// account was rebuilt) still resolves by the username it names.
+async function inviteAccountFor(store, appDoc) {
+    if (appDoc.inviteAccountId) {
+        const byId = await store.getAccount(appDoc.inviteAccountId).catch(() => null);
+        if (byId) return byId;
+    }
+    if (appDoc.inviteUsername) {
+        return store.getAccountByUsername(String(appDoc.inviteUsername).toLowerCase()).catch(() => null);
+    }
+    return null;
+}
+
+// Read one invitation back, message included.
+app.get('/api/crew/:slug/applications/:id/invite', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'applications.review');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const appDoc = await store.getApplication(req.params.id);
+        if (!appDoc) return res.status(404).json({ error: 'Application not found.' });
+        sweepExpiredInvite(store, appDoc);
+        res.set('Cache-Control', 'no-store');
+        res.json({ invite: crewInvite.staffInvite(appDoc, inviteContext(va, appDoc, req.params.slug)) });
+    } catch (err) { crewFail(res, err, { log: 'invite read error', message: 'Could not load that invitation.' }); }
+});
+
+// Mint a fresh temporary password for a pilot who never got the first one.
+//
+// This resets the account's real password too — the two cannot be allowed to
+// disagree, or the invitation would show a password that does not work. Which
+// also means it invalidates whatever the pilot may already be holding, so the
+// dashboard asks before calling it.
+app.post('/api/crew/:slug/applications/:id/invite/regenerate', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'applications.review');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const appDoc = await store.getApplication(req.params.id);
+        if (!appDoc) return res.status(404).json({ error: 'Application not found.' });
+        if (appDoc.status !== 'accepted') {
+            return res.status(400).json({ error: 'Only an accepted application has an invitation.' });
+        }
+        const account = await inviteAccountFor(store, appDoc);
+        if (!account) {
+            return res.status(404).json({ error: 'This pilot has no crew center login to reissue. Create one from the roster.' });
+        }
+        const reset = await crewAccounts.resetPassword(store, account._id);
+        if (!reset) return res.status(404).json({ error: 'This pilot has no crew center login to reissue.' });
+        const updated = await store.updateApplication(appDoc._id, crewInvite.issuePatch({
+            username: reset.username, password: reset.password, accountId: account._id,
+        })) || { ...appDoc };
+        res.set('Cache-Control', 'no-store');
+        res.json({ invite: crewInvite.staffInvite(updated, inviteContext(va, updated, req.params.slug)) });
+    } catch (err) { crewFail(res, err, { log: 'invite regenerate error', message: 'Could not reissue that invitation.' }); }
+});
+
+// Throw the invitation away.
+//
+// Deliberately does NOT touch the pilot's account: an invitation nobody needs
+// any more is not the same event as a pilot losing their login, and conflating
+// them would make tidying up the applications list a way to lock somebody out.
+// Suspending or deleting the account is its own action on the accounts screen.
+app.delete('/api/crew/:slug/applications/:id/invite', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'applications.review');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const appDoc = await store.getApplication(req.params.id);
+        if (!appDoc) return res.status(404).json({ error: 'Application not found.' });
+        const updated = await store.updateApplication(appDoc._id, crewInvite.revokePatch()) || { ...appDoc };
+        res.json({ invite: crewInvite.staffInvite(updated, inviteContext(va, updated, req.params.slug)) });
+    } catch (err) { crewFail(res, err, { log: 'invite revoke error', message: 'Could not discard that invitation.' }); }
 });
 
 // ---- Public statistics ----

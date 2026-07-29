@@ -25,8 +25,32 @@ const crypto = require('crypto');
 
 const crewStore = require('./crewStore');
 const crewAccounts = require('./crewAccounts');
+const crewInvite = require('./crewInvite');
 
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString('hex');
+
+/**
+ * Retire the invitation that let a pilot in, the moment they use it.
+ *
+ * Deliberately returns nothing and swallows everything. This runs after a
+ * password has already been checked and accepted, so there is no outcome here —
+ * including "the store went away mid-login" — that should turn a successful
+ * sign-in into a failure. The worst case is an invitation that stays readable
+ * until it expires, which is what would have happened anyway.
+ */
+function claimInvitation(store, accountId) {
+    if (!store || !accountId || typeof store.getApplicationByInviteAccount !== 'function') return;
+    Promise.resolve()
+        .then(async () => {
+            const appDoc = await store.getApplicationByInviteAccount(String(accountId));
+            // No invitation, or one that has already been spent. Either way
+            // there is nothing left to clear, and re-stamping a claim date that
+            // is already set would only move it.
+            if (!appDoc || !appDoc.invitePassword) return;
+            await store.updateApplication(appDoc._id, crewInvite.claimPatch());
+        })
+        .catch((err) => console.warn('crew login: could not clear invitation —', err?.message || err));
+}
 const TOKEN_TTL = '7d';
 
 // Known layout presets + login looks (mirrors the crew center front-end).
@@ -288,6 +312,16 @@ function registerCrewAuthRoutes(app) {
                         name: pilot.displayName || pilot.username,
                         mustChangePassword: !!pilot.mustChangePassword,
                     };
+                    // The invitation has done its job. Clearing it here rather
+                    // than on the password change is on purpose: arriving is the
+                    // proof it was delivered, and a pilot who signs in and then
+                    // wanders off should not leave a live credential on a status
+                    // page anyone they forwarded the link to can still read.
+                    //
+                    // Fire-and-forget, and it must stay that way — a store that
+                    // cannot record this is not a reason to refuse a login whose
+                    // password we have already verified.
+                    claimInvitation(store, pilot._id);
                 }
             } catch (err) {
                 if (err && err.code !== 'store_not_connected') {

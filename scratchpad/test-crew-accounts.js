@@ -58,7 +58,7 @@ let hasAccounts = true;
 const tables = {
     crew_members: [],
     crew_accounts: [],
-    crew_schema_info: [{ version: 3, installed_at: '2026-01-01T00:00:00Z' }],
+    crew_schema_info: [{ version: 4, installed_at: '2026-01-01T00:00:00Z' }],
 };
 let seq = 0;
 const uuid = () => `id-${++seq}`;
@@ -234,7 +234,7 @@ const server = http.createServer((req, res) => {
     T('health reports the project cannot hold logins', health.accounts, false);
     T('and flags it as outdated', health.outdated, true);
     hasAccounts = true;
-    tables.crew_schema_info[0].version = 3;
+    tables.crew_schema_info[0].version = 4;
     T('a current project reports it can', (await store.health()).accounts, true);
 
     server.close();
