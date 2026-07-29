@@ -54,7 +54,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 6;
+const EXPECTED_SCHEMA_VERSION = 7;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -92,6 +92,9 @@ const EVENTS_SCHEMA_VERSION = 6;
 // ---------------------------------------------------------------------------
 const LATE_COLUMNS = {
     crew_routes: new Set(['kind', 'partner_name', 'partner_logo', 'min_rank']),
+    crew_members: new Set(['checks_passed']),
+    crew_events: new Set(['route_id']),
+    crew_pireps: new Set(['event_id']),
     crew_applications: new Set([
         'discord_invite', 'invite_username', 'invite_password',
         'invite_issued_at', 'invite_claimed_at', 'invite_revoked_at', 'invite_account_id',
@@ -100,6 +103,9 @@ const LATE_COLUMNS = {
 
 // What each dropped column costs, in words a VA reads rather than column names.
 const DRIFT_LABELS = {
+    'crew_members.checks_passed': 'check-ride sign-offs',
+    'crew_events.route_id': 'events tied to a route',
+    'crew_pireps.event_id': 'flights logged against an event',
     'crew_routes.kind': 'codeshare routes',
     'crew_routes.partner_name': 'codeshare partner names',
     'crew_routes.partner_logo': 'codeshare partner logos',
@@ -211,6 +217,9 @@ const memberFromRow = (r) => r && {
     status: r.status || 'active',
     ifUserId: r.if_user_id || '',
     ifcName: r.ifc_name || '',
+    // v7. The rungs this pilot has been signed off for. Names, not indexes —
+    // see the schema, and crewRanks' header, for why.
+    checksPassed: Array.isArray(r.checks_passed) ? r.checks_passed : [],
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
 };
@@ -224,6 +233,8 @@ const memberToRow = (m) => {
     pick(m, out, 'status', 'status', (v) => (['active', 'loa', 'inactive'].includes(v) ? v : 'active'));
     pick(m, out, 'ifUserId', 'if_user_id', (v) => str(v, 40));
     pick(m, out, 'ifcName', 'ifc_name', (v) => str(v, 60));
+    pick(m, out, 'checksPassed', 'checks_passed', (v) => (Array.isArray(v)
+        ? [...new Set(v.map((c) => str(c, 40)).filter(Boolean))].slice(0, 40) : []));
     return out;
 };
 
@@ -306,6 +317,8 @@ const pirepFromRow = (r) => r && {
     _id: r.id,
     memberId: r.member_id || null,
     routeId: r.route_id || null,
+    // v7. The event this flight was flown for, when it was flown for one.
+    eventId: r.event_id || null,
     pilotName: r.pilot_name || '',
     callsign: r.callsign || '',
     flightNumber: r.flight_number || '',
@@ -334,6 +347,7 @@ const pirepToRow = (p) => {
     const out = {};
     pick(p, out, 'memberId', 'member_id', (v) => v || null);
     pick(p, out, 'routeId', 'route_id', (v) => v || null);
+    pick(p, out, 'eventId', 'event_id', (v) => (str(v, 64) || null));
     pick(p, out, 'pilotName', 'pilot_name', (v) => str(v, 60));
     pick(p, out, 'callsign', 'callsign', (v) => str(v, 20));
     pick(p, out, 'flightNumber', 'flight_number', (v) => str(v, 12));
@@ -432,6 +446,10 @@ const eventFromRow = (r) => r && {
     destination: r.destination || '',
     aircraft: r.aircraft || '',
     flightNumber: r.flight_number || '',
+    // v7. The leg in the VA's own network this event is flown on, when it is
+    // one. The leg details above are kept alongside rather than read through
+    // it — plenty of events are one-offs the network does not carry.
+    routeId: r.route_id || null,
     server: r.server || '',
     startsAt: date(r.starts_at),
     endsAt: date(r.ends_at),
@@ -459,6 +477,8 @@ const eventToRow = (e) => {
     pick(e, out, 'destination', 'destination', icao);
     pick(e, out, 'aircraft', 'aircraft', (v) => str(v, 60));
     pick(e, out, 'flightNumber', 'flight_number', (v) => str(v, 12));
+    // A uuid column: '' is not a valid uuid, so "no route" has to go as null.
+    pick(e, out, 'routeId', 'route_id', (v) => (str(v, 64) || null));
     pick(e, out, 'server', 'server', (v) => str(v, 30));
     pick(e, out, 'startsAt', 'starts_at', (v) => (date(v) ? date(v).toISOString() : null));
     pick(e, out, 'endsAt', 'ends_at', (v) => (date(v) ? date(v).toISOString() : null));
@@ -509,6 +529,35 @@ const signupToRow = (s) => {
     pick(s, out, 'gateKind', 'gate_kind', (v) => str(v, 30));
     pick(s, out, 'note', 'note', (v) => str(v, 300));
     pick(s, out, 'status', 'status', (v) => (v === 'waitlist' ? 'waitlist' : 'going'));
+    return out;
+};
+
+// v7. A row on the VA's noticeboard. Two kinds of thing live here in one
+// shape: what staff write, and what the crew center writes for them when
+// something worth telling the crew happens.
+const announcementFromRow = (r) => r && {
+    _id: r.id,
+    title: r.title || '',
+    body: r.body || '',
+    kind: r.kind || 'notice',
+    source: r.source === 'auto' ? 'auto' : 'staff',
+    pinned: !!r.pinned,
+    refId: r.ref_id || null,
+    authorName: r.author_name || '',
+    createdAt: date(r.created_at),
+    updatedAt: date(r.updated_at),
+};
+const ANNOUNCEMENT_KINDS = ['notice', 'promotion', 'join', 'event', 'checkride'];
+const announcementToRow = (a) => {
+    const out = {};
+    pick(a, out, 'title', 'title', (v) => str(v, 160));
+    pick(a, out, 'body', 'body', (v) => str(v, 4000));
+    pick(a, out, 'kind', 'kind', (v) => (ANNOUNCEMENT_KINDS.includes(v) ? v : 'notice'));
+    pick(a, out, 'source', 'source', (v) => (v === 'auto' ? 'auto' : 'staff'));
+    pick(a, out, 'pinned', 'pinned', (v) => !!v);
+    // A uuid column: '' is not a valid uuid, so an empty id has to go as null.
+    pick(a, out, 'refId', 'ref_id', (v) => (str(v, 64) || null));
+    pick(a, out, 'authorName', 'author_name', (v) => str(v, 80));
     return out;
 };
 
@@ -854,6 +903,17 @@ class SupabaseStore {
     }
     async deletePirep(id) { await this.db.remove('crew_pireps', this.ident(id)); return true; }
 
+    // The flights filed for one event. Answers "who actually flew it?", which
+    // is a different question from "who said they were coming" and the one
+    // that matters after the fact.
+    async listPirepsForEvent(eventId, { limit = 500 } = {}) {
+        if (!eventId) return [];
+        const rows = await this.db.select('crew_pireps', {
+            ...this.scope, event_id: `eq.${eventId}`, order: 'flown_at.desc.nullslast,created_at.desc', limit,
+        });
+        return (rows || []).map(pirepFromRow);
+    }
+
     // Which of these Infinite Flight flight ids have we already captured? Used
     // by the sync to skip flights without attempting (and failing) an insert.
     async seenFlightIds(flightIds) {
@@ -993,6 +1053,51 @@ class SupabaseStore {
     }
     deleteSignup(id) {
         return this.events(async () => { await this.db.remove('crew_event_signups', this.ident(id)); return true; });
+    }
+
+    // --- The noticeboard ---
+    //
+    // Wrapped like events and accounts: a project on a pre-v7 schema has no
+    // crew_announcements table, and the caller that writes to it is almost
+    // always doing so as a SIDE EFFECT of something that has already happened
+    // (a promotion, a pilot joining). So the missing table has to surface as a
+    // thing the VA can fix, and the caller has to be free to ignore it.
+    async announcements(fn) {
+        try { return await fn(); } catch (err) {
+            if (err instanceof CrewStoreError && err.code === 'store_schema_missing') {
+                throw new CrewStoreError(
+                    'This crew center’s project does not have the announcements table yet. Re-run the setup SQL (Settings → Data store) to add it.',
+                    { status: 409, code: 'store_announcements_missing', detail: err.detail });
+            }
+            throw err;
+        }
+    }
+
+    listAnnouncements({ limit = 50 } = {}) {
+        return this.announcements(async () => {
+            const rows = await this.db.select('crew_announcements', {
+                ...this.scope, order: 'pinned.desc,created_at.desc', limit,
+            });
+            return (rows || []).map(announcementFromRow);
+        });
+    }
+    getAnnouncement(id) {
+        return this.announcements(() => this.one('crew_announcements', this.ident(id), announcementFromRow));
+    }
+    createAnnouncement(data) {
+        return this.announcements(async () => {
+            const [row] = await this.db.insert('crew_announcements', { va_slug: this.slug, ...announcementToRow(data) });
+            return announcementFromRow(row);
+        });
+    }
+    updateAnnouncement(id, patch) {
+        return this.announcements(async () => {
+            const [row] = await this.db.update('crew_announcements', this.ident(id), announcementToRow(patch));
+            return row ? announcementFromRow(row) : null;
+        });
+    }
+    deleteAnnouncement(id) {
+        return this.announcements(async () => { await this.db.remove('crew_announcements', this.ident(id)); return true; });
     }
 
     // --- Aggregates ---
@@ -1214,6 +1319,8 @@ class LegacyStore {
         return this.lean(p);
     }
     async deletePirep(id) { await models.CrewPirep.deleteOne({ ...this.q, _id: id }); return true; }
+    // No events on this path, so nothing was ever flown for one.
+    async listPirepsForEvent() { return []; }
     async seenFlightIds(flightIds) {
         const ids = (flightIds || []).filter(Boolean);
         if (!ids.length) return new Set();
@@ -1268,6 +1375,19 @@ class LegacyStore {
     createSignup() { return this.events(); }
     updateSignup() { return this.events(); }
     deleteSignup() { return this.events(); }
+
+    // The noticeboard, like events, is not built on the retiring path. Same
+    // reasoning, same shape of refusal.
+    announcements() {
+        return Promise.reject(new CrewStoreError(
+            'The noticeboard needs your VA’s own database. Connect one in Crew Center → Settings → Data store.',
+            { status: 409, code: 'store_announcements_unsupported' }));
+    }
+    listAnnouncements() { return this.announcements(); }
+    getAnnouncement() { return this.announcements(); }
+    createAnnouncement() { return this.announcements(); }
+    updateAnnouncement() { return this.announcements(); }
+    deleteAnnouncement() { return this.announcements(); }
 
     async stats() {
         const [members, pireps, routes, applications] = await Promise.all([

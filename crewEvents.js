@@ -88,6 +88,10 @@ function sanitizeEvent(b) {
         destination: icao(b.destination),
         aircraft: str(b.aircraft, 60),
         flightNumber: str(b.flightNumber, 12),
+        // The leg in the VA's network this event is flown on, when it is one.
+        // '' rather than a uuid means a one-off: a fly-in from anywhere, a
+        // charter to a field the network does not serve.
+        routeId: str(b.routeId, 64),
         server: str(b.server, 30),
         startsAt: when(b.startsAt),
         endsAt: when(b.endsAt),
@@ -168,6 +172,7 @@ function publicEvent(e, { signups = null, ranks = null, viewer = null, canManage
         destination: e.destination,
         aircraft: e.aircraft,
         flightNumber: e.flightNumber,
+        routeId: e.routeId || null,
         server: e.server,
         startsAt: e.startsAt,
         endsAt: e.endsAt,

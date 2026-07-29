@@ -99,9 +99,26 @@ create table if not exists crew_members (
     -- A member with an if_user_id is eligible for automatic PIREP capture.
     if_user_id  text not null default '',
     ifc_name    text not null default '',
+    -- ------------------------------------------------------------------------
+    -- v7. Check-rides.
+    --
+    -- The names of the rungs this pilot has been signed off for. A VA can mark
+    -- any rung of their ladder "requires a check-ride" (crew center settings →
+    -- ranks), and a pilot who has the hours for such a rung does NOT hold it
+    -- until their name appears here — they sit at the rung below, marked as
+    -- ready, and staff sign them off.
+    --
+    -- Names, not indexes, for the reason min_rank is a name: a VA reordering
+    -- their ladder must not silently un-promote their whole roster. A rung that
+    -- is renamed lets the requirement lapse, so the failure mode is "the pilot
+    -- gets promoted" rather than "the pilot is stuck and nobody knows why".
+    -- ------------------------------------------------------------------------
+    checks_passed text[] not null default '{}',
     created_at  timestamptz not null default now(),
     updated_at  timestamptz not null default now()
 );
+-- v7. Added separately so a project provisioned at v1–v6 picks it up on re-run.
+alter table crew_members add column if not exists checks_passed text[] not null default '{}';
 create index if not exists crew_members_va_idx      on crew_members (va_slug);
 create index if not exists crew_members_hours_idx   on crew_members (va_slug, hours desc);
 create index if not exists crew_members_if_idx      on crew_members (va_slug, if_user_id) where if_user_id <> '';
@@ -307,6 +324,16 @@ create table if not exists crew_pireps (
     va_slug       text not null,
     member_id     uuid references crew_members (id) on delete set null,
     route_id      uuid references crew_routes  (id) on delete set null,
+    -- v7. The event this flight was flown for, when it was flown for one.
+    -- Set when a pilot files from an event's brief, which is what lets the
+    -- event show what has actually been flown rather than only who said they
+    -- would turn up.
+    --
+    -- The foreign key is added further down, once crew_events exists — this
+    -- table is created before it, and a reference to a table that is not there
+    -- yet fails a FRESH install while looking fine on an upgrade. The column is
+    -- declared bare here and constrained there.
+    event_id      uuid,
     -- Denormalised so a report still reads correctly after the pilot or route
     -- it points at has been deleted.
     pilot_name    text not null default '',
@@ -335,8 +362,14 @@ create table if not exists crew_pireps (
     created_at    timestamptz not null default now(),
     updated_at    timestamptz not null default now()
 );
+-- v7. Added separately so a project provisioned at v1–v6 picks it up on re-run.
+-- The constraint that ties it to crew_events waits until that table exists —
+-- see the block below crew_event_signups.
+alter table crew_pireps add column if not exists event_id uuid;
 create index if not exists crew_pireps_va_idx     on crew_pireps (va_slug, status, flown_at desc);
 create index if not exists crew_pireps_member_idx on crew_pireps (va_slug, member_id);
+-- What has been flown for an event. Partial: almost no flight belongs to one.
+create index if not exists crew_pireps_event_idx  on crew_pireps (va_slug, event_id) where event_id is not null;
 -- One row per real Infinite Flight flight. Enforced in the database rather than
 -- in application code so two concurrent syncs cannot both insert the same leg.
 create unique index if not exists crew_pireps_flight_idx
@@ -376,6 +409,20 @@ create table if not exists crew_events (
     destination   text not null default '',
     aircraft      text not null default '',
     flight_number text not null default '',
+    -- ------------------------------------------------------------------------
+    -- v7. The leg this event is flown on, when it is one of the VA's own.
+    --
+    -- Optional, and the leg details above are kept alongside it rather than
+    -- read through it. An event is often a route the airline already publishes
+    -- — picking it fills the fields in and ties the two together, so a PIREP
+    -- filed for the event credits against the route like any other flight. But
+    -- plenty of events are one-offs (a fly-in from anywhere, a charter to a
+    -- field the network does not serve), so the leg has to stand on its own.
+    --
+    -- `on delete set null`: retiring a route must not delete the event that was
+    -- flown on it, nor quietly blank the leg everybody signed up for.
+    -- ------------------------------------------------------------------------
+    route_id      uuid references crew_routes (id) on delete set null,
     -- Which Infinite Flight server this is being flown on. Free text: the
     -- server list is Infinite Flight's to change, not ours to constrain.
     server        text not null default '',
@@ -400,6 +447,8 @@ create table if not exists crew_events (
     created_at    timestamptz not null default now(),
     updated_at    timestamptz not null default now()
 );
+-- v7. Added separately so a project provisioned at v6 picks it up on a re-run.
+alter table crew_events add column if not exists route_id uuid references crew_routes (id) on delete set null;
 create index if not exists crew_events_va_idx     on crew_events (va_slug, starts_at desc);
 create index if not exists crew_events_public_idx on crew_events (va_slug, starts_at) where status = 'published';
 
@@ -465,6 +514,65 @@ create unique index if not exists crew_event_signups_account_idx
 create unique index if not exists crew_event_signups_member_idx
     on crew_event_signups (event_id, member_id) where member_id is not null;
 
+-- v7. crew_pireps.event_id points at an event, and can only say so once
+-- crew_events exists — which, in file order, is here. `on delete set null`:
+-- deleting an event must not delete anybody's logbook entry, and a flight that
+-- was flown was still flown after the event it belonged to is gone.
+--
+-- Wrapped because `add constraint` has no `if not exists`, and this file is run
+-- again on every upgrade.
+do $$
+begin
+    alter table crew_pireps
+        add constraint crew_pireps_event_fk
+        foreign key (event_id) references crew_events (id) on delete set null;
+exception
+    when duplicate_object then null;
+end $$;
+
+-- ----------------------------------------------------------------------------
+-- Announcements. v7.
+--
+-- The noticeboard on a pilot's home page. Two kinds of row live here and they
+-- are deliberately the same shape:
+--
+--   * what staff write — "July schedule is live", pinned notices, briefings;
+--   * what the crew center writes for them — a pilot promoted, a pilot joined,
+--     an event published.
+--
+-- The second kind is the point. A VA's own good news already happens inside the
+-- crew center and was visible only as a Discord message that scrolls away; a
+-- pilot who joins on Tuesday should still see on Friday that they joined, and
+-- that two other people did too. `kind` is what lets the page draw them
+-- differently without needing a second table, and `source = 'auto'` is what
+-- stops a staff member's hand-written notice being tidied up by a job that
+-- prunes generated ones.
+--
+-- `ref_id` points at whatever caused an automatic row (a member, an event). It
+-- is deliberately NOT a foreign key: an announcement is a record of something
+-- that happened, and it stays true after the pilot leaves or the event is
+-- deleted. Nothing reads it back as a join — it is there so a page can offer a
+-- link when the target still exists.
+-- ----------------------------------------------------------------------------
+create table if not exists crew_announcements (
+    id          uuid primary key default gen_random_uuid(),
+    va_slug     text not null,
+    title       text not null default '',
+    body        text not null default '',
+    kind        text not null default 'notice'
+                check (kind in ('notice','promotion','join','event','checkride')),
+    source      text not null default 'staff' check (source in ('staff','auto')),
+    -- Pinned notices sort above everything regardless of age: "read the new
+    -- rules before you file" has to stay at the top of the board.
+    pinned      boolean not null default false,
+    ref_id      uuid,
+    author_name text not null default '',
+    created_at  timestamptz not null default now(),
+    updated_at  timestamptz not null default now()
+);
+create index if not exists crew_announcements_va_idx
+    on crew_announcements (va_slug, pinned desc, created_at desc);
+
 -- ----------------------------------------------------------------------------
 -- updated_at maintenance
 -- ----------------------------------------------------------------------------
@@ -479,7 +587,7 @@ $$;
 do $$
 declare t text;
 begin
-    foreach t in array array['crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps','crew_events','crew_event_signups','crew_schema_info']
+    foreach t in array array['crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps','crew_events','crew_event_signups','crew_announcements','crew_schema_info']
     loop
         execute format('drop trigger if exists %I on %I', t || '_touch', t);
         execute format(
@@ -627,6 +735,7 @@ alter table crew_routes        enable row level security;
 alter table crew_pireps        enable row level security;
 alter table crew_events        enable row level security;
 alter table crew_event_signups enable row level security;
+alter table crew_announcements enable row level security;
 alter table crew_schema_info   enable row level security;
 
 drop policy if exists crew_members_public_read on crew_members;
@@ -664,12 +773,21 @@ create policy crew_event_signups_public_read on crew_event_signups
         )
     );
 
+-- The noticeboard is what a VA tells its crew, and a crew center shows it to
+-- anyone looking at the airline. Nothing sensitive goes in it — staff write the
+-- notices, and the generated ones carry names that are already on the public
+-- roster.
+drop policy if exists crew_announcements_public_read on crew_announcements;
+create policy crew_announcements_public_read on crew_announcements
+    for select to anon, authenticated using (true);
+
 drop policy if exists crew_schema_info_public_read on crew_schema_info;
 create policy crew_schema_info_public_read on crew_schema_info
     for select to anon, authenticated using (true);
 
 grant usage on schema public to anon, authenticated;
-grant select on crew_members, crew_routes, crew_pireps, crew_events, crew_event_signups, crew_schema_info to anon, authenticated;
+grant select on crew_members, crew_routes, crew_pireps, crew_events, crew_event_signups,
+    crew_announcements, crew_schema_info to anon, authenticated;
 -- Deliberately NOT granted on crew_applications or crew_accounts. The first
 -- holds applicant emails and unclaimed invitation passwords, the second holds
 -- password hashes; neither has a policy above, and revoking the grant means a
@@ -687,5 +805,5 @@ grant execute on function crew_stats(text) to anon, authenticated;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 6)
+insert into crew_schema_info (id, version) values (1, 7)
 on conflict (id) do update set version = excluded.version, updated_at = now();
