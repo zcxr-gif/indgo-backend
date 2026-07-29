@@ -115,9 +115,80 @@ console.log('\n what a member carries');
 const badge = R.memberRank(LADDER, 0);
 T('a new pilot carries the entry rank', badge.name, 'Cadet');
 T('  …with its styling', [badge.color, badge.icon], ['#64748b', 'star']);
-T('  …and what is next', badge.next, { name: 'Second Officer', minHours: 25, hoursAway: 25 });
+T('  …and what is next', badge.next,
+    { name: 'Second Officer', minHours: 25, hoursAway: 25, requiresCheck: false });
 T('a top-rank pilot has no next', R.memberRank(LADDER, 5000).next, null);
 T('no ladder means no badge at all', R.memberRank([], 100), null);
+
+// --- Check-rides ------------------------------------------------------------
+//
+// A rung a VA has gated on a check-ride is the one place hours do not decide
+// rank. What is checked here is that hours get a pilot to the door and no
+// further, that they are told they are AT the door, that a sign-off both
+// promotes and announces, and — the two that would be quiet disasters — that a
+// gated rung is never leapfrogged, and that a ladder edit fails toward
+// promoting people rather than stranding them.
+console.log('\n check-rides');
+const CHECKED = [
+    { name: 'Cadet', minHours: 0 },
+    { name: 'Second Officer', minHours: 25 },
+    { name: 'First Officer', minHours: 100 },
+    { name: 'Captain', minHours: 300, requiresCheck: true, checkNote: 'One long-haul sector with a training captain.' },
+    { name: 'Senior Captain', minHours: 600 },
+];
+
+T('below the gate, nothing changes', R.rankForHours(CHECKED, 150, []).name, 'First Officer');
+T('at the gate WITHOUT a sign-off, the pilot holds the rung below',
+    R.rankForHours(CHECKED, 400, []).name, 'First Officer');
+T('  …and is told which rung they are waiting on',
+    R.awaitingCheck(CHECKED, 400, []).name, 'Captain');
+T('  …in the VA’s own words',
+    R.awaitingCheck(CHECKED, 400, []).checkNote, 'One long-haul sector with a training captain.');
+T('with the sign-off, the rung is theirs',
+    R.rankForHours(CHECKED, 400, ['Captain']).name, 'Captain');
+T('  …and nobody is waiting on anything', R.awaitingCheck(CHECKED, 400, ['Captain']), null);
+T('sign-off is matched case-insensitively, like every other rank reference',
+    R.rankForHours(CHECKED, 400, ['captain']).name, 'Captain');
+
+// The quiet disaster: hours for a rung ABOVE the gate must not carry a pilot
+// over it. A ladder is a ladder.
+T('a gated rung is never leapfrogged, however many hours are logged',
+    R.rankForHours(CHECKED, 5000, []).name, 'First Officer');
+T('  …and clearing it releases everything above it',
+    R.rankForHours(CHECKED, 5000, ['Captain']).name, 'Senior Captain');
+
+// The other one: an edit to the ladder must fail toward promoting people.
+T('a renamed gate lapses rather than stranding the pilot',
+    R.rankForHours([{ name: 'Cadet', minHours: 0 }, { name: 'Skipper', minHours: 300 }], 400, []).name, 'Skipper');
+T('a check-ride on the ENTRY rung is ignored — there is nothing below it',
+    R.rankForHours([{ name: 'Cadet', minHours: 0, requiresCheck: true }], 0, []).name, 'Cadet');
+
+// Hours crossing a gated rung is not a promotion — it is a pilot arriving at a
+// door. Announcing "Jo is now a Captain" there would be a lie staff then have
+// to walk back.
+T('crossing INTO a gated rung announces nothing', R.promotionFor(CHECKED, 250, 400, []), null);
+T('  …but crossing an ungated one still does',
+    R.promotionFor(CHECKED, 50, 150, []).to.name, 'First Officer');
+T('and the sign-off is what announces the promotion',
+    R.promotionForCheck(CHECKED, 400, [], ['Captain']).to.name, 'Captain');
+T('  …saying where from', R.promotionForCheck(CHECKED, 400, [], ['Captain']).from.name, 'First Officer');
+T('revoking a sign-off announces NOTHING, like every other downward move',
+    R.promotionForCheck(CHECKED, 400, ['Captain'], []), null);
+T('signing off a pilot who has not got the hours announces nothing',
+    R.promotionForCheck(CHECKED, 50, [], ['Captain']), null);
+
+const waiting = R.memberRank(CHECKED, 400, []);
+T('the badge shows the rank actually held', waiting.name, 'First Officer');
+T('  …and that a check-ride is what is holding it up', waiting.awaitingCheck.name, 'Captain');
+// "Next" is the rung ABOVE the one held, not the next threshold in hours —
+// otherwise a pilot waiting on their Captain check is told Senior Captain is
+// what's next, which is both true and useless.
+T('  …and the next rung is the one blocking them, not the one past it',
+    waiting.next.name, 'Captain');
+T('  …which says a check-ride is what it wants', waiting.next.requiresCheck, true);
+T('  …and that there are no hours left to fly for it', waiting.next.hoursAway, 0);
+T('a signed-off pilot’s badge is clean', R.memberRank(CHECKED, 400, ['Captain']).awaitingCheck, null);
+T('an ungated ladder never makes anyone wait', R.memberRank(LADDER, 5000).awaitingCheck, null);
 
 console.log(failures ? `\n${failures} failing check(s)\n` : '\nall checks passed\n');
 process.exit(failures ? 1 : 0);

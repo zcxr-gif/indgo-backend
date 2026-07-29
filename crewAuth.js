@@ -125,6 +125,13 @@ function sanitizeRanks(arr) {
         color: isHexColor(r && r.color) ? r.color : '',
         icon: clampStr(r && r.icon, 30),
         image: cleanImageUrl(r && r.image),
+        // v7. A rung a pilot cannot reach on hours alone — staff sign them off.
+        // A VA's choice, per rung: most gate none, or one (the step up to
+        // Captain). See crewRanks for how it resolves.
+        requiresCheck: !!(r && r.requiresCheck),
+        // What the check-ride actually is, in the VA's words. Shown to the
+        // pilot waiting on it, so "awaiting a check-ride" says what to do.
+        checkNote: clampStr(r && r.checkNote, 300),
     })).filter(r => r.name).sort((a, b) => a.minHours - b.minHours);
 }
 function sanitizeRoles(arr) {
@@ -187,8 +194,8 @@ const CREW_CAPABILITIES = [
     { id: 'settings.notifications', group: 'Notifications',  label: 'Manage Discord & email notifications' },
     { id: 'routes.manage',          group: 'Operations',    label: 'Create & manage the route network' },
     { id: 'flights.review',         group: 'Operations',    label: 'Review flights (PIREPs) & auto-tracking' },
+    { id: 'events.manage',          group: 'Operations',    label: 'Create & manage events and the gate board' },
     // Room to grow, e.g.:
-    // { id: 'events.manage',     group: 'Operations', label: 'Create & manage events' },
     // { id: 'schedules.manage',  group: 'Operations', label: 'Manage schedules & bookings' },
     // { id: 'members.message',   group: 'Roster',     label: 'Message crew members' },
 ];

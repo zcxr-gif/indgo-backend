@@ -86,7 +86,18 @@ than at the row.
 | `POST /api/crew/:slug/applications/:id/invite/regenerate` | staff | mint a fresh temporary password (resets the account's too) |
 | `DELETE /api/crew/:slug/applications/:id/invite` | staff | discard the invitation. Does **not** touch the account |
 | `GET /api/crew/:slug/routes` | public | the network, split into own/codeshare counts, with each route marked locked or open for the pilot asking |
-| `GET/POST /api/crew/:slug/webhook` | staff | read/set the main webhook, or one feed's override (`feed: recruitment\|pireps\|routes`) |
+| `GET /api/crew/:slug/events` | public | the calendar. Drafts are added only for a caller who can manage events |
+| `GET /api/crew/:slug/events/:id` | public | one event with its attendee board and gate allocation |
+| `POST/PATCH/DELETE /api/crew/:slug/events[/:id]` | `events.manage` | publish, edit and remove events |
+| `POST /api/crew/:slug/events/:id/banner` | `events.manage` | upload the event's artwork |
+| `POST/PATCH/DELETE /api/crew/:slug/events/:id/signup` | the pilot | sign up, change gate or aircraft, withdraw |
+| `POST/DELETE /api/crew/:slug/events/:id/signups[/:signupId]` | `events.manage` | add a guest to the board, or remove an attendee |
+| `GET /api/crew/:slug/events/:id/gates` | public | the gate board — every mapped stand at the airport, marked taken or free |
+| `POST /api/crew/:slug/pireps` | the pilot | file a flight. `eventId` ties it to an event and fills the leg in from it |
+| `POST /api/crew/:slug/roster/:id/checkride` | `roster.manage` | pass (or revoke) a pilot's check-ride for a rank |
+| `GET /api/crew/:slug/announcements` | public | the noticeboard |
+| `POST/PATCH/DELETE /api/crew/:slug/announcements[/:id]` | `roster.manage` | post, pin and remove notices |
+| `GET/POST /api/crew/:slug/webhook` | staff | read/set the main webhook, or one feed's override (`feed: recruitment\|pireps\|routes\|events`) |
 | `GET /api/crew/:slug/roster.csv` | staff | the roster as a spreadsheet, every column |
 | `POST /api/crew/:slug/roster/import` | staff | upsert from CSV. `dryRun` defaults true |
 | `GET /api/crew/:slug/routes.csv` | staff | the route network as a spreadsheet |
@@ -252,6 +263,147 @@ point of a ladder; a route that simply is not there is indistinguishable from a
 network smaller than advertised. Staff and the public are never marked locked —
 the gate is about what a pilot may fly.
 
+## Events and the gate board
+
+`crew_events` is what a VA gathers around — a group departure, a fly-in, a
+long-haul night. `crew_event_signups` is who is coming, and from which stand.
+
+An event starts as a **draft**. Drafts are the working copy staff write over
+several sittings and are invisible everywhere until published — the anon policy
+on `crew_events` only returns `published` and `cancelled`. Cancelled is kept
+rather than deleted, because pilots who signed up are owed the notice and a row
+that vanished tells nobody anything.
+
+`slots` caps attendance and `0` means uncapped. Signing up past the cap is not
+refused: the signup lands on the **waitlist**, which is a real attendance record
+that simply does not hold a gate. An event that quietly turns pilots away is one
+staff find out about too late.
+
+### The gate board
+
+`gate_icao` names the airport whose stands the board covers, stored rather than
+derived because the answer is not always the origin — a group departure parks
+everyone at the field they leave from, a fly-in parks them at the field they
+arrive at. Empty means "the origin", which is the common case.
+
+Stands come from OpenStreetMap (`aeroway=gate|stand|parking_position`, the same
+query the tracker's dispatch gate picker uses), so no gate list has to be
+maintained per airport. A pilot picks one off a map: taken stands are drawn in
+use and name whoever is parked there, free ones are pickable.
+
+**The claim happens in the database, not in the browser.** This unique index is
+the whole mechanism:
+
+```sql
+create unique index crew_event_signups_gate_idx
+    on crew_event_signups (event_id, upper(gate)) where gate <> '';
+```
+
+Two pilots tapping the same marker seconds after an event is announced is not a
+rare case, and any "is this gate free?" check performed before the insert loses
+that race. The second insert fails on the index, the crew center says the stand
+has just gone, and the board is never wrong about who is parked where. Upper-cased
+because `b24` and `B24` are the same gate to everyone except a database.
+
+`gates_open` is what a VA turns off for an event where stands are irrelevant (a
+formation over the ocean). `gates_locked` freezes the allocation once it is
+final without deleting anybody's stand.
+
+Withdrawing **deletes** the signup row rather than flagging it. A withdrawn
+pilot still holding a gate is the bug the table exists to prevent.
+
+`member_id` is nullable so staff can put a guest on the board — a partner VA
+flying in — without inventing a roster row for them. `account_id` is
+deliberately *not* a foreign key onto `crew_accounts`: deleting a login must not
+cascade a pilot off an event that has already been planned around them.
+
+## Check-rides
+
+Hours decide rank — except on a rung the VA marks `requiresCheck`. Most VAs
+gate none, some gate one (the step up to Captain). It is a per-rung choice in
+Settings → Crew, with a note saying what the check-ride actually is.
+
+On a gated rung the hours carry a pilot to the **door and no further**: they
+hold the rung below, the roster shows them as *ready for their Captain
+check-ride*, and a staff member signs them off from there
+(`POST /api/crew/:slug/roster/:id/checkride`). The rung's name lands in
+`crew_members.checks_passed`.
+
+Rank is still derived — from two inputs now instead of one. What is stored is
+the **sign-off**, which is a different kind of thing: a record of something a
+person did. It does not go stale when the ladder is edited and it cannot
+disagree with the hours beside it.
+
+Three rules, all in `crewRanks.js` and all covered by
+`scratchpad/test-crew-ranks.js`:
+
+- **A gated rung is never leapfrogged.** A pilot with the hours for two rungs
+  above the gate still stops at the gate. A ladder is a ladder.
+- **A rename lets the requirement lapse**, promoting the pilot — the same
+  direction of failure `meetsRank` chose for route gating. A pilot stuck below a
+  rank because of a rename nobody remembers is a support ticket nobody can
+  answer.
+- **Crossing into a gated rung announces nothing.** Arriving at a door is not a
+  promotion, and "Jo is now a Captain" is not a thing to say and then walk back.
+  The sign-off is what announces it, and it earns the same notice an
+  hours-driven promotion does — from the pilot's side they are the same event.
+
+The moment a pilot arrives at the door fires its own notice, once, to the
+`pireps` feed and the noticeboard. Without it the pilot quietly stops being
+promoted and nobody — them or staff — ever finds out why.
+
+## Events on a route, and flights flown for an event
+
+`crew_events.route_id` ties an event to a leg the airline already publishes.
+Picking one in the editor fills the leg in; leaving it off is right for a
+one-off (a fly-in from anywhere, a charter to a field the network does not
+serve), which is why the leg fields are kept alongside rather than read through
+the route.
+
+Filing goes through `POST /api/crew/:slug/pireps` with an `eventId` — the same
+endpoint every other manual report uses. An event flight is an ordinary flight
+that happens to know why it was flown, and it must be reviewed, credited and
+route-matched by exactly the same code as any other. The event supplies whatever
+the pilot did not type, which filing straight off the brief is everything except
+how long it took.
+
+`crew_pireps.event_id` is what lets the brief show what was actually **flown**,
+as opposed to who said they would turn up.
+
+## Codeshare partners
+
+`GET /api/crew/:slug/routes` returns a `partners` array beside the routes: one
+entry per codeshare airline with its name, logo, leg count, destination count
+and how many of those legs are locked to the pilot asking.
+
+Grouped server-side for the reason `counts` is — so the route panel, the network
+map and a VA's own website cannot quote different figures — and case-folded on
+the partner name, because a VA typing "Delta Virtual" and "delta virtual" on
+different routes means one airline to everybody except a `groupBy`.
+
+It is also what makes a partner's **logo** something to click: a route list
+filtered to one airline is the question a pilot actually has ("what can I fly on
+Delta's metal?"), which a flat list of two hundred legs does not answer.
+
+## The noticeboard
+
+`crew_announcements`. Two kinds of row in one shape: what staff write, and what
+the crew center writes for them — a promotion, a pilot joining, someone ready
+for a check-ride.
+
+The second kind is the point. Those all already happen inside the crew center
+and used to leave no trace but a Discord line that scrolls away by Thursday. A
+pilot who joined on Tuesday should still see on Friday that they joined.
+
+`source` tells them apart. A generated row cannot be rewritten through the API —
+only pinned — because staff editing what the crew center recorded would make the
+board untrustworthy, and `kind` is forced to `notice` on anything posted by
+hand so a hand-written "promotion" cannot be mistaken for one that happened.
+
+Writing a notice is always **fire-and-forget** for the thing that caused it: a
+promotion that happened must never be reported as a failure because the
+announcement about it could not be written.
+
 ## Notification feeds
 
 A VA sets one Discord webhook and everything posts to that channel. That is the
@@ -264,11 +416,17 @@ Three feeds can each be pointed somewhere else instead:
 | `recruitment` | new applications, accept / decline decisions |
 | `pireps` | flight reports **filed, approved and rejected** — one feed — plus promotions |
 | `routes` | routes added, edited, removed, or imported |
+| `events` | events published, changed and cancelled — **not** signups |
 
 Each is an override, not a switch: an empty value means "use the main webhook",
 never "off", so tidying up in the UI cannot silently mute a VA's notifications.
 Every existing VA keeps receiving everything on the hook they already set,
 because `crewWebhookUrlFor` falls back to it.
+
+Signups deliberately do **not** post to the events feed. A popular event would
+fire forty embeds in an evening, which is how a channel gets muted, and "who is
+coming" is a question the event's own attendee board answers better than a
+scroll-back.
 
 Filed / approved / rejected deliberately share one feed. They are three moments
 in the same conversation and splitting them across channels means nobody can
@@ -379,6 +537,20 @@ Version history:
 - **v5** — `crew_routes.kind` / `partner_name` / `partner_logo` / `min_rank`:
   codeshares are separated from the airline's own metal, and a route can open at
   a rank
+- **v6** — `crew_events` and `crew_event_signups`: events, who is attending, and
+  a gate board whose allocation is enforced by a unique index rather than by the
+  browser
+- **v7** — `crew_members.checks_passed`, `crew_events.route_id`,
+  `crew_pireps.event_id`, and `crew_announcements`: a rank can require a
+  check-ride, an event can be built on a route and flown against it, and the
+  crew center keeps a noticeboard of its own
+
+Note what v6 is not: it adds two **tables**, so there is nothing for
+`LATE_COLUMNS` to degrade to. A project still on v5 has no events tables at all,
+and the crew center says exactly that (`store_events_missing` → *"re-run the
+setup SQL"*) rather than reporting the generic missing-tables error over a crew
+center whose roster, routes and flight reports are all working fine. Same
+reasoning as `crew_accounts` in v3.
 
 ## Accepting a pilot
 
@@ -441,6 +613,22 @@ hours holds a rank even when the ladder starts at 25, that a gate on a rank that
 no longer exists lapses open rather than shrinking the network, that a promotion
 reports the rung actually reached and a rollback reports nothing at all, and
 that normalising a ladder never mutates the caller's array.
+
+`node scratchpad/test-crew-events.js` drives events and the gate board: that a
+misspelt status becomes a draft rather than reaching a VA's public calendar,
+that the board's airport falls back origin → destination but always yields to
+what the VA chose, that a claimed stand reads as taken whatever case it was
+typed in, that a stand OpenStreetMap has never heard of still appears on the
+board when somebody holds it, that attendance is `null` rather than `0` when
+nobody counted it, that the waitlist fills past the cap and drains oldest-first,
+and that a pilot editing their own place can change their stand but not their
+name or their waitlist position.
+
+The gate race itself is checked in `test-crew-store.js`, against an
+impersonator that enforces the schema's unique indexes: a second pilot cannot
+take a claimed stand, lower case is not a way around it, and the store reports
+*which* rule bit so the handler can say "that stand has just gone" instead of
+"that record already exists".
 
 `node scratchpad/test-crew-csv.js` drives the spreadsheet round trip: that an
 untouched export re-imports as a no-op, that ids update precisely and hand-typed

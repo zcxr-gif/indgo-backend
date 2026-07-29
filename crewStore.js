@@ -10,10 +10,13 @@
  * Supabase project — never in ours. Inflight keeps only what it needs to run
  * the platform: the VA's *staff* logins, and the VA's directory/branding
  * metadata (name, slug, colours, fleet definitions, rank ladder, join
- * requirements). Rosters, flight reports, applications, applicant emails and
- * pilot accounts are created in, read from and deleted from the VA's project.
+ * requirements). Rosters, flight reports, applications, applicant emails,
+ * events and pilot accounts are created in, read from and deleted from the VA's
+ * project.
  *
- * Two adapters implement one interface:
+ * Two adapters implement one interface — with one exception, events, which the
+ * legacy adapter refuses rather than implements (see LegacyStore.events for why
+ * a retiring storage path is not given new features):
  *
  *   SupabaseStore  The real one. Talks PostgREST to the VA's project with their
  *                  service key. See supabase/crew-center-schema.sql for the
@@ -51,10 +54,16 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 5;
+const EXPECTED_SCHEMA_VERSION = 7;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
+
+// The version that introduced crew_events + crew_event_signups. Like accounts,
+// events are a whole feature a pre-v6 project simply has not got — there are no
+// columns to degrade, so the crew center names the missing thing instead of
+// reporting a broken store over a VA whose roster and routes work fine.
+const EVENTS_SCHEMA_VERSION = 6;
 
 // ---------------------------------------------------------------------------
 // Columns that arrived after the first release
@@ -83,6 +92,9 @@ const ACCOUNTS_SCHEMA_VERSION = 3;
 // ---------------------------------------------------------------------------
 const LATE_COLUMNS = {
     crew_routes: new Set(['kind', 'partner_name', 'partner_logo', 'min_rank']),
+    crew_members: new Set(['checks_passed']),
+    crew_events: new Set(['route_id']),
+    crew_pireps: new Set(['event_id']),
     crew_applications: new Set([
         'discord_invite', 'invite_username', 'invite_password',
         'invite_issued_at', 'invite_claimed_at', 'invite_revoked_at', 'invite_account_id',
@@ -91,6 +103,9 @@ const LATE_COLUMNS = {
 
 // What each dropped column costs, in words a VA reads rather than column names.
 const DRIFT_LABELS = {
+    'crew_members.checks_passed': 'check-ride sign-offs',
+    'crew_events.route_id': 'events tied to a route',
+    'crew_pireps.event_id': 'flights logged against an event',
     'crew_routes.kind': 'codeshare routes',
     'crew_routes.partner_name': 'codeshare partner names',
     'crew_routes.partner_logo': 'codeshare partner logos',
@@ -202,6 +217,9 @@ const memberFromRow = (r) => r && {
     status: r.status || 'active',
     ifUserId: r.if_user_id || '',
     ifcName: r.ifc_name || '',
+    // v7. The rungs this pilot has been signed off for. Names, not indexes —
+    // see the schema, and crewRanks' header, for why.
+    checksPassed: Array.isArray(r.checks_passed) ? r.checks_passed : [],
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
 };
@@ -215,6 +233,8 @@ const memberToRow = (m) => {
     pick(m, out, 'status', 'status', (v) => (['active', 'loa', 'inactive'].includes(v) ? v : 'active'));
     pick(m, out, 'ifUserId', 'if_user_id', (v) => str(v, 40));
     pick(m, out, 'ifcName', 'ifc_name', (v) => str(v, 60));
+    pick(m, out, 'checksPassed', 'checks_passed', (v) => (Array.isArray(v)
+        ? [...new Set(v.map((c) => str(c, 40)).filter(Boolean))].slice(0, 40) : []));
     return out;
 };
 
@@ -297,6 +317,8 @@ const pirepFromRow = (r) => r && {
     _id: r.id,
     memberId: r.member_id || null,
     routeId: r.route_id || null,
+    // v7. The event this flight was flown for, when it was flown for one.
+    eventId: r.event_id || null,
     pilotName: r.pilot_name || '',
     callsign: r.callsign || '',
     flightNumber: r.flight_number || '',
@@ -325,6 +347,7 @@ const pirepToRow = (p) => {
     const out = {};
     pick(p, out, 'memberId', 'member_id', (v) => v || null);
     pick(p, out, 'routeId', 'route_id', (v) => v || null);
+    pick(p, out, 'eventId', 'event_id', (v) => (str(v, 64) || null));
     pick(p, out, 'pilotName', 'pilot_name', (v) => str(v, 60));
     pick(p, out, 'callsign', 'callsign', (v) => str(v, 20));
     pick(p, out, 'flightNumber', 'flight_number', (v) => str(v, 12));
@@ -405,6 +428,136 @@ const applicationToRow = (a) => {
     // A uuid column: '' is not a valid uuid, so an empty id has to go as null.
     pick(a, out, 'inviteAccountId', 'invite_account_id', (v) => (str(v, 64) || null));
     pick(a, out, 'reviewedAt', 'reviewed_at', (v) => (date(v) ? date(v).toISOString() : null));
+    return out;
+};
+
+// v6. An event, and one pilot's place at it.
+//
+// `gateIcao` is stored rather than derived: the board's airport is the origin
+// for a group departure and the destination for a fly-in, and only the VA knows
+// which this is. crewEvents.gateAirport() applies that fallback in one place so
+// every caller resolves it the same way.
+const eventFromRow = (r) => r && {
+    _id: r.id,
+    title: r.title || '',
+    description: r.description || '',
+    bannerUrl: r.banner_url || '',
+    origin: r.origin || '',
+    destination: r.destination || '',
+    aircraft: r.aircraft || '',
+    flightNumber: r.flight_number || '',
+    // v7. The leg in the VA's own network this event is flown on, when it is
+    // one. The leg details above are kept alongside rather than read through
+    // it — plenty of events are one-offs the network does not carry.
+    routeId: r.route_id || null,
+    server: r.server || '',
+    startsAt: date(r.starts_at),
+    endsAt: date(r.ends_at),
+    slots: Number(r.slots) || 0,
+    gatesOpen: r.gates_open !== false,
+    gatesLocked: !!r.gates_locked,
+    gateIcao: r.gate_icao || '',
+    minRank: r.min_rank || '',
+    status: r.status || 'draft',
+    createdBy: r.created_by || '',
+    createdAt: date(r.created_at),
+    updatedAt: date(r.updated_at),
+};
+const eventToRow = (e) => {
+    const out = {};
+    pick(e, out, 'title', 'title', (v) => str(v, 120));
+    pick(e, out, 'description', 'description', (v) => str(v, 4000));
+    // Event artwork lands in an <img> on a public page — same rule as a
+    // codeshare partner's logo, so anything not plainly https is dropped.
+    pick(e, out, 'bannerUrl', 'banner_url', (v) => {
+        const s = str(v, 600);
+        return /^https:\/\//i.test(s) ? s : '';
+    });
+    pick(e, out, 'origin', 'origin', icao);
+    pick(e, out, 'destination', 'destination', icao);
+    pick(e, out, 'aircraft', 'aircraft', (v) => str(v, 60));
+    pick(e, out, 'flightNumber', 'flight_number', (v) => str(v, 12));
+    // A uuid column: '' is not a valid uuid, so "no route" has to go as null.
+    pick(e, out, 'routeId', 'route_id', (v) => (str(v, 64) || null));
+    pick(e, out, 'server', 'server', (v) => str(v, 30));
+    pick(e, out, 'startsAt', 'starts_at', (v) => (date(v) ? date(v).toISOString() : null));
+    pick(e, out, 'endsAt', 'ends_at', (v) => (date(v) ? date(v).toISOString() : null));
+    pick(e, out, 'slots', 'slots', (v) => int(v, 0, 5000));
+    pick(e, out, 'gatesOpen', 'gates_open', (v) => !!v);
+    pick(e, out, 'gatesLocked', 'gates_locked', (v) => !!v);
+    pick(e, out, 'gateIcao', 'gate_icao', icao);
+    pick(e, out, 'minRank', 'min_rank', (v) => str(v, 40));
+    pick(e, out, 'status', 'status', (v) => (['draft', 'published', 'cancelled'].includes(v) ? v : 'draft'));
+    pick(e, out, 'createdBy', 'created_by', (v) => str(v, 80));
+    return out;
+};
+
+const signupFromRow = (r) => r && {
+    _id: r.id,
+    eventId: r.event_id || null,
+    memberId: r.member_id || null,
+    accountId: r.account_id || null,
+    pilotName: r.pilot_name || '',
+    callsign: r.callsign || '',
+    aircraft: r.aircraft || '',
+    gate: r.gate || '',
+    // Nullable in the column and left null here: 0/0 is a real place in the
+    // Gulf of Guinea, and a board that pins an unplaced stand there is worse
+    // than one that simply does not draw it.
+    gateLat: r.gate_lat == null ? null : Number(r.gate_lat),
+    gateLon: r.gate_lon == null ? null : Number(r.gate_lon),
+    gateKind: r.gate_kind || '',
+    note: r.note || '',
+    status: r.status === 'waitlist' ? 'waitlist' : 'going',
+    createdAt: date(r.created_at),
+    updatedAt: date(r.updated_at),
+};
+const signupToRow = (s) => {
+    const out = {};
+    pick(s, out, 'eventId', 'event_id', (v) => (str(v, 64) || null));
+    pick(s, out, 'memberId', 'member_id', (v) => (str(v, 64) || null));
+    pick(s, out, 'accountId', 'account_id', (v) => (str(v, 64) || null));
+    pick(s, out, 'pilotName', 'pilot_name', (v) => str(v, 80));
+    pick(s, out, 'callsign', 'callsign', (v) => str(v, 20));
+    pick(s, out, 'aircraft', 'aircraft', (v) => str(v, 60));
+    // Upper-cased on the way in, because the unique index that makes a stand
+    // one pilot's is on upper(gate) — storing "b24" would claim the same stand
+    // as "B24" but read back as a different one on the board.
+    pick(s, out, 'gate', 'gate', (v) => str(v, 20).toUpperCase());
+    pick(s, out, 'gateLat', 'gate_lat', (v) => (v == null || v === '' ? null : num(v, -90, 90)));
+    pick(s, out, 'gateLon', 'gate_lon', (v) => (v == null || v === '' ? null : num(v, -180, 180)));
+    pick(s, out, 'gateKind', 'gate_kind', (v) => str(v, 30));
+    pick(s, out, 'note', 'note', (v) => str(v, 300));
+    pick(s, out, 'status', 'status', (v) => (v === 'waitlist' ? 'waitlist' : 'going'));
+    return out;
+};
+
+// v7. A row on the VA's noticeboard. Two kinds of thing live here in one
+// shape: what staff write, and what the crew center writes for them when
+// something worth telling the crew happens.
+const announcementFromRow = (r) => r && {
+    _id: r.id,
+    title: r.title || '',
+    body: r.body || '',
+    kind: r.kind || 'notice',
+    source: r.source === 'auto' ? 'auto' : 'staff',
+    pinned: !!r.pinned,
+    refId: r.ref_id || null,
+    authorName: r.author_name || '',
+    createdAt: date(r.created_at),
+    updatedAt: date(r.updated_at),
+};
+const ANNOUNCEMENT_KINDS = ['notice', 'promotion', 'join', 'event', 'checkride'];
+const announcementToRow = (a) => {
+    const out = {};
+    pick(a, out, 'title', 'title', (v) => str(v, 160));
+    pick(a, out, 'body', 'body', (v) => str(v, 4000));
+    pick(a, out, 'kind', 'kind', (v) => (ANNOUNCEMENT_KINDS.includes(v) ? v : 'notice'));
+    pick(a, out, 'source', 'source', (v) => (v === 'auto' ? 'auto' : 'staff'));
+    pick(a, out, 'pinned', 'pinned', (v) => !!v);
+    // A uuid column: '' is not a valid uuid, so an empty id has to go as null.
+    pick(a, out, 'refId', 'ref_id', (v) => (str(v, 64) || null));
+    pick(a, out, 'authorName', 'author_name', (v) => str(v, 80));
     return out;
 };
 
@@ -514,7 +667,14 @@ class Postgrest {
             return err;
         }
         if (res.status === 409 || body.code === '23505') {
-            return new CrewStoreError('That record already exists.', { status: 409, code: 'store_conflict', detail });
+            const err = new CrewStoreError('That record already exists.', { status: 409, code: 'store_conflict', detail });
+            // Which uniqueness was violated, when Postgres says. A caller that
+            // knows its indexes can turn this into the sentence the user needs
+            // — "that gate has just been taken" rather than "that record
+            // already exists" — and one that doesn't is unaffected.
+            const m = /unique constraint\s+"([a-z0-9_]+)"/i.exec(detail);
+            err.constraint = m ? m[1] : '';
+            return err;
         }
         return new CrewStoreError('The VA’s data store returned an error.',
             { status: 502, code: 'store_error', detail: detail || `HTTP ${res.status}` });
@@ -743,6 +903,17 @@ class SupabaseStore {
     }
     async deletePirep(id) { await this.db.remove('crew_pireps', this.ident(id)); return true; }
 
+    // The flights filed for one event. Answers "who actually flew it?", which
+    // is a different question from "who said they were coming" and the one
+    // that matters after the fact.
+    async listPirepsForEvent(eventId, { limit = 500 } = {}) {
+        if (!eventId) return [];
+        const rows = await this.db.select('crew_pireps', {
+            ...this.scope, event_id: `eq.${eventId}`, order: 'flown_at.desc.nullslast,created_at.desc', limit,
+        });
+        return (rows || []).map(pirepFromRow);
+    }
+
     // Which of these Infinite Flight flight ids have we already captured? Used
     // by the sync to skip flights without attempting (and failing) an insert.
     async seenFlightIds(flightIds) {
@@ -786,6 +957,149 @@ class SupabaseStore {
         return row ? applicationFromRow(row) : null;
     }
 
+    // --- Events ---
+    //
+    // Same shape as accounts(): a project on a pre-v6 schema has no events
+    // tables, and the generic "your tables are missing" would read as a lie on
+    // a crew center whose roster, routes and flight reports are all answering.
+    async events(fn) {
+        try { return await fn(); } catch (err) {
+            if (err instanceof CrewStoreError && err.code === 'store_schema_missing') {
+                throw new CrewStoreError(
+                    'This crew center’s project does not have the events tables yet. Re-run the setup SQL (Settings → Data store) to add them.',
+                    { status: 409, code: 'store_events_missing', detail: err.detail });
+            }
+            throw err;
+        }
+    }
+
+    // `upcomingOnly` is deliberately "starts after 12 hours ago" rather than
+    // "starts in the future": an event under way is exactly what a pilot
+    // opening the crew center mid-departure needs to see, and it matches the
+    // window the public VA-events feed already uses.
+    listEvents({ status = '', upcomingOnly = false, limit = 300 } = {}) {
+        return this.events(async () => {
+            const params = { ...this.scope, order: 'starts_at.asc.nullslast,created_at.desc', limit };
+            if (status) params.status = `eq.${status}`;
+            if (upcomingOnly) params.starts_at = `gte.${new Date(Date.now() - 12 * 3600 * 1000).toISOString()}`;
+            const rows = await this.db.select('crew_events', params);
+            return (rows || []).map(eventFromRow);
+        });
+    }
+    getEvent(id) { return this.events(() => this.one('crew_events', this.ident(id), eventFromRow)); }
+    createEvent(data) {
+        return this.events(async () => {
+            const [row] = await this.db.insert('crew_events', { va_slug: this.slug, ...eventToRow(data) });
+            return eventFromRow(row);
+        });
+    }
+    updateEvent(id, patch) {
+        return this.events(async () => {
+            const [row] = await this.db.update('crew_events', this.ident(id), eventToRow(patch));
+            return row ? eventFromRow(row) : null;
+        });
+    }
+    // The signups go with it: crew_event_signups.event_id cascades on delete.
+    deleteEvent(id) {
+        return this.events(async () => { await this.db.remove('crew_events', this.ident(id)); return true; });
+    }
+
+    // --- Who is attending ---
+    listSignups(eventId, { limit = 1000 } = {}) {
+        return this.events(async () => {
+            const rows = await this.db.select('crew_event_signups', {
+                ...this.scope, event_id: `eq.${eventId}`, order: 'created_at.asc', limit,
+            });
+            return (rows || []).map(signupFromRow);
+        });
+    }
+    // Every attendee of several events at once. The calendar needs a count on
+    // each card, and asking per event would be one round trip per event — sixty
+    // of them on a busy VA's events page. One `in.()` query answers the lot.
+    listSignupsForEvents(eventIds, { limit = 5000 } = {}) {
+        const ids = (eventIds || []).map((i) => String(i)).filter(Boolean);
+        if (!ids.length) return Promise.resolve([]);
+        return this.events(async () => {
+            const rows = await this.db.select('crew_event_signups', {
+                ...this.scope,
+                event_id: `in.(${ids.map((i) => `"${i.replace(/"/g, '')}"`).join(',')})`,
+                order: 'created_at.asc',
+                limit,
+            });
+            return (rows || []).map(signupFromRow);
+        });
+    }
+    getSignup(id) { return this.events(() => this.one('crew_event_signups', this.ident(id), signupFromRow)); }
+    // The row belonging to one pilot at one event, however we know them. Used
+    // to answer "am I signed up?" and to route a gate change to the right row.
+    getSignupFor(eventId, { accountId = '', memberId = '' } = {}) {
+        const key = accountId ? { account_id: `eq.${accountId}` } : memberId ? { member_id: `eq.${memberId}` } : null;
+        if (!key) return Promise.resolve(null);
+        return this.events(() => this.one('crew_event_signups', {
+            ...this.scope, event_id: `eq.${eventId}`, ...key,
+        }, signupFromRow));
+    }
+    createSignup(data) {
+        return this.events(async () => {
+            const [row] = await this.db.insert('crew_event_signups', { va_slug: this.slug, ...signupToRow(data) });
+            return signupFromRow(row);
+        });
+    }
+    updateSignup(id, patch) {
+        return this.events(async () => {
+            const [row] = await this.db.update('crew_event_signups', this.ident(id), signupToRow(patch));
+            return row ? signupFromRow(row) : null;
+        });
+    }
+    deleteSignup(id) {
+        return this.events(async () => { await this.db.remove('crew_event_signups', this.ident(id)); return true; });
+    }
+
+    // --- The noticeboard ---
+    //
+    // Wrapped like events and accounts: a project on a pre-v7 schema has no
+    // crew_announcements table, and the caller that writes to it is almost
+    // always doing so as a SIDE EFFECT of something that has already happened
+    // (a promotion, a pilot joining). So the missing table has to surface as a
+    // thing the VA can fix, and the caller has to be free to ignore it.
+    async announcements(fn) {
+        try { return await fn(); } catch (err) {
+            if (err instanceof CrewStoreError && err.code === 'store_schema_missing') {
+                throw new CrewStoreError(
+                    'This crew center’s project does not have the announcements table yet. Re-run the setup SQL (Settings → Data store) to add it.',
+                    { status: 409, code: 'store_announcements_missing', detail: err.detail });
+            }
+            throw err;
+        }
+    }
+
+    listAnnouncements({ limit = 50 } = {}) {
+        return this.announcements(async () => {
+            const rows = await this.db.select('crew_announcements', {
+                ...this.scope, order: 'pinned.desc,created_at.desc', limit,
+            });
+            return (rows || []).map(announcementFromRow);
+        });
+    }
+    getAnnouncement(id) {
+        return this.announcements(() => this.one('crew_announcements', this.ident(id), announcementFromRow));
+    }
+    createAnnouncement(data) {
+        return this.announcements(async () => {
+            const [row] = await this.db.insert('crew_announcements', { va_slug: this.slug, ...announcementToRow(data) });
+            return announcementFromRow(row);
+        });
+    }
+    updateAnnouncement(id, patch) {
+        return this.announcements(async () => {
+            const [row] = await this.db.update('crew_announcements', this.ident(id), announcementToRow(patch));
+            return row ? announcementFromRow(row) : null;
+        });
+    }
+    deleteAnnouncement(id) {
+        return this.announcements(async () => { await this.db.remove('crew_announcements', this.ident(id)); return true; });
+    }
+
     // --- Aggregates ---
     // One round trip via the schema's crew_stats() function. If the project is
     // on an older schema that predates it, fall back to counting client-side so
@@ -825,6 +1139,10 @@ class SupabaseStore {
                 // `outdated` because it is the one capability an older schema
                 // actually lacks, and the dashboard says so in those terms.
                 accounts: version >= ACCOUNTS_SCHEMA_VERSION,
+                // Same question for events, so the dashboard can offer the
+                // update button on the events panel itself rather than sending
+                // a VA off to hunt for what "outdated" means for them.
+                events: version >= EVENTS_SCHEMA_VERSION,
                 installedAt: (rows && rows[0] && rows[0].installed_at) || null,
             };
         } catch (err) {
@@ -834,6 +1152,7 @@ class SupabaseStore {
                 version: 0,
                 expectedVersion: EXPECTED_SCHEMA_VERSION,
                 accounts: false,
+                events: false,
                 code: err.code || 'store_error',
                 error: err.message,
                 detail: err.detail || '',
@@ -1000,6 +1319,8 @@ class LegacyStore {
         return this.lean(p);
     }
     async deletePirep(id) { await models.CrewPirep.deleteOne({ ...this.q, _id: id }); return true; }
+    // No events on this path, so nothing was ever flown for one.
+    async listPirepsForEvent() { return []; }
     async seenFlightIds(flightIds) {
         const ids = (flightIds || []).filter(Boolean);
         if (!ids.length) return new Set();
@@ -1025,6 +1346,49 @@ class LegacyStore {
         return this.lean(a);
     }
 
+    // --- Events ---
+    //
+    // Not implemented here, and deliberately so. Managed storage is the thing
+    // this platform is moving away from: every collection above exists because
+    // a VA already had rows in it before their own project was a requirement,
+    // and giving a retiring path a brand-new feature would mean building rows
+    // we would then have to write a migration for. A VA who wants events
+    // connects their own database, which takes about a minute and is what the
+    // dashboard already asks them to do.
+    //
+    // Said in the VA's words rather than as a 500, and as a 409 (something for
+    // you to do) rather than a 502 (something broken at our end).
+    events() {
+        return Promise.reject(new CrewStoreError(
+            'Events need your VA’s own database. Connect one in Crew Center → Settings → Data store — it takes about a minute, and your roster and routes come with you.',
+            { status: 409, code: 'store_events_unsupported' }));
+    }
+    listEvents() { return this.events(); }
+    getEvent() { return this.events(); }
+    createEvent() { return this.events(); }
+    updateEvent() { return this.events(); }
+    deleteEvent() { return this.events(); }
+    listSignups() { return this.events(); }
+    listSignupsForEvents() { return this.events(); }
+    getSignup() { return this.events(); }
+    getSignupFor() { return this.events(); }
+    createSignup() { return this.events(); }
+    updateSignup() { return this.events(); }
+    deleteSignup() { return this.events(); }
+
+    // The noticeboard, like events, is not built on the retiring path. Same
+    // reasoning, same shape of refusal.
+    announcements() {
+        return Promise.reject(new CrewStoreError(
+            'The noticeboard needs your VA’s own database. Connect one in Crew Center → Settings → Data store.',
+            { status: 409, code: 'store_announcements_unsupported' }));
+    }
+    listAnnouncements() { return this.announcements(); }
+    getAnnouncement() { return this.announcements(); }
+    createAnnouncement() { return this.announcements(); }
+    updateAnnouncement() { return this.announcements(); }
+    deleteAnnouncement() { return this.announcements(); }
+
     async stats() {
         const [members, pireps, routes, applications] = await Promise.all([
             this.listMembers({ limit: 5000 }),
@@ -1038,8 +1402,9 @@ class LegacyStore {
     async health() {
         // `accounts: true` — managed pilot logins work, they just work in our
         // database instead of the VA's, which is the thing the migration fixes.
+        // `events: false` — those never existed here; see the block above.
         return {
-            ok: true, provisioned: true, managed: true, accounts: true,
+            ok: true, provisioned: true, managed: true, accounts: true, events: false,
             version: 0, expectedVersion: EXPECTED_SCHEMA_VERSION,
         };
     }
@@ -1176,5 +1541,6 @@ module.exports = {
     SELECT,
     EXPECTED_SCHEMA_VERSION,
     ACCOUNTS_SCHEMA_VERSION,
+    EVENTS_SCHEMA_VERSION,
     REQUIRE_OWN_STORE,
 };

@@ -69,6 +69,11 @@ const crewCsv = require('./crewCsv');
 // disagree — and so a rank can gate something. See crewRanks.js.
 const crewRanks = require('./crewRanks');
 
+// Events, and the gate board that stops a dozen aircraft spawning on the same
+// stand. Everything that is a decision rather than a database write lives
+// there — including where the stands themselves come from. See crewEvents.js.
+const crewEvents = require('./crewEvents');
+
 // One-paste setup for a VA's Supabase project: given a Supabase access token we
 // install the schema, read the project's keys back and store the connection
 // ourselves, so nobody has to hand-copy three values between two dashboards.
@@ -292,6 +297,10 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
             pireps:      { type: String, trim: true, default: '' },
             // Route network changes: added, edited, removed, imported.
             routes:      { type: String, trim: true, default: '' },
+            // Events published, changed and cancelled. Deliberately not
+            // signups: a popular event would fire forty embeds in an evening,
+            // which is how a channel gets muted.
+            events:      { type: String, trim: true, default: '' },
         }, { _id: false }),
         default: () => ({}),
         select: false,
@@ -690,8 +699,13 @@ const REQ_META = {
 // Post a small embed to a VA's crew webhook. Fire-and-forget: never let a
 // webhook hiccup fail the applicant's request.
 const CREW_COLORS = { new: 0xF59E0B, accepted: 0x16A34A, declined: 0x6E685D };
-async function postCrewNotice(url, { title, description, color, fields }) {
+async function postCrewNotice(url, { title, description, color, fields, image }) {
     if (!url || !isDiscordWebhookUrl(url)) return false;
+    // A malformed image URL makes Discord reject the WHOLE post with a 400,
+    // silently dropping the notice — so anything that is not plainly an https
+    // URL is left off rather than sent and hoped for. Same rule vaEventCard.js
+    // follows for every URL it puts in an embed.
+    const art = /^https:\/\/\S+$/i.test(String(image || '')) ? String(image) : '';
     try {
         await axios.post(url, {
             embeds: [{
@@ -699,6 +713,7 @@ async function postCrewNotice(url, { title, description, color, fields }) {
                 description: description ? String(description).slice(0, 2000) : undefined,
                 color: color != null ? color : 0x1C1A16,
                 fields: Array.isArray(fields) ? fields.slice(0, 10) : [],
+                image: art ? { url: art } : undefined,
                 footer: { text: 'Inflight · Crew Center' },
                 timestamp: new Date().toISOString(),
             }],
@@ -822,7 +837,7 @@ function crewCredentialsHtml({ username, password, signInUrl }) {
 
 // The feeds a VA can point at a Discord channel. Adding one here is most of the
 // work of adding a new notification category.
-const CREW_FEEDS = ['recruitment', 'pireps', 'routes'];
+const CREW_FEEDS = ['recruitment', 'pireps', 'routes', 'events'];
 
 /**
  * Load a VA's (secret) webhook URL for one feed.
@@ -898,13 +913,23 @@ function postPirepNotice(va, event, pirep, actor) {
  * for a rollback, so correcting a mistyped hours figure cannot publish "Jo has
  * been demoted" to a Discord channel.
  */
-function postPromotionNotice(va, member, promotion) {
+function postPromotionNotice(va, member, promotion, opts) {
     if (!va || !promotion || !promotion.to) return;
     const from = promotion.from ? promotion.from.name : null;
+    const by = (opts && opts.by) || '';
+    // A promotion that came from a check-ride says who signed it off. It is a
+    // person's decision rather than an arithmetic threshold, and the crew
+    // channel reads very differently when it names them.
+    const how = (opts && opts.viaCheck)
+        ? `Check-ride passed${by ? `, signed off by ${by}` : ''}.`
+        : '';
     crewWebhookUrlFor(va._id, 'pireps')
         .then((hook) => hook && postCrewNotice(hook, {
             title: `🎖️ ${member.name || 'A pilot'} promoted to ${promotion.to.name}`,
-            description: from ? `Up from ${from}${promotion.skipped ? ` — skipping ${promotion.skipped} rank${promotion.skipped === 1 ? '' : 's'}` : ''}.` : undefined,
+            description: [
+                from ? `Up from ${from}${promotion.skipped ? ` — skipping ${promotion.skipped} rank${promotion.skipped === 1 ? '' : 's'}` : ''}.` : '',
+                how,
+            ].filter(Boolean).join(' ') || undefined,
             color: PIREP_COLORS.promoted,
             fields: [
                 member.callsign ? { name: 'Callsign', value: member.callsign, inline: true } : null,
@@ -912,6 +937,63 @@ function postPromotionNotice(va, member, promotion) {
             ].filter(Boolean),
         }))
         .catch(() => {});
+}
+
+/**
+ * A pilot has flown the hours for a rung that needs a person to sign it off.
+ *
+ * Fires once, at the moment they arrive — which is the only moment anybody
+ * would otherwise find out, because the alternative is a pilot who quietly
+ * stops being promoted and a staff member who never learns they are waiting.
+ *
+ * Rides the pireps feed because an approved flight is what causes it, and that
+ * is the channel already being watched for exactly this kind of movement.
+ */
+function postCheckRideDueNotice(va, member, rung, actor) {
+    if (!va || !member || !rung) return;
+    crewWebhookUrlFor(va._id, 'pireps')
+        .then((hook) => hook && postCrewNotice(hook, {
+            title: `🧭 ${member.name || 'A pilot'} is ready for their ${rung.name} check-ride`,
+            description: rung.checkNote
+                ? String(rung.checkNote).slice(0, 600)
+                : 'They have the hours — the rank is waiting on a sign-off.',
+            color: 0x7C3AED,
+            fields: [
+                member.callsign ? { name: 'Callsign', value: member.callsign, inline: true } : null,
+                { name: 'Hours', value: String(Math.round((Number(member.hours) || 0) * 10) / 10), inline: true },
+                { name: 'Needs', value: `${rung.name} · ${rung.minHours}h`, inline: true },
+            ].filter(Boolean),
+        }))
+        .catch(() => {});
+    postAnnouncement(va, {
+        kind: 'checkride',
+        title: `${member.name || 'A pilot'} is ready for their ${rung.name} check-ride`,
+        body: rung.checkNote || '',
+        refId: member._id,
+        authorName: (actor && actor.name) || '',
+    });
+}
+
+/**
+ * Write a row on the VA's noticeboard.
+ *
+ * Fire-and-forget, and deliberately silent on failure: a promotion that
+ * happened must not be reported as a failure because the announcement about it
+ * could not be written. A VA on an older schema has no crew_announcements table
+ * at all, and that is a reason to skip the notice, never to fail the thing that
+ * caused it.
+ */
+function postAnnouncement(va, { kind = 'notice', title, body = '', refId = null, authorName = '' }) {
+    if (!va || !title) return;
+    Promise.resolve()
+        .then(async () => {
+            const store = await crewStore.forVaOrNull(va);
+            if (!store || typeof store.createAnnouncement !== 'function') return;
+            await store.createAnnouncement({
+                kind, title, body, refId, authorName, source: 'auto',
+            });
+        })
+        .catch((err) => console.warn('announcement skipped —', err?.message || err));
 }
 
 // ---- Route network notices ----
@@ -982,6 +1064,65 @@ function postRouteImportNotice(va, summary, actor) {
                 { name: 'Updated', value: String(summary.updated || 0), inline: true },
                 { name: 'Unchanged', value: String(summary.unchanged || 0), inline: true },
             ],
+        }))
+        .catch(() => {});
+}
+
+// ---- Event notices ----
+//
+// What this feed is for: an event only works if people know it is happening,
+// and the channel a VA already watches is where they will see it. So the loud
+// moments post — published, cancelled, starting — and the quiet ones do not.
+//
+// Signups deliberately do NOT post. A popular event would fire forty embeds in
+// an evening, which is how a channel gets muted, and "who is coming" is a
+// question the event's own attendee board answers better than a scroll-back.
+const EVENT_COLORS = { published: 0x16A34A, updated: 0x0EA5E9, cancelled: 0xDC2626, removed: 0x6E685D };
+
+const eventLabel = (e) => {
+    const leg = [e.origin, e.destination].filter(Boolean).join(' → ');
+    return e.title || leg || 'an event';
+};
+
+/**
+ * Post an event change. Fire-and-forget like every other notice: a Discord
+ * webhook that is down must never turn "publish this event" into an error the
+ * VA sees.
+ *
+ * `when` is sent as a Discord timestamp (<t:epoch:F>) rather than a formatted
+ * string, so every pilot reads the departure in their OWN timezone. An event
+ * time is the single most misread thing a VA posts, and a Z-time in prose is
+ * what makes it so.
+ */
+function postEventNotice(va, action, event, actor) {
+    if (!va || !event) return;
+    const who = (actor && actor.name) || '';
+    const title = {
+        published: `📣 Event published — ${eventLabel(event)}`,
+        updated: `✏️ Event updated — ${eventLabel(event)}`,
+        cancelled: `⚠️ Event cancelled — ${eventLabel(event)}`,
+        removed: `🗑️ Event removed — ${eventLabel(event)}`,
+    }[action];
+    if (!title) return;
+    const startsAt = event.startsAt ? new Date(event.startsAt) : null;
+    const stamp = startsAt && !Number.isNaN(startsAt.getTime())
+        ? `<t:${Math.floor(startsAt.getTime() / 1000)}:F>` : '';
+    crewWebhookUrlFor(va._id, 'events')
+        .then((hook) => hook && postCrewNotice(hook, {
+            title,
+            description: [event.description ? String(event.description).slice(0, 600) : '', who ? `By ${who}.` : '']
+                .filter(Boolean).join('\n\n') || undefined,
+            color: EVENT_COLORS[action],
+            image: /^https:\/\//i.test(event.bannerUrl || '') ? event.bannerUrl : undefined,
+            fields: [
+                stamp ? { name: 'Departs', value: stamp, inline: false } : null,
+                (event.origin || event.destination)
+                    ? { name: 'Route', value: [event.origin, event.destination].filter(Boolean).join(' → '), inline: true } : null,
+                event.aircraft ? { name: 'Aircraft', value: String(event.aircraft).slice(0, 60), inline: true } : null,
+                event.server ? { name: 'Server', value: String(event.server).slice(0, 30), inline: true } : null,
+                event.slots ? { name: 'Slots', value: String(event.slots), inline: true } : null,
+                event.minRank ? { name: 'Opens at', value: String(event.minRank), inline: true } : null,
+            ].filter(Boolean),
         }))
         .catch(() => {});
 }
@@ -1835,7 +1976,12 @@ const publicMember = (m, ranks) => ({
     id: m._id, name: m.name, callsign: m.callsign, hours: m.hours,
     role: m.role, aircraft: m.aircraft || [], status: m.status,
     linked: !!m.ifUserId,   // is this pilot linked to an IF account for auto-PIREPs?
-    rank: crewRanks.memberRank(ranks, m.hours),
+    // The badge, plus `awaitingCheck` when hours have taken this pilot as far
+    // as a rung a person has to sign off. The roster draws "ready for their
+    // Captain check-ride" from it, which is the difference between a pilot who
+    // has stopped being promoted and one who is waiting on staff.
+    rank: crewRanks.memberRank(ranks, m.hours, m.checksPassed),
+    checksPassed: Array.isArray(m.checksPassed) ? m.checksPassed : [],
 });
 // Owner/staff (or Inflight) gate for roster writes.
 function crewCanManage(req, slug) {
@@ -1911,7 +2057,7 @@ app.patch('/api/crew/:slug/roster/:id', async (req, res) => {
         const m = await store.updateMember(req.params.id, cleanMember({ ...existing, ...req.body }));
         // Staff editing hours by hand can promote someone too — that is a real
         // promotion and worth the same notice an approved flight would earn.
-        const promotion = crewRanks.promotionFor(va.ranks, existing.hours, m.hours);
+        const promotion = crewRanks.promotionFor(va.ranks, existing.hours, m.hours, m.checksPassed);
         if (promotion) postPromotionNotice(va, m, promotion);
         res.json({ member: publicMember(m, va.ranks) });
     } catch (err) { crewFail(res, err, { log: 'roster edit error', message: 'Could not update the pilot.' }); }
@@ -1925,6 +2071,59 @@ app.delete('/api/crew/:slug/roster/:id', async (req, res) => {
         await store.deleteMember(req.params.id);
         res.json({ ok: true });
     } catch (err) { crewFail(res, err, { log: 'roster delete error', message: 'Could not remove the pilot.' }); }
+});
+
+/**
+ * Sign a pilot off for a rung — or take the sign-off back.
+ *
+ * A VA can mark any rung of their ladder "requires a check-ride", and hours
+ * then carry a pilot only as far as its door: they hold the rung below and the
+ * roster shows them waiting. This is the door being opened.
+ *
+ * POST { rank: 'Captain' }              — passed, promote them
+ * POST { rank: 'Captain', pass: false } — take it back
+ *
+ * The promotion this causes earns the SAME announcement an hours-driven one
+ * does (crewRanks.promotionForCheck), because from the pilot's side they are
+ * the same event: they are a Captain now. Revoking announces nothing, like
+ * every other downward move in this codebase.
+ */
+app.post('/api/crew/:slug/roster/:id/checkride', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const member = await store.getMember(req.params.id);
+        if (!member) return res.status(404).json({ error: 'Pilot not found.' });
+
+        const wanted = String((req.body || {}).rank || '').trim().slice(0, 40);
+        if (!wanted) return res.status(400).json({ error: 'Say which rank the check-ride was for.' });
+        // The rung has to be one on the VA's current ladder. A sign-off for a
+        // rank that does not exist would sit in the column forever, doing
+        // nothing and confusing whoever reads it next.
+        const ladder = crewRanks.normalizeLadder(va.ranks);
+        const rung = ladder.find((r) => r.name.toLowerCase() === wanted.toLowerCase());
+        if (!rung) return res.status(400).json({ error: `${wanted} isn’t a rank on your ladder.` });
+
+        const pass = (req.body || {}).pass !== false;
+        const before = Array.isArray(member.checksPassed) ? member.checksPassed : [];
+        const after = pass
+            ? [...new Set([...before, rung.name])]
+            : before.filter((c) => String(c).toLowerCase() !== rung.name.toLowerCase());
+
+        const saved = await store.updateMember(member._id, { checksPassed: after });
+        const promotion = crewRanks.promotionForCheck(va.ranks, saved.hours, before, after);
+        if (promotion) {
+            postPromotionNotice(va, saved, promotion, { by: (gate.p && gate.p.name) || '', viaCheck: true });
+            postAnnouncement(va, {
+                kind: 'promotion',
+                title: `${saved.name || 'A pilot'} is now ${promotion.to.name}`,
+                body: `Signed off after their ${rung.name} check-ride.`,
+                refId: saved._id,
+            });
+        }
+        res.json(withDrift(store, { member: publicMember(saved, va.ranks), promoted: !!promotion }));
+    } catch (err) { crewFail(res, err, { log: 'checkride error', message: 'Could not record the check-ride.' }); }
 });
 
 // ---- Route network ----
@@ -1974,6 +2173,58 @@ const publicRoute = (r, ranks, viewer) => {
         hoursUntilUnlock: locked ? crewRanks.hoursUntilRank(ranks, viewer.hours, r.minRank) : 0,
     };
 };
+/**
+ * The codeshare network, grouped by partner airline.
+ *
+ * One entry per partner, carrying enough to draw a clickable tile — the name,
+ * a logo when the VA gave one, how many legs, where they go, and the lowest
+ * rank that opens any of them.
+ *
+ * Grouped on a case-folded name because "Delta Virtual" and "delta virtual" are
+ * one airline to everybody except a `groupBy`, and a VA typing the partner in
+ * by hand on each route WILL produce both. The display name kept is the first
+ * spelling seen, so the tile reads the way the VA writes it.
+ *
+ * `lockedRoutes` counts what is shut to the pilot ASKING, so a tile can say
+ * "3 of 8 open at First Officer" rather than either hiding the partner or
+ * pretending all of it is available. It is 0 for staff and the public, who are
+ * never marked locked — the gate is about what a pilot may fly.
+ */
+function codesharePartners(routes) {
+    const byName = new Map();
+    for (const r of routes) {
+        if (r.kind !== 'codeshare') continue;
+        const name = String(r.partnerName || '').trim();
+        const key = name.toLowerCase() || '(unnamed)';
+        let p = byName.get(key);
+        if (!p) {
+            p = {
+                name: name || 'Partner airline',
+                logo: r.partnerLogo || '',
+                routes: 0,
+                destinations: new Set(),
+                lockedRoutes: 0,
+            };
+            byName.set(key, p);
+        }
+        p.routes += 1;
+        if (!p.logo && r.partnerLogo) p.logo = r.partnerLogo;
+        if (r.destination) p.destinations.add(r.destination);
+        if (r.locked) p.lockedRoutes += 1;
+    }
+    return [...byName.values()]
+        .map((p) => ({
+            name: p.name,
+            logo: p.logo,
+            routes: p.routes,
+            destinations: p.destinations.size,
+            // How much of this partner is shut to the pilot asking. Zero for
+            // staff and the public, who are never marked locked.
+            lockedRoutes: p.lockedRoutes,
+        }))
+        .sort((a, b) => b.routes - a.routes || a.name.localeCompare(b.name));
+}
+
 // Public: the VA's route network (active only for non-managers is handled client-side;
 // here we return all so managers see drafts too — the list isn't sensitive).
 //
@@ -1994,6 +2245,17 @@ app.get('/api/crew/:slug/routes', async (req, res) => {
                 codeshare: out.filter((r) => r.kind === 'codeshare').length,
                 locked: out.filter((r) => r.locked).length,
             },
+            // The codeshare network, grouped by the airline whose metal it is.
+            //
+            // Sent from here rather than grouped in three different browsers,
+            // for the reason `counts` is: one answer to "who do we codeshare
+            // with, and how much", so a VA's own site, the route panel and the
+            // network map cannot quote different figures. It is also what makes
+            // a partner's logo something to click — a route list filtered to
+            // one airline is the question a pilot actually has ("what can I fly
+            // on Delta's metal?"), and grouping it here means the front end
+            // only has to draw it.
+            partners: codesharePartners(out),
             // So a pilot's route list can say "unlocks at First Officer" using
             // the VA's own words rather than an hours figure.
             ranks: crewRanks.normalizeLadder(va.ranks).map((r) => ({ name: r.name, minHours: r.minHours })),
@@ -2195,6 +2457,580 @@ app.post('/api/crew/:slug/routes/import', async (req, res) => {
     } catch (err) { crewFail(res, err, { log: 'routes import error', message: 'Could not import the routes.' }); }
 });
 
+// ---- The noticeboard ----
+//
+// What a VA tells its crew, and what the crew center tells them on the VA's
+// behalf. The second kind is why this exists: a promotion, a new pilot, a
+// published event all already happen inside the crew center, and until now the
+// only trace was a Discord message that scrolls away by Thursday. A pilot who
+// joined on Tuesday should still be able to see on Friday that they joined.
+const cleanAnnouncement = (b) => {
+    b = b || {};
+    return {
+        title: String(b.title || '').trim().slice(0, 160),
+        body: String(b.body || '').trim().slice(0, 4000),
+        // Only 'notice' can be written by hand. The other kinds are the crew
+        // center's own record of things that happened, and a staff member
+        // posting a hand-written "promotion" would be indistinguishable on the
+        // board from one that actually occurred.
+        kind: 'notice',
+        pinned: !!b.pinned,
+    };
+};
+
+const publicAnnouncement = (a) => ({
+    id: a._id,
+    title: a.title, body: a.body, kind: a.kind,
+    // So a page can style what the crew center wrote differently from what a
+    // human wrote, and so a cleanup job can tell them apart.
+    auto: a.source === 'auto',
+    pinned: a.pinned,
+    refId: a.refId || null,
+    authorName: a.authorName || '',
+    createdAt: a.createdAt,
+});
+
+// Public: a crew center's noticeboard is part of what it shows the world.
+app.get('/api/crew/:slug/announcements', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const canManage = !(await requireCap(req, req.params.slug, 'roster.manage')).error;
+        const list = await store.listAnnouncements({ limit: 50 });
+        res.json({ announcements: list.map(publicAnnouncement), canManage });
+    } catch (err) { crewFail(res, err, { log: 'announcements list error', message: 'Could not load the noticeboard.' }); }
+});
+
+app.post('/api/crew/:slug/announcements', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const body = cleanAnnouncement(req.body);
+        if (!body.title) return res.status(400).json({ error: 'Give the notice a title.' });
+        const a = await store.createAnnouncement({
+            ...body, source: 'staff', authorName: (gate.p && gate.p.name) || '',
+        });
+        res.status(201).json(withDrift(store, { announcement: publicAnnouncement(a) }));
+    } catch (err) { crewFail(res, err, { log: 'announcement add error', message: 'Could not post the notice.' }); }
+});
+
+app.patch('/api/crew/:slug/announcements/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const existing = await store.getAnnouncement(req.params.id);
+        if (!existing) return res.status(404).json({ error: 'Notice not found.' });
+        const b = req.body || {};
+        const patch = {};
+        // Pinning is the one thing that may be done to a generated row: staff
+        // keeping a promotion at the top of the board is reasonable, rewriting
+        // what the crew center recorded is not.
+        if (b.pinned !== undefined) patch.pinned = !!b.pinned;
+        if (existing.source !== 'auto') {
+            if (b.title !== undefined) patch.title = String(b.title || '').trim().slice(0, 160);
+            if (b.body !== undefined) patch.body = String(b.body || '').trim().slice(0, 4000);
+        }
+        const a = await store.updateAnnouncement(existing._id, patch);
+        res.json(withDrift(store, { announcement: publicAnnouncement(a) }));
+    } catch (err) { crewFail(res, err, { log: 'announcement edit error', message: 'Could not update the notice.' }); }
+});
+
+app.delete('/api/crew/:slug/announcements/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        await store.deleteAnnouncement(req.params.id);
+        res.json({ ok: true });
+    } catch (err) { crewFail(res, err, { log: 'announcement delete error', message: 'Could not remove the notice.' }); }
+});
+
+// ---- Events and the gate board ----
+//
+// An event is the thing a VA gathers around; the gate board is what stops
+// twelve pilots spawning on top of each other at the same stand. Staff publish
+// an event, pilots sign themselves up and claim a stand off a map, and the
+// airline's own website reads the same rows — so the calendar a visitor sees is
+// the one staff filled in rather than a copy kept by hand.
+//
+// Where the authority sits, because it is the whole design:
+//   * WHO IS COMING is crew_event_signups — one row per pilot per event,
+//     withdrawal deletes it.
+//   * WHICH STAND IS THEIRS is a unique index on (event_id, upper(gate)). Not a
+//     check in this file: two pilots tapping the same marker seconds after an
+//     event is announced is the normal case, and any "is it free?" read
+//     performed before the insert loses that race. We attempt the insert and
+//     let Postgres arbitrate.
+//   * WHAT STANDS EXIST is OpenStreetMap, cached below — no VA maintains a gate
+//     list, and the tracker's dispatch gate picker already reads the same tags.
+
+// The pure decisions — what an event may say, what it looks like to the world,
+// which stands exist and which are held — live in crewEvents.js so they can be
+// tested without standing up a server. This file keeps the routing, the auth
+// and the notices.
+const cleanEvent = crewEvents.sanitizeEvent;
+const publicSignup = crewEvents.publicSignup;
+
+// `viewer` is the pilot asking, when there is one, so an event can say whether
+// their rank opens it — identical treatment to a rank-gated route, including
+// showing it locked rather than hidden. `hoursUntilUnlock` is added here
+// because it is the one field that needs the ladder maths.
+const publicEvent = (e, opts = {}) => {
+    const out = crewEvents.publicEvent(e, { ...opts, meetsRank: crewRanks.meetsRank });
+    out.hoursUntilUnlock = out.locked
+        ? crewRanks.hoursUntilRank(opts.ranks, opts.viewer.hours, e.minRank)
+        : 0;
+    return out;
+};
+
+// The pilot making this request: their login, their roster row, their hours.
+// Staff and Inflight oversight come back with `account: null` — they can manage
+// the board but they are not automatically ON it, and a manager who wants to
+// fly the event signs up like anyone else.
+async function crewPilot(req, store) {
+    const p = verifyCrewRequest(req);
+    if (!p || p.kind !== 'crew') return null;
+    try {
+        const account = await store.getAccount(p.sub);
+        if (!account || account.active === false) return null;
+        const member = account.memberId ? await store.getMember(account.memberId) : null;
+        return {
+            accountId: account._id,
+            memberId: member ? member._id : null,
+            name: (member && member.name) || account.displayName || account.username || 'A pilot',
+            callsign: (member && member.callsign) || '',
+            hours: member ? Number(member.hours) || 0 : 0,
+        };
+    } catch { return null; }
+}
+
+// Can this caller see drafts and edit the calendar?
+const canManageEvents = async (req, slug) => !(await requireCap(req, slug, 'events.manage')).error;
+
+// Where the backend keeps its airport coordinates, handed to crewEvents so that
+// module does not have to know. Falls back to an Overpass lookup by ICAO tag
+// for a field the coordinate set has never heard of.
+const gateCoordsFor = (icao) => AIRPORT_COORDS[icao] || null;
+
+// A gate clash, in the words of the person who just lost the race. The store
+// tells us which uniqueness bit (see Postgrest.explain), so "that stand has
+// just gone" is never guessed — a pilot who is simply already signed up gets
+// their own, different sentence.
+function eventConflict(err, res) {
+    if (!(err instanceof crewStore.CrewStoreError) || err.code !== 'store_conflict') return false;
+    if (String(err.constraint || '').includes('gate')) {
+        res.status(409).json({
+            error: 'That stand has just been taken — pick another one.',
+            code: 'gate_taken',
+        });
+        return true;
+    }
+    res.status(409).json({ error: 'You are already signed up for this event.', code: 'already_signed_up' });
+    return true;
+}
+
+// The calendar. Public: published and cancelled events, because a pilot who
+// signed up for something that has been called off needs to see that it was.
+// Drafts are added only for a caller who can manage them.
+app.get('/api/crew/:slug/events', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const canManage = await canManageEvents(req, req.params.slug);
+        const viewer = await crewPilot(req, store);
+        const upcomingOnly = String(req.query.upcoming || '') === '1';
+
+        const all = await store.listEvents({ upcomingOnly });
+        const events = canManage ? all : all.filter((e) => e.status !== 'draft');
+
+        // Attendance for the whole page in ONE query rather than one per event.
+        // The count belongs on the card ("34 going"), and a sixty-event
+        // calendar that fetched them separately would be sixty round trips to
+        // the VA's project for a figure each card shows in small print.
+        const counted = events.slice(0, 60);
+        const allSignups = await store.listSignupsForEvents(counted.map((e) => e._id)).catch(() => []);
+        const byEvent = new Map(counted.map((e) => [String(e._id), []]));
+        for (const s of allSignups) {
+            const list = byEvent.get(String(s.eventId));
+            if (list) list.push(s);
+        }
+        const isMine = (s) => (viewer.accountId && s.accountId === viewer.accountId)
+            || (viewer.memberId && s.memberId === viewer.memberId);
+
+        res.json({
+            events: counted.map((e) => publicEvent(e, {
+                signups: byEvent.get(String(e._id)) || [], ranks: va.ranks, viewer, canManage,
+            })),
+            canManage,
+            // So a pilot's own card can say "you're signed up, stand B24"
+            // without a second request per event.
+            mine: viewer
+                ? allSignups.filter(isMine).map((s) => ({ eventId: s.eventId, ...publicSignup(s) }))
+                : [],
+            ranks: crewRanks.normalizeLadder(va.ranks).map((r) => ({ name: r.name, minHours: r.minHours })),
+        });
+    } catch (err) { crewFail(res, err, { log: 'events list error', message: 'Could not load events.' }); }
+});
+
+// One event, with who is attending. This is the endpoint the event page reads.
+app.get('/api/crew/:slug/events/:id', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const canManage = await canManageEvents(req, req.params.slug);
+        const event = await store.getEvent(req.params.id);
+        if (!event) return res.status(404).json({ error: 'Event not found.' });
+        if (event.status === 'draft' && !canManage) return res.status(404).json({ error: 'Event not found.' });
+
+        const viewer = await crewPilot(req, store);
+        const signups = await store.listSignups(event._id);
+        const mine = viewer
+            ? signups.find((s) => (viewer.accountId && s.accountId === viewer.accountId)
+                || (viewer.memberId && s.memberId === viewer.memberId))
+            : null;
+
+        // What was actually flown, as opposed to who said they would turn up.
+        // Best-effort: a project on an older schema has no event_id column, and
+        // an event whose flights cannot be listed is still an event worth
+        // opening.
+        const flights = await store.listPirepsForEvent(event._id).catch(() => []);
+
+        res.json({
+            event: publicEvent(event, { signups, ranks: va.ranks, viewer, canManage }),
+            attending: signups.map(publicSignup),
+            mine: mine ? publicSignup(mine) : null,
+            // Approved only for everyone but staff, matching the public flight
+            // log: a pending report is staff business until a decision is made.
+            flights: flights
+                .filter((f) => canManage || f.status === 'approved')
+                .map(publicPirep),
+            // So the brief can say "you filed this" without a second request.
+            myFlightFiled: !!(viewer && flights.some((f) => f.memberId && viewer.memberId
+                && String(f.memberId) === String(viewer.memberId))),
+            canManage,
+        });
+    } catch (err) { crewFail(res, err, { log: 'event read error', message: 'Could not load the event.' }); }
+});
+
+// The gate board: every mapped stand at the event's airport, marked taken or
+// free. Public, like the attendee list — seeing which stands are left is the
+// reason to open it.
+app.get('/api/crew/:slug/events/:id/gates', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const canManage = await canManageEvents(req, req.params.slug);
+        const event = await store.getEvent(req.params.id);
+        if (!event) return res.status(404).json({ error: 'Event not found.' });
+        if (event.status === 'draft' && !canManage) return res.status(404).json({ error: 'Event not found.' });
+
+        const icao = crewEvents.gateAirport(event);
+        if (!icao) return res.json({ icao: '', gates: [], source: 'none' });
+
+        const signups = await store.listSignups(event._id);
+        let gates = [];
+        let source = 'osm';
+        try {
+            gates = await crewEvents.fetchAirportGates(icao, gateCoordsFor);
+        } catch (err) {
+            // OpenStreetMap being slow or blocked must not take the board with
+            // it. The stands pilots have already claimed are ours, not OSM's,
+            // and buildGateBoard puts them on the board either way — so a VA
+            // sees who is parked where and simply cannot pick a NEW stand off
+            // the map until Overpass answers again.
+            console.warn('event gates: Overpass lookup failed —', err?.message || err);
+            source = 'unavailable';
+        }
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            icao,
+            gatesOpen: event.gatesOpen,
+            gatesLocked: event.gatesLocked,
+            gates: crewEvents.buildGateBoard(gates, signups),
+            source,
+        });
+    } catch (err) { crewFail(res, err, { log: 'event gates error', message: 'Could not load the gate board.' }); }
+});
+
+app.post('/api/crew/:slug/events', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'events.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const e = await store.createEvent({ ...cleanEvent(req.body), createdBy: (gate.p && gate.p.name) || '' });
+        if (e.status === 'published') postEventNotice(va, 'published', e, gate.p);
+        res.status(201).json(withDrift(store, { event: publicEvent(e, { canManage: true }) }));
+    } catch (err) { crewFail(res, err, { log: 'event add error', message: 'Could not create the event.' }); }
+});
+
+app.patch('/api/crew/:slug/events/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'events.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const existing = await store.getEvent(req.params.id);
+        if (!existing) return res.status(404).json({ error: 'Event not found.' });
+        // Merge over the current row before cleaning, so a partial PATCH (the
+        // gate-lock toggle sends one field) keeps everything it didn't mention.
+        const e = await store.updateEvent(req.params.id, cleanEvent({ ...existing, ...req.body }));
+
+        // Which notice, if any. A draft becoming published is the announcement;
+        // anything becoming cancelled is the one pilots must not miss. An edit
+        // to a draft nobody can see is not news and stays quiet.
+        if (existing.status !== 'published' && e.status === 'published') postEventNotice(va, 'published', e, gate.p);
+        else if (existing.status !== 'cancelled' && e.status === 'cancelled') postEventNotice(va, 'cancelled', e, gate.p);
+        else if (e.status === 'published') postEventNotice(va, 'updated', e, gate.p);
+
+        const signups = await store.listSignups(e._id).catch(() => []);
+        res.json(withDrift(store, { event: publicEvent(e, { signups, canManage: true }) }));
+    } catch (err) { crewFail(res, err, { log: 'event edit error', message: 'Could not update the event.' }); }
+});
+
+app.delete('/api/crew/:slug/events/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'events.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        // Read it before it goes so the notice can name the event rather than
+        // an id nobody recognises.
+        const existing = await store.getEvent(req.params.id).catch(() => null);
+        await store.deleteEvent(req.params.id);   // signups cascade with it
+        if (existing && existing.status === 'published') postEventNotice(va, 'removed', existing, gate.p);
+        res.json({ ok: true });
+    } catch (err) { crewFail(res, err, { log: 'event delete error', message: 'Could not remove the event.' }); }
+});
+
+// Event artwork. Same upload path as the crew badge, so a VA gets the same
+// resizing and the same bucket rather than a second way to store an image.
+app.post('/api/crew/:slug/events/:id/banner', upload.single('image'), async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'events.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        if (!req.file) return res.status(400).json({ error: 'No image uploaded.' });
+        const { store } = await resolveCrewStore(req.params.slug);
+        const event = await store.getEvent(req.params.id);
+        if (!event) return res.status(404).json({ error: 'Event not found.' });
+
+        const slug = String(req.params.slug || '').toLowerCase();
+        const va = await VirtualAirlineAd.findOne({ slug }).select('_id').lean();
+        const url = await uploadVaImage(s3Client, req.file, va ? String(va._id) : slug, 'banner');
+        const saved = await store.updateEvent(event._id, { bannerUrl: url });
+        res.set('Cache-Control', 'no-store');
+        res.json(withDrift(store, { url, event: publicEvent(saved, { canManage: true }) }));
+    } catch (err) { crewFail(res, err, { log: 'event banner error', message: 'Could not upload the event image.' }); }
+});
+
+/* ---- Signing up ---------------------------------------------------------
+ * The pilot's own place at an event. Any signed-in crew member may take one:
+ * this is the one crew endpoint that is deliberately not staff-gated, because
+ * an event pilots cannot sign themselves up for is a spreadsheet.
+ */
+app.post('/api/crew/:slug/events/:id/signup', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const viewer = await crewPilot(req, store);
+        if (!viewer) return res.status(401).json({ error: 'Sign in to your crew center to join an event.' });
+
+        const event = await store.getEvent(req.params.id);
+        if (!event || event.status === 'draft') return res.status(404).json({ error: 'Event not found.' });
+        if (event.status === 'cancelled') return res.status(409).json({ error: 'This event has been cancelled.' });
+        if (event.minRank && !crewRanks.meetsRank(va.ranks, viewer.hours, event.minRank)) {
+            return res.status(403).json({
+                error: `This event opens at ${event.minRank}.`,
+                code: 'rank_locked',
+                hoursUntilUnlock: crewRanks.hoursUntilRank(va.ranks, viewer.hours, event.minRank),
+            });
+        }
+
+        const b = req.body || {};
+        const gateWanted = String(b.gate || '').trim().slice(0, 20).toUpperCase();
+        if (gateWanted && (!event.gatesOpen || event.gatesLocked)) {
+            return res.status(409).json({
+                error: event.gatesLocked
+                    ? 'Stands for this event are locked — talk to staff if you need a change.'
+                    : 'This event isn’t using a gate board.',
+                code: 'gates_closed',
+            });
+        }
+
+        // Past the cap you are still coming, you are just on the waitlist — and
+        // a waitlisted pilot holds no stand, because the stand belongs to the
+        // event and someone who may not fly it should not be sitting on one.
+        const waitlisted = crewEvents.isWaitlisted(event, await store.listSignups(event._id));
+
+        const signup = await store.createSignup({
+            eventId: event._id,
+            memberId: viewer.memberId,
+            accountId: viewer.accountId,
+            pilotName: viewer.name,
+            callsign: String(b.callsign || viewer.callsign || '').trim().slice(0, 20),
+            aircraft: String(b.aircraft || event.aircraft || '').trim().slice(0, 60),
+            gate: waitlisted ? '' : gateWanted,
+            gateLat: waitlisted ? null : b.gateLat,
+            gateLon: waitlisted ? null : b.gateLon,
+            gateKind: waitlisted ? '' : String(b.gateKind || '').trim().slice(0, 30),
+            note: String(b.note || '').trim().slice(0, 300),
+            status: waitlisted ? 'waitlist' : 'going',
+        });
+        res.status(201).json(withDrift(store, { signup: publicSignup(signup), waitlisted }));
+    } catch (err) {
+        if (eventConflict(err, res)) return;
+        crewFail(res, err, { log: 'event signup error', message: 'Could not sign you up.' });
+    }
+});
+
+// Change your stand, your aircraft or your note. Same endpoint whether a pilot
+// is picking a gate for the first time or swapping one — the unique index makes
+// the swap safe without a "release then claim" dance that could lose both.
+app.patch('/api/crew/:slug/events/:id/signup', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const viewer = await crewPilot(req, store);
+        if (!viewer) return res.status(401).json({ error: 'Sign in to your crew center first.' });
+
+        const event = await store.getEvent(req.params.id);
+        if (!event || event.status === 'draft') return res.status(404).json({ error: 'Event not found.' });
+        const mine = await store.getSignupFor(event._id, { accountId: viewer.accountId, memberId: viewer.memberId });
+        if (!mine) return res.status(404).json({ error: 'You are not signed up for this event.' });
+
+        const b = req.body || {};
+        if (b.gate !== undefined) {
+            if (!event.gatesOpen || event.gatesLocked) {
+                return res.status(409).json({
+                    error: event.gatesLocked
+                        ? 'Stands for this event are locked — talk to staff if you need a change.'
+                        : 'This event isn’t using a gate board.',
+                    code: 'gates_closed',
+                });
+            }
+            if (mine.status === 'waitlist') {
+                return res.status(409).json({
+                    error: 'You’re on the waitlist for this event, so there’s no stand to hold yet.',
+                    code: 'waitlisted',
+                });
+            }
+        }
+        // A pilot may change their own stand, aircraft, callsign and note — not
+        // their name (it is their roster row's) and not their waitlist status
+        // (that is the event's cap talking, not a preference).
+        const saved = await store.updateSignup(mine._id, crewEvents.sanitizeSignupPatch(b));
+        res.json(withDrift(store, { signup: publicSignup(saved) }));
+    } catch (err) {
+        if (eventConflict(err, res)) return;
+        crewFail(res, err, { log: 'event signup edit error', message: 'Could not update your signup.' });
+    }
+});
+
+// Withdraw. Deletes the row rather than flagging it, which is what frees the
+// stand — see the schema note on why a withdrawn pilot must not keep one.
+app.delete('/api/crew/:slug/events/:id/signup', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const viewer = await crewPilot(req, store);
+        if (!viewer) return res.status(401).json({ error: 'Sign in to your crew center first.' });
+        const mine = await store.getSignupFor(req.params.id, { accountId: viewer.accountId, memberId: viewer.memberId });
+        if (!mine) return res.json({ ok: true });   // already not going; nothing to undo
+        await store.deleteSignup(mine._id);
+        await promoteFromWaitlist(store, req.params.id);
+        res.json({ ok: true });
+    } catch (err) { crewFail(res, err, { log: 'event withdraw error', message: 'Could not withdraw you.' }); }
+});
+
+/**
+ * A seat has come free, so the pilot who has waited longest gets it.
+ *
+ * Runs after any removal rather than being left for staff to notice. Who is
+ * next is crewEvents.nextOffWaitlist; this is the part that talks to the store.
+ *
+ * Swallows its errors on purpose — a withdrawal that succeeded must not report
+ * failure because the tidy-up afterwards did not.
+ */
+async function promoteFromWaitlist(store, eventId) {
+    try {
+        const event = await store.getEvent(eventId);
+        if (!event || !event.slots) return;
+        const next = crewEvents.nextOffWaitlist(event, await store.listSignups(eventId));
+        if (next) await store.updateSignup(next._id, { status: 'going' });
+    } catch (err) {
+        console.warn('event waitlist promotion failed —', err?.message || err);
+    }
+}
+
+// Staff putting someone on the board by hand: a guest from a partner VA, or a
+// pilot who asked in Discord. No account is invented for them — the signup
+// carries a name, which is all the board needs.
+app.post('/api/crew/:slug/events/:id/signups', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'events.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const event = await store.getEvent(req.params.id);
+        if (!event) return res.status(404).json({ error: 'Event not found.' });
+
+        const b = req.body || {};
+        const name = String(b.pilotName || '').trim().slice(0, 80);
+        if (!name) return res.status(400).json({ error: 'Give the pilot a name.' });
+        // A roster pilot gets their real row linked so the board can follow
+        // them; a guest does not, and the unique index leaves guests alone.
+        const member = b.memberId ? await store.getMember(b.memberId).catch(() => null) : null;
+
+        const signup = await store.createSignup({
+            eventId: event._id,
+            memberId: member ? member._id : null,
+            accountId: null,
+            pilotName: member ? (member.name || name) : name,
+            callsign: String(b.callsign || (member && member.callsign) || '').trim().slice(0, 20),
+            aircraft: String(b.aircraft || event.aircraft || '').trim().slice(0, 60),
+            gate: String(b.gate || '').trim().slice(0, 20).toUpperCase(),
+            gateLat: b.gateLat, gateLon: b.gateLon,
+            gateKind: String(b.gateKind || '').trim().slice(0, 30),
+            note: String(b.note || '').trim().slice(0, 300),
+            status: b.status === 'waitlist' ? 'waitlist' : 'going',
+        });
+        res.status(201).json(withDrift(store, { signup: publicSignup(signup) }));
+    } catch (err) {
+        if (eventConflict(err, res)) return;
+        crewFail(res, err, { log: 'event guest add error', message: 'Could not add them to the event.' });
+    }
+});
+
+// Staff editing somebody else's place — moving a pilot to a different stand
+// during the final allocation, mostly.
+app.patch('/api/crew/:slug/events/:id/signups/:signupId', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'events.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const existing = await store.getSignup(req.params.signupId);
+        if (!existing || existing.eventId !== req.params.id) return res.status(404).json({ error: 'Attendee not found.' });
+
+        // Staff may move a pilot's stand even when the board is locked: locking
+        // is what stops PILOTS shuffling, and the person doing the final
+        // allocation is exactly who needs to move people at that point. They
+        // may also change a name and a waitlist position, which a pilot editing
+        // their own row may not — hence allowIdentity.
+        const saved = await store.updateSignup(
+            existing._id,
+            crewEvents.sanitizeSignupPatch(req.body, { allowIdentity: true }),
+        );
+        res.json(withDrift(store, { signup: publicSignup(saved) }));
+    } catch (err) {
+        if (eventConflict(err, res)) return;
+        crewFail(res, err, { log: 'event attendee edit error', message: 'Could not update the attendee.' });
+    }
+});
+
+app.delete('/api/crew/:slug/events/:id/signups/:signupId', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'events.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const existing = await store.getSignup(req.params.signupId);
+        if (!existing || existing.eventId !== req.params.id) return res.status(404).json({ error: 'Attendee not found.' });
+        await store.deleteSignup(existing._id);
+        await promoteFromWaitlist(store, req.params.id);
+        res.json({ ok: true });
+    } catch (err) { crewFail(res, err, { log: 'event attendee remove error', message: 'Could not remove the attendee.' }); }
+});
+
 // ---- Flight reports (PIREPs) — auto-captured from real IF history ----
 const _norm = (s) => String(s || '').trim().toLowerCase();
 // Loose aircraft-name match. Fleet types are the canonical IF names now, so an
@@ -2249,8 +3085,26 @@ async function applyPirepHours(store, pirep, va) {
         if (before) {
             const after = await store.getMember(pirep.memberId).catch(() => null);
             if (after) {
-                const promotion = crewRanks.promotionFor(va.ranks, before.hours, after.hours);
-                if (promotion) postPromotionNotice(va, after, promotion);
+                const promotion = crewRanks.promotionFor(va.ranks, before.hours, after.hours, after.checksPassed);
+                if (promotion) {
+                    postPromotionNotice(va, after, promotion);
+                    postAnnouncement(va, {
+                        kind: 'promotion',
+                        title: `${after.name || 'A pilot'} is now ${promotion.to.name}`,
+                        body: promotion.from ? `Up from ${promotion.from.name}.` : '',
+                        refId: after._id,
+                    });
+                }
+                // Or the hours took them to the door of a rung somebody has to
+                // sign off. Fired once, on the crossing — comparing before and
+                // after is what makes it once rather than on every subsequent
+                // flight, which would be a weekly nag for a pilot nobody has
+                // got round to yet.
+                const wasWaiting = crewRanks.awaitingCheck(va.ranks, before.hours, before.checksPassed);
+                const nowWaiting = crewRanks.awaitingCheck(va.ranks, after.hours, after.checksPassed);
+                if (nowWaiting && (!wasWaiting || wasWaiting.name !== nowWaiting.name)) {
+                    postCheckRideDueNotice(va, after, nowWaiting);
+                }
             }
         }
     }
@@ -2265,7 +3119,7 @@ async function reversePirepHours(store, pirep) {
     return (await store.updatePirep(pirep._id, { hoursApplied: false })) || { ...pirep, hoursApplied: false };
 }
 const publicPirep = (p) => ({
-    id: p._id, memberId: p.memberId, routeId: p.routeId,
+    id: p._id, memberId: p.memberId, routeId: p.routeId, eventId: p.eventId || null,
     pilotName: p.pilotName, callsign: p.callsign, flightNumber: p.flightNumber,
     origin: p.origin, destination: p.destination,
     aircraftName: p.aircraftName, liveryName: p.liveryName,
@@ -2308,9 +3162,25 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
         const { va, store } = await resolveCrewStore(req.params.slug);
         const b = req.body || {};
         const icao = (v) => String(v || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
-        const origin = icao(b.origin), destination = icao(b.destination);
+
+        // Filing FROM an event's brief. The event supplies whatever the pilot
+        // did not type — which, filing straight off the brief, is everything
+        // except how long it took. Deliberately handled here rather than in a
+        // second endpoint: an event flight is an ordinary flight that happens
+        // to know why it was flown, and it must be reviewed, credited and
+        // route-matched by exactly the same code as any other.
+        let event = null;
+        if (b.eventId) {
+            event = await store.getEvent(b.eventId).catch(() => null);
+            if (!event || event.status === 'draft') {
+                return res.status(404).json({ error: 'That event isn’t available.' });
+            }
+        }
+
+        const origin = icao(b.origin) || (event ? event.origin : '');
+        const destination = icao(b.destination) || (event ? event.destination : '');
         if (!origin || !destination) return res.status(400).json({ error: 'Enter both a departure and an arrival airport.' });
-        const aircraftName = String(b.aircraftName || b.aircraft || '').trim().slice(0, 60);
+        const aircraftName = String(b.aircraftName || b.aircraft || (event && event.aircraft) || '').trim().slice(0, 60);
         const liveryName = String(b.liveryName || b.livery || '').trim().slice(0, 80);
         // Duration accepts either a minutes number or hours+minutes fields.
         let durationMin = Math.round(Number(b.durationMin) || 0);
@@ -2328,11 +3198,16 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
         const route = matchRoute(routes, origin, destination, aircraftName);
         const inFleet = pirepInFleet((vaFull && vaFull.crewFleet) || [], aircraftName);
         // If the pilot typed a flight number, note when it disagrees with the route's.
-        const claimedFlight = String(b.flightNumber || '').trim().slice(0, 12);
+        const claimedFlight = String(b.flightNumber || (event && event.flightNumber) || '').trim().slice(0, 12);
         const flightNumberMismatch = !!(route && route.flightNumber && claimedFlight && _norm(route.flightNumber) !== _norm(claimedFlight));
 
         const doc = await store.createPirep({
-            memberId: (member && member._id) || null, routeId: (route && route._id) || null,
+            memberId: (member && member._id) || null,
+            // The route the LEG matched, falling back to the one the event was
+            // built on. An event flown on a published route credits against it
+            // even when the pilot's typed airports were the thing that matched.
+            routeId: (route && route._id) || (event && event.routeId) || null,
+            eventId: event ? event._id : null,
             pilotName: (member && member.name) || p.name || '', callsign: String(b.callsign || (member && member.callsign) || '').slice(0, 20),
             flightNumber: (route && route.flightNumber) || claimedFlight, ifUserId: (member && member.ifUserId) || '',
             origin, destination, aircraftName, liveryName,
@@ -2797,6 +3672,16 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
                     ifUserId: appDoc.ifUserId || '', ifcName: appDoc.ifcName || '',
                 });
                 vaStats.recordEngagement(va._id, 'crewJoin', 1, va.name);
+                // Put them on the noticeboard. A new pilot's first visit to the
+                // crew center is the one where they are most likely to be
+                // looking, and "welcome aboard" being there for the crew to see
+                // is worth more than the Discord line that scrolls away.
+                postAnnouncement(va, {
+                    kind: 'join',
+                    title: `${member.name || 'A new pilot'} joined the crew`,
+                    body: member.callsign ? `Flying as ${member.callsign}.` : '',
+                    refId: member._id,
+                });
             }
 
             // A crew center login, when the reviewer asked for one. It is
@@ -3113,6 +3998,7 @@ app.get('/api/crew/:slug/store', async (req, res) => {
             legacyTotal: pending.members + pending.routes + pending.pireps + pending.applications + pending.accounts,
             schemaVersion: crewStore.EXPECTED_SCHEMA_VERSION,
             accountsSchemaVersion: crewStore.ACCOUNTS_SCHEMA_VERSION,
+            eventsSchemaVersion: crewStore.EVENTS_SCHEMA_VERSION,
         });
     } catch (err) { crewFail(res, err, { log: 'crew store health error', message: 'Could not check the data store.' }); }
 });
@@ -3719,6 +4605,7 @@ app.post('/api/crew/:slug/webhook', async (req, res) => {
                 recruitment: 'New applications, and accept / decline decisions, will show up here.',
                 pireps: 'Flight reports — filed, approved and rejected — and pilot promotions will show up here.',
                 routes: 'Route network changes will show up here.',
+                events: 'Events published, changed and cancelled will show up here. Signups will not — a busy event would fire dozens of them in an evening.',
             }[feed] || 'Your Crew Center is connected. New applications and accept / decline decisions will show up here.';
             const ok = await postCrewNotice(target, {
                 title: `🔔 ${ad.name || 'Crew Center'} — test message`,
