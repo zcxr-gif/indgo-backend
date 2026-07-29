@@ -84,8 +84,15 @@ const crewSchedules = require('./crewSchedules');
 // One-paste setup for a VA's Supabase project: given a Supabase access token we
 // install the schema, read the project's keys back and store the connection
 // ourselves, so nobody has to hand-copy three values between two dashboards.
-// The token is used for the request and never stored. See crewSetup.js.
+// The token is used for the request, and kept afterwards only if the VA asks us
+// to — sealed, and only so later schema updates need no second visit to
+// supabase.com. See crewSetup.js.
 const crewSetup = require('./crewSetup');
+
+// AES-256-GCM at rest for the VA secrets we do keep — today, the Supabase
+// access token above. The key lives in the environment, not the database. See
+// crewSecrets.js.
+const crewSecrets = require('./crewSecrets');
 
 // Group flights — a VA owner selects the aircraft flying their event and mints
 // one short link to share. Ownership is claimed with the contact email already
@@ -388,6 +395,43 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     supabaseUrl: { type: String, trim: true, default: '' },
     supabaseAnonKey: { type: String, trim: true, default: '' },
     supabaseServiceKey: { type: String, trim: true, default: '', select: false },
+
+    // --- The kept access token (opt-in) ---
+    // A Supabase personal access token, SEALED (crewSecrets — AES-256-GCM under
+    // a key that lives in the environment, never in this document), stored only
+    // when the VA ticks "remember this" and deletable by them at any time.
+    //
+    // WHY WE KEEP ONE AT ALL. The crew center's schema gains columns as the
+    // product does, and a project set up last year has not got them. Without a
+    // token that upgrade means the VA going back to supabase.com, minting a new
+    // token and pasting it — months after they last thought about any of this —
+    // so in practice it did not happen, and the first sign of the gap was a save
+    // that quietly dropped a field. With one, the update is a button, or nothing
+    // at all (see supabaseAutoUpdate).
+    //
+    // It is used for exactly one thing: running OUR schema file against the
+    // project this VA is already connected to. Never echoed to a browser, never
+    // logged, never used to reach any other project on the account.
+    supabaseAccessToken: { type: String, default: '', select: false },
+    // Non-secret companions, safe to show staff so they can tell which token
+    // they saved and when — "sbp_…9f3a", not the token.
+    supabaseTokenHint: { type: String, default: '' },
+    supabaseTokenSavedAt: { type: Date, default: null },
+    supabaseTokenUsedAt: { type: Date, default: null },
+    // Set when Supabase last rejected the stored token (revoked, or belonging to
+    // another account now). Keeps us from retrying a dead credential on every
+    // health check, and gives the dashboard something honest to say.
+    supabaseTokenFailedAt: { type: Date, default: null },
+    supabaseTokenError: { type: String, default: '' },
+    // May we run a schema update on the VA's behalf when we notice their project
+    // is behind? On by default WHEN A TOKEN IS SAVED (saving one is the consent;
+    // this switch is the VA's way to take it back without giving up one-click
+    // updates). Irrelevant with no token — nothing can run.
+    supabaseAutoUpdate: { type: Boolean, default: true },
+    // Stamped by the automatic updater so the dashboard can show what it did,
+    // and so a project that keeps failing is not retried in a loop.
+    supabaseAutoUpdatedAt: { type: Date, default: null },
+    supabaseAutoUpdatedTo: { type: Number, default: 0 },
 
     // --- Copy ---
     tagline: { type: String, trim: true, maxlength: 140, default: '' }, // short hook
@@ -4911,7 +4955,16 @@ app.get('/api/crew/:slug/store', async (req, res) => {
         if (!va) return res.status(404).json({ error: 'Crew center not found.' });
         const connected = crewStore.isConnected(va);
         const store = await crewStore.forVaOrNull(va);
-        const health = store ? await store.health() : { ok: false, provisioned: false, code: 'store_not_connected' };
+        let health = store ? await store.health() : { ok: false, provisioned: false, code: 'store_not_connected' };
+
+        // A project that is behind, and a token the VA gave us to fix exactly
+        // that: run it now rather than showing them a warning about a thing we
+        // were asked to handle. Silent when there is no token, when the VA
+        // turned it off, or when it ran recently — see autoUpdateStore.
+        const auto = await autoUpdateStore(va, health);
+        if (auto && auto.ran && store) health = await store.health();
+
+        const tokenMeta = await VirtualAirlineAd.findById(va._id).select(CREW_TOKEN_META).lean();
         // How much is still sitting in our managed collections? A non-zero count
         // is what the migrate button acts on.
         const pending = {
@@ -4937,9 +4990,78 @@ app.get('/api/crew/:slug/store', async (req, res) => {
             schemaVersion: crewStore.EXPECTED_SCHEMA_VERSION,
             accountsSchemaVersion: crewStore.ACCOUNTS_SCHEMA_VERSION,
             eventsSchemaVersion: crewStore.EVENTS_SCHEMA_VERSION,
+            storageSchemaVersion: crewStore.STORAGE_SCHEMA_VERSION,
+            // The saved access token, described but never disclosed.
+            token: tokenState(tokenMeta),
+            // Set when this very request brought the project up to date, so the
+            // screen can say what happened instead of just looking fine.
+            autoUpdated: !!(auto && auto.ran),
         });
     } catch (err) { crewFail(res, err, { log: 'crew store health error', message: 'Could not check the data store.' }); }
 });
+
+// ---- How much room is the VA using? ----
+//
+// Supabase's free plan stops at half a gigabyte of database, and a project that
+// hits the ceiling goes read-only: applications stop saving, PIREPs stop
+// filing, and the crew center looks broken for a reason nothing in it explains.
+// The number is on Supabase's dashboard — a place VA staff have no account for
+// once the owner has finished the setup — so the crew center reports it here,
+// with the per-table breakdown that makes it actionable.
+//
+// Staff-level, not owner-only, unlike the rest of the data-store screen: this
+// is a thing to WATCH, and the person watching it is whoever runs the airline
+// day to day. It reveals sizes and row counts, never row contents.
+app.get('/api/crew/:slug/store/usage', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'settings.notifications');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        if (!crewStore.isConnected(va)) {
+            return res.status(409).json({
+                error: 'Connect your Supabase project first — there is nothing to measure yet.',
+                code: 'store_not_connected',
+            });
+        }
+        const store = new crewStore.SupabaseStore(va);
+        const health = await store.health();
+        // A project on an older schema has no crew_storage_usage() to call. Say
+        // which thing is missing and let the screen offer the update, rather
+        // than reporting a broken store over a project that is working fine.
+        if (health.ok && health.provisioned && !health.storage) {
+            return res.status(409).json({
+                error: `Your database is on v${health.version}; the storage report arrived in v${crewStore.STORAGE_SCHEMA_VERSION}. Update your database and this fills in.`,
+                code: 'store_storage_unsupported',
+                health,
+            });
+        }
+
+        const usage = await store.storageUsage();
+        // What the numbers are being read against. Supabase's own limit is a
+        // property of the VA's plan, which we cannot see from here — so this is
+        // the free-plan figure, named as an assumption rather than presented as
+        // fact, and overridable for a deployment whose VAs are on paid plans.
+        const limitBytes = CREW_STORAGE_LIMIT_MB * 1024 * 1024;
+        const used = Number(usage.databaseBytes || 0);
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            ...usage,
+            limitBytes,
+            limitLabel: `${CREW_STORAGE_LIMIT_MB} MB`,
+            limitIsAssumed: true,
+            percentUsed: limitBytes > 0 ? Math.min(100, Math.round((used / limitBytes) * 1000) / 10) : 0,
+            url: va.supabaseUrl || '',
+            projectRef: crewSetup.refFromUrl(va.supabaseUrl),
+            health,
+        });
+    } catch (err) { crewFail(res, err, { log: 'crew store usage error', message: 'Could not read your database size.' }); }
+});
+
+// The ceiling the storage screen measures against, in MB. Supabase's free plan
+// is 500 MB of database; a deployment whose VAs are on paid plans can raise it.
+// Only ever a reference line — nothing enforces it, and the screen says so.
+const CREW_STORAGE_LIMIT_MB = parseInt(process.env.CREW_STORAGE_LIMIT_MB, 10) || 500;
 
 // Move a VA's remaining managed data into their own project. Owner (or
 // Inflight) only — this is the one-way door out of our storage.
@@ -5148,12 +5270,24 @@ app.delete('/api/crew/:slug/store/legacy', async (req, res) => {
 // crew center. These two endpoints do it instead, given one Supabase access
 // token.
 //
-// THE TOKEN IS NEVER STORED. It is read from the request body, used for the
-// duration of the call, and dropped. It is not written to the database, not
-// logged, and not echoed back. A Supabase personal access token is not scoped
-// to one project — it can do anything to the account that issued it — so
-// keeping one at rest would make us a far better target than the service key we
-// do keep, and nothing at run time needs it.
+// WHAT HAPPENS TO THE TOKEN. By default the same thing that always happened: it
+// is read from the request body, used for the duration of the call, and
+// dropped. It is never logged and never echoed back.
+//
+// The VA can now ask us to keep it — a tick on the setup screen, off unless
+// they turn it on, withdrawable from the same screen. That is not a change of
+// heart about how dangerous a personal access token is (it is not scoped to one
+// project; it can do anything to the account that issued it) but an answer to a
+// problem the "never store it" rule created: every release that adds a column
+// leaves every existing VA's project behind, and catching up meant a trip back
+// to supabase.com for a fresh token. Nobody made that trip. Their projects sat
+// on old schemas and their saves quietly dropped fields.
+//
+// So a kept token is sealed with AES-256-GCM under a key from the environment
+// (crewSecrets), is used for exactly one thing — running OUR schema file
+// against the project this VA is already connected to — and is deleted the
+// moment they ask. With no encryption key configured the offer is not made and
+// nothing is kept.
 
 // Owner (or Inflight) gate, shared by the setup routes. Connecting a data store
 // is deliberately not delegable to staff: it is the VA's data and their
@@ -5168,6 +5302,177 @@ function crewOwnerGate(req, slug) {
         return { error: 403, message: 'Wrong crew center.' };
     }
     return { p };
+}
+
+// ---------------------------------------------------------------------------
+// The kept access token
+//
+// Everything that reads, writes or forgets one goes through here, so there is
+// one place that knows a token is sealed, one place that decides when to stop
+// trusting a stored one, and no handler that has to remember either.
+// ---------------------------------------------------------------------------
+
+// Non-secret fields the data-store screens need. Deliberately without
+// +supabaseAccessToken: the state of the token is not the token, and the only
+// two places that want the value itself ask for it explicitly below.
+const CREW_TOKEN_META = 'supabaseTokenHint supabaseTokenSavedAt supabaseTokenUsedAt '
+    + 'supabaseTokenFailedAt supabaseTokenError supabaseAutoUpdate supabaseAutoUpdatedAt supabaseAutoUpdatedTo';
+
+/**
+ * What the dashboard is told about a saved token: that there is one, which one,
+ * when, and whether it last worked. Never the token.
+ */
+function tokenState(ad) {
+    const savedAt = ad && ad.supabaseTokenSavedAt ? ad.supabaseTokenSavedAt : null;
+    const saved = !!savedAt;
+    return {
+        saved,
+        hint: saved ? (ad.supabaseTokenHint || '') : '',
+        savedAt,
+        lastUsedAt: (ad && ad.supabaseTokenUsedAt) || null,
+        // A stored token Supabase has since refused. Kept rather than deleted so
+        // the screen can say "the one you saved in March stopped working"
+        // instead of silently reverting to asking for a token with no
+        // explanation of where the last one went.
+        failed: !!(ad && ad.supabaseTokenFailedAt),
+        failedAt: (ad && ad.supabaseTokenFailedAt) || null,
+        error: (ad && ad.supabaseTokenError) || '',
+        autoUpdate: saved && ad.supabaseAutoUpdate !== false,
+        autoUpdatedAt: (ad && ad.supabaseAutoUpdatedAt) || null,
+        autoUpdatedTo: (ad && ad.supabaseAutoUpdatedTo) || 0,
+        // Can this deployment keep one at all? When false the dashboard hides
+        // the offer rather than showing a tick that silently does nothing.
+        canSave: crewSecrets.available(),
+        unavailableReason: crewSecrets.unavailableReason(),
+    };
+}
+
+/** The stored token in the clear, or '' — for a wrong key as much as for none. */
+async function readAccessToken(vaId) {
+    const ad = await VirtualAirlineAd.findById(vaId).select('+supabaseAccessToken').lean();
+    if (!ad || !ad.supabaseAccessToken) return '';
+    return crewSecrets.open(ad.supabaseAccessToken);
+}
+
+/**
+ * The token this request should use: the one pasted, or failing that the one
+ * the VA saved. In that order deliberately — a VA who has just pasted a token
+ * is correcting something, and the fresh one is the one they mean.
+ */
+async function requestAccessToken(req, va) {
+    const given = String(req.body?.accessToken || '').trim();
+    if (given) return { token: given, source: 'request' };
+    const stored = va ? await readAccessToken(va._id) : '';
+    return stored ? { token: stored, source: 'stored' } : { token: '', source: '' };
+}
+
+/**
+ * Keep a token, or refuse to.
+ *
+ * Refusing is a real outcome, not an error: with no encryption key configured
+ * we will not write an account-wide credential in the clear, and the caller
+ * carries on having done the thing the VA actually asked for (the setup, the
+ * update) while telling them the remembering part did not happen.
+ */
+async function storeAccessToken(vaId, token, { autoUpdate } = {}) {
+    const sealed = crewSecrets.seal(token);
+    if (!sealed) return { saved: false, reason: crewSecrets.unavailableReason() };
+    await VirtualAirlineAd.updateOne({ _id: vaId }, {
+        $set: {
+            supabaseAccessToken: sealed,
+            supabaseTokenHint: crewSecrets.hint(token),
+            supabaseTokenSavedAt: new Date(),
+            supabaseTokenFailedAt: null,
+            supabaseTokenError: '',
+            ...(autoUpdate === undefined ? {} : { supabaseAutoUpdate: !!autoUpdate }),
+        },
+    });
+    return { saved: true, hint: crewSecrets.hint(token) };
+}
+
+/** Forget it. The VA still has to revoke it in Supabase; the screen says so. */
+async function clearAccessToken(vaId) {
+    await VirtualAirlineAd.updateOne({ _id: vaId }, {
+        $set: {
+            supabaseAccessToken: '', supabaseTokenHint: '', supabaseTokenSavedAt: null,
+            supabaseTokenUsedAt: null, supabaseTokenFailedAt: null, supabaseTokenError: '',
+        },
+    });
+}
+
+const markTokenUsed = (vaId) => VirtualAirlineAd.updateOne({ _id: vaId },
+    { $set: { supabaseTokenUsedAt: new Date(), supabaseTokenFailedAt: null, supabaseTokenError: '' } }).catch(() => {});
+
+// Supabase said no. The token stays put — deleting it would lose the hint that
+// explains what went wrong — but it is marked, and the automatic updater skips
+// a marked one until a human replaces it.
+const markTokenFailed = (vaId, message) => VirtualAirlineAd.updateOne({ _id: vaId },
+    { $set: { supabaseTokenFailedAt: new Date(), supabaseTokenError: String(message || '').slice(0, 300) } }).catch(() => {});
+
+/**
+ * Bring a VA's project up to the current schema, unasked, using their kept
+ * token.
+ *
+ * THE POINT OF IT. A release that adds a column has, until now, produced a
+ * silent fleet of VAs whose projects cannot hold it. Each of them finds out
+ * separately, later, through a save that did less than it said. This closes
+ * that window: the first time we notice a project is behind and we hold a token
+ * the VA gave us for this purpose, we run the same idempotent script the button
+ * runs. It only ever adds, so it cannot undo an earlier fix.
+ *
+ * Bounded on purpose:
+ *   * only when a token was saved AND auto-update is on,
+ *   * never for a token Supabase has already refused,
+ *   * once per VA per AUTO_UPDATE_COOLDOWN_MS, even across failures,
+ *   * one at a time per VA (a second request finds the guard set and moves on).
+ *
+ * Returns quietly. The caller re-reads health afterwards if it cares — nothing
+ * here is allowed to turn a page load into an error.
+ */
+const AUTO_UPDATE_COOLDOWN_MS = 30 * 60 * 1000;
+const _autoUpdateSeen = new Map();          // vaId -> last attempt (ms)
+
+async function autoUpdateStore(va, health) {
+    if (!va || !health || !health.ok || !health.provisioned || !health.outdated) return null;
+    const id = String(va._id);
+    const last = _autoUpdateSeen.get(id) || 0;
+    if (Date.now() - last < AUTO_UPDATE_COOLDOWN_MS) return null;
+    _autoUpdateSeen.set(id, Date.now());     // set BEFORE the work, so a second
+                                             // request during it does not stack
+
+    const ad = await VirtualAirlineAd.findById(va._id).select(CREW_TOKEN_META + ' +supabaseAccessToken').lean();
+    if (!ad || !ad.supabaseAccessToken || ad.supabaseAutoUpdate === false || ad.supabaseTokenFailedAt) return null;
+    const accessToken = crewSecrets.open(ad.supabaseAccessToken);
+    if (!accessToken) return null;           // key rotated — the VA re-saves one
+
+    const ref = crewSetup.refFromUrl(va.supabaseUrl);
+    if (!ref) return null;
+
+    try {
+        await crewSetup.updateSchema({ accessToken, ref, sql: readSetupSql() });
+        crewStore.forgetSchemaDrift(va.supabaseUrl);
+        _crewStatsCache.delete(String(va.slug || '').toLowerCase());
+        await VirtualAirlineAd.updateOne({ _id: va._id }, {
+            $set: {
+                supabaseTokenUsedAt: new Date(),
+                supabaseAutoUpdatedAt: new Date(),
+                supabaseAutoUpdatedTo: crewStore.EXPECTED_SCHEMA_VERSION,
+                supabaseTokenFailedAt: null, supabaseTokenError: '',
+            },
+        });
+        console.log(`crew store auto-update: ${va.slug} -> v${crewStore.EXPECTED_SCHEMA_VERSION}`);
+        return { ran: true, version: crewStore.EXPECTED_SCHEMA_VERSION };
+    } catch (err) {
+        const code = (err && err.code) || '';
+        // A token that no longer opens the account is the VA's to replace; a
+        // project that is paused, or Supabase having a bad minute, is not the
+        // token's fault and must not condemn it.
+        if (code === 'bad_token' || code === 'project_not_found') {
+            await markTokenFailed(va._id, err.message);
+        }
+        console.warn(`crew store auto-update failed (${va.slug}):`, err && err.message ? err.message : err);
+        return { ran: false, error: err && err.message ? err.message : 'Update failed.' };
+    }
 }
 
 function setupFail(res, err, log) {
@@ -5189,9 +5494,13 @@ function setupFail(res, err, log) {
 app.post('/api/crew/:slug/store/projects', async (req, res) => {
     const gate = crewOwnerGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
-    const accessToken = String(req.body?.accessToken || '').trim();
-    if (!accessToken) return res.status(400).json({ error: 'Paste a Supabase access token first.', code: 'no_token' });
     try {
+        // A VA who kept a token does not have to fetch a new one to move to a
+        // different project, which is most of the reason they kept it.
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const { token: accessToken, source } = await requestAccessToken(req, va);
+        if (!accessToken) return res.status(400).json({ error: 'Paste a Supabase access token first.', code: 'no_token' });
         const mgmt = new crewSetup.Management(accessToken);
         // Organizations are a nice-to-have (they only matter for creating a new
         // project); a token that cannot list them still lists projects fine.
@@ -5199,12 +5508,14 @@ app.post('/api/crew/:slug/store/projects', async (req, res) => {
             mgmt.listProjects(),
             mgmt.listOrganizations().catch(() => []),
         ]);
+        if (source === 'stored') markTokenUsed(va._id);
         res.set('Cache-Control', 'no-store');
         res.json({
             projects: (Array.isArray(projects) ? projects : []).map(crewSetup.publicProject),
             organizations: (Array.isArray(organizations) ? organizations : [])
                 .map((o) => ({ id: o.id || o.slug || '', name: o.name || '' })).filter((o) => o.id),
             regions: CREW_SUPABASE_REGIONS,
+            usedSavedToken: source === 'stored',
         });
     } catch (err) { setupFail(res, err, 'crew setup projects error'); }
 });
@@ -5235,13 +5546,17 @@ const CREW_SUPABASE_REGIONS = [
 app.post('/api/crew/:slug/store/provision', async (req, res) => {
     const gate = crewOwnerGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
-    const accessToken = String(req.body?.accessToken || '').trim();
-    if (!accessToken) return res.status(400).json({ error: 'Paste a Supabase access token first.', code: 'no_token' });
 
     try {
         const va = await resolveCrewVa(req.params.slug);
         if (!va) return res.status(404).json({ error: 'Crew center not found.' });
         const slug = String(va.slug || req.params.slug).toLowerCase();
+        const { token: accessToken, source } = await requestAccessToken(req, va);
+        if (!accessToken) return res.status(400).json({ error: 'Paste a Supabase access token first.', code: 'no_token' });
+        // Remembering is opt-in and asked for per request. A polling call in the
+        // middle of a provisioning wait carries the same flag, so the answer
+        // does not depend on which poll happened to be the one that finished.
+        const remember = req.body?.remember === true || req.body?.remember === 'true';
 
         const create = req.body?.create ? {
             name: String(req.body.create.name || `${slug}-crew-center`).slice(0, 60),
@@ -5280,12 +5595,29 @@ app.post('/api/crew/:slug/store/provision', async (req, res) => {
         crewStore.forgetSchemaDrift(out && out.url);
         _crewStatsCache.delete(slug);
 
+        // Keep the token only once the setup it was pasted for has actually
+        // finished. A token saved against a half-provisioned project would be a
+        // credential held for a connection that never came up.
+        let keptToken = null;
+        if (out && out.ready) {
+            if (remember) keptToken = await storeAccessToken(va._id, accessToken, { autoUpdate: true });
+            else if (source === 'stored') markTokenUsed(va._id);
+        }
+        const meta = await VirtualAirlineAd.findById(va._id).select(CREW_TOKEN_META).lean();
+
         res.set('Cache-Control', 'no-store');
         res.json({
             ...out,
             projectRef: out.project ? out.project.ref : '',
             connected: !!out.ready,
             hasServiceKey: !!out.ready,
+            usedSavedToken: source === 'stored',
+            // Whether the "remember this" tick took effect, and if not, why —
+            // a silent no would leave the VA believing they never have to paste
+            // a token again.
+            tokenSaved: !!(keptToken && keptToken.saved),
+            tokenSaveError: keptToken && !keptToken.saved ? keptToken.reason : '',
+            token: tokenState(meta),
         });
     } catch (err) { setupFail(res, err, 'crew setup provision error'); }
 });
@@ -5306,13 +5638,13 @@ app.post('/api/crew/:slug/store/provision', async (req, res) => {
 // no project picking and no keys touched. The connection the VA already has
 // keeps working throughout — the script only ever adds.
 //
-// The token is used for this request and forgotten, exactly as in setup. See
-// the note at the top of crewSetup.js for why we will not store one.
+// The token comes from the request, or from the one the VA chose to keep. A VA
+// with a kept token presses one button here and pastes nothing; one without is
+// exactly where they were. Either way the token is used only to run our own
+// script against the project this crew center is already connected to.
 app.post('/api/crew/:slug/store/upgrade', async (req, res) => {
     const gate = crewOwnerGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
-    const accessToken = String(req.body?.accessToken || '').trim();
-    if (!accessToken) return res.status(400).json({ error: 'Paste a Supabase access token first.', code: 'no_token' });
 
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -5323,6 +5655,14 @@ app.post('/api/crew/:slug/store/upgrade', async (req, res) => {
                 code: 'store_not_connected',
             });
         }
+        const { token: accessToken, source } = await requestAccessToken(req, va);
+        if (!accessToken) {
+            return res.status(400).json({
+                error: 'Paste a Supabase access token first.',
+                code: 'no_token',
+            });
+        }
+        const remember = req.body?.remember === true || req.body?.remember === 'true';
         // The project to run against is the one we are already talking to, read
         // from the stored URL rather than taken from the request: this endpoint
         // updates THIS crew center's database and must not be steerable into
@@ -5335,24 +5675,32 @@ app.post('/api/crew/:slug/store/upgrade', async (req, res) => {
             });
         }
 
-        const mgmt = new crewSetup.Management(accessToken);
-        // Fails with a clear message if the token belongs to a different
-        // Supabase account than the project does — the single likeliest thing
-        // to go wrong here, since the VA made that token months after setup.
-        const project = await mgmt.getProject(ref);
-        if (project && project.status && project.status !== crewSetup.HEALTHY) {
-            return res.status(409).json({
-                error: 'That project is paused or still starting up. Resume it in Supabase, then try again.',
-                code: 'project_not_ready',
-                project: crewSetup.publicProject(project),
-            });
+        let project;
+        try {
+            // Fails with a clear message if the token belongs to a different
+            // Supabase account than the project does — the single likeliest
+            // thing to go wrong here, since the VA made that token months after
+            // setup (or, with a kept one, revoked it since).
+            ({ project } = await crewSetup.updateSchema({ accessToken, ref, sql: readSetupSql() }));
+        } catch (err) {
+            // A kept token that Supabase has refused gets marked, so the screen
+            // says which token stopped working and the automatic updater stops
+            // trying it. A pasted one is the VA's problem in the moment and
+            // needs no bookkeeping.
+            if (source === 'stored' && (err.code === 'bad_token' || err.code === 'project_not_found')) {
+                await markTokenFailed(va._id, err.message);
+            }
+            throw err;
         }
-
-        await crewSetup.installSchema(mgmt, ref, readSetupSql());
 
         // The columns are there now, so stop leaving them out of writes.
         crewStore.forgetSchemaDrift(va.supabaseUrl);
         _crewStatsCache.delete(String(va.slug || req.params.slug).toLowerCase());
+
+        let keptToken = null;
+        if (remember && source === 'request') keptToken = await storeAccessToken(va._id, accessToken, { autoUpdate: true });
+        else if (source === 'stored') markTokenUsed(va._id);
+        const meta = await VirtualAirlineAd.findById(va._id).select(CREW_TOKEN_META).lean();
 
         // Report the version the project now answers with, over the same path
         // real writes take — "we ran the script" is not the same claim as "your
@@ -5361,11 +5709,98 @@ app.post('/api/crew/:slug/store/upgrade', async (req, res) => {
         res.set('Cache-Control', 'no-store');
         res.json({
             ok: true,
-            project: crewSetup.publicProject(project || { id: ref }),
+            project,
             health,
             schemaVersion: crewStore.EXPECTED_SCHEMA_VERSION,
+            usedSavedToken: source === 'stored',
+            tokenSaved: !!(keptToken && keptToken.saved),
+            tokenSaveError: keptToken && !keptToken.saved ? keptToken.reason : '',
+            token: tokenState(meta),
         });
     } catch (err) { setupFail(res, err, 'crew store upgrade error'); }
+});
+
+// ---- The kept token, on its own ----
+//
+// Save one without doing anything else (a VA who set up before this existed, or
+// whose old one has been revoked), and throw one away. Both owner-only, like
+// every other data-store action.
+//
+// Saving VERIFIES first. A token that does not open the project this crew
+// center is connected to is refused rather than stored, because the failure it
+// would otherwise cause arrives weeks later, in an automatic update nobody is
+// watching, and would look like the update feature being broken.
+app.post('/api/crew/:slug/store/token', async (req, res) => {
+    const gate = crewOwnerGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    const accessToken = String(req.body?.accessToken || '').trim();
+    const hasAuto = req.body?.autoUpdate !== undefined;
+    const autoUpdate = req.body?.autoUpdate === true || req.body?.autoUpdate === 'true';
+
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+
+        // Just flipping the automatic-update switch on a token we already hold.
+        if (!accessToken && hasAuto) {
+            const existing = await VirtualAirlineAd.findById(va._id).select(CREW_TOKEN_META + ' +supabaseAccessToken').lean();
+            if (!existing || !existing.supabaseAccessToken) {
+                return res.status(409).json({ error: 'There is no saved token to change.', code: 'no_saved_token' });
+            }
+            await VirtualAirlineAd.updateOne({ _id: va._id }, { $set: { supabaseAutoUpdate: autoUpdate } });
+            const meta = await VirtualAirlineAd.findById(va._id).select(CREW_TOKEN_META).lean();
+            res.set('Cache-Control', 'no-store');
+            return res.json({ ok: true, token: tokenState(meta) });
+        }
+
+        if (!accessToken) return res.status(400).json({ error: 'Paste a Supabase access token first.', code: 'no_token' });
+        if (!crewSecrets.available()) {
+            return res.status(503).json({ error: crewSecrets.unavailableReason(), code: 'sealing_unavailable' });
+        }
+        if (!crewStore.isConnected(va)) {
+            return res.status(409).json({
+                error: 'Connect a Supabase project first — a saved token has nothing to act on yet.',
+                code: 'store_not_connected',
+            });
+        }
+        const ref = crewSetup.refFromUrl(va.supabaseUrl);
+        if (!ref) {
+            return res.status(409).json({
+                error: 'Your stored project URL doesn’t look like a Supabase project. Re-connect it under “Set it up for me”.',
+                code: 'bad_project_url',
+            });
+        }
+        // Throws bad_token for a revoked one and project_not_found for a token
+        // from a different Supabase account, which are different mistakes with
+        // different fixes.
+        await crewSetup.checkAccess(accessToken, ref);
+
+        const saved = await storeAccessToken(va._id, accessToken, { autoUpdate: hasAuto ? autoUpdate : true });
+        if (!saved.saved) return res.status(503).json({ error: saved.reason, code: 'sealing_unavailable' });
+        const meta = await VirtualAirlineAd.findById(va._id).select(CREW_TOKEN_META).lean();
+        res.set('Cache-Control', 'no-store');
+        res.json({ ok: true, token: tokenState(meta) });
+    } catch (err) { setupFail(res, err, 'crew store token save error'); }
+});
+
+// Forget it. Deleting our copy is all we can do — the token still exists in the
+// VA's Supabase account until they revoke it there, and the reply says so
+// rather than letting "forgotten" be mistaken for "revoked".
+app.delete('/api/crew/:slug/store/token', async (req, res) => {
+    const gate = crewOwnerGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        await clearAccessToken(va._id);
+        const meta = await VirtualAirlineAd.findById(va._id).select(CREW_TOKEN_META).lean();
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            ok: true,
+            token: tokenState(meta),
+            revokeUrl: 'https://supabase.com/dashboard/account/tokens',
+        });
+    } catch (err) { setupFail(res, err, 'crew store token delete error'); }
 });
 
 // ---- Pilot logins ----

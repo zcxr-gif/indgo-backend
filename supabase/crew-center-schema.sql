@@ -42,6 +42,13 @@
 -- it is safe to run as often as you like. Re-running the SQL by hand does the
 -- same thing.
 --
+-- If you let the crew center keep your Supabase access token when you set up
+-- (one tick, and you can withdraw it whenever you like), that update needs no
+-- token pasted — and with "keep my database up to date" left on, it happens on
+-- its own the first time the crew center notices this file has moved ahead of
+-- your project. Nothing about what runs changes: it is this script, unmodified,
+-- against the project you are already connected to.
+--
 -- Until then the crew center keeps working and simply cannot store what your
 -- project has no column for — it says so at the time rather than failing the
 -- write.
@@ -897,6 +904,115 @@ as $$
 $$;
 
 -- ============================================================================
+-- v9. How much room is this crew center using?
+--
+-- Supabase's free plan gives a project half a gigabyte of database, and a VA
+-- who blows through it discovers that fact when writes start failing — the
+-- project goes read-only and the crew center looks broken. The number is on
+-- Supabase's own dashboard, but that is a place VA staff do not otherwise go
+-- and, once the crew center is set up, have no reason to have an account for.
+--
+-- So the crew center answers it directly: total database size, what each crew
+-- table costs, and what else is in the project (a VA may keep their own tables
+-- alongside ours, and if something is eating the plan it is worth seeing which
+-- thing). Sizes include indexes and TOAST — pg_total_relation_size is what the
+-- plan is actually measured against, so a figure that left them out would read
+-- low and reassure a VA who is about to run out.
+--
+-- SECURITY: definer, because the sizes live in catalogues an ordinary caller
+-- cannot read, and because storage.objects belongs to another schema. It
+-- returns sizes and counts — no row contents, no names of anything but tables.
+-- Execute is granted to service_role only: the browser key has no business with
+-- it, and everything the dashboard shows comes through the backend anyway.
+-- ============================================================================
+create or replace function crew_storage_usage(p_va_slug text default null)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+declare
+    crew_tables text[] := array[
+        'crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps',
+        'crew_events','crew_event_signups','crew_announcements','crew_schedules',
+        'crew_bookings','crew_schema_info'];
+    t              text;
+    rel            regclass;
+    tbl_bytes      bigint;
+    tbl_rows       bigint;
+    tbl_mine       bigint;
+    tables_json    jsonb := '[]'::jsonb;
+    crew_bytes     bigint := 0;
+    db_bytes       bigint := 0;
+    other_json     jsonb := '[]'::jsonb;
+    other_bytes    bigint := 0;
+    storage_bytes  bigint := 0;
+    storage_files  bigint := 0;
+begin
+    foreach t in array crew_tables loop
+        rel := to_regclass('public.' || t);
+        continue when rel is null;                   -- project predates this table
+        tbl_bytes := pg_total_relation_size(rel);
+        execute format('select count(*) from public.%I', t) into tbl_rows;
+        -- Rows belonging to THIS crew center, where the table is per-VA. One
+        -- project can back several brands (see the multi-brand note above), so
+        -- "your rows" and "rows in here" are different questions and staff
+        -- looking at a shared project need both.
+        tbl_mine := null;
+        if p_va_slug is not null and t <> 'crew_schema_info' then
+            execute format('select count(*) from public.%I where va_slug = $1', t)
+                into tbl_mine using p_va_slug;
+        end if;
+        crew_bytes := crew_bytes + tbl_bytes;
+        tables_json := tables_json || jsonb_build_object(
+            'table', t, 'bytes', tbl_bytes, 'rows', tbl_rows, 'vaRows', tbl_mine);
+    end loop;
+
+    db_bytes := pg_database_size(current_database());
+
+    -- Anything else the VA keeps in this project. Named, because "something is
+    -- using 400 MB" is only actionable if you can see what.
+    select coalesce(sum(bytes), 0),
+           coalesce(jsonb_agg(jsonb_build_object('table', name, 'bytes', bytes)
+                    order by bytes desc) filter (where rn <= 8), '[]'::jsonb)
+      into other_bytes, other_json
+      from (
+        select c.relname::text as name,
+               pg_total_relation_size(c.oid) as bytes,
+               row_number() over (order by pg_total_relation_size(c.oid) desc) as rn
+          from pg_class c
+          join pg_namespace n on n.oid = c.relnamespace
+         where n.nspname = 'public'
+           and c.relkind in ('r','p','m')
+           and not (c.relname = any (crew_tables))
+      ) s;
+
+    -- Supabase Storage, if the project uses it. Its own schema, so a project
+    -- where it is absent or locked down reports zero rather than failing the
+    -- whole call — this figure is a nice-to-have next to the database size.
+    begin
+        execute 'select coalesce(sum((metadata->>''size'')::bigint), 0), count(*) from storage.objects'
+            into storage_bytes, storage_files;
+    exception when others then
+        storage_bytes := 0; storage_files := 0;
+    end;
+
+    return jsonb_build_object(
+        'databaseBytes',  db_bytes,
+        'crewBytes',      crew_bytes,
+        'otherBytes',     other_bytes,
+        'storageBytes',   storage_bytes,
+        'storageFiles',   storage_files,
+        'tables',         tables_json,
+        'otherTables',    other_json,
+        'vaSlug',         p_va_slug,
+        'generatedAt',    now()
+    );
+end;
+$$;
+
+-- ============================================================================
 -- Row Level Security
 --
 -- Default deny on every table. The anon key then gets back exactly the three
@@ -1005,9 +1121,20 @@ revoke all on crew_accounts     from anon, authenticated;
 -- be read.
 grant execute on function crew_stats(text) to anon, authenticated;
 
+-- crew_storage_usage is the opposite call: definer over the size catalogues and
+-- another schema's tables, so it is kept away from the browser key entirely.
+-- The backend reads it with the service key and shows staff the result.
+revoke all on function crew_storage_usage(text) from public, anon, authenticated;
+do $$
+begin
+    if exists (select 1 from pg_roles where rolname = 'service_role') then
+        execute 'grant execute on function crew_storage_usage(text) to service_role';
+    end if;
+end $$;
+
 -- ----------------------------------------------------------------------------
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 8)
+insert into crew_schema_info (id, version) values (1, 9)
 on conflict (id) do update set version = excluded.version, updated_at = now();

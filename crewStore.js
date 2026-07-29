@@ -54,7 +54,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 8;
+const EXPECTED_SCHEMA_VERSION = 9;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -70,6 +70,12 @@ const EVENTS_SCHEMA_VERSION = 6;
 // names the missing feature rather than reporting a broken store over a VA
 // whose roster, routes, flights and events are all answering.
 const SCHEDULES_SCHEMA_VERSION = 8;
+
+// The version that introduced crew_storage_usage(). Reported separately for the
+// same reason as the others: the storage screen is a whole feature an older
+// project cannot answer, and "your database is behind" is a better sentence
+// there than a broken panel.
+const STORAGE_SCHEMA_VERSION = 9;
 
 // ---------------------------------------------------------------------------
 // Columns that arrived after the first release
@@ -1344,6 +1350,28 @@ class SupabaseStore {
         return { ...computeStats({ members, pireps, routes, applications: [] }), source: 'supabase-fallback' };
     }
 
+    /**
+     * How much room this project is using, from the project itself.
+     *
+     * One round trip to crew_storage_usage(), which is a definer function over
+     * Postgres' own size catalogues — the alternative, adding up what we think
+     * we wrote, would ignore indexes, TOAST and dead tuples and report a number
+     * comfortably under the one Supabase bills against, which is the opposite
+     * of useful on a screen whose job is to warn.
+     *
+     * A project on an older schema has not got the function; that surfaces as
+     * `store_schema_missing`, which the handler turns into "update your
+     * database" rather than an error.
+     */
+    async storageUsage() {
+        const out = await this.db.rpc('crew_storage_usage', { p_va_slug: this.slug });
+        if (!out || typeof out !== 'object') {
+            throw new CrewStoreError('The VA’s data store did not report its size.',
+                { status: 502, code: 'store_error' });
+        }
+        return out;
+    }
+
     // Is the project reachable and provisioned? Powers the settings screen's
     // green tick and tells the VA precisely what to fix when it is not.
     async health() {
@@ -1368,6 +1396,10 @@ class SupabaseStore {
                 // update button itself instead of sending a VA off to work out
                 // what "outdated" means for them.
                 schedules: version >= SCHEDULES_SCHEMA_VERSION,
+                // And whether the project can answer "how much room am I
+                // using?" — the storage screen offers the update button itself
+                // when it cannot.
+                storage: version >= STORAGE_SCHEMA_VERSION,
                 installedAt: (rows && rows[0] && rows[0].installed_at) || null,
             };
         } catch (err) {
@@ -1379,6 +1411,7 @@ class SupabaseStore {
                 accounts: false,
                 events: false,
                 schedules: false,
+                storage: false,
                 code: err.code || 'store_error',
                 error: err.message,
                 detail: err.detail || '',
@@ -1792,5 +1825,6 @@ module.exports = {
     ACCOUNTS_SCHEMA_VERSION,
     EVENTS_SCHEMA_VERSION,
     SCHEDULES_SCHEMA_VERSION,
+    STORAGE_SCHEMA_VERSION,
     REQUIRE_OWN_STORE,
 };
