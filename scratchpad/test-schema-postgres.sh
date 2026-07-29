@@ -188,6 +188,34 @@ is "one seat cannot be sold twice" "$(sold_twice)" "refused"
 is "crew_stats is callable by anon (it is what a VA's homepage shows)" \
    "$(asanon "select (crew_stats('amv')->>'pilots')")" "1"
 
+# ---------------------------------------------------------------------------
+echo "• the storage report (v9)"
+#
+# It reads Postgres' own size catalogues and another schema's tables, so it is
+# definer — which makes "who may call it" the thing to check, not just "does it
+# answer". The backend calls it with the service key; a browser key must not be
+# able to, and the numbers it returns have to be real ones rather than zeroes.
+# ---------------------------------------------------------------------------
+usage() { $PSQL -d fresh -tAc "select (crew_storage_usage('amv')->>'$1')"; }
+
+is "it counts this crew center's rows separately from the project's" \
+   "$($PSQL -d fresh -tAc "select (t->>'vaRows') from jsonb_array_elements(crew_storage_usage('amv')->'tables') t where t->>'table'='crew_members'")" \
+   "1"
+[ "$(usage databaseBytes)" -gt 0 ] 2>/dev/null \
+    && ok "it reports a real database size" || bad "it reports a real database size" "got '$(usage databaseBytes)'"
+[ "$(usage crewBytes)" -gt 0 ] 2>/dev/null \
+    && ok "…and what the crew tables cost inside it" || bad "…and what the crew tables cost inside it"
+# Supabase Storage lives in another schema that a bare cluster has not got. The
+# function has to survive that rather than failing the whole call — a VA whose
+# project locks it down still gets their database size.
+is "a project without Supabase Storage still reports" "$(usage storageFiles)" "0"
+# Called without a slug (the shape a shared project's operator would use), the
+# per-VA column is absent rather than wrong.
+is "no slug means no per-VA claim" \
+   "$($PSQL -d fresh -tAc "select coalesce((t->>'vaRows'),'null') from jsonb_array_elements(crew_storage_usage()->'tables') t where t->>'table'='crew_members'")" \
+   "null"
+is "a browser key cannot call it" "$(saidno "select crew_storage_usage('amv')")" "yes"
+
 echo
 if [ "$fail" -gt 0 ]; then echo "$fail check(s) failed"; exit 1; fi
 echo "Schema applies, upgrades and holds its boundaries ✅"

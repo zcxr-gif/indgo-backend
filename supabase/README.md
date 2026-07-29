@@ -34,12 +34,49 @@ picks a project (or asks for a new one), and the backend installs the schema,
 reads the project's API keys back and stores the connection itself. About a
 minute, one paste, nothing to copy.
 
-**The access token is never stored.** It is used for the duration of that
-request and dropped — not written to the database, not logged, not returned to
-the browser. A Supabase personal access token is not scoped to one project, so
-holding one at rest would make us a far more attractive target than the service
-key we do keep, and nothing at run time needs it. The setup screen says so and
-tells the VA to delete the token afterwards.
+**The access token is not stored unless the VA asks us to keep it.** By default
+it is used for the duration of that request and dropped — not written to the
+database, not logged, not returned to the browser. A Supabase personal access
+token is not scoped to one project, so holding one at rest makes us a more
+attractive target than the service key we do keep.
+
+### Keeping the token, on purpose
+
+The setup screen offers one tick: *keep this token so updates are one click*.
+Off unless the VA turns it on, withdrawable from the same screen.
+
+It exists because "never store it" had a cost that only showed up later.
+`crew-center-schema.sql` gains columns every time the crew center gains a
+feature, and catching a project up meant the VA going back to supabase.com,
+minting a fresh token and pasting it — months after they last thought about any
+of this. In practice nobody did, projects sat on old schemas, and the first sign
+of the gap was a save that quietly dropped a field.
+
+What a kept token is, and is not:
+
+- **Sealed at rest.** AES-256-GCM (`crewSecrets.js`) under `CREW_SECRET_KEY`
+  from the environment, never a value in the document. A dump of the collection
+  is ciphertext. With no key configured the offer is not made and nothing is
+  kept — we would rather lose the convenience than hold an account-wide
+  credential in the clear.
+- **Used for exactly one thing**: running *this repo's* schema file against the
+  project this crew center is already connected to. The project ref comes from
+  the stored `supabaseUrl`, never from a request, so a kept token cannot be
+  steered at another project on the account.
+- **Never disclosed.** The dashboard is told there is one, which one
+  (`sbp_…9f3a`), when it was saved and whether it last worked. Never the value.
+- **The VA's to withdraw.** `DELETE /store/token` deletes our copy; the reply
+  says plainly that revoking it in Supabase is a separate act, because
+  "forgotten" is not "revoked".
+- **Allowed to go stale.** A token Supabase refuses is marked rather than
+  deleted, so the screen can say *the one you saved in March stopped working*
+  instead of silently reverting to asking for a token with no explanation. The
+  automatic updater skips a marked token until a human replaces it.
+
+With a token kept, `supabaseAutoUpdate` (on by default; saving the token is the
+consent, the switch is how to take it back) lets the backend run the update
+itself the first time it notices the project is behind — see *Getting the change
+onto the VA's database* below.
 
 By hand, if a VA would rather (still supported, under "I'll do it myself"):
 
@@ -58,7 +95,7 @@ By hand, if a VA would rather (still supported, under "I'll do it myself"):
 |---|---|---|
 | `anon` | any browser | read the roster, active routes and approved flight reports; call `crew_stats()`. Nothing else, and no writes. |
 | `service_role` | the Inflight backend only | everything. Bypasses RLS. Never sent to a browser. |
-| access token | nobody, after setup | used once to install the schema and read the two keys above. Not stored. |
+| access token | nobody, unless the VA opts in | installs the schema and reads the two keys above. Dropped after the request, or sealed and kept — only to re-run *our* schema on the project already connected. |
 
 Row-level security is default-deny. Note what has no public policy at all:
 `crew_applications` and `crew_accounts`. Applicant emails, status tokens and
@@ -73,7 +110,10 @@ than at the row.
 | `GET /api/crew/setup-sql` | public | the schema, served from the copy in this repo |
 | `POST /api/crew/:slug/store/projects` | owner | list the Supabase projects a pasted access token can see |
 | `POST /api/crew/:slug/store/provision` | owner | install the schema, fetch the keys, connect and verify |
-| `POST /api/crew/:slug/store/upgrade` | owner | re-run the current schema on the project already connected. Keys untouched |
+| `POST /api/crew/:slug/store/upgrade` | owner | re-run the current schema on the project already connected. Keys untouched. Uses the kept token when no token is pasted |
+| `POST /api/crew/:slug/store/token` | owner | save (and verify) an access token to keep, or flip `autoUpdate` on the one already kept |
+| `DELETE /api/crew/:slug/store/token` | owner | forget the kept token. Revoking it in Supabase is the VA's separate act |
+| `GET /api/crew/:slug/store/usage` | staff | how much room the project is using — database total, per-table, and what else is in there |
 | `GET /api/crew/:slug/stats` | public | aggregate figures. Application counters are added only for a caller who can review applications. |
 | `GET /api/crew/:slug/store` | staff | is the project reachable, provisioned, on the current schema — and how much is still in managed storage |
 | `POST /api/crew/:slug/store/migrate` | owner | copy managed rows into the VA's project |
@@ -404,6 +444,44 @@ Writing a notice is always **fire-and-forget** for the thing that caused it: a
 promotion that happened must never be reported as a failure because the
 announcement about it could not be written.
 
+## How much room is left
+
+**Crew Center → Settings → Storage**, backed by `GET /api/crew/:slug/store/usage`
+and `crew_storage_usage()` in the schema.
+
+Supabase's free plan stops at 500 MB of database, and a project that reaches the
+ceiling goes **read-only**: applications stop saving, PIREPs stop filing, and
+the crew center looks broken for a reason nothing inside it explains. The figure
+has always been on Supabase's own dashboard — which is a place VA staff have no
+account for once the owner has finished the setup.
+
+So the project reports its own size. Three things are on the screen and each
+answers a different question:
+
+| figure | the question |
+|---|---|
+| database total, against the plan ceiling | *are we about to be cut off?* |
+| per crew table, with row counts | *what is growing?* |
+| everything else in the project, named | *what is that 300 MB that isn't us?* |
+
+Sizes are `pg_total_relation_size` — indexes and TOAST included — because that
+is what the plan is measured against. Adding up the rows we think we wrote would
+report comfortably low and reassure a VA who is about to run out, which is the
+opposite of what this screen is for.
+
+Two deliberate choices:
+
+- **Staff, not owner-only**, unlike the rest of the data-store screen. This is a
+  thing to *watch*, and the person watching it is whoever runs the airline day to
+  day. It reveals sizes and counts, never row contents.
+- **The ceiling is an assumption, and says so.** Supabase's real limit comes
+  from the VA's plan, which we cannot see. `CREW_STORAGE_LIMIT_MB` (default 500)
+  is the reference line the bar is drawn against; nothing enforces it.
+
+Where one project backs several brands, each table reports both its total rows
+and this crew center's share — `vaRows` — because on a shared project those are
+different questions.
+
 ## Notification feeds
 
 A VA sets one Discord webhook and everything posts to that channel. That is the
@@ -490,15 +568,26 @@ across every project at once.
 
 ### Getting the change onto the VA's database
 
-**Settings → Data store → Update my database.** The VA pastes an access token
-and `POST /api/crew/:slug/store/upgrade` runs this file against the project they
-are already connected to — no project picking, no keys touched, nothing to copy.
-The token is used for that request and dropped, exactly as in setup.
+Three ways, in the order a VA will meet them:
+
+1. **Nothing at all.** A VA who kept their token with `autoUpdate` on gets the
+   update run for them the first time we notice their project is behind —
+   `autoUpdateStore` in `server.js`, triggered from `GET /api/crew/:slug/store`.
+   It runs the same idempotent script the button runs, at most once per VA per
+   30 minutes, never for a token Supabase has already refused, and it logs what
+   it did. Nothing about the script changes: it only ever adds, so it cannot
+   undo an earlier fix.
+2. **Settings → Data store → Update my database**, with nothing to paste,
+   because the kept token is used when the request carries none.
+3. **The same button, pasting a token** — the original path, unchanged, and the
+   only one available to a VA who has not kept one.
 
 The project it runs against is read from the stored `supabaseUrl`
 (`crewSetup.refFromUrl`) rather than taken from the request, so the endpoint
 updates *this* crew center's database and cannot be steered into running our DDL
-against some other project on the account.
+against some other project on the account. All three paths go through
+`crewSetup.updateSchema`, so "I pressed update" and "it updated itself" cannot
+drift apart in what they do to a VA's database.
 
 The button appears on its own when `GET /api/crew/:slug/store` reports
 `outdated: true`, and whenever a write has just had to leave a column out.
@@ -544,6 +633,16 @@ Version history:
   `crew_pireps.event_id`, and `crew_announcements`: a rank can require a
   check-ride, an event can be built on a route and flown against it, and the
   crew center keeps a noticeboard of its own
+- **v8** — `crew_schedules` and `crew_bookings`: the VA publishes departures and
+  pilots book a seat on one, with the seat arbitrated by a unique index
+- **v9** — `crew_storage_usage()`: the project reports its own size, so VA staff
+  can see how close they are to their Supabase plan's ceiling from inside the
+  crew center
+
+Note what v9 is not: it adds no columns and no tables, only a function, so
+nothing degrades on a project that has not got it. `GET /store/usage` answers
+`store_storage_unsupported` and the screen offers the update button instead of
+showing a broken panel over a project that is otherwise working perfectly.
 
 Note what v6 is not: it adds two **tables**, so there is nothing for
 `LATE_COLUMNS` to degrade to. A project still on v5 has no events tables at all,
@@ -601,6 +700,17 @@ nothing else, that a project still booting parks the flow instead of failing it,
 that the SQL executed is this repo's own file, and that the service key reaches
 storage but never the reply.
 
+`node scratchpad/test-crew-token-vault.js` covers the kept token. On the sealing
+side: that with no key configured `seal()` returns nothing rather than falling
+back to plaintext (checked in a child process, because the module resolves its
+key once), that an edited or truncated blob opens to `''` instead of to some
+other string, and that the hint drops the middle of the token rather than
+masking it. On the updating side, against a Management API impersonator: that
+the file executed is this repo's own, that it runs against the project it was
+given and no other, that a paused project is refused rather than half-updated,
+and that a revoked token and a token from somebody else's account come back as
+*different* codes — they are different mistakes with different fixes.
+
 `node scratchpad/test-crew-invite.js` drives the invitation lifecycle: that a
 claimed, revoked or expired invitation never yields its password to staff or to
 the status link even while the column still holds one, that claiming and
@@ -650,8 +760,10 @@ formats, lookalike hosts, non-invite Discord paths, scheme downgrades, and the
 three-way `'' / url / null` contract that lets a handler tell "clear this" from
 "the caller sent junk".
 
-The schema itself is worth checking against a real Postgres when it changes:
-create the `anon` and `authenticated` roles (Supabase provides them; a bare
-cluster does not), run the file twice to confirm idempotency, then check
-`crew_stats()` and the RLS boundaries as `anon` — including that
-`crew_accounts` is unreadable.
+`bash scratchpad/test-schema-postgres.sh` runs the schema against a **real**
+Postgres, which is the only thing that catches what the impersonators cannot: it
+installs the previous committed version, puts rows in, upgrades in place, and
+checks the VA's data survived. Then it checks the RLS boundaries as `anon`
+(including that `crew_accounts` is unreadable) and that `crew_storage_usage()`
+reports real figures to the service key while being refused to a browser key.
+Run it whenever `crew-center-schema.sql` changes.

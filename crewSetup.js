@@ -26,13 +26,27 @@
  *
  * WHAT WE DO WITH THE TOKEN
  * -------------------------
- * Use it for the duration of the request and then forget it. It is never
- * written to the database, never logged, and never returned to the browser.
- * That matters more than usual here: a Supabase PAT is not scoped to one
- * project, so it can do anything to the account that issued it. Holding one at
- * rest would make us a far more valuable target than holding a service key, and
- * the token is only needed for setup — nothing at run time uses it. The setup
- * flow tells the VA this, and tells them to revoke it afterwards.
+ * By default: use it for the duration of the request and then forget it. It is
+ * never logged and never returned to the browser. A Supabase PAT is not scoped
+ * to one project, so it can do anything to the account that issued it, and a
+ * token nobody kept cannot leak.
+ *
+ * The VA may however ASK us to keep it — one tick, on the setup screen, off
+ * unless they turn it on. That exists because "forget it" had a cost nobody
+ * priced in at setup time: this file's schema gains columns every time the crew
+ * center gains a feature, and catching a project up meant the VA going back to
+ * supabase.com, minting a fresh token and pasting it, months after they last
+ * thought about any of this. Most never did, so their project sat behind, and
+ * the first they heard of it was a save that silently dropped a field. A kept
+ * token turns that into a button — or into nothing at all, because the backend
+ * can run the update itself.
+ *
+ * A kept token is sealed with AES-256-GCM before it is written (crewSecrets.js)
+ * under a key held in the environment rather than the database, is used only to
+ * run OUR schema against the project the VA is ALREADY connected to, and can be
+ * withdrawn from the same screen at any time — which deletes it here and leaves
+ * the VA to revoke it in Supabase. Where no encryption key is configured, we
+ * decline to keep it at all and the flow behaves exactly as it did before.
  *
  * Env:
  *   SUPABASE_API_URL         override the management API base (tests point this
@@ -211,6 +225,41 @@ async function installSchema(mgmt, ref, sql) {
 }
 
 /**
+ * Is this token still good for this project?
+ *
+ * Both halves matter and they fail differently. A revoked token is `bad_token`
+ * and the VA needs a new one; a live token belonging to a DIFFERENT Supabase
+ * account is `project_not_found`, and the VA needs the right one. Telling those
+ * apart is the whole reason this is a call rather than an assumption — a stored
+ * token that has quietly stopped working must say which kind of stopped.
+ *
+ * Returns the project as the Management API describes it, so callers can also
+ * see whether it is paused before they try to run anything against it.
+ */
+async function checkAccess(accessToken, ref) {
+    const mgmt = new Management(accessToken);
+    const project = await mgmt.getProject(ref);
+    return { mgmt, project, ready: !!project && (!project.status || project.status === HEALTHY) };
+}
+
+/**
+ * Bring a project that is already connected up to the current schema.
+ *
+ * The one path both the button and the automatic updater take, so "I pressed
+ * update" and "it updated itself overnight" cannot drift apart in what they
+ * actually do to a VA's database.
+ */
+async function updateSchema({ accessToken, ref, sql }) {
+    const { mgmt, project, ready } = await checkAccess(accessToken, ref);
+    if (!ready) {
+        throw new SetupError('That project is paused or still starting up. Resume it in Supabase, then try again.',
+            { status: 409, code: 'project_not_ready' });
+    }
+    await installSchema(mgmt, ref, sql);
+    return { project: publicProject(project || { id: ref }) };
+}
+
+/**
  * The whole setup, as one resumable step.
  *
  * Resumable because creating a Supabase project takes a minute or two, which is
@@ -299,6 +348,8 @@ module.exports = {
     SetupError,
     provision,
     installSchema,
+    updateSchema,
+    checkAccess,
     extractKeys,
     publicProject,
     projectUrl,
