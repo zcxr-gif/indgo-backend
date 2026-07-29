@@ -26,6 +26,9 @@ const crypto = require('crypto');
 const crewStore = require('./crewStore');
 const crewAccounts = require('./crewAccounts');
 const crewInvite = require('./crewInvite');
+// The schedule's rules are normalised by the module that enforces them, so the
+// bounds a VA can save and the bounds the endpoints apply are one definition.
+const crewSchedules = require('./crewSchedules');
 
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString('hex');
 
@@ -427,10 +430,16 @@ function registerCrewAuthRoutes(app) {
             const touchesRecruit = ['joinMode', 'minGrade', 'callsignPrefix', 'discordInvite', 'applicationForm', 'joinRequirements'].some(f => body[f] !== undefined);
             const touchesTeam = body.staffRoles !== undefined || body.staffAssignments !== undefined;
             const touchesOps = body.pirepAutoApprove !== undefined;
+            const touchesSchedule = body.schedule !== undefined;
             if (touchesBranding && !can('settings.branding')) return res.status(403).json({ error: 'You don’t have permission to change appearance.' });
             if (touchesRecruit && !can('settings.recruitment')) return res.status(403).json({ error: 'You don’t have permission to change recruitment settings.' });
             if (touchesTeam && !(isInflight || p.role === 'owner')) return res.status(403).json({ error: 'Only the owner can manage staff roles.' });
             if (touchesOps && !can('flights.review')) return res.status(403).json({ error: 'You don’t have permission to change flight tracking.' });
+            // Gated on the same capability as building the schedule itself. A
+            // staff member trusted to publish the week is the one who decides
+            // how it is bid for; one who is not should not be able to switch
+            // self-service booking off for the whole airline.
+            if (touchesSchedule && !can('schedules.manage')) return res.status(403).json({ error: 'You don’t have permission to change the schedule settings.' });
 
             if (typeof req.body?.layout === 'string') {
                 const layout = req.body.layout.toLowerCase();
@@ -466,6 +475,29 @@ function registerCrewAuthRoutes(app) {
             if (req.body?.fleet !== undefined) {
                 const f = sanitizeFleet(req.body.fleet);
                 if (f) ad.crewFleet = f;
+            }
+            // How this VA runs its schedule. Normalised by the same module that
+            // ENFORCES these rules, so what is stored and what is applied
+            // cannot disagree — a settings screen with its own idea of the
+            // bounds is how a cap of 500 gets saved and then never applied.
+            if (req.body?.schedule !== undefined && req.body.schedule !== null) {
+                const incoming = req.body.schedule;
+                if (typeof incoming !== 'object') {
+                    return res.status(400).json({ error: 'Schedule settings must be an object.' });
+                }
+                // Merged over what is stored, not replacing it: the settings
+                // screen sends the field that changed, and a partial body must
+                // not reset the other five to their defaults.
+                const merged = { ...crewSchedules.normalizeRules(ad.crewSchedule), ...incoming };
+                const rules = crewSchedules.normalizeRules(merged);
+                // A rank gate naming a rung that does not exist would lock the
+                // schedule for everybody, silently. Same rule the route and
+                // event gates follow: an unknown rung lapses OPEN.
+                if (rules.minRank && !(Array.isArray(ad.ranks) ? ad.ranks : []).some(
+                    (r) => String(r.name || '').toLowerCase() === rules.minRank.toLowerCase())) {
+                    rules.minRank = '';
+                }
+                ad.crewSchedule = rules;
             }
             if (typeof req.body?.joinMode === 'string' && ['free', 'application'].includes(req.body.joinMode)) {
                 ad.joinMode = req.body.joinMode;

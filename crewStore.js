@@ -1168,6 +1168,22 @@ class SupabaseStore {
         });
     }
     getSchedule(id) { return this.schedules(() => this.one('crew_schedules', this.ident(id), scheduleFromRow)); }
+    // Several departures at once, for the per-pilot booking cap: a pilot with a
+    // season of bookings would otherwise cost one round trip per booking to
+    // answer "how many are you still holding?", which would make the check more
+    // expensive than the booking it guards.
+    listSchedulesByIds(ids, { limit = 500 } = {}) {
+        const clean = [...new Set((ids || []).map((i) => String(i)).filter(Boolean))];
+        if (!clean.length) return Promise.resolve([]);
+        return this.schedules(async () => {
+            const rows = await this.db.select('crew_schedules', {
+                ...this.scope,
+                id: `in.(${clean.map((i) => `"${i.replace(/"/g, '')}"`).join(',')})`,
+                limit,
+            });
+            return (rows || []).map(scheduleFromRow);
+        });
+    }
     createSchedule(data) {
         return this.schedules(async () => {
             const [row] = await this.db.insert('crew_schedules', { va_slug: this.slug, ...scheduleToRow(data) });
@@ -1595,6 +1611,7 @@ class LegacyStore {
     }
     listSchedules() { return this.schedules(); }
     getSchedule() { return this.schedules(); }
+    listSchedulesByIds() { return this.schedules(); }
     createSchedule() { return this.schedules(); }
     updateSchedule() { return this.schedules(); }
     deleteSchedule() { return this.schedules(); }

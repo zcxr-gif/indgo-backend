@@ -152,5 +152,79 @@ T('a leg with only a flight number does not print empty arrows',
     S.describeLeg({ flightNumber: 'BA117' }), 'BA117');
 T('nothing at all is empty, not "undefined"', S.describeLeg(null), '');
 
+console.log('\ncrewSchedules — the rules a VA sets');
+
+// Absent means ON. The feature predates anybody's choice about it, and a crew
+// center that quietly hid a section nobody asked to hide reads as a bug.
+T('an unconfigured VA has the schedule on', S.normalizeRules(undefined).enabled, true);
+T('…with self-service booking', S.normalizeRules(undefined).booking, 'pilots');
+T('…and no caps', [S.normalizeRules({}).maxPerPilot, S.normalizeRules({}).openDaysAhead], [0, 0]);
+T('an explicit off is honoured', S.normalizeRules({ enabled: false }).enabled, false);
+T('an unknown booking mode falls back to pilots', S.normalizeRules({ booking: 'wat' }).booking, 'pilots');
+// Out-of-range values are clamped, not rejected: the settings screen and the
+// enforcement read the SAME normaliser, so a cap of 500 cannot be stored and
+// then never applied.
+T('caps are clamped', S.normalizeRules({ maxPerPilot: 900 }).maxPerPilot, 50);
+T('negatives are floored', S.normalizeRules({ openDaysAhead: -5 }).openDaysAhead, 0);
+T('garbage falls back to the default', S.normalizeRules({ maxPerPilot: 'lots' }).maxPerPilot, 0);
+
+const openLeg = { status: 'published', departsAt: new Date(Date.now() + 5 * 86400e3).toISOString() };
+const yes = () => true;
+const no = () => false;
+
+T('nothing in the way is no refusal',
+    S.bookingRefusal(openLeg, {}, { meetsRank: yes }), null);
+T('the feature being off refuses everybody',
+    (S.bookingRefusal(openLeg, { enabled: false }, {}) || {}).code, 'schedule_off');
+T('staff-assigned mode refuses a pilot',
+    (S.bookingRefusal(openLeg, { booking: 'staff' }, {}) || {}).code, 'staff_assigned');
+// Assigning by hand IS the override. Blocking staff with a bidding window would
+// leave a departure uncovered to enforce a rule about fairness.
+T('…but not a staff member assigning cover',
+    S.bookingRefusal(openLeg, { booking: 'staff' }, { byStaff: true }), null);
+T('the airline-wide rank gate refuses below it',
+    (S.bookingRefusal(openLeg, { minRank: 'Captain' }, { meetsRank: no }) || {}).code, 'rank_locked');
+T('…and lets a Captain through',
+    S.bookingRefusal(openLeg, { minRank: 'Captain' }, { meetsRank: yes }), null);
+T('the bidding window refuses before it opens',
+    (S.bookingRefusal(openLeg, { openDaysAhead: 2 }, { meetsRank: yes }) || {}).code, 'not_open_yet');
+T('…and allows once inside it',
+    S.bookingRefusal(openLeg, { openDaysAhead: 14 }, { meetsRank: yes }), null);
+T('a per-pilot cap refuses at the limit',
+    (S.bookingRefusal(openLeg, { maxPerPilot: 2 }, { held: 2, meetsRank: yes }) || {}).code, 'max_bookings');
+T('…and allows below it',
+    S.bookingRefusal(openLeg, { maxPerPilot: 2 }, { held: 1, meetsRank: yes }), null);
+// The first true thing is what the pilot is told. "Staff assign the flying" is
+// more use than "you hold three legs" to somebody who could never have booked.
+T('the most useful refusal wins',
+    (S.bookingRefusal(openLeg, { booking: 'staff', maxPerPilot: 1 }, { held: 9 }) || {}).code, 'staff_assigned');
+T('a refusal always carries a sentence',
+    typeof (S.bookingRefusal(openLeg, { enabled: false }, {}) || {}).message, 'string');
+
+T('booking opens the stated number of days out',
+    S.opensAt({ departsAt: '2026-03-15T18:40:00.000Z' }, { openDaysAhead: 7 }).toISOString(),
+    '2026-03-08T18:40:00.000Z');
+T('no window means always open', S.opensAt({ departsAt: '2026-03-15T18:40:00.000Z' }, {}), null);
+
+console.log('\ncrewSchedules — giving a leg back');
+
+const soonLeg = { departsAt: new Date(Date.now() + 2 * 3600e3).toISOString() };
+T('an ordinary booking can be given back',
+    S.cancelRefusal({ status: 'booked' }, soonLeg, {}), null);
+// A flown leg is a record of what happened. Deleting it would erase who flew it,
+// and the fix for a wrong record is the flight report, not the booking.
+T('a flown leg cannot be given back',
+    (S.cancelRefusal({ status: 'flown' }, soonLeg, {}) || {}).code, 'already_flown');
+T('…not even by staff',
+    (S.cancelRefusal({ status: 'flown' }, soonLeg, {}, { byStaff: true }) || {}).code, 'already_flown');
+T('a cutoff refuses inside the window',
+    (S.cancelRefusal({ status: 'booked' }, soonLeg, { cancelHoursBefore: 6 }) || {}).code, 'too_late');
+T('…and allows outside it',
+    S.cancelRefusal({ status: 'booked' }, { departsAt: new Date(Date.now() + 48 * 3600e3).toISOString() },
+        { cancelHoursBefore: 6 }), null);
+// Finding cover is staff's job, so the courtesy window is theirs to override.
+T('staff override the cutoff',
+    S.cancelRefusal({ status: 'booked' }, soonLeg, { cancelHoursBefore: 6 }, { byStaff: true }), null);
+
 console.log(failures ? `\n${failures} failure(s)\n` : '\nAll good.\n');
 process.exit(failures ? 1 : 0);

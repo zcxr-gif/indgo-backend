@@ -268,6 +268,172 @@ function expandSeries({ departsAt, arrivesAt, repeat = 'none', count = 1 } = {})
     return out;
 }
 
+/* ===========================================================================
+ * HOW THE VA CHOOSES TO RUN IT
+ *
+ * Airlines run bidding very differently and the crew center should not have an
+ * opinion. Some publish a week and let anyone take anything; some assign every
+ * leg by hand; some open the schedule at First Officer and no lower. That is
+ * what these rules are, and they are the VA's to set (see `crewSchedule` on the
+ * VA document).
+ *
+ * Two things worth stating, because they are what make this safe:
+ *
+ *   1. THE REFUSAL IS DECIDED HERE, ON THE SERVER'S SIDE OF THE WIRE. The panel
+ *      reads the same rules to grey a button out and say why — but a browser
+ *      that skipped straight to POST /book still gets stopped, because this
+ *      function is what the endpoint calls. A rule enforced only in the UI is a
+ *      suggestion.
+ *
+ *   2. A REFUSAL IS A SENTENCE, NOT A BOOLEAN. Every one of these carries the
+ *      reason a pilot needs: not "you cannot book this" but "the schedule opens
+ *      seven days before departure — this one opens on Tuesday". A rule a pilot
+ *      cannot see the shape of is one they will ask staff about instead.
+ * ========================================================================= */
+
+const DEFAULT_RULES = {
+    enabled: true,
+    booking: 'pilots',
+    minRank: '',
+    maxPerPilot: 0,
+    openDaysAhead: 0,
+    cancelHoursBefore: 0,
+};
+
+const BOOKING_MODES = ['pilots', 'staff'];
+
+/**
+ * The VA's settings, with every field present and in range.
+ *
+ * Callers get a whole object or nothing useful — a half-populated rules object
+ * is how "0 means unlimited" turns into "undefined means refuse everybody".
+ */
+function normalizeRules(cfg) {
+    const c = cfg || {};
+    const int = (v, lo, hi, def) => {
+        const n = Math.round(Number(v));
+        return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : def;
+    };
+    return {
+        // Absent means on. The feature predates nobody's choice about it, and a
+        // VA who has never opened these settings has not asked for it to be off.
+        enabled: c.enabled === undefined ? true : !!c.enabled,
+        booking: BOOKING_MODES.includes(c.booking) ? c.booking : 'pilots',
+        minRank: str(c.minRank, 40),
+        maxPerPilot: int(c.maxPerPilot, 0, 50, 0),
+        openDaysAhead: int(c.openDaysAhead, 0, 365, 0),
+        cancelHoursBefore: int(c.cancelHoursBefore, 0, 336, 0),
+    };
+}
+
+/** When booking opens for a departure, or null when it is always open. */
+function opensAt(schedule, rules) {
+    const r = normalizeRules(rules);
+    const dep = when(schedule && schedule.departsAt);
+    if (!r.openDaysAhead || !dep) return null;
+    return new Date(dep.getTime() - r.openDaysAhead * 24 * 3600 * 1000);
+}
+
+/**
+ * Why this pilot may not take this leg — or null, meaning they may.
+ *
+ * Checked in the order a pilot would ask the questions, so the FIRST true thing
+ * is the one they are told. "The schedule is staff-assigned" is more useful than
+ * "you already hold three legs" to somebody who could never have booked it.
+ *
+ * `byStaff` skips the lot. A staff member assigning cover, or putting a guest
+ * crew from a partner VA on a leg, is deliberately overriding these rules —
+ * that is what assigning by hand IS — and blocking them with a bidding window
+ * would leave a departure uncovered to enforce a rule about fairness.
+ */
+function bookingRefusal(schedule, rules, {
+    now = Date.now(), held = 0, hours = 0, ranks = null, meetsRank = null, byStaff = false,
+} = {}) {
+    const r = normalizeRules(rules);
+
+    if (!r.enabled) {
+        return { code: 'schedule_off', message: 'This crew center isn’t using the schedule.' };
+    }
+    if (byStaff) return null;
+
+    if (r.booking === 'staff') {
+        return {
+            code: 'staff_assigned',
+            message: 'Your staff assign the flying on this schedule — ask them for a leg.',
+        };
+    }
+
+    // The airline-wide gate. A per-departure minRank is checked separately by
+    // the caller and stacks on top of this: either can refuse, so the effective
+    // bar is whichever is higher, without this needing to order the ladder.
+    if (r.minRank && typeof meetsRank === 'function' && !meetsRank(ranks, hours, r.minRank)) {
+        return {
+            code: 'rank_locked',
+            message: `The schedule opens at ${r.minRank}.`,
+            minRank: r.minRank,
+        };
+    }
+
+    const open = opensAt(schedule, r);
+    if (open && now < open.getTime()) {
+        return {
+            code: 'not_open_yet',
+            message: `Booking opens ${r.openDaysAhead} day${r.openDaysAhead === 1 ? '' : 's'} before departure.`,
+            opensAt: open,
+        };
+    }
+
+    if (r.maxPerPilot && held >= r.maxPerPilot) {
+        return {
+            code: 'max_bookings',
+            message: `You’re already holding ${held} departure${held === 1 ? '' : 's'} — this crew center allows ${r.maxPerPilot} at a time.`,
+            maxPerPilot: r.maxPerPilot,
+        };
+    }
+
+    return null;
+}
+
+/**
+ * Why this pilot may not hand this leg back — or null, meaning they may.
+ *
+ * Two reasons, and they are different in kind. A flight already FLOWN is a
+ * record of something that happened and deleting it would erase who flew it —
+ * refused for everybody, staff included, because the fix for a wrong record is
+ * to correct the flight report, not to unbook the past. A cutoff, by contrast,
+ * is a courtesy to whoever has to find cover, so staff can always override it.
+ */
+function cancelRefusal(booking, schedule, rules, { now = Date.now(), byStaff = false } = {}) {
+    if (booking && booking.status === 'flown') {
+        return {
+            code: 'already_flown',
+            message: 'This leg has already been flown — it stays on the record.',
+        };
+    }
+    if (byStaff) return null;
+
+    const r = normalizeRules(rules);
+    const dep = when(schedule && schedule.departsAt);
+    if (r.cancelHoursBefore && dep && dep.getTime() - now < r.cancelHoursBefore * 3600 * 1000) {
+        return {
+            code: 'too_late',
+            message: `Legs can’t be given back within ${r.cancelHoursBefore} hour${r.cancelHoursBefore === 1 ? '' : 's'} of departure — talk to your staff.`,
+            cancelHoursBefore: r.cancelHoursBefore,
+        };
+    }
+    return null;
+}
+
+/**
+ * The rules as the crew center reads them.
+ *
+ * Sent on every schedule fetch so the panel can grey the right button and say
+ * why before a pilot presses it. Identical in shape to what is enforced, which
+ * is the point — two descriptions of one rule is how a UI ends up promising
+ * something the server refuses.
+ */
+const publicRules = (rules) => normalizeRules(rules);
+
 /**
  * The leg in words, for a Discord notice or a noticeboard row.
  *
@@ -292,6 +458,13 @@ module.exports = {
     bookingClosedReason,
     expandSeries,
     describeLeg,
+    normalizeRules,
+    bookingRefusal,
+    cancelRefusal,
+    opensAt,
+    publicRules,
+    DEFAULT_RULES,
+    BOOKING_MODES,
     STATUSES,
     REPEATS,
     MAX_SEATS,

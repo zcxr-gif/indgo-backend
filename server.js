@@ -266,6 +266,52 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // capture and its hours roll straight onto the roster.
     crewPirepAutoApprove: { type: Boolean, default: false },
 
+    // --- The schedule, as the VA chooses to run it (v8) ---
+    //
+    // Airlines run bidding very differently and the crew center should not have
+    // an opinion. Some publish a week and let anyone take anything; some assign
+    // every leg by hand; some open the schedule to First Officers and up and
+    // nobody else. All of that is this object, and every field of it is
+    // enforced on the SERVER — the panel reads these to explain a refusal
+    // before it happens, but it is not what makes the refusal.
+    //
+    // The rules live centrally, with the rank ladder and the fleet, rather than
+    // in the VA's own Postgres: they are definitions of how the airline is run,
+    // the same class of thing as `ranks`, and the crew center reads them before
+    // it has a store connection to read anything else from.
+    crewSchedule: {
+        // The whole feature. Off hides the panel, the tile and the hero button
+        // — a VA that assigns flying in Discord should not have a schedule tab
+        // that is permanently empty. Existing VAs default ON: the feature is
+        // new, nobody has opted into anything, and a crew center that quietly
+        // hid a section they had not asked to hide would read as a bug.
+        enabled: { type: Boolean, default: true },
+        // 'pilots' — anyone who meets the rank takes what they want.
+        // 'staff'  — staff assign every leg; pilots read the schedule and
+        //            cannot book. Not the same as disabling the feature: the
+        //            schedule is still published, it is just not self-service.
+        booking: { type: String, enum: ['pilots', 'staff'], default: 'pilots' },
+        // The rung the schedule OPENS at, airline-wide. Names a rank exactly as
+        // crew_routes.min_rank and crew_events.min_rank do, and for the same
+        // reason: what a rank is worth is decided in one place. A per-departure
+        // min_rank still applies on top — it can raise the bar for one leg, and
+        // deliberately cannot lower it below this.
+        minRank: { type: String, trim: true, default: '' },
+        // How many upcoming legs one pilot may be holding at once. 0 = as many
+        // as they like. This is the rule that stops one keen pilot taking the
+        // whole week ten minutes after it is published, which is the failure
+        // every VA running a schedule eventually writes a Discord rule about.
+        maxPerPilot: { type: Number, default: 0, min: 0, max: 50 },
+        // Booking opens this many days before departure. 0 = as soon as it is
+        // published. Non-zero is how a VA runs a fair weekly bid instead of a
+        // race to whoever was online when staff pressed publish.
+        openDaysAhead: { type: Number, default: 0, min: 0, max: 365 },
+        // How close to departure a pilot may still hand a leg back. 0 = right
+        // up to the moment. Non-zero gives staff time to find cover rather than
+        // discovering an empty seat at pushback.
+        cancelHoursBefore: { type: Number, default: 0, min: 0, max: 336 },
+    },
+
     // --- Recruitment / join settings ---
     // joinMode: 'free' = instant account; 'application' = staff review.
     joinMode: { type: String, enum: ['free', 'application'], default: 'application' },
@@ -3264,7 +3310,7 @@ const publicSchedule = (s, opts = {}) => {
 // tells us which uniqueness bit gave way (see Postgrest.explain), so "somebody
 // just took that seat" is never guessed — a pilot who is simply already booked
 // on the leg gets their own, different sentence.
-function bookingConflict(err, res) {
+function bookingConflict(err, res, { byStaff = false } = {}) {
     if (!(err instanceof crewStore.CrewStoreError) || err.code !== 'store_conflict') return false;
     if (String(err.constraint || '').includes('seat')) {
         res.status(409).json({
@@ -3273,8 +3319,30 @@ function bookingConflict(err, res) {
         });
         return true;
     }
-    res.status(409).json({ error: 'You are already booked on this departure.', code: 'already_booked' });
+    // Whose booking it is changes the sentence. A staff member assigning cover
+    // is not "already booked on this departure" — the pilot they picked is, and
+    // telling staff otherwise sends them looking for a booking of their own.
+    res.status(409).json({
+        error: byStaff
+            ? 'That pilot is already on this departure.'
+            : 'You are already booked on this departure.',
+        code: 'already_booked',
+    });
     return true;
+}
+
+/**
+ * The VA's schedule rules, read fresh.
+ *
+ * `resolveCrewVa` selects only what running an airline needs (crewStore.SELECT)
+ * and these are not in it, so they are read on the requests that enforce them.
+ * One indexed lookup by id, and it must not be cached: an owner turning
+ * self-service booking off expects the next pilot to be refused, not the one
+ * after the cache expires.
+ */
+async function scheduleRules(vaId) {
+    const doc = await VirtualAirlineAd.findById(vaId).select('crewSchedule').lean().catch(() => null);
+    return crewSchedules.normalizeRules(doc && doc.crewSchedule);
 }
 
 /**
@@ -3322,6 +3390,7 @@ app.get('/api/crew/:slug/schedules', async (req, res) => {
         const { va, store } = await resolveCrewStore(req.params.slug);
         const canManage = await canManageSchedules(req, req.params.slug);
         const viewer = await crewPilot(req, store);
+        const rules = await scheduleRules(va._id);
         const upcomingOnly = String(req.query.upcoming || '') === '1';
 
         const all = await store.listSchedules({ upcomingOnly });
@@ -3340,10 +3409,36 @@ app.get('/api/crew/:slug/schedules', async (req, res) => {
         const isMine = (b) => (viewer.accountId && b.accountId === viewer.accountId)
             || (viewer.memberId && b.memberId === viewer.memberId);
 
+        // Why this pilot cannot take each leg, decided HERE and sent with the
+        // row rather than re-derived in the browser.
+        //
+        // The panel needs to grey a button and say why, and the obvious way to
+        // do that is to reimplement the rules client-side — which is two
+        // descriptions of one rule, and the two drift. So the server answers
+        // the question it is already the authority on, once per row, and the
+        // panel renders the sentence it is given. A pilot who bypassed the UI
+        // hits the identical check in POST /book.
+        //
+        // `held` is counted once for the whole page, not per row.
+        const held = viewer
+            ? await countUpcomingHeld(store, allBookings.filter(isMine))
+            : 0;
+        const refusalFor = (s) => {
+            if (!viewer) return null;                    // nobody is asking
+            if (bySchedule.get(String(s._id) || '')?.some(isMine)) return null;  // already theirs
+            const r = crewSchedules.bookingRefusal(s, rules, {
+                held, hours: viewer.hours, ranks: va.ranks, meetsRank: crewRanks.meetsRank,
+            });
+            return r ? { code: r.code, message: r.message, opensAt: r.opensAt || null } : null;
+        };
+
         res.json({
-            schedules: listed.map((s) => publicSchedule(s, {
-                bookings: bySchedule.get(String(s._id)) || [],
-                ranks: va.ranks, viewer, canManage,
+            schedules: listed.map((s) => ({
+                ...publicSchedule(s, {
+                    bookings: bySchedule.get(String(s._id)) || [],
+                    ranks: va.ranks, viewer, canManage,
+                }),
+                refusal: refusalFor(s),
             })),
             canManage,
             // So a pilot's own row can say "you have this one, seat 1" without a
@@ -3351,6 +3446,10 @@ app.get('/api/crew/:slug/schedules', async (req, res) => {
             mine: viewer
                 ? allBookings.filter(isMine).map((b) => ({ scheduleId: b.scheduleId, ...crewSchedules.publicBooking(b) }))
                 : [],
+            // How this VA has chosen to run the schedule. Sent so the panel can
+            // grey the right button and say why BEFORE a pilot presses it —
+            // the same rules the endpoints below enforce, not a second copy.
+            rules: crewSchedules.publicRules(rules),
             ranks: crewRanks.normalizeLadder(va.ranks).map((r) => ({ name: r.name, minHours: r.minHours })),
         });
     } catch (err) { crewFail(res, err, { log: 'schedules list error', message: 'Could not load the schedule.' }); }
@@ -3410,13 +3509,21 @@ app.post('/api/crew/:slug/schedules', async (req, res) => {
         if (!template.origin || !template.destination) {
             return res.status(400).json({ error: 'A departure needs both a departure and an arrival airport.' });
         }
+        // Asking to repeat something with no departure time is a mistake worth
+        // naming: expandSeries would silently return one row (it refuses to
+        // multiply an undated template), and staff who asked for fourteen would
+        // get one with no explanation.
+        const wantsSeries = ['daily', 'weekly'].includes(String(b.repeat || '')) && Number(b.count) > 1;
+        if (wantsSeries && !template.departsAt) {
+            return res.status(400).json({
+                error: 'Give the first departure a time before repeating it.',
+                code: 'series_needs_time',
+            });
+        }
         const series = crewSchedules.expandSeries({
             departsAt: template.departsAt, arrivesAt: template.arrivesAt,
             repeat: b.repeat, count: b.count,
         });
-        if (series.length > 1 && !template.departsAt) {
-            return res.status(400).json({ error: 'Give the first departure a time before repeating it.' });
-        }
 
         const created = [];
         for (const times of series) {
@@ -3457,15 +3564,26 @@ app.patch('/api/crew/:slug/schedules/:id', async (req, res) => {
         const before = await store.getSchedule(req.params.id);
         if (!before) return res.status(404).json({ error: 'Departure not found.' });
 
-        // Seats may not be cut below the pilots already on the leg. Doing so
-        // would leave bookings holding seat numbers the departure no longer
-        // has — nobody is bumped by an edit, and staff who need one gone remove
-        // that booking themselves.
+        // Seats may not be cut below the HIGHEST SEAT ALREADY HELD — not below
+        // the booking count, which is the same number only when the seats in
+        // use happen to be contiguous.
+        //
+        // They often are not. Three pilots book seats 1, 2 and 3; the first two
+        // give their legs back; one pilot remains, sitting in seat 3. Guarding
+        // on the count would let staff cut the departure to one seat while seat
+        // 3 is still occupied — and nextFreeSeat would then hand seat 1 to
+        // somebody else, putting two pilots on a one-seat leg.
+        //
+        // Nobody is bumped by an edit either way: staff who need a pilot off
+        // remove that booking themselves.
         const patch = crewSchedules.sanitizeSchedule({ ...before, ...req.body });
         const booked = await store.listBookings(before._id).catch(() => []);
-        if (booked.length && patch.seats < booked.length) {
+        const highestHeld = booked.reduce((n, b) => Math.max(n, Number(b.seat) || 0), 0);
+        if (highestHeld && patch.seats < highestHeld) {
             return res.status(409).json({
-                error: `${booked.length} pilot${booked.length === 1 ? ' is' : 's are'} already booked on this departure — remove a booking before cutting the seats.`,
+                error: booked.length === 1
+                    ? `A pilot is holding seat ${highestHeld} on this departure — remove that booking before cutting the seats.`
+                    : `${booked.length} pilots are booked, up to seat ${highestHeld} — remove a booking before cutting the seats.`,
                 code: 'seats_below_booked',
             });
         }
@@ -3509,6 +3627,29 @@ app.post('/api/crew/:slug/schedules/:id/book', async (req, res) => {
         if (closed === 'cancelled') return res.status(409).json({ error: 'This departure has been cancelled.', code: 'cancelled' });
         if (closed === 'departed') return res.status(409).json({ error: 'This departure has already gone.', code: 'departed' });
 
+        // The airline's own rules: is the feature on, may pilots book at all,
+        // has the bidding window opened, is this pilot already holding as many
+        // legs as the VA allows? Refused with the reason, never a bare 403.
+        //
+        // `held` counts only what is still AHEAD of them. A pilot who flew four
+        // legs last month is not "holding four" — counting history would ratchet
+        // a per-pilot cap into a lifetime quota.
+        const rules = await scheduleRules(va._id);
+        const mineAll = await store.listBookingsForPilot(
+            { accountId: viewer.accountId, memberId: viewer.memberId },
+        ).catch(() => []);
+        const held = await countUpcomingHeld(store, mineAll);
+
+        const refused = crewSchedules.bookingRefusal(schedule, rules, {
+            held, hours: viewer.hours, ranks: va.ranks, meetsRank: crewRanks.meetsRank,
+        });
+        if (refused) return res.status(403).json(refused.code === 'not_open_yet'
+            ? { error: refused.message, code: refused.code, opensAt: refused.opensAt }
+            : { error: refused.message, code: refused.code });
+
+        // The per-departure gate, on top of the airline-wide one. Either can
+        // refuse, so the effective bar is whichever is higher — and staff can
+        // raise it for one leg without being able to lower it below the VA's.
         if (schedule.minRank && !crewRanks.meetsRank(va.ranks, viewer.hours, schedule.minRank)) {
             return res.status(403).json({
                 error: `This departure opens at ${schedule.minRank}.`,
@@ -3539,6 +3680,30 @@ app.post('/api/crew/:slug/schedules/:id/book', async (req, res) => {
     }
 });
 
+/**
+ * How many legs this pilot is still holding — ahead of them, not behind.
+ *
+ * One `in.()` read of the departures their bookings point at, rather than one
+ * per booking: a pilot with a season of history would otherwise make the cap
+ * check cost more than the booking it guards. A departure that cannot be read
+ * (deleted under them, an older schema) is not counted, because refusing a
+ * booking over a row we could not fetch would be the cap failing closed on the
+ * pilot rather than on the rule.
+ */
+async function countUpcomingHeld(store, bookings) {
+    const live = (bookings || []).filter((b) => b.status !== 'flown');
+    if (!live.length) return 0;
+    try {
+        const rows = await store.listSchedulesByIds(live.map((b) => b.scheduleId));
+        const now = Date.now();
+        return rows.filter((s) => s
+            && s.status === 'published'
+            && (!s.departsAt || new Date(s.departsAt).getTime() > now)).length;
+    } catch {
+        return 0;
+    }
+}
+
 // Change your callsign or your note on a leg you hold. Not your seat — that is
 // the database's to arbitrate — and not your name, which is your roster row's.
 app.patch('/api/crew/:slug/schedules/:id/book', async (req, res) => {
@@ -3557,11 +3722,20 @@ app.patch('/api/crew/:slug/schedules/:id/book', async (req, res) => {
 // frees the seat — the same reasoning as withdrawing from an event.
 app.delete('/api/crew/:slug/schedules/:id/book', async (req, res) => {
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
+        const { va, store } = await resolveCrewStore(req.params.slug);
         const viewer = await crewPilot(req, store);
         if (!viewer) return res.status(401).json({ error: 'Sign in to your crew center first.' });
         const mine = await store.getBookingFor(req.params.id, { accountId: viewer.accountId, memberId: viewer.memberId });
         if (!mine) return res.json({ ok: true });   // not booked; nothing to undo
+
+        // A leg already flown is a record of something that happened, and
+        // deleting it would erase who flew it — refused for everybody. A cutoff
+        // close to departure is a courtesy to whoever has to find cover, and
+        // only applies to the pilot.
+        const schedule = await store.getSchedule(req.params.id).catch(() => null);
+        const refused = crewSchedules.cancelRefusal(mine, schedule, await scheduleRules(va._id));
+        if (refused) return res.status(409).json({ error: refused.message, code: refused.code });
+
         await store.deleteBooking(mine._id);
         res.json({ ok: true });
     } catch (err) { crewFail(res, err, { log: 'schedule cancel error', message: 'Could not cancel your booking.' }); }
@@ -3595,7 +3769,7 @@ app.post('/api/crew/:slug/schedules/:id/bookings', async (req, res) => {
         if (full) return res.status(409).json({ error: 'Every seat on this departure has gone.', code: 'full' });
         res.status(201).json(withDrift(store, { booking: crewSchedules.publicBooking(booking) }));
     } catch (err) {
-        if (bookingConflict(err, res)) return;
+        if (bookingConflict(err, res, { byStaff: true })) return;
         crewFail(res, err, { log: 'schedule assign error', message: 'Could not assign that pilot.' });
     }
 });
@@ -3607,6 +3781,11 @@ app.delete('/api/crew/:slug/schedules/:id/bookings/:bookingId', async (req, res)
         const { store } = await resolveCrewStore(req.params.slug);
         const existing = await store.getBooking(req.params.bookingId);
         if (!existing || existing.scheduleId !== req.params.id) return res.status(404).json({ error: 'Booking not found.' });
+        // Staff override the cutoff — finding cover is their job — but not the
+        // flown record. Correcting a flight that was flown is the flight
+        // report's business, not the booking's.
+        const refused = crewSchedules.cancelRefusal(existing, null, null, { byStaff: true });
+        if (refused) return res.status(409).json({ error: refused.message, code: refused.code });
         await store.deleteBooking(existing._id);
         res.json({ ok: true });
     } catch (err) { crewFail(res, err, { log: 'schedule booking remove error', message: 'Could not remove the booking.' }); }
@@ -6909,7 +7088,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles crewFleet crewPirepAutoApprove joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles crewFleet crewPirepAutoApprove crewSchedule joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -6949,6 +7128,12 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             roles: Array.isArray(ad.roles) ? ad.roles : [],
             fleet: Array.isArray(ad.crewFleet) ? ad.crewFleet : [],
             pirepAutoApprove: !!ad.crewPirepAutoApprove,
+            // How this VA runs its schedule. Public because the crew center
+            // reads it before it has a session — a VA that does not use the
+            // schedule should not show a Schedule button to a signed-out
+            // visitor either. Nothing here is a secret; it is the same class of
+            // thing as the rank ladder sitting above it.
+            schedule: crewSchedules.publicRules(ad.crewSchedule),
             join: {
                 mode: ad.joinMode || 'application',
                 minGrade: ad.minGrade || 0,
