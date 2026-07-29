@@ -297,6 +297,10 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
             pireps:      { type: String, trim: true, default: '' },
             // Route network changes: added, edited, removed, imported.
             routes:      { type: String, trim: true, default: '' },
+            // Events published, changed and cancelled. Deliberately not
+            // signups: a popular event would fire forty embeds in an evening,
+            // which is how a channel gets muted.
+            events:      { type: String, trim: true, default: '' },
         }, { _id: false }),
         default: () => ({}),
         select: false,
@@ -4261,6 +4265,7 @@ app.post('/api/crew/:slug/webhook', async (req, res) => {
                 recruitment: 'New applications, and accept / decline decisions, will show up here.',
                 pireps: 'Flight reports — filed, approved and rejected — and pilot promotions will show up here.',
                 routes: 'Route network changes will show up here.',
+                events: 'Events published, changed and cancelled will show up here. Signups will not — a busy event would fire dozens of them in an evening.',
             }[feed] || 'Your Crew Center is connected. New applications and accept / decline decisions will show up here.';
             const ok = await postCrewNotice(target, {
                 title: `🔔 ${ad.name || 'Crew Center'} — test message`,
