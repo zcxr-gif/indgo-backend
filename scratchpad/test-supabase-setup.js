@@ -206,6 +206,22 @@ const server = http.createServer((req, res) => {
     T('a project that reveals nothing usable',
         crewSetup.extractKeys([{ name: 'anon' }]), { anonKey: '', serviceKey: '' });
 
+    // --- Which project is a stored connection pointing at? ---
+    //
+    // The upgrade path runs DDL against the project the crew center is already
+    // connected to, and works that out from the stored URL rather than from the
+    // request — so this is the function that decides which database our schema
+    // lands in, and it says '' rather than guessing.
+    console.log('\nreading a project ref back off a stored URL');
+    T('a project URL', crewSetup.refFromUrl('https://abcdefghijklmnopqrst.supabase.co'), 'abcdefghijklmnopqrst');
+    T('  …with a trailing slash and a path', crewSetup.refFromUrl('https://abcdefghijklmnopqrst.supabase.co/rest/v1/'), 'abcdefghijklmnopqrst');
+    T('  …upper-cased by whoever pasted it', crewSetup.refFromUrl('https://ABCDEFGHIJKLMNOPQRST.supabase.co'), 'abcdefghijklmnopqrst');
+    T('a self-hosted PostgREST is not a Supabase project', crewSetup.refFromUrl('https://db.someairline.com'), '');
+    T('nor is a lookalike host', crewSetup.refFromUrl('https://abcdefghijklmnopqrst.supabase.co.evil.test'), '');
+    T('nor a subdomain of one', crewSetup.refFromUrl('https://x.abcdefghijklmnopqrst.supabase.co'), '');
+    T('junk', crewSetup.refFromUrl('not a url'), '');
+    T('nothing at all', crewSetup.refFromUrl(''), '');
+
     server.close();
     console.log(failures ? `\n${failures} failing check(s)\n` : '\nall checks passed\n');
     process.exit(failures ? 1 : 0);

@@ -124,7 +124,12 @@ T('  …and reports what it did not carry',
 console.log('\n duplicate lines');
 plan = crewCsv.planImport(crewCsv.ROSTER_SPEC, 'name,callsign,hours\nFresh One,AMX500,1\nFresh One,AMX500,2\n', []);
 T('the same new pilot twice is created once', plan.create.length, 1);
-T('  …and the second line updates the first', plan.update.length, 1);
+// The first line has not been written yet, so it has no id and there is nothing
+// for the second line to update — it is folded into the pending create instead.
+// Planning an update against an empty id failed at commit and reported the VA's
+// own file back to them as a broken row.
+T('  …and the second line folds into it rather than becoming an update', plan.update.length, 0);
+T('  …with the later line winning', plan.create[0].values.hours, 2);
 
 // --- Header tolerance -------------------------------------------------------
 console.log('\n header spellings');
