@@ -51,7 +51,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 4;
+const EXPECTED_SCHEMA_VERSION = 5;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -183,6 +183,13 @@ const routeFromRow = (r) => r && {
     distanceNm: Number(r.distance_nm) || 0,
     notes: r.notes || '',
     active: r.active !== false,
+    // v5. `kind` defaults to 'own' rather than '' so a route read from a
+    // pre-v5 project sorts with the airline's own network instead of falling
+    // into a third, nonexistent category.
+    kind: r.kind === 'codeshare' ? 'codeshare' : 'own',
+    partnerName: r.partner_name || '',
+    partnerLogo: r.partner_logo || '',
+    minRank: r.min_rank || '',
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
 };
@@ -195,6 +202,15 @@ const routeToRow = (r) => {
     pick(r, out, 'distanceNm', 'distance_nm', (v) => int(v, 0, 20000));
     pick(r, out, 'notes', 'notes', (v) => str(v, 500));
     pick(r, out, 'active', 'active', (v) => !!v);
+    pick(r, out, 'kind', 'kind', (v) => (v === 'codeshare' ? 'codeshare' : 'own'));
+    pick(r, out, 'partnerName', 'partner_name', (v) => str(v, 60));
+    // A logo lands in an <img> on a public crew center page, so anything that
+    // is not plainly an https URL is dropped rather than rendered.
+    pick(r, out, 'partnerLogo', 'partner_logo', (v) => {
+        const s = str(v, 600);
+        return /^https:\/\//i.test(s) ? s : '';
+    });
+    pick(r, out, 'minRank', 'min_rank', (v) => str(v, 40));
     return out;
 };
 
@@ -928,7 +944,11 @@ function computeStats({ members = [], pireps = [], routes = [], applications = [
 // `va` must have been loaded with the secret service key selected — see
 // crewStore.SELECT, which every caller uses so nobody forgets a field.
 // ---------------------------------------------------------------------------
-const SELECT = '_id slug callsign name contactEmail crewAccent supabaseUrl supabaseAnonKey +supabaseServiceKey';
+// `ranks` rides along because rank is now resolved server-side on nearly every
+// crew route — the roster, the route network's gating, a promotion notice — and
+// fetching the same small array again in each handler would be a second query
+// per request for a field that is a few hundred bytes.
+const SELECT = '_id slug callsign name contactEmail crewAccent ranks supabaseUrl supabaseAnonKey +supabaseServiceKey';
 
 function isConnected(va) {
     return !!(va && va.supabaseUrl && va.supabaseServiceKey);

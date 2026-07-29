@@ -84,6 +84,8 @@ than at the row.
 | `GET /api/crew/:slug/applications/:id/invite` | staff | read the invitation back, message included |
 | `POST /api/crew/:slug/applications/:id/invite/regenerate` | staff | mint a fresh temporary password (resets the account's too) |
 | `DELETE /api/crew/:slug/applications/:id/invite` | staff | discard the invitation. Does **not** touch the account |
+| `GET /api/crew/:slug/routes` | public | the network, split into own/codeshare counts, with each route marked locked or open for the pilot asking |
+| `GET/POST /api/crew/:slug/webhook` | staff | read/set the main webhook, or one feed's override (`feed: recruitment\|pireps\|routes`) |
 | `GET /api/crew/:slug/roster.csv` | staff | the roster as a spreadsheet, every column |
 | `POST /api/crew/:slug/roster/import` | staff | upsert from CSV. `dryRun` defaults true |
 | `GET /api/crew/:slug/routes.csv` | staff | the route network as a spreadsheet |
@@ -199,6 +201,81 @@ them to connect a project.
 Setting `CREW_STORE_REQUIRE_OWN=false` reopens managed storage to everyone.
 That is an escape hatch for an incident, not a supported configuration.
 
+## Ranks
+
+`crewRanks.js`. A VA defines a ladder — a name and a minimum hours figure per
+rung — in crew center settings. That has existed for a while; what is new is
+that the **server** resolves it.
+
+**Rank is derived from hours, never stored.** There is no `rank` column on
+`crew_members` and there should not be one: the moment a rank is stored it can
+disagree with the hours printed next to it, and it would — on every approved
+flight, every rolled-back rejection, and every time a VA moves a threshold.
+Moving a threshold would need a migration. A derived rank is simply correct.
+
+Two rules worth knowing:
+
+- **The lowest rung is the entry rank, whatever number is next to it.** A VA
+  whose ladder starts at "Second Officer, 25h" would otherwise leave a brand-new
+  pilot with no rank at all, on the day they are most likely to be looking at
+  their own profile. `rankForHours` floors it; every rung above still requires
+  its hours.
+- **A gate naming a rank that no longer exists lapses open.** A VA who renames
+  or deletes a rank gets an open route, never a network that quietly shrank.
+
+Promotions are detected where hours actually move (`applyPirepHours`, and a
+staff edit of the hours field) by comparing the rank held before against the
+rank held after. That makes it immune to how the hours moved: one long flight
+clearing two rungs reports the rung reached. **A rollback announces nothing** —
+an admin correcting a mistyped figure must never publish "Jo has been demoted"
+to a Discord channel.
+
+## Codeshares and rank-gated routes
+
+`crew_routes.kind` is `own` or `codeshare`. The split is not decoration: a
+network map that draws someone else's metal identically to your own overstates
+what the airline operates, which is the one thing that map is for. Codeshares
+are listed under their own filter, drawn dashed and muted on the map, excluded
+from the map's glow layer, and counted separately so "our network is 120 routes"
+cannot quietly mean "40 of ours and 80 of somebody else's". A partner name and
+an optional https logo ride along.
+
+`min_rank` names a rung on the VA's ladder rather than storing an hours figure,
+so the VA sets what a rank is worth in one place and every route gated on it
+moves with the threshold. It is a **name, not an index** — a VA reordering their
+ladder would otherwise silently re-gate their whole network.
+
+A pilot below the bar sees the route **locked, not hidden**, with how much
+further they have to fly. A route you can see and are working toward is the
+point of a ladder; a route that simply is not there is indistinguishable from a
+network smaller than advertised. Staff and the public are never marked locked —
+the gate is about what a pilot may fly.
+
+## Notification feeds
+
+A VA sets one Discord webhook and everything posts to that channel. That is the
+default and it is what most VAs want.
+
+Three feeds can each be pointed somewhere else instead:
+
+| feed | what posts |
+|---|---|
+| `recruitment` | new applications, accept / decline decisions |
+| `pireps` | flight reports **filed, approved and rejected** — one feed — plus promotions |
+| `routes` | routes added, edited, removed, or imported |
+
+Each is an override, not a switch: an empty value means "use the main webhook",
+never "off", so tidying up in the UI cannot silently mute a VA's notifications.
+Every existing VA keeps receiving everything on the hook they already set,
+because `crewWebhookUrlFor` falls back to it.
+
+Filed / approved / rejected deliberately share one feed. They are three moments
+in the same conversation and splitting them across channels means nobody can
+follow a report end to end; the colour and the verb carry the difference. Two
+noise rules are enforced: re-approving an already-approved report posts nothing,
+and a CSV import posts **one** summary rather than one embed per row — a VA
+pasting a 200-route network would otherwise rate-limit themselves.
+
 ## Taking it out as a spreadsheet
 
 `crewCsv.js`, behind the four CSV endpoints above and the **CSV** button on the
@@ -252,6 +329,9 @@ Version history:
 - **v3** — `crew_accounts`: pilot logins move out of our database into the VA's
 - **v4** — `crew_applications.invite_*`: the temporary password an accepted
   applicant is handed now outlives the request that created it
+- **v5** — `crew_routes.kind` / `partner_name` / `partner_logo` / `min_rank`:
+  codeshares are separated from the airline's own metal, and a route can open at
+  a rank
 
 ## Accepting a pilot
 
@@ -308,6 +388,12 @@ the status link even while the column still holds one, that claiming and
 revoking actually blank the value rather than only flagging it, that a reissue
 clears the previous outcome, that the applicant's view is strictly narrower than
 the staff view, and that every channel renders the same message.
+
+`node scratchpad/test-crew-ranks.js` drives the ladder: that a pilot at zero
+hours holds a rank even when the ladder starts at 25, that a gate on a rank that
+no longer exists lapses open rather than shrinking the network, that a promotion
+reports the rung actually reached and a rollback reports nothing at all, and
+that normalising a ladder never mutates the caller's array.
 
 `node scratchpad/test-crew-csv.js` drives the spreadsheet round trip: that an
 untouched export re-imports as a no-op, that ids update precisely and hand-typed

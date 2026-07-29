@@ -102,6 +102,16 @@ const ROUTES_SPEC = {
         { key: 'distanceNm', header: 'distanceNm', aliases: ['distance', 'nm', 'distancenm'], type: 'number', min: 0, max: 20000 },
         { key: 'notes', header: 'notes', type: 'text', max: 500 },
         { key: 'active', header: 'active', aliases: ['published', 'live'], type: 'bool', default: true },
+        // v5. A VA building a network in a spreadsheet is exactly the VA who
+        // wants to mark half of it as codeshare and gate the long-haul on a
+        // rank, so these belong in the file rather than being twenty clicks
+        // afterwards.
+        { key: 'kind', header: 'kind', aliases: ['type'], type: 'enum', values: ['own', 'codeshare'], default: 'own' },
+        { key: 'partnerName', header: 'partnerName', aliases: ['partner', 'operator'], type: 'text', max: 60 },
+        { key: 'partnerLogo', header: 'partnerLogo', aliases: ['partnerlogourl', 'logo'], type: 'text', max: 600 },
+        // Named, not numeric: the VA's own rank names are what they think in,
+        // and the hours behind them are set once on the ladder.
+        { key: 'minRank', header: 'minRank', aliases: ['rank', 'opensat', 'requiredrank'], type: 'text', max: 40 },
     ],
     // A flight number is the airline's own identifier for a leg, so it wins.
     // Falling back to the city pair is right for the many VAs that do not

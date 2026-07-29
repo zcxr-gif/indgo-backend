@@ -64,6 +64,11 @@ const crewInvite = require('./crewInvite');
 // VA can take their data to a spreadsheet and bring it back. See crewCsv.js.
 const crewCsv = require('./crewCsv');
 
+// The VA's rank ladder. Rank is DERIVED from hours rather than stored, and it
+// is derived here so the server, the dashboard and the pilot view cannot
+// disagree — and so a rank can gate something. See crewRanks.js.
+const crewRanks = require('./crewRanks');
+
 // One-paste setup for a VA's Supabase project: given a Supabase access token we
 // install the schema, read the project's keys back and store the connection
 // ourselves, so nobody has to hand-copy three values between two dashboards.
@@ -267,6 +272,30 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // accept / decline decisions + the staff's message) is posted to their
     // server. Secret (contains a token) → select:false, never echoed back.
     crewWebhookUrl: { type: String, trim: true, default: null, select: false },
+
+    // Per-feed webhooks. Each is optional and each falls back to
+    // crewWebhookUrl above, which means a VA that wants one Discord channel for
+    // everything sets exactly one URL and is done — and a VA that wants
+    // recruitment in #staff, flights in #pireps and network changes in
+    // #ops-notices sets three. That fallback is why adding these breaks nothing
+    // for the VAs already running on the single hook.
+    //
+    // Secret, like the one above: a Discord webhook URL contains its own token,
+    // so it is select:false and is never echoed back to a browser (see
+    // maskWebhookUrl).
+    crewWebhooks: {
+        type: new mongoose.Schema({
+            // New applications, accept/decline decisions, and pilots joining.
+            recruitment: { type: String, trim: true, default: '' },
+            // Flight reports filed, approved and rejected — one feed, plus the
+            // promotions those approvals cause.
+            pireps:      { type: String, trim: true, default: '' },
+            // Route network changes: added, edited, removed, imported.
+            routes:      { type: String, trim: true, default: '' },
+        }, { _id: false }),
+        default: () => ({}),
+        select: false,
+    },
 
     // The VA's Discord INVITE (not the webhook above — this one is public and
     // shareable). Handed to a pilot when their application is accepted, so
@@ -533,6 +562,15 @@ const CrewRouteSchema = new mongoose.Schema({
     distanceNm:  { type: Number, default: 0, min: 0 },        // optional great-circle distance
     notes:       { type: String, trim: true, default: '' },
     active:      { type: Boolean, default: true },            // hidden from pilots when false
+    // v5 — the legacy mirror of the codeshare/rank columns in
+    // supabase/crew-center-schema.sql. `kind` splits the airline's own network
+    // from legs it sells on a partner's metal; `minRank` names a rung on the
+    // VA's ladder rather than an hours figure, so moving the threshold moves
+    // every route gated on it.
+    kind:        { type: String, enum: ['own', 'codeshare'], default: 'own' },
+    partnerName: { type: String, trim: true, default: '' },
+    partnerLogo: { type: String, trim: true, default: '' },
+    minRank:     { type: String, trim: true, default: '' },
 }, { timestamps: true });
 const CrewRoute = mongoose.models.CrewRoute || mongoose.model('CrewRoute', CrewRouteSchema);
 
@@ -782,13 +820,170 @@ function crewCredentialsHtml({ username, password, signInUrl }) {
         + (signInUrl ? `<br><br>Sign in: <a href="${escHtml(signInUrl)}">${escHtml(signInUrl)}</a>` : '');
 }
 
-// Load a VA's (secret) crew webhook url by id. Returns '' when unset/invalid.
-async function crewWebhookUrlFor(vaId) {
+// The feeds a VA can point at a Discord channel. Adding one here is most of the
+// work of adding a new notification category.
+const CREW_FEEDS = ['recruitment', 'pireps', 'routes'];
+
+/**
+ * Load a VA's (secret) webhook URL for one feed.
+ *
+ * Falls back to the single crewWebhookUrl, which is the whole compatibility
+ * story: every VA already configured keeps receiving everything on the hook
+ * they set, and pointing a feed somewhere else is opt-in.
+ *
+ * Returns '' when unset or not a real Discord webhook.
+ */
+async function crewWebhookUrlFor(vaId, feed = 'recruitment') {
     try {
-        const doc = await VirtualAirlineAd.findById(vaId).select('+crewWebhookUrl').lean();
-        const u = doc && doc.crewWebhookUrl;
+        const doc = await VirtualAirlineAd.findById(vaId).select('+crewWebhookUrl +crewWebhooks').lean();
+        if (!doc) return '';
+        const specific = CREW_FEEDS.includes(feed) ? (doc.crewWebhooks && doc.crewWebhooks[feed]) : '';
+        const u = specific || doc.crewWebhookUrl;
         return u && isDiscordWebhookUrl(u) ? u : '';
     } catch { return ''; }
+}
+
+// ---- Flight report notices ----
+//
+// Filed, approved and rejected all go to ONE feed. They are three moments in
+// the same conversation — a pilot files, staff decide — and splitting them
+// across channels means nobody can follow a report from end to end. The colour
+// and the verb carry the difference.
+const PIREP_COLORS = { filed: 0x0EA5E9, approved: 0x16A34A, rejected: 0x6E685D, promoted: 0xD97706 };
+
+function pirepFields(p) {
+    const leg = [p.origin, p.destination].filter(Boolean).join(' → ');
+    const hours = Math.round(((Number(p.durationMin) || 0) / 60) * 10) / 10;
+    return [
+        leg ? { name: 'Route', value: leg, inline: true } : null,
+        p.flightNumber ? { name: 'Flight', value: String(p.flightNumber), inline: true } : null,
+        p.aircraftName ? { name: 'Aircraft', value: String(p.aircraftName).slice(0, 60), inline: true } : null,
+        hours ? { name: 'Hours', value: `${hours}`, inline: true } : null,
+        Number(p.landings) ? { name: 'Landings', value: String(p.landings), inline: true } : null,
+        Number(p.violations) ? { name: 'Violations', value: String(p.violations), inline: true } : null,
+    ].filter(Boolean);
+}
+
+/**
+ * Post a flight report event. Fire-and-forget, always: a webhook that is down,
+ * rate-limited or misconfigured must never turn a pilot's filed report or a
+ * reviewer's decision into an error.
+ */
+function postPirepNotice(va, event, pirep, actor) {
+    if (!va || !pirep) return;
+    const who = (actor && actor.name) || '';
+    const title = {
+        filed: `📋 Flight filed — ${pirep.pilotName || 'a pilot'}`,
+        approved: `✅ Flight approved — ${pirep.pilotName || 'a pilot'}`,
+        rejected: `🚫 Flight rejected — ${pirep.pilotName || 'a pilot'}`,
+    }[event];
+    if (!title) return;
+    crewWebhookUrlFor(va._id, 'pireps')
+        .then((hook) => hook && postCrewNotice(hook, {
+            title,
+            description: event === 'filed'
+                ? (pirep.source === 'auto' ? 'Captured automatically from Infinite Flight.' : undefined)
+                : (who ? `Reviewed by ${who}.` : undefined),
+            color: PIREP_COLORS[event],
+            fields: pirepFields(pirep),
+        }))
+        .catch(() => {});
+}
+
+/**
+ * Announce a promotion. Rides the pireps feed because an approval is what
+ * causes one, and a VA watching flights come in is the audience for it.
+ *
+ * Only ever called for a genuine climb — crewRanks.promotionFor returns nothing
+ * for a rollback, so correcting a mistyped hours figure cannot publish "Jo has
+ * been demoted" to a Discord channel.
+ */
+function postPromotionNotice(va, member, promotion) {
+    if (!va || !promotion || !promotion.to) return;
+    const from = promotion.from ? promotion.from.name : null;
+    crewWebhookUrlFor(va._id, 'pireps')
+        .then((hook) => hook && postCrewNotice(hook, {
+            title: `🎖️ ${member.name || 'A pilot'} promoted to ${promotion.to.name}`,
+            description: from ? `Up from ${from}${promotion.skipped ? ` — skipping ${promotion.skipped} rank${promotion.skipped === 1 ? '' : 's'}` : ''}.` : undefined,
+            color: PIREP_COLORS.promoted,
+            fields: [
+                member.callsign ? { name: 'Callsign', value: member.callsign, inline: true } : null,
+                { name: 'Hours', value: String(Math.round((Number(member.hours) || 0) * 10) / 10), inline: true },
+            ].filter(Boolean),
+        }))
+        .catch(() => {});
+}
+
+// ---- Route network notices ----
+const ROUTE_COLORS = { added: 0x16A34A, updated: 0x0EA5E9, removed: 0x6E685D, imported: 0x4F46E5 };
+
+const routeLabel = (r) => {
+    const leg = [r.origin, r.destination].filter(Boolean).join(' → ') || 'a route';
+    return r.flightNumber ? `${r.flightNumber} · ${leg}` : leg;
+};
+
+/**
+ * Post a route change. `before` lets an edit say what actually changed rather
+ * than "someone touched this route", which is the difference between a feed
+ * worth watching and one people mute.
+ */
+function postRouteNotice(va, event, route, actor, before) {
+    if (!va || !route) return;
+    const who = (actor && actor.name) || '';
+    const changed = [];
+    if (before && event === 'updated') {
+        const watch = [
+            ['origin', 'Origin'], ['destination', 'Destination'], ['aircraft', 'Aircraft'],
+            ['flightNumber', 'Flight number'], ['kind', 'Type'], ['minRank', 'Rank required'],
+            ['partnerName', 'Partner'], ['active', 'Published'],
+        ];
+        for (const [key, label] of watch) {
+            if (String(before[key] ?? '') !== String(route[key] ?? '')) {
+                changed.push(`${label}: ${before[key] || '—'} → ${route[key] || '—'}`);
+            }
+        }
+        // Nothing a human would notice changed — a re-save of the same values.
+        // Staying quiet is the right call; a feed that fires on no-ops is noise.
+        if (!changed.length) return;
+    }
+    crewWebhookUrlFor(va._id, 'routes')
+        .then((hook) => hook && postCrewNotice(hook, {
+            title: `${event === 'added' ? '🛫 Route added' : event === 'removed' ? '🗑️ Route removed' : '✏️ Route updated'} — ${routeLabel(route)}`,
+            description: [changed.join('\n'), who ? `By ${who}.` : ''].filter(Boolean).join('\n\n') || undefined,
+            color: ROUTE_COLORS[event] || ROUTE_COLORS.updated,
+            fields: [
+                route.kind === 'codeshare'
+                    ? { name: 'Type', value: `Codeshare${route.partnerName ? ` · ${route.partnerName}` : ''}`, inline: true }
+                    : { name: 'Type', value: 'Own metal', inline: true },
+                route.minRank ? { name: 'Opens at', value: String(route.minRank), inline: true } : null,
+                route.distanceNm ? { name: 'Distance', value: `${Math.round(route.distanceNm)} nm`, inline: true } : null,
+            ].filter(Boolean),
+        }))
+        .catch(() => {});
+}
+
+/**
+ * One notice for a whole CSV import, rather than one per row.
+ *
+ * A VA pasting in a 200-route network would otherwise post 200 embeds and get
+ * themselves rate-limited by Discord — and nobody wants to scroll past that to
+ * find the one route somebody edited by hand.
+ */
+function postRouteImportNotice(va, summary, actor) {
+    if (!va || !summary || (!summary.created && !summary.updated)) return;
+    const who = (actor && actor.name) || '';
+    crewWebhookUrlFor(va._id, 'routes')
+        .then((hook) => hook && postCrewNotice(hook, {
+            title: '📥 Route network imported',
+            description: who ? `By ${who}.` : undefined,
+            color: ROUTE_COLORS.imported,
+            fields: [
+                { name: 'Added', value: String(summary.created || 0), inline: true },
+                { name: 'Updated', value: String(summary.updated || 0), inline: true },
+                { name: 'Unchanged', value: String(summary.unchanged || 0), inline: true },
+            ],
+        }))
+        .catch(() => {});
 }
 
 function evaluateRequirements(reqs, stats, agreed) {
@@ -1613,10 +1808,15 @@ function cleanMember(b) {
         ifcName: String(b.ifcName || '').trim().slice(0, 60),
     };
 }
-const publicMember = (m) => ({
+// `ranks` is the VA's ladder. Passing it resolves the pilot's rank here rather
+// than in each of the three front-ends that draw a badge — one arithmetic, one
+// answer. A new pilot at zero hours lands on the entry rung rather than on
+// nothing, which is the whole point of resolving it centrally.
+const publicMember = (m, ranks) => ({
     id: m._id, name: m.name, callsign: m.callsign, hours: m.hours,
     role: m.role, aircraft: m.aircraft || [], status: m.status,
     linked: !!m.ifUserId,   // is this pilot linked to an IF account for auto-PIREPs?
+    rank: crewRanks.memberRank(ranks, m.hours),
 });
 // Owner/staff (or Inflight) gate for roster writes.
 function crewCanManage(req, slug) {
@@ -1640,12 +1840,31 @@ async function requireCap(req, slug, capability) {
     return { error: 403 };
 }
 
+// The pilot making this request, when it is a pilot — so a route can say
+// whether their rank opens it.
+//
+// Returns null for staff, for Inflight oversight and for the public. None of
+// them are flying these legs, and marking a route "locked" for a manager
+// reviewing their own network would be nonsense.
+async function crewViewer(req, store) {
+    const p = verifyCrewRequest(req);
+    if (!p || p.kind !== 'crew') return null;
+    try {
+        const account = await store.getAccount(p.sub);
+        if (!account) return null;
+        const member = account.memberId ? await store.getMember(account.memberId) : null;
+        // A pilot with a login but no roster row yet is treated as zero hours —
+        // the entry rank — rather than as nobody.
+        return { hours: member ? Number(member.hours) || 0 : 0, memberId: member ? member._id : null };
+    } catch { return null; }
+}
+
 // Public read — the roster is shown on the crew center.
 app.get('/api/crew/:slug/roster', async (req, res) => {
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
+        const { va, store } = await resolveCrewStore(req.params.slug);
         const members = await store.listMembers();
-        res.json({ roster: members.map(publicMember) });
+        res.json({ roster: members.map((m) => publicMember(m, va.ranks)) });
     } catch (err) { crewFail(res, err, { log: 'roster list error', message: 'Could not load the roster.' }); }
 });
 // Add a member.
@@ -1656,7 +1875,7 @@ app.post('/api/crew/:slug/roster', async (req, res) => {
         const { va, store } = await resolveCrewStore(req.params.slug);
         const m = await store.createMember(cleanMember(req.body));
         vaStats.recordEngagement(va._id, 'crewJoin', 1, va.name);
-        res.status(201).json({ member: publicMember(m) });
+        res.status(201).json({ member: publicMember(m, va.ranks) });
     } catch (err) { crewFail(res, err, { log: 'roster add error', message: 'Could not add the pilot.' }); }
 });
 // Edit a member.
@@ -1664,14 +1883,18 @@ app.patch('/api/crew/:slug/roster/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'roster.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
+        const { va, store } = await resolveCrewStore(req.params.slug);
         const existing = await store.getMember(req.params.id);
         if (!existing) return res.status(404).json({ error: 'Pilot not found.' });
         // Merge over the current record before cleaning so a partial PATCH keeps
         // the fields it didn't mention (notably the IF link, which the roster
         // editor never sends back).
         const m = await store.updateMember(req.params.id, cleanMember({ ...existing, ...req.body }));
-        res.json({ member: publicMember(m) });
+        // Staff editing hours by hand can promote someone too — that is a real
+        // promotion and worth the same notice an approved flight would earn.
+        const promotion = crewRanks.promotionFor(va.ranks, existing.hours, m.hours);
+        if (promotion) postPromotionNotice(va, m, promotion);
+        res.json({ member: publicMember(m, va.ranks) });
     } catch (err) { crewFail(res, err, { log: 'roster edit error', message: 'Could not update the pilot.' }); }
 });
 // Remove a member.
@@ -1689,6 +1912,11 @@ app.delete('/api/crew/:slug/roster/:id', async (req, res) => {
 const cleanRoute = (b) => {
     b = b || {};
     const icao = (v) => String(v || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
+    // A partner logo is rendered in an <img> on a public crew center page, so
+    // anything that is not plainly an https URL is dropped rather than passed
+    // through — the same rule the branding fields already follow.
+    const logo = String(b.partnerLogo || '').trim().slice(0, 600);
+    const kind = b.kind === 'codeshare' ? 'codeshare' : 'own';
     return {
         flightNumber: String(b.flightNumber || '').trim().slice(0, 12),
         origin: icao(b.origin),
@@ -1697,47 +1925,94 @@ const cleanRoute = (b) => {
         distanceNm: Math.max(0, Math.min(20000, Math.round(Number(b.distanceNm) || 0))),
         notes: String(b.notes || '').trim().slice(0, 500),
         active: b.active === undefined ? true : !!b.active,
+        kind,
+        // Partner details only mean anything on a codeshare. Clearing them when
+        // a route is flipped back to 'own' stops a stale partner logo appearing
+        // beside a leg the airline now operates itself.
+        partnerName: kind === 'codeshare' ? String(b.partnerName || '').trim().slice(0, 60) : '',
+        partnerLogo: kind === 'codeshare' && /^https:\/\//i.test(logo) ? logo : '',
+        minRank: String(b.minRank || '').trim().slice(0, 40),
     };
 };
-const publicRoute = (r) => ({
-    id: r._id, flightNumber: r.flightNumber, origin: r.origin, destination: r.destination,
-    aircraft: r.aircraft, distanceNm: r.distanceNm, notes: r.notes, active: r.active,
-});
+// `viewer` carries the hours of the pilot asking, when there is one, so a route
+// can say whether it is open to them. Staff and the public get `locked: false`
+// — the gate is about what a PILOT may fly, and hiding the shape of the network
+// from everyone else would make a rank ladder impossible to plan around.
+const publicRoute = (r, ranks, viewer) => {
+    const gated = !!r.minRank;
+    const locked = gated && !!viewer && !crewRanks.meetsRank(ranks, viewer.hours, r.minRank);
+    return {
+        id: r._id, flightNumber: r.flightNumber, origin: r.origin, destination: r.destination,
+        aircraft: r.aircraft, distanceNm: r.distanceNm, notes: r.notes, active: r.active,
+        kind: r.kind === 'codeshare' ? 'codeshare' : 'own',
+        partnerName: r.partnerName || '', partnerLogo: r.partnerLogo || '',
+        minRank: r.minRank || '',
+        locked,
+        // How much further this particular pilot has to fly. Shown rather than
+        // hidden on purpose: "unlocks in 12h" is the thing that makes a rank
+        // ladder worth climbing, where a route that simply is not there is
+        // indistinguishable from a network that is smaller than advertised.
+        hoursUntilUnlock: locked ? crewRanks.hoursUntilRank(ranks, viewer.hours, r.minRank) : 0,
+    };
+};
 // Public: the VA's route network (active only for non-managers is handled client-side;
 // here we return all so managers see drafts too — the list isn't sensitive).
+//
+// `counts` splits the network the way the map and the panel draw it. Sent from
+// here rather than counted in the browser so the figure a VA quotes for "our
+// network" is the same number everywhere, and so it is obvious at a glance how
+// much of a network is the airline's own metal.
 app.get('/api/crew/:slug/routes', async (req, res) => {
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
+        const { va, store } = await resolveCrewStore(req.params.slug);
         const routes = await store.listRoutes();
-        res.json({ routes: routes.map(publicRoute) });
+        const viewer = await crewViewer(req, store);
+        const out = routes.map((r) => publicRoute(r, va.ranks, viewer));
+        res.json({
+            routes: out,
+            counts: {
+                own: out.filter((r) => r.kind === 'own').length,
+                codeshare: out.filter((r) => r.kind === 'codeshare').length,
+                locked: out.filter((r) => r.locked).length,
+            },
+            // So a pilot's route list can say "unlocks at First Officer" using
+            // the VA's own words rather than an hours figure.
+            ranks: crewRanks.normalizeLadder(va.ranks).map((r) => ({ name: r.name, minHours: r.minHours })),
+        });
     } catch (err) { crewFail(res, err, { log: 'routes list error', message: 'Could not load routes.' }); }
 });
 app.post('/api/crew/:slug/routes', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'routes.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
+        const { va, store } = await resolveCrewStore(req.params.slug);
         const r = await store.createRoute(cleanRoute(req.body));
-        res.status(201).json({ route: publicRoute(r) });
+        postRouteNotice(va, 'added', r, gate.p);
+        res.status(201).json({ route: publicRoute(r, va.ranks, null) });
     } catch (err) { crewFail(res, err, { log: 'route add error', message: 'Could not add the route.' }); }
 });
 app.patch('/api/crew/:slug/routes/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'routes.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
+        const { va, store } = await resolveCrewStore(req.params.slug);
         const existing = await store.getRoute(req.params.id);
         if (!existing) return res.status(404).json({ error: 'Route not found.' });
         const r = await store.updateRoute(req.params.id, cleanRoute({ ...existing, ...req.body }));
-        res.json({ route: publicRoute(r) });
+        postRouteNotice(va, 'updated', r, gate.p, existing);
+        res.json({ route: publicRoute(r, va.ranks, null) });
     } catch (err) { crewFail(res, err, { log: 'route edit error', message: 'Could not update the route.' }); }
 });
 app.delete('/api/crew/:slug/routes/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'routes.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        // Read it before it goes, so the notice can name the leg rather than an
+        // id nobody recognises.
+        const existing = await store.getRoute(req.params.id).catch(() => null);
         await store.deleteRoute(req.params.id);
+        if (existing) postRouteNotice(va, 'removed', existing, gate.p);
         res.json({ ok: true });
     } catch (err) { crewFail(res, err, { log: 'route delete error', message: 'Could not remove the route.' }); }
 });
@@ -1769,7 +2044,7 @@ function sendCsv(res, slug, kind, spec, rows) {
 // The dry run is not an optimisation, it is the point — the dashboard shows a
 // VA what an upload would do before it touches a live roster, and the commit
 // replays that same plan rather than re-deciding.
-async function runCsvImport({ req, res, spec, kind, existing, create, update }) {
+async function runCsvImport({ req, res, spec, kind, existing, create, update, onDone }) {
     const csvText = String(req.body?.csv || '');
     if (!csvText.trim()) return res.status(400).json({ error: 'Attach a CSV file first.' });
 
@@ -1818,6 +2093,7 @@ async function runCsvImport({ req, res, spec, kind, existing, create, update }) 
             failures.push({ line: row.line, message: err?.message || 'Could not update this row.' });
         }
     }
+    if (onDone) { try { onDone({ ...summary, created, updated }); } catch { /* never fail an import over a notice */ } }
     res.json({ dryRun: false, ...summary, created, updated, failures });
 }
 
@@ -1875,16 +2151,20 @@ app.post('/api/crew/:slug/routes/import', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'routes.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
+        const { va, store } = await resolveCrewStore(req.params.slug);
         const routes = await store.listRoutes();
         await runCsvImport({
             req, res, kind: 'routes', spec: crewCsv.ROUTES_SPEC,
             existing: (routes || []).map((r) => ({
                 id: r._id, flightNumber: r.flightNumber, origin: r.origin, destination: r.destination,
                 aircraft: r.aircraft, distanceNm: r.distanceNm, notes: r.notes, active: r.active,
+                kind: r.kind, partnerName: r.partnerName, partnerLogo: r.partnerLogo, minRank: r.minRank,
             })),
             create: (values) => store.createRoute(cleanRoute(values)),
             update: (id, values, before) => store.updateRoute(id, cleanRoute({ ...before, ...values })),
+            // One notice for the whole file. Posting per row would rate-limit a
+            // VA importing a 200-route network and bury everything else.
+            onDone: (summary) => postRouteImportNotice(va, summary, gate.p),
         });
     } catch (err) { crewFail(res, err, { log: 'routes import error', message: 'Could not import the routes.' }); }
 });
@@ -1928,10 +2208,26 @@ function resolveFlightNames(flight, meta) {
 // it is flipped in the same store the hours landed in, so approving an
 // already-approved report is a no-op rather than a double credit. Returns the
 // updated report.
-async function applyPirepHours(store, pirep) {
+// `va` is optional and only enables the promotion notice — the hours are
+// credited either way. Passing it makes this the one place a promotion can be
+// detected, because it is the one place hours move: comparing the rank held
+// before against the rank held after means a single long flight that clears two
+// rungs reports the rung actually reached, and nothing else has to know the
+// ladder exists.
+async function applyPirepHours(store, pirep, va) {
     if (!pirep || pirep.hoursApplied || !pirep.memberId) return pirep;
     const hrs = (Number(pirep.durationMin) || 0) / 60;
-    if (hrs > 0) await store.addMemberHours(pirep.memberId, hrs);
+    if (hrs > 0) {
+        const before = va ? await store.getMember(pirep.memberId).catch(() => null) : null;
+        await store.addMemberHours(pirep.memberId, hrs);
+        if (before) {
+            const after = await store.getMember(pirep.memberId).catch(() => null);
+            if (after) {
+                const promotion = crewRanks.promotionFor(va.ranks, before.hours, after.hours);
+                if (promotion) postPromotionNotice(va, after, promotion);
+            }
+        }
+    }
     return (await store.updatePirep(pirep._id, { hoursApplied: true })) || { ...pirep, hoursApplied: true };
 }
 // Roll a PIREP's credited hours back off its pilot (on reject/delete), clamped
@@ -2019,6 +2315,7 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
             flownAt: b.flownAt ? new Date(b.flownAt) : new Date(),
         });
         vaStats.recordEngagement(va._id, 'pirep', 1, va.name);
+        postPirepNotice(va, 'filed', doc, p);
         res.status(201).json({
             pirep: publicPirep(doc),
             routeMatched: !!route,
@@ -2086,7 +2383,17 @@ app.post('/api/crew/:slug/pireps/sync', async (req, res) => {
                 } catch { continue; } // a concurrent sync may have inserted the same flight
                 created++;
                 vaStats.recordEngagement(va._id, 'pirep', 1, va.name);
-                if (willApprove) { await applyPirepHours(store, doc); approved++; }
+                // An auto-captured flight is still a flight report arriving, so
+                // it posts like one. Auto-approved legs post twice on purpose —
+                // filed, then approved — because that is what happened, and a
+                // VA watching the feed should see the same two beats whether a
+                // human pressed the button or the rule did.
+                postPirepNotice(va, 'filed', doc, null);
+                if (willApprove) {
+                    await applyPirepHours(store, doc, va);
+                    postPirepNotice(va, 'approved', doc, { name: 'Auto-approval' });
+                    approved++;
+                }
             }
         }
         res.json({ ok: true, created, approved, scanned, pilots: members.length });
@@ -2099,18 +2406,24 @@ app.patch('/api/crew/:slug/pireps/:id', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'flights.review');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
+        const { va, store } = await resolveCrewStore(req.params.slug);
         let p = await store.getPirep(req.params.id);
         if (!p) return res.status(404).json({ error: 'Flight not found.' });
         const action = String(req.body && req.body.action || '');
         if (action === 'approve') {
+            // Only announce a real transition. Re-approving an approved report
+            // is a no-op, and a feed that fires on those trains people to stop
+            // reading it.
             if (p.status !== 'approved') {
                 p = await store.updatePirep(p._id, { status: 'approved', reviewedAt: new Date() });
-                p = await applyPirepHours(store, p);
+                p = await applyPirepHours(store, p, va);
+                postPirepNotice(va, 'approved', p, gate.p);
             }
         } else if (action === 'reject') {
+            const was = p.status;
             p = await reversePirepHours(store, p);
             p = await store.updatePirep(p._id, { status: 'rejected', reviewedAt: new Date() });
+            if (was !== 'rejected') postPirepNotice(va, 'rejected', p, gate.p);
         } else return res.status(400).json({ error: 'Unknown action.' });
         res.json({ pirep: publicPirep(p) });
     } catch (err) { crewFail(res, err, { log: 'pirep review error', message: 'Could not update the flight.' }); }
@@ -3231,9 +3544,25 @@ app.get('/api/crew/:slug/webhook', async (req, res) => {
     try {
         const va = await resolveCrewVa(req.params.slug);
         if (!va) return res.status(404).json({ error: 'Crew center not found.' });
-        const doc = await VirtualAirlineAd.findById(va._id).select('+crewWebhookUrl').lean();
+        const doc = await VirtualAirlineAd.findById(va._id).select('+crewWebhookUrl +crewWebhooks').lean();
+        const hooks = (doc && doc.crewWebhooks) || {};
         res.set('Cache-Control', 'no-store');
-        res.json({ configured: !!(doc && doc.crewWebhookUrl), hint: maskWebhookUrl(doc && doc.crewWebhookUrl) });
+        res.json({
+            configured: !!(doc && doc.crewWebhookUrl),
+            hint: maskWebhookUrl(doc && doc.crewWebhookUrl),
+            // Per-feed state. `usingDefault` is the bit that matters in the UI:
+            // it says "this feed is going to your main channel" rather than
+            // leaving a blank box that looks like nothing is configured.
+            feeds: CREW_FEEDS.reduce((acc, feed) => {
+                const url = hooks[feed] || '';
+                acc[feed] = {
+                    configured: !!url,
+                    hint: maskWebhookUrl(url),
+                    usingDefault: !url && !!(doc && doc.crewWebhookUrl),
+                };
+                return acc;
+            }, {}),
+        });
     } catch (err) { console.error('crew webhook get error:', err); res.status(500).json({ error: 'Could not load the webhook.' }); }
 });
 // Staff: set / clear ('' clears) / test the crew Discord webhook.
@@ -3243,28 +3572,65 @@ app.post('/api/crew/:slug/webhook', async (req, res) => {
     try {
         const va = await resolveCrewVa(req.params.slug);
         if (!va) return res.status(404).json({ error: 'Crew center not found.' });
-        const ad = await VirtualAirlineAd.findById(va._id).select('+crewWebhookUrl name callsign');
+        const ad = await VirtualAirlineAd.findById(va._id).select('+crewWebhookUrl +crewWebhooks name callsign');
         if (!ad) return res.status(404).json({ error: 'Crew center not found.' });
         const b = req.body || {};
+        // Which feed is being configured. Absent means the main webhook, which
+        // is what every existing caller sends — so the old request shape keeps
+        // working untouched.
+        const feed = CREW_FEEDS.includes(b.feed) ? b.feed : '';
+
         if (b.webhookUrl !== undefined) {
             const raw = String(b.webhookUrl || '').trim();
             if (raw && !isDiscordWebhookUrl(raw)) {
                 return res.status(400).json({ error: 'That doesn’t look like a Discord webhook URL (https://discord.com/api/webhooks/…).' });
             }
-            ad.crewWebhookUrl = raw || null;
+            if (feed) {
+                if (!ad.crewWebhooks) ad.crewWebhooks = {};
+                // '' clears the override, which puts the feed back on the main
+                // channel rather than switching it off — that is what a VA
+                // emptying the box means, and silently muting a feed instead
+                // would be a very quiet way to lose notifications.
+                ad.crewWebhooks[feed] = raw;
+                ad.markModified('crewWebhooks');
+            } else {
+                ad.crewWebhookUrl = raw || null;
+            }
             await ad.save();
         }
+
         if (b.test) {
-            if (!ad.crewWebhookUrl) return res.status(400).json({ error: 'Add a webhook URL first.' });
-            const ok = await postCrewNotice(ad.crewWebhookUrl, {
+            // Test what this feed would actually use, fallback included — the
+            // question a VA is asking is "will my messages arrive", not "is
+            // this box full".
+            const target = feed
+                ? ((ad.crewWebhooks && ad.crewWebhooks[feed]) || ad.crewWebhookUrl)
+                : ad.crewWebhookUrl;
+            if (!target) return res.status(400).json({ error: 'Add a webhook URL first.' });
+            const blurb = {
+                recruitment: 'New applications, and accept / decline decisions, will show up here.',
+                pireps: 'Flight reports — filed, approved and rejected — and pilot promotions will show up here.',
+                routes: 'Route network changes will show up here.',
+            }[feed] || 'Your Crew Center is connected. New applications and accept / decline decisions will show up here.';
+            const ok = await postCrewNotice(target, {
                 title: `🔔 ${ad.name || 'Crew Center'} — test message`,
-                description: 'Your Crew Center is connected. New applications and accept / decline decisions will show up here.',
+                description: blurb,
                 color: CREW_COLORS.new,
             });
             if (!ok) return res.status(502).json({ error: 'We couldn’t deliver a message to that webhook. Double-check the URL.' });
         }
+
+        const hooks = ad.crewWebhooks || {};
         res.set('Cache-Control', 'no-store');
-        res.json({ configured: !!ad.crewWebhookUrl, hint: maskWebhookUrl(ad.crewWebhookUrl) });
+        res.json({
+            configured: !!ad.crewWebhookUrl,
+            hint: maskWebhookUrl(ad.crewWebhookUrl),
+            feeds: CREW_FEEDS.reduce((acc, f) => {
+                const url = hooks[f] || '';
+                acc[f] = { configured: !!url, hint: maskWebhookUrl(url), usingDefault: !url && !!ad.crewWebhookUrl };
+                return acc;
+            }, {}),
+        });
     } catch (err) { console.error('crew webhook set error:', err); res.status(500).json({ error: 'Could not save the webhook.' }); }
 });
 

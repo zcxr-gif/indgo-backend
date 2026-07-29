@@ -237,11 +237,49 @@ create table if not exists crew_routes (
     distance_nm   numeric(10,2) not null default 0 check (distance_nm >= 0),
     notes         text not null default '',
     active        boolean not null default true,
+    -- ------------------------------------------------------------------------
+    -- v5.
+    --
+    -- `kind` splits the network in two. A VA's own routes are what the airline
+    -- flies; a codeshare is a leg it sells under a partner's metal. They are
+    -- listed apart and drawn apart on the map, because a network map that mixes
+    -- them overstates what the airline actually operates — which is the one
+    -- thing that map is for.
+    --
+    -- `min_rank` names a rung on the VA's ladder (crew center settings → ranks)
+    -- rather than storing an hours figure. The VA sets what a rank is worth in
+    -- one place; move the threshold and every route gated on it moves with it.
+    -- Empty means open to everyone, which is the default and the common case.
+    --
+    -- Deliberately a NAME and not an index: a VA reordering their ladder would
+    -- otherwise silently re-gate their whole network. A name that no longer
+    -- exists lets the gate lapse (see crewRanks.meetsRank) — a VA who renames a
+    -- rank gets an open route, never a network that quietly shrinks.
+    -- ------------------------------------------------------------------------
+    kind          text not null default 'own' check (kind in ('own','codeshare')),
+    partner_name  text not null default '',
+    partner_logo  text not null default '',
+    min_rank      text not null default '',
     created_at    timestamptz not null default now(),
     updated_at    timestamptz not null default now()
 );
 create index if not exists crew_routes_va_idx  on crew_routes (va_slug, flight_number);
 create index if not exists crew_routes_od_idx  on crew_routes (va_slug, origin, destination) where active;
+-- v5. Added separately so a project provisioned at v1–v4 picks them up on a
+-- re-run rather than needing the table rebuilt. The check constraint goes on
+-- afterwards for the same reason, and is skipped if it is already there.
+alter table crew_routes add column if not exists kind         text not null default 'own';
+alter table crew_routes add column if not exists partner_name text not null default '';
+alter table crew_routes add column if not exists partner_logo text not null default '';
+alter table crew_routes add column if not exists min_rank     text not null default '';
+do $$
+begin
+    alter table crew_routes add constraint crew_routes_kind_chk check (kind in ('own','codeshare'));
+exception
+    when duplicate_object then null;
+end $$;
+-- The network map and the route panel both split on this.
+create index if not exists crew_routes_kind_idx on crew_routes (va_slug, kind) where active;
 
 -- ----------------------------------------------------------------------------
 -- Flight reports. Either captured automatically from a linked pilot's real
@@ -475,5 +513,5 @@ grant execute on function crew_stats(text) to anon, authenticated;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 4)
+insert into crew_schema_info (id, version) values (1, 5)
 on conflict (id) do update set version = excluded.version, updated_at = now();

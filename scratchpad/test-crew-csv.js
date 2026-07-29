@@ -36,9 +36,13 @@ const ROSTER = [
     { id: 'm2', name: 'Jo Smith, Jr.', callsign: 'AMX102', hours: 0, role: '', aircraft: [], status: 'loa', ifcName: '', ifUserId: '' },
 ];
 
+// Shaped exactly as crewStore.routeFromRow returns them — `kind` is always
+// populated ('own' for anything written before v5), never absent. A fixture
+// that omitted it would make the round-trip test pass for the wrong reason.
 const ROUTES = [
-    { id: 'r1', flightNumber: 'AMX10', origin: 'MMMX', destination: 'KLAX', aircraft: 'B738', distanceNm: 1240, notes: 'Daily', active: true },
-    { id: 'r2', flightNumber: '', origin: 'MMMX', destination: 'MMUN', aircraft: 'A320', distanceNm: 0, notes: '', active: false },
+    { id: 'r1', flightNumber: 'AMX10', origin: 'MMMX', destination: 'KLAX', aircraft: 'B738', distanceNm: 1240, notes: 'Daily', active: true, kind: 'own', partnerName: '', partnerLogo: '', minRank: '' },
+    { id: 'r2', flightNumber: '', origin: 'MMMX', destination: 'MMUN', aircraft: 'A320', distanceNm: 0, notes: '', active: false, kind: 'own', partnerName: '', partnerLogo: '', minRank: '' },
+    { id: 'r3', flightNumber: 'AMX900', origin: 'MMMX', destination: 'LEMD', aircraft: 'B789', distanceNm: 5000, notes: '', active: true, kind: 'codeshare', partnerName: 'Iberia', partnerLogo: 'https://example.com/ib.png', minRank: 'Captain' },
 ];
 
 console.log('\ncrewCsv\n');
@@ -67,7 +71,22 @@ T('  …with no errors', plan.errors, []);
 
 const routesCsv = crewCsv.toCsv(crewCsv.ROUTES_SPEC, ROUTES);
 plan = crewCsv.planImport(crewCsv.ROUTES_SPEC, routesCsv, ROUTES);
-T('same for routes: nothing to do', [plan.create.length, plan.update.length, plan.unchanged], [0, 0, 2]);
+T('same for routes: nothing to do', [plan.create.length, plan.update.length, plan.unchanged], [0, 0, 3]);
+T('  …codeshare details survive the trip', routesCsv.includes('codeshare,Iberia'), true);
+T('  …as does the rank a route opens at', routesCsv.includes('Captain'), true);
+
+// --- Codeshares and rank gates (v5) ----------------------------------------
+console.log('\n codeshares and rank gates');
+plan = crewCsv.planImport(crewCsv.ROUTES_SPEC,
+    'origin,destination,kind,partner,rank\nMMMX,EGLL,codeshare,British Airways,First Officer\n', []);
+T('a codeshare can be built from a file', plan.create[0].values.kind, 'codeshare');
+T('  …with the partner under an alias header', plan.create[0].values.partnerName, 'British Airways');
+T('  …and the rank gate under one too', plan.create[0].values.minRank, 'First Officer');
+plan = crewCsv.planImport(crewCsv.ROUTES_SPEC, 'origin,destination,kind\nMMMX,EGLL,franchise\n', []);
+T('an unknown kind is rejected rather than guessed', plan.errors.length, 1);
+plan = crewCsv.planImport(crewCsv.ROUTES_SPEC, 'id,kind,partner\nr1,codeshare,Iberia\n', ROUTES);
+T('flipping an own route to codeshare is one update',
+    plan.update[0].values, { kind: 'codeshare', partnerName: 'Iberia' });
 
 // --- Editing an exported file ----------------------------------------------
 console.log('\n edits');
