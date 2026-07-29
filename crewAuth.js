@@ -199,10 +199,119 @@ const CREW_CAPABILITIES = [
     { id: 'flights.review',         group: 'Operations',    label: 'Review flights (PIREPs) & auto-tracking' },
     { id: 'events.manage',          group: 'Operations',    label: 'Create & manage events and the gate board' },
     { id: 'schedules.manage',       group: 'Operations',    label: 'Build the schedule & assign bookings' },
+    // Split out of roster.manage. Writing to the noticeboard was gated on
+    // "add, edit & remove pilots", which made the two jobs one: a VA could not
+    // have somebody who writes to the crew without also handing them the
+    // roster, and could not have a flight reviewer who was NOT able to post
+    // notices in the airline's name. See the compatibility note in
+    // effectiveCaps — a role built before this split does not lose the power.
+    { id: 'announcements.manage',   group: 'Communications', label: 'Post & pin notices on the noticeboard' },
+    // The VA's standing with Inflight — warnings included. Owner-only until an
+    // owner grants it, which is the point: some VAs have a person who handles
+    // the partnership and is not the owner, and the alternative was that owner
+    // forwarding screenshots.
+    { id: 'partnership.view',       group: 'Partnership',   label: 'See the Inflight partnership & warnings' },
     // Room to grow, e.g.:
     // { id: 'members.message',   group: 'Roster',     label: 'Message crew members' },
 ];
 const CREW_CAP_IDS = CREW_CAPABILITIES.map(c => c.id);
+
+/**
+ * Ready-made roles.
+ *
+ * The permission system worked before this and almost nobody used it, for a
+ * reason worth naming: it asked a volunteer airline manager to read eleven
+ * capability ids and decide which combination adds up to "the person who
+ * approves flight reports". That is our model of the product, not theirs. VAs
+ * do not think in capabilities, they think in JOBS — somebody does the PIREPs,
+ * somebody runs recruitment, somebody organises events.
+ *
+ * So these are the jobs, with the capabilities already worked out. An owner
+ * picks one, renames it if they like, and edits the ticks afterwards — a preset
+ * is a starting point that becomes an ordinary role the moment it lands, not a
+ * type of role with behaviour of its own. Nothing downstream knows a role came
+ * from here.
+ *
+ * Deliberately NOT included: anything that would let a preset grant more than
+ * the owner realised. There is no "deputy owner" preset with the lot ticked —
+ * an owner who wants that can tick the lot themselves, having seen each line.
+ */
+const CREW_ROLE_PRESETS = [
+    {
+        id: 'pirep-manager',
+        name: 'PIREP manager',
+        color: '#0EA5E9',
+        description: 'Reviews flight reports and keeps auto-tracking honest.',
+        permissions: ['flights.review'],
+    },
+    {
+        id: 'roster-manager',
+        name: 'Roster manager',
+        color: '#4F46E5',
+        description: 'Looks after the pilots — adding, editing, promoting.',
+        permissions: ['roster.manage'],
+    },
+    {
+        id: 'recruiter',
+        name: 'Recruiter',
+        color: '#16A34A',
+        description: 'Handles applications and how the airline recruits.',
+        permissions: ['applications.review', 'settings.recruitment', 'roster.manage'],
+    },
+    {
+        id: 'ops-manager',
+        name: 'Operations manager',
+        color: '#D97706',
+        description: 'Runs the network and the week — routes, schedule, bookings.',
+        permissions: ['routes.manage', 'schedules.manage', 'flights.review'],
+    },
+    {
+        id: 'events-coordinator',
+        name: 'Events coordinator',
+        color: '#DB2777',
+        description: 'Organises group flights and works the gate board.',
+        permissions: ['events.manage'],
+    },
+    {
+        id: 'schedule-manager',
+        name: 'Schedule manager',
+        color: '#7C3AED',
+        description: 'Publishes the flying and assigns legs to pilots.',
+        permissions: ['schedules.manage'],
+    },
+    {
+        id: 'comms',
+        name: 'Communications',
+        color: '#0891B2',
+        description: 'Writes to the crew and looks after Discord & email.',
+        permissions: ['announcements.manage', 'settings.notifications', 'events.manage'],
+    },
+    {
+        id: 'brand-manager',
+        name: 'Brand manager',
+        color: '#BE185D',
+        description: 'Owns how the crew center looks, plus ranks and fleet.',
+        permissions: ['settings.branding'],
+    },
+    {
+        id: 'partnership-liaison',
+        name: 'Partnership liaison',
+        color: '#475569',
+        description: 'Watches the airline’s standing with Inflight.',
+        permissions: ['partnership.view'],
+    },
+    {
+        id: 'observer',
+        name: 'Observer',
+        color: '#6B7280',
+        // The one that has to exist and is easy to forget. A staff account with
+        // no role assigned keeps FULL access (see effectiveCaps), so "I want
+        // them to see the dashboard and change nothing" is not the absence of a
+        // role — it is a role with nothing ticked.
+        description: 'Sees the crew center and changes nothing.',
+        permissions: [],
+    },
+];
 
 function slugifyRoleId(s) {
     const base = String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
@@ -232,10 +341,34 @@ function sanitizeAssignments(arr) {
         roleId: clampStr(a && a.roleId, 40),
     })).filter(a => { if (!a.username || !a.roleId || seen.has(a.username)) return false; seen.add(a.username); return true; });
 }
-// The capabilities a caller effectively has. Owner + Inflight get everything;
-// pilots get nothing. A staff member gets their assigned role's permissions —
-// but a staff member with NO assignment keeps full access, so turning on the
-// system doesn't silently lock out a VA's existing team until they choose to.
+/**
+ * Capabilities that used to be part of another one.
+ *
+ * Splitting a capability in two is a silent downgrade for everybody already
+ * using it: a VA who ticked "add, edit & remove pilots" for their roster
+ * manager last month had also, without being asked, given them the
+ * noticeboard — and the morning after the split that person opens the
+ * dashboard and the composer is gone, with nothing to explain it.
+ *
+ * So a role holding the OLD capability keeps the new one until an owner edits
+ * that role, at which point the ticks on screen become the whole truth. Written
+ * as data rather than as an `if` in the middle of the resolver, because the next
+ * split will want the same treatment and should not have to rediscover why.
+ */
+const CAPABILITY_HEIRS = {
+    'roster.manage': ['announcements.manage'],
+};
+
+/**
+ * The capabilities a caller effectively has.
+ *
+ * Owner + Inflight get everything; pilots get nothing. A staff member gets
+ * their assigned role's permissions — but a staff member with NO assignment
+ * keeps full access, so turning the system on does not silently lock out a VA's
+ * existing team until they choose to give people roles. That default is why
+ * "see everything, change nothing" has to be an Observer role with nothing
+ * ticked rather than the absence of one.
+ */
 function effectiveCaps(va, p) {
     if (!p) return [];
     if (p.kind === 'inflight' || p.role === 'owner') return CREW_CAP_IDS.slice();
@@ -246,7 +379,12 @@ function effectiveCaps(va, p) {
     const a = uname && asn.find(x => String(x.username || '').toLowerCase() === uname);
     if (a) {
         const role = roles.find(r => r.id === a.roleId);
-        return role ? (role.permissions || []).filter(c => CREW_CAP_IDS.includes(c)) : [];
+        if (!role) return [];
+        const held = new Set((role.permissions || []).filter(c => CREW_CAP_IDS.includes(c)));
+        for (const [older, heirs] of Object.entries(CAPABILITY_HEIRS)) {
+            if (held.has(older)) heirs.forEach((h) => held.add(h));
+        }
+        return [...held];
     }
     return CREW_CAP_IDS.slice(); // unassigned staff → full (non-breaking default)
 }
@@ -388,7 +526,7 @@ function registerCrewAuthRoutes(app) {
                 // told to use the portal.
                 mustChangePassword: !!identity.mustChangePassword,
                 canChangePassword: identity.kind === 'crew',
-                caps, capabilities: CREW_CAPABILITIES,
+                caps, capabilities: CREW_CAPABILITIES, rolePresets: CREW_ROLE_PRESETS,
                 va: { name: va.name, slug: va.slug || null, code: va.callsign || null },
             });
         } catch (err) {
@@ -640,7 +778,7 @@ function registerCrewAuthRoutes(app) {
             username: p.uname || '',
             mustChangePassword,
             canChangePassword: p.kind === 'crew',
-            caps, capabilities: CREW_CAPABILITIES,
+            caps, capabilities: CREW_CAPABILITIES, rolePresets: CREW_ROLE_PRESETS,
             staffRoles: (isOwner && va && va.staffRoles) || [],
             staffAssignments: (isOwner && va && va.staffAssignments) || [],
         });
@@ -650,5 +788,5 @@ function registerCrewAuthRoutes(app) {
 module.exports = {
     registerCrewAuthRoutes, viewForRole, verifyCrewRequest, effectiveCaps,
     isDiscordInviteUrl, cleanDiscordInvite,
-    CREW_CAPABILITIES, CREW_CAP_IDS,
+    CREW_CAPABILITIES, CREW_CAP_IDS, CREW_ROLE_PRESETS, CAPABILITY_HEIRS,
 };

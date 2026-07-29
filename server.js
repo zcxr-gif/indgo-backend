@@ -2593,18 +2593,27 @@ const publicAnnouncement = (a) => ({
     createdAt: a.createdAt,
 });
 
+// Who may write to the noticeboard.
+//
+// `announcements.manage` was split out of `roster.manage`, which had made
+// writing to the crew and administering the roster one job: a VA could not have
+// somebody who posts notices without also handing them every pilot record.
+// crewAuth's CAPABILITY_HEIRS keeps a role built before the split working, so
+// this asks for the precise capability and gets the right answer either way.
+const canManageNotices = async (req, slug) => !(await requireCap(req, slug, 'announcements.manage')).error;
+
 // Public: a crew center's noticeboard is part of what it shows the world.
 app.get('/api/crew/:slug/announcements', async (req, res) => {
     try {
         const { store } = await resolveCrewStore(req.params.slug);
-        const canManage = !(await requireCap(req, req.params.slug, 'roster.manage')).error;
+        const canManage = await canManageNotices(req, req.params.slug);
         const list = await store.listAnnouncements({ limit: 50 });
         res.json({ announcements: list.map(publicAnnouncement), canManage });
     } catch (err) { crewFail(res, err, { log: 'announcements list error', message: 'Could not load the noticeboard.' }); }
 });
 
 app.post('/api/crew/:slug/announcements', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    const gate = await requireCap(req, req.params.slug, 'announcements.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const { store } = await resolveCrewStore(req.params.slug);
@@ -2618,7 +2627,7 @@ app.post('/api/crew/:slug/announcements', async (req, res) => {
 });
 
 app.patch('/api/crew/:slug/announcements/:id', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    const gate = await requireCap(req, req.params.slug, 'announcements.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const { store } = await resolveCrewStore(req.params.slug);
@@ -2640,7 +2649,7 @@ app.patch('/api/crew/:slug/announcements/:id', async (req, res) => {
 });
 
 app.delete('/api/crew/:slug/announcements/:id', async (req, res) => {
-    const gate = await requireCap(req, req.params.slug, 'roster.manage');
+    const gate = await requireCap(req, req.params.slug, 'announcements.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const { store } = await resolveCrewStore(req.params.slug);
@@ -2671,13 +2680,19 @@ app.delete('/api/crew/:slug/announcements/:id', async (req, res) => {
 // Owner-only (or Inflight oversight). A VA's staff run the airline; its
 // standing with us — warnings especially — is the owner's business.
 app.get('/api/crew/:slug/partnership', async (req, res) => {
+    // The owner always; a staff member only if the owner has granted it.
+    // Some VAs have a person who handles the partnership and is not the owner,
+    // and the alternative to delegating it was that owner forwarding
+    // screenshots of their own warnings.
     const p = verifyCrewRequest(req);
     if (!p) return res.status(401).json({ error: 'Not authenticated.' });
-    if (!(p.kind === 'inflight' || p.role === 'owner')) {
-        return res.status(403).json({ error: 'Only the VA owner can see the partnership.' });
-    }
-    if (p.kind !== 'inflight' && p.slug && p.slug !== String(req.params.slug).toLowerCase()) {
-        return res.status(403).json({ error: 'Wrong crew center.' });
+    const gate = await requireCap(req, req.params.slug, 'partnership.view');
+    if (gate.error) {
+        return res.status(gate.error).json({
+            error: gate.error === 401
+                ? 'Not authenticated.'
+                : 'Only the owner, or a role they’ve given partnership access, can see this.',
+        });
     }
     try {
         const { TOS_VERSION, TOS_EFFECTIVE_DATE, TOS_PAGE_PATH, TOS_PDF_PATH, getWarningLevel } = require('./vaTos');
@@ -2834,20 +2849,142 @@ const publicEvent = (e, opts = {}) => {
 // fly the event signs up like anyone else.
 async function crewPilot(req, store) {
     const p = verifyCrewRequest(req);
-    if (!p || p.kind !== 'crew') return null;
+    if (!p) return null;
     try {
-        const account = await store.getAccount(p.sub);
-        if (!account || account.active === false) return null;
-        const member = account.memberId ? await store.getMember(account.memberId) : null;
-        return {
-            accountId: account._id,
-            memberId: member ? member._id : null,
-            name: (member && member.name) || account.displayName || account.username || 'A pilot',
-            callsign: (member && member.callsign) || '',
-            hours: member ? Number(member.hours) || 0 : 0,
-        };
+        // A pilot account in the VA's own store. The ordinary case.
+        if (p.kind === 'crew') {
+            const account = await store.getAccount(p.sub);
+            if (!account || account.active === false) return null;
+            const member = account.memberId ? await store.getMember(account.memberId) : null;
+            return {
+                accountId: account._id,
+                memberId: member ? member._id : null,
+                name: (member && member.name) || account.displayName || account.username || 'A pilot',
+                callsign: (member && member.callsign) || '',
+                hours: member ? Number(member.hours) || 0 : 0,
+            };
+        }
+
+        // A VA staff or owner account — one of OUR accounts, not a row in their
+        // project. These people fly too, and until they could be resolved here
+        // they could publish a schedule and not book off it, open the events
+        // panel and not sign up, review flight reports and not file one.
+        //
+        // They are a pilot only once they have said WHICH pilot they are: the
+        // link is a roster row they claimed themselves (see
+        // POST /api/crew/:slug/me/pilot). No link means no identity on the
+        // roster, and every pilot endpoint keeps treating them as a manager
+        // watching rather than a crew member taking a leg.
+        //
+        // `accountId` stays null on purpose. It is the crew_accounts id and
+        // this person has none; the roster row is what identifies them, and the
+        // signup/booking uniqueness indexes are partial precisely so a row with
+        // a member and no account is a valid row.
+        if (p.kind === 'va') {
+            const VaPortalAccount = mongoose.model('VaPortalAccount');
+            const acct = await VaPortalAccount.findById(p.sub).select('crewMemberId displayName username active').lean();
+            if (!acct || acct.active === false || !acct.crewMemberId) return null;
+            const member = await store.getMember(acct.crewMemberId);
+            if (!member) return null;         // the roster row has since gone
+            return {
+                accountId: null,
+                memberId: member._id,
+                name: member.name || acct.displayName || acct.username || 'A pilot',
+                callsign: member.callsign || '',
+                hours: Number(member.hours) || 0,
+            };
+        }
+
+        // Inflight oversight is not on anybody's roster, and must never be
+        // silently booked onto a VA's flying.
+        return null;
     } catch { return null; }
 }
+
+/**
+ * Which pilot the signed-in person is, and letting them say so.
+ *
+ * Only ever about the CALLER's own identity — there is no path here to set
+ * somebody else's, because claiming to be another pilot would let a staff
+ * member book, withdraw and file flights in that pilot's name. Staff who need
+ * to put a pilot on a departure do it through the assign endpoints, where it is
+ * recorded as staff having done it.
+ *
+ * A crew-store account's link already lives in its own row and is set when the
+ * account is created, so this is a no-op for them; it exists for our central
+ * accounts, which have nowhere else to keep it.
+ */
+app.get('/api/crew/:slug/me/pilot', async (req, res) => {
+    const p = verifyCrewRequest(req);
+    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const me = await crewPilot(req, store);
+        // Only a central account can be re-pointed here; a store-backed pilot's
+        // link belongs to their account row and is not theirs to swap.
+        const linkable = p.kind === 'va';
+        res.json({
+            linkable,
+            linked: !!(me && me.memberId),
+            pilot: me && me.memberId
+                ? { memberId: me.memberId, name: me.name, callsign: me.callsign, hours: me.hours }
+                : null,
+        });
+    } catch (err) { crewFail(res, err, { log: 'me/pilot read error', message: 'Could not read your pilot record.' }); }
+});
+
+app.post('/api/crew/:slug/me/pilot', async (req, res) => {
+    const p = verifyCrewRequest(req);
+    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+    if (p.kind !== 'va') {
+        return res.status(400).json({
+            error: 'Your pilot record is already linked to your crew center account.',
+            code: 'not_linkable',
+        });
+    }
+    if (p.slug && p.slug !== String(req.params.slug).toLowerCase()) {
+        return res.status(403).json({ error: 'Wrong crew center.' });
+    }
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const wanted = String((req.body && req.body.memberId) || '').trim();
+
+        // Clearing it is a legitimate thing to want: a staff member who has
+        // stopped flying should be able to stop being offered a seat.
+        if (!wanted) {
+            await mongoose.model('VaPortalAccount').findByIdAndUpdate(p.sub, { crewMemberId: null });
+            return res.json({ linked: false, pilot: null });
+        }
+
+        // The row has to exist on THIS VA's roster. The store is already scoped
+        // to the slug, so a member id from another airline's project simply is
+        // not found rather than being linked across.
+        const member = await store.getMember(wanted);
+        if (!member) return res.status(404).json({ error: 'That pilot isn’t on this roster.' });
+
+        // One roster row, one person. Two staff accounts pointing at the same
+        // pilot would each be able to book and cancel the other's flying, and
+        // the schedule would show one name doing both.
+        const taken = await mongoose.model('VaPortalAccount').findOne({
+            vaAdId: p.vaId, crewMemberId: String(member._id), _id: { $ne: p.sub },
+        }).select('_id').lean();
+        if (taken) {
+            return res.status(409).json({
+                error: 'Another staff account is already flying as that pilot.',
+                code: 'pilot_taken',
+            });
+        }
+
+        await mongoose.model('VaPortalAccount').findByIdAndUpdate(p.sub, { crewMemberId: String(member._id) });
+        res.json({
+            linked: true,
+            pilot: {
+                memberId: member._id, name: member.name, callsign: member.callsign,
+                hours: Number(member.hours) || 0,
+            },
+        });
+    } catch (err) { crewFail(res, err, { log: 'me/pilot write error', message: 'Could not link your pilot record.' }); }
+});
 
 // Can this caller see drafts and edit the calendar?
 const canManageEvents = async (req, slug) => !(await requireCap(req, slug, 'events.manage')).error;
@@ -3428,6 +3565,12 @@ app.get('/api/crew/:slug/schedules', async (req, res) => {
             if (bySchedule.get(String(s._id) || '')?.some(isMine)) return null;  // already theirs
             const r = crewSchedules.bookingRefusal(s, rules, {
                 held, hours: viewer.hours, ranks: va.ranks, meetsRank: crewRanks.meetsRank,
+                // A staff member who builds the schedule and also flies is not
+                // refused by the airline's own bidding rules — they can assign
+                // themselves the leg either way, and a greyed button telling a
+                // schedule manager that "staff assign the flying here" is the
+                // system explaining their own rule back at them.
+                byStaff: canManage,
             });
             return r ? { code: r.code, message: r.message, opensAt: r.opensAt || null } : null;
         };
@@ -3642,6 +3785,10 @@ app.post('/api/crew/:slug/schedules/:id/book', async (req, res) => {
 
         const refused = crewSchedules.bookingRefusal(schedule, rules, {
             held, hours: viewer.hours, ranks: va.ranks, meetsRank: crewRanks.meetsRank,
+            // Same override as the list: somebody who may assign this leg to
+            // anybody may assign it to themselves, and routing them through the
+            // staff endpoint to do it would only obscure who took it.
+            byStaff: await canManageSchedules(req, req.params.slug),
         });
         if (refused) return res.status(403).json(refused.code === 'not_open_yet'
             ? { error: refused.message, code: refused.code, opensAt: refused.opensAt }
@@ -3733,7 +3880,9 @@ app.delete('/api/crew/:slug/schedules/:id/book', async (req, res) => {
         // close to departure is a courtesy to whoever has to find cover, and
         // only applies to the pilot.
         const schedule = await store.getSchedule(req.params.id).catch(() => null);
-        const refused = crewSchedules.cancelRefusal(mine, schedule, await scheduleRules(va._id));
+        const refused = crewSchedules.cancelRefusal(mine, schedule, await scheduleRules(va._id), {
+            byStaff: await canManageSchedules(req, req.params.slug),
+        });
         if (refused) return res.status(409).json({ error: refused.message, code: refused.code });
 
         await store.deleteBooking(mine._id);

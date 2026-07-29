@@ -112,6 +112,25 @@ const VaPortalAccountSchema = new mongoose.Schema({
     // "whenever we update the ToS, partners are updated on it in their portal".
     tosAckVersion: { type: String, default: '' },
     tosAckAt: { type: Date, default: null },
+
+    // --- Which pilot this person is, on their own roster ---
+    //
+    // A VA's staff fly. That sounds obvious and the crew center did not allow
+    // for it: a portal account could publish a schedule and could not book a
+    // leg off it, could open the events panel and could not sign up, because
+    // every pilot-side endpoint resolves the caller through the VA's OWN store
+    // (crew_accounts.member_id) and a portal account has no row there.
+    //
+    // So this is the same link, from the other side: the id of the row in the
+    // VA's crew_members table that IS this person. Set by the account holder
+    // themselves from the crew center — nobody else's identity is theirs to
+    // claim — and used only to answer "who is asking?" on the pilot endpoints.
+    //
+    // A bare string, not an ObjectId: it is a uuid in somebody else's Postgres,
+    // and casting it here would be asserting a relationship this database
+    // cannot enforce. Null means "this person does not fly", which is a normal
+    // thing for a staff account to be.
+    crewMemberId: { type: String, default: null, trim: true },
 }, { timestamps: true });
 
 const VaPortalAccount = mongoose.models.VaPortalAccount
