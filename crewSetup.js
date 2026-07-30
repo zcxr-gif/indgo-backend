@@ -141,9 +141,63 @@ class Management {
     // `reveal=true` returns the key values themselves rather than just their
     // names — this endpoint is the reason the VA never has to copy them.
     apiKeys(ref) { return this.request('get', `/v1/projects/${encodeURIComponent(ref)}/api-keys?reveal=true`); }
-    runSql(ref, query) {
-        return this.request('post', `/v1/projects/${encodeURIComponent(ref)}/database/query`, { query });
+    // `read_only` is sent explicitly rather than left to the endpoint's default.
+    // Supabase runs the statement inside a transaction whose mode this flag
+    // decides, and a read-only one cannot run a line of our schema — every
+    // statement in it is DDL, so the whole install fails on the first
+    // `create extension` with SQLSTATE 25006. Naming the mode we need means the
+    // install does not depend on an undocumented default staying put.
+    runSql(ref, query, { readOnly = false } = {}) {
+        return this.request('post', `/v1/projects/${encodeURIComponent(ref)}/database/query`,
+            { query, read_only: !!readOnly });
     }
+}
+
+// Postgres' SQLSTATE for "tried to write inside a read-only transaction".
+const READ_ONLY_SQLSTATE = '25006';
+const looksReadOnly = (detail) =>
+    new RegExp(`\\b${READ_ONLY_SQLSTATE}\\b`).test(detail || '') ||
+    /read-only transaction/i.test(detail || '');
+
+/**
+ * Work out WHY a project would not accept our schema, when it refused because
+ * the transaction was read-only.
+ *
+ * Two very different things produce SQLSTATE 25006 and they need different
+ * answers, so this asks the project which one it is rather than relaying
+ * Postgres' wording and leaving the VA to guess:
+ *
+ *   • the DATABASE is in read-only mode — Supabase's own protection when a
+ *     project runs out of disk (the free plan stops at 500 MB) or while it is
+ *     still restoring. Nothing can be installed OR saved until that is dealt
+ *     with, and only the account holder can deal with it.
+ *   • the database is writable and only our request's transaction was read-only
+ *     — a Supabase-side default we now set explicitly, so this should no longer
+ *     happen; if it does, it is ours to chase and not the VA's to fix.
+ *
+ * The probe deliberately runs read-write: asked inside a read-only transaction,
+ * the setting would read back as 'on' whatever the database's own state is, and
+ * the distinction would be lost. It is best-effort — a project that will not
+ * answer it gets the safer of the two messages.
+ */
+async function explainReadOnly(mgmt, ref, detail) {
+    let dbReadOnly = null;
+    try {
+        const rows = await mgmt.runSql(
+            ref, `select current_setting('default_transaction_read_only', true) as ro`);
+        const value = Array.isArray(rows) && rows[0] ? String(rows[0].ro ?? '') : '';
+        if (value) dbReadOnly = /^(on|true)$/i.test(value);
+    } catch (_) { /* diagnosis only — never turn a failed probe into the error */ }
+
+    if (dbReadOnly === false) {
+        return new SetupError(
+            'Supabase ran the setup script in a read-only transaction, so none of the tables could be created. Your database itself is fine and nothing on it was changed. Try again in a moment — if it keeps happening, tell us, and meanwhile you can paste the script into the Supabase SQL editor yourself.',
+            { status: 502, code: 'read_only_transaction', detail });
+    }
+
+    return new SetupError(
+        'That Supabase project is in read-only mode, so nothing can be written to it — not this script, and not the crew center either. Supabase does that when a project runs out of database space (the free plan stops at 500 MB) or while it is still restoring from a pause. Clear some space or raise the disk size in Supabase, wait for the project to report itself healthy, then run this again. Nothing was changed on the project.',
+        { status: 409, code: 'project_read_only', detail });
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +270,10 @@ async function installSchema(mgmt, ref, sql) {
         await mgmt.runSql(ref, sql);
     } catch (err) {
         if (err instanceof SetupError && err.code === 'supabase_error') {
+            // "cannot execute CREATE EXTENSION in a read-only transaction" is
+            // Postgres explaining the state of the project, not a fault in the
+            // script — it has its own diagnosis and its own advice.
+            if (looksReadOnly(err.detail)) throw await explainReadOnly(mgmt, ref, err.detail);
             throw new SetupError(
                 'Supabase refused to run the setup script on that project. Its own message: ' + (err.detail || 'no detail given'),
                 { status: 502, code: 'schema_install_failed', detail: err.detail });
@@ -348,6 +406,7 @@ module.exports = {
     SetupError,
     provision,
     installSchema,
+    looksReadOnly,
     updateSchema,
     checkAccess,
     extractKeys,

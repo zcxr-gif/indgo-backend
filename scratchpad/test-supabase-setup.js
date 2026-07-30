@@ -46,6 +46,7 @@ const projects = [
     { id: 'aaaaaaaaaaaaaaaaaaaa', name: 'my-other-app', region: 'eu-west-2', status: 'ACTIVE_HEALTHY', created_at: '2026-01-01T00:00:00Z' },
 ];
 const ranSql = [];        // every statement we were asked to execute
+const probes = [];        // every read-only diagnosis probe
 const seenAuth = [];      // every Authorization header we received
 
 const server = http.createServer((req, res) => {
@@ -91,7 +92,25 @@ const server = http.createServer((req, res) => {
             }
             if (rest === '/database/query') {
                 if (project.status !== 'ACTIVE_HEALTHY') return send(503, { message: 'Project is not ready' });
-                ranSql.push({ ref: project.id, query: data.query });
+                const query = String((data && data.query) || '');
+
+                // The read-only diagnosis probe. `probeFails` is a project that
+                // will not answer it at all.
+                if (/default_transaction_read_only/.test(query)) {
+                    probes.push({ ref: project.id, readOnly: !!data.read_only });
+                    if (project.probeFails) return send(500, { message: 'catalog unavailable' });
+                    return send(201, [{ ro: project.dbReadOnly ? 'on' : 'off' }]);
+                }
+
+                // A project Supabase has switched to read-only mode (out of
+                // disk, or still restoring) refuses every write, and the first
+                // statement of our schema is one. `txnReadOnly` is the other
+                // shape: a writable database, but the API ran our statement in
+                // a read-only transaction.
+                if (project.dbReadOnly || project.txnReadOnly) {
+                    return send(400, { message: 'Failed to run sql query: ERROR: 25006: cannot execute CREATE EXTENSION in a read-only transaction' });
+                }
+                ranSql.push({ ref: project.id, query, readOnly: !!data.read_only });
                 return send(201, []);
             }
         }
@@ -197,6 +216,53 @@ const server = http.createServer((req, res) => {
     try { await call({ projectRef: 'aaaaaaaaaaaaaaaaaaaa', sql: 'drop table users;' }); } catch (e) { junkSql = e; }
     T('a schema that isn’t ours is refused before it is executed', junkSql && junkSql.code, 'schema_unavailable');
     T('and nothing extra was run', ranSql.length, 3);
+
+    // --- A project that cannot be written to ---
+    //
+    // Every statement in the schema is DDL, so a read-only transaction fails on
+    // the first line with SQLSTATE 25006. Postgres' own wording ("cannot
+    // execute CREATE EXTENSION in a read-only transaction") tells a VA nothing
+    // about what to do, and the two causes need opposite answers — so the
+    // module asks the project which one it is.
+    console.log('\na project in read-only mode');
+    OK('the install asks Supabase for a read-write transaction', ranSql[0].readOnly === false,
+        `read_only was ${JSON.stringify(ranSql[0].readOnly)}`);
+
+    projects.push({ id: 'dddddddddddddddddddd', name: 'full-project', region: 'us-east-1', status: 'ACTIVE_HEALTHY', dbReadOnly: true });
+    let full = null;
+    try { await call({ projectRef: 'dddddddddddddddddddd' }); } catch (e) { full = e; }
+    T('the database being read-only is its own diagnosis', full && full.code, 'project_read_only');
+    T('and a conflict, not a bad gateway', full && full.status, 409);
+    OK('it names the cause the VA can act on', /run(s)? out of database space|500 MB/.test(full.message), full.message);
+    OK('it says the crew center is affected too, not just the script', /crew center/i.test(full.message), full.message);
+    OK('and that nothing was half-installed', /[Nn]othing was changed/.test(full.message), full.message);
+    OK('Postgres’ own wording is kept for the log, not shown', /25006/.test(full.detail) && !/25006/.test(full.message));
+    T('the diagnosis probe ran read-write, or it would read “on” regardless',
+        probes.filter((p) => p.ref === 'dddddddddddddddddddd').map((p) => p.readOnly), [false]);
+    T('and nothing was installed', ranSql.filter((r) => r.ref === 'dddddddddddddddddddd').length, 0);
+
+    // The same SQLSTATE from a database that is perfectly writable is ours to
+    // chase, not the VA's — so it must not tell them to go clear disk space.
+    projects.push({ id: 'eeeeeeeeeeeeeeeeeeee', name: 'writable-project', region: 'us-east-1', status: 'ACTIVE_HEALTHY', txnReadOnly: true });
+    let txn = null;
+    try { await call({ projectRef: 'eeeeeeeeeeeeeeeeeeee' }); } catch (e) { txn = e; }
+    T('a writable database that answered 25006 anyway is a different fault', txn && txn.code, 'read_only_transaction');
+    OK('and is not blamed on the VA’s disk usage', !/500 MB/.test(txn.message), txn.message);
+    OK('it still says the database was left alone', /nothing on it was changed/i.test(txn.message), txn.message);
+
+    // A project that will not answer the probe gets the message that assumes
+    // the worse of the two, because that is the one with something to do.
+    projects.push({ id: 'ffffffffffffffffffff', name: 'quiet-project', region: 'us-east-1', status: 'ACTIVE_HEALTHY', dbReadOnly: true, probeFails: true });
+    let quiet = null;
+    try { await call({ projectRef: 'ffffffffffffffffffff' }); } catch (e) { quiet = e; }
+    T('an unanswered probe still produces an actionable error', quiet && quiet.code, 'project_read_only');
+
+    T('read-only detection reads the SQLSTATE',
+        crewSetup.looksReadOnly('Failed to run sql query: ERROR: 25006: cannot execute CREATE EXTENSION in a read-only transaction'), true);
+    T('  …or the wording, if the code is absent',
+        crewSetup.looksReadOnly('cannot execute INSERT in a read-only transaction'), true);
+    T('an unrelated failure is not mistaken for it',
+        crewSetup.looksReadOnly('permission denied for schema public'), false);
 
     // --- Key extraction ---
     console.log('\nreading keys back');
