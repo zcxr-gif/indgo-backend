@@ -186,6 +186,10 @@ class CrewStoreError extends Error {
     }
 }
 
+// Postgres' SQLSTATE for a write attempted in a read-only transaction, which
+// is what a Supabase project out of disk answers to everything. See explain().
+const READ_ONLY_SQLSTATE = '25006';
+
 const NOT_CONNECTED = () => new CrewStoreError(
     'This VA has not connected a data store yet. Connect your Supabase project in Crew Center → Settings → Data store.',
     { status: 409, code: 'store_not_connected' });
@@ -753,6 +757,17 @@ class Postgrest {
                 { status: 409, code: 'store_schema_outdated', detail });
             err.column = column;
             return err;
+        }
+        // The project is in read-only mode — Supabase's protection when a
+        // project runs out of database space, or while it is restoring from a
+        // pause. Every write fails with SQLSTATE 25006 until that is resolved,
+        // and the VA is the only one who can resolve it, so say which thing is
+        // wrong instead of "the data store returned an error". 409 for the same
+        // reason as the outdated-schema case: nothing here is broken.
+        if (body.code === READ_ONLY_SQLSTATE || /read-only transaction/i.test(detail)) {
+            return new CrewStoreError(
+                'The VA’s Supabase project is in read-only mode, so nothing can be saved to it. Supabase does that when a project runs out of database space (the free plan stops at 500 MB) or while it is restoring from a pause. Crew Center → Settings → Data store shows what is using the room; clear some, or raise the disk size in Supabase.',
+                { status: 409, code: 'store_read_only', detail });
         }
         if (res.status === 409 || body.code === '23505') {
             const err = new CrewStoreError('That record already exists.', { status: 409, code: 'store_conflict', detail });

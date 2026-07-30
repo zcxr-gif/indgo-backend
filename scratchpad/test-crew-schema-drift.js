@@ -84,6 +84,11 @@ const server = http.createServer((req, res) => {
                 if (rows[0].origin === '') {
                     return send(400, { code: '23502', message: 'null value in column "origin" of relation "crew_routes" violates not-null constraint' });
                 }
+                // What a project that has run out of disk answers to every
+                // write: Supabase has switched it to read-only mode.
+                if (rows[0].origin === 'FULL') {
+                    return send(400, { code: '25006', message: 'cannot execute INSERT in a read-only transaction' });
+                }
             }
             const out = rows.map((r) => ({ id: `id-${++seq}`, ...r }));
             if (req.method === 'POST') table.push(...out);
@@ -132,6 +137,16 @@ const server = http.createServer((req, res) => {
     try { await store2.db.insert('crew_routes', { va_slug: 'x', origin: '' }); }
     catch (err) { caught = err; }
     T('a not-null violation is a store error, not a version problem', caught && caught.code, 'store_error');
+
+    // A project Supabase has switched to read-only mode (out of disk, or
+    // restoring) refuses every write with 25006. That is neither a broken store
+    // nor an old schema, and the VA is the only one who can clear it — so it
+    // gets its own answer instead of "the data store returned an error".
+    caught = null;
+    try { await store2.db.insert('crew_routes', { va_slug: 'x', origin: 'FULL' }); }
+    catch (err) { caught = err; }
+    T('a read-only project says so', [caught && caught.code, caught && caught.status], ['store_read_only', 409]);
+    OK('  …and names what to do about it', /500 MB|disk size/.test(caught.message), caught && caught.message);
 
     console.log('\n after the VA updates their database');
     V4_ROUTE_COLUMNS.add('kind'); V4_ROUTE_COLUMNS.add('partner_name');
