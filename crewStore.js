@@ -1017,6 +1017,23 @@ class SupabaseStore {
         return (rows || []).map(pirepFromRow);
     }
 
+    /**
+     * One pilot's own flights — their logbook.
+     *
+     * Every status, unlike the public flight log. A pilot must be able to see
+     * that the report they filed on Tuesday is still pending, and that the one
+     * before it was rejected; showing them only the approved ones is how a
+     * rejection becomes a report that silently never existed.
+     */
+    async listPirepsForMember(memberId, { limit = 500 } = {}) {
+        if (!memberId) return [];
+        const rows = await this.db.select('crew_pireps', {
+            ...this.scope, member_id: `eq.${memberId}`,
+            order: 'flown_at.desc.nullslast,created_at.desc', limit,
+        });
+        return (rows || []).map(pirepFromRow);
+    }
+
     // Which of these Infinite Flight flight ids have we already captured? Used
     // by the sync to skip flights without attempting (and failing) an insert.
     async seenFlightIds(flightIds) {
@@ -1693,6 +1710,13 @@ class LegacyStore {
     async deletePirep(id) { await models.CrewPirep.deleteOne({ ...this.q, _id: id }); return true; }
     // No events on this path, so nothing was ever flown for one.
     async listPirepsForEvent() { return []; }
+    // The pilot's own logbook. Every status, for the reason the Supabase store
+    // gives: a pending report a pilot cannot see is one they will file twice.
+    async listPirepsForMember(memberId, { limit = 500 } = {}) {
+        if (!memberId) return [];
+        return models.CrewPirep.find({ ...this.q, memberId: String(memberId) })
+            .sort({ flownAt: -1, createdAt: -1 }).limit(limit).lean();
+    }
     async seenFlightIds(flightIds) {
         const ids = (flightIds || []).filter(Boolean);
         if (!ids.length) return new Set();

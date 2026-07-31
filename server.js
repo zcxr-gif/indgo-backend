@@ -4119,6 +4119,78 @@ const publicPirep = (p) => ({
     source: p.source, status: p.status, flownAt: p.flownAt, createdAt: p.createdAt,
 });
 
+/* ===========================================================================
+ * THE PILOT'S OWN FLYING
+ *
+ * The pilot home showed four invented Air Canada legs — CYYZ→CYVR, CYYZ→EGLL,
+ * CYUL→KLGA, CYVR→RJTT — hardcoded into the page, plus a rank card reading
+ * "First Officer → Captain, 214h of 250h". Every pilot at every VA saw the same
+ * four flights and the same 214 hours, over a logbook that contained none of it.
+ *
+ * That is the same bug crewNotices.js was written to remove from the owner
+ * dashboard's activity feed. It was fixed there and never here, which meant the
+ * half of the product MOST people actually use was a mockup.
+ *
+ * One endpoint rather than four, because this is one screen: who the caller is,
+ * what rank that makes them, what they have flown, and the totals underneath.
+ * A page that has to stitch that together from /me/pilot + /pireps + /roster is
+ * a page that renders three different half-truths while it waits.
+ * ========================================================================= */
+app.get('/api/crew/:slug/me/flying', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const me = await crewPilot(req, store);
+
+        // Not signed in, or signed in as somebody with no roster identity. Not
+        // an error: the page shows its "link your pilot record" state, exactly
+        // as the staff dashboard's My flying card does.
+        if (!me || !me.memberId) {
+            return res.json({ pilot: null, rank: null, flights: [], totals: null });
+        }
+
+        const member = await store.getMember(me.memberId);
+        const hours = member ? Number(member.hours) || 0 : me.hours;
+        const flights = await store.listPirepsForMember(me.memberId);
+
+        // Totals from the pilot's OWN reports rather than the roster's hours
+        // column, and approved-only — a pending report is not yet time flown,
+        // and counting it would have the number drop when staff reject one.
+        const approved = flights.filter((f) => f.status === 'approved');
+        const since30d = Date.now() - 30 * 86400000;
+        const minutes = (list) => list.reduce((s, f) => s + (Number(f.durationMin) || 0), 0);
+        const recent = approved.filter((f) => {
+            const t = new Date(f.flownAt || f.createdAt).getTime();
+            return Number.isFinite(t) && t >= since30d;
+        });
+
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            pilot: {
+                memberId: me.memberId,
+                name: me.name,
+                callsign: me.callsign || '',
+                hours,
+                status: (member && member.status) || 'active',
+            },
+            // The whole ladder question answered server-side. The page draws a
+            // bar; deciding what "next rank" means — including a pilot who has
+            // the hours but is waiting on a check-ride — is not a thing to
+            // reimplement in markup that cannot see the ladder.
+            rank: crewRanks.memberRank(va.ranks, hours, member && member.checksPassed),
+            flights: flights.map(publicPirep),
+            totals: {
+                flights: approved.length,
+                pending: flights.filter((f) => f.status === 'pending').length,
+                rejected: flights.filter((f) => f.status === 'rejected').length,
+                minutes: minutes(approved),
+                minutes30d: minutes(recent),
+                flights30d: recent.length,
+                lastFlightAt: approved.length ? (approved[0].flownAt || approved[0].createdAt) : null,
+            },
+        });
+    } catch (err) { crewFail(res, err, { log: 'me/flying error', message: 'Could not load your flying.' }); }
+});
+
 // List PIREPs. Managers (flights.review) see everything and can filter by status;
 // everyone else sees the approved flights only — a public flight log.
 app.get('/api/crew/:slug/pireps', async (req, res) => {
