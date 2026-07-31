@@ -1433,7 +1433,105 @@ class SupabaseStore {
             };
         }
     }
+
+    /* =====================================================================
+     * BULK DATA MANAGEMENT
+     *
+     * Per-row deletes already exist everywhere they belong — a bin on a notice,
+     * on a flight report, on a schedule. What did not exist was a way to answer
+     * "this project is filling up, get rid of the 2023 flight reports", and the
+     * storage screen has been telling VAs to do exactly that with no button to
+     * do it with.
+     *
+     * Two shapes, because they are different decisions:
+     *   · a purge BY AGE — routine housekeeping, the common case
+     *   · a WIPE of one dataset — deliberate, and confirmed by typing the name
+     *
+     * Both go through countPurgeable() first so the VA is told how many rows
+     * they are about to lose BEFORE they lose them, and both are scoped by
+     * va_slug like every other query here: one Supabase project can back
+     * several brands, and a purge must never reach past its own.
+     * =================================================================== */
+
+    async countPurgeable(dataset, { before = null } = {}) {
+        const set = PURGE_DATASETS[dataset];
+        if (!set) throw new CrewStoreError('Unknown dataset.', { code: 'unknown_dataset', status: 400 });
+        const rows = await this.db.select(set.table, {
+            ...this.purgeFilter(set, before), select: 'id', limit: PURGE_MAX + 1,
+        });
+        const n = (rows || []).length;
+        // A count that hit the ceiling is reported as "at least this many" so a
+        // VA with 80k reports is not told they have exactly 20,000.
+        return { count: Math.min(n, PURGE_MAX), capped: n > PURGE_MAX };
+    }
+
+    /**
+     * Delete the rows a purge covers, and say how many went.
+     *
+     * Ids are read first and the delete is keyed on them rather than repeating
+     * the date filter: PostgREST would happily DELETE on a filter, but then the
+     * count comes from a second round trip that can disagree with what was
+     * actually removed — and a row written between the two would be deleted
+     * without ever having been counted or shown.
+     */
+    async purge(dataset, { before = null } = {}) {
+        const set = PURGE_DATASETS[dataset];
+        if (!set) throw new CrewStoreError('Unknown dataset.', { code: 'unknown_dataset', status: 400 });
+
+        let deleted = 0;
+        // Batched so one call cannot build a URL longer than PostgREST accepts,
+        // and so a very large purge makes progress rather than timing out whole.
+        for (let pass = 0; pass < PURGE_PASSES; pass++) {
+            const rows = await this.db.select(set.table, {
+                ...this.purgeFilter(set, before), select: 'id', limit: PURGE_BATCH,
+            });
+            const ids = (rows || []).map((r) => r.id).filter((id) => id != null);
+            if (!ids.length) break;
+            await this.db.remove(set.table, {
+                ...this.scope, id: `in.(${ids.map((i) => `"${String(i).replace(/"/g, '')}"`).join(',')})`,
+            });
+            deleted += ids.length;
+            if (ids.length < PURGE_BATCH) break;
+        }
+        return { deleted, dataset };
+    }
+
+    /** The scope + date window one purge covers. No date = the whole dataset. */
+    purgeFilter(set, before) {
+        const params = { ...this.scope };
+        if (before) {
+            // `or` rather than a plain lt: an event with no start date, or a
+            // report never given a flown_at, would otherwise be invisible to
+            // every age-based purge and sit in the project forever.
+            params.or = `(${set.dateColumn}.lt.${before},${set.dateColumn}.is.null)`;
+        }
+        return params;
+    }
 }
+
+/**
+ * What can be bulk-managed, and which column decides how old a row is.
+ *
+ * Deliberately NOT the whole schema. The roster, the route network and pilot
+ * accounts are the crew center's spine — deleting those in bulk is not
+ * housekeeping, it is closing the airline, and it belongs behind its own
+ * conversation rather than a dropdown next to "flight reports".
+ */
+const PURGE_DATASETS = {
+    pireps:        { table: 'crew_pireps',        dateColumn: 'flown_at',   label: 'Flight reports' },
+    events:        { table: 'crew_events',        dateColumn: 'starts_at',  label: 'Events' },
+    schedules:     { table: 'crew_schedules',     dateColumn: 'departs_at', label: 'Scheduled flights' },
+    applications:  { table: 'crew_applications',  dateColumn: 'created_at', label: 'Applications' },
+    announcements: { table: 'crew_announcements', dateColumn: 'created_at', label: 'Noticeboard posts' },
+};
+
+// How many rows one count will look at, one delete will take at a time, and how
+// many batches a single purge will run. 20k rows per call is far more than any
+// crew center clears in one go, and the ceiling is what stops a runaway request
+// holding a VA's project open indefinitely.
+const PURGE_MAX = 20000;
+const PURGE_BATCH = 500;
+const PURGE_PASSES = 40;
 
 // ---------------------------------------------------------------------------
 // Legacy managed storage (our Mongo)
@@ -1723,7 +1821,47 @@ class LegacyStore {
         LEGACY_DATA_CACHE.set(key, { at: Date.now(), value });
         return value;
     }
+
+    /* ---------------------------------------------------------------------
+     * Bulk data management
+     *
+     * Managed storage only ever held four things, so this covers the two a VA
+     * would want to clear out. Events, schedules and the noticeboard never
+     * existed here — asking to purge them is not an error, there is simply
+     * nothing to purge, and saying "unsupported" would send a VA looking for a
+     * problem that does not exist.
+     * ------------------------------------------------------------------- */
+
+    async countPurgeable(dataset, { before = null } = {}) {
+        const model = LEGACY_PURGE_MODELS[dataset];
+        if (!model) return { count: 0, capped: false, unsupported: true };
+        const n = await models[model.name].countDocuments(this.purgeQuery(model, before));
+        return { count: n, capped: false };
+    }
+
+    async purge(dataset, { before = null } = {}) {
+        const model = LEGACY_PURGE_MODELS[dataset];
+        if (!model) return { deleted: 0, dataset, unsupported: true };
+        const res = await models[model.name].deleteMany(this.purgeQuery(model, before));
+        return { deleted: res.deletedCount || 0, dataset };
+    }
+
+    /** Same "or the date is missing" rule the Supabase store applies. */
+    purgeQuery(model, before) {
+        if (!before) return { ...this.q };
+        const d = new Date(before);
+        return {
+            ...this.q,
+            $or: [{ [model.dateField]: { $lt: d } }, { [model.dateField]: null }, { [model.dateField]: { $exists: false } }],
+        };
+    }
 }
+
+// The managed-storage half of PURGE_DATASETS. Only what Mongo ever held.
+const LEGACY_PURGE_MODELS = {
+    pireps:       { name: 'CrewPirep',       dateField: 'flownAt' },
+    applications: { name: 'CrewApplication', dateField: 'createdAt' },
+};
 
 // vaAdId -> { at, value }. See LegacyStore.hasData.
 const LEGACY_DATA_CACHE = new Map();
@@ -1835,6 +1973,7 @@ module.exports = {
     CrewStoreError,
     SupabaseStore,
     LegacyStore,
+    PURGE_DATASETS,
     SELECT,
     EXPECTED_SCHEMA_VERSION,
     ACCOUNTS_SCHEMA_VERSION,

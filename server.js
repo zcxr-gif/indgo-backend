@@ -3038,6 +3038,43 @@ const canManageEvents = async (req, slug) => !(await requireCap(req, slug, 'even
 // for a field the coordinate set has never heard of.
 const gateCoordsFor = (icao) => AIRPORT_COORDS[icao] || null;
 
+/**
+ * Our own stands for an airport, used only when every Overpass mirror has
+ * refused.
+ *
+ * This dataset was already here — /api/gates/:icao serves it to the tracker —
+ * and the gate board simply never asked it. The shapes differ (ours is a bare
+ * list of names, or objects with a gate/name/ref field), so it is normalised to
+ * what buildGateBoard expects. No lat/lon: these rows are not geocoded, and a
+ * stand with no coordinates renders in the list and is marked off-map rather
+ * than being dropped.
+ */
+async function localAirportGates(icao) {
+    const doc = await AirportGate.findOne({ airportCode: String(icao).toUpperCase() }).lean();
+    if (!doc || !doc.gates) return [];
+    const raw = Array.isArray(doc.gates) ? doc.gates : Object.values(doc.gates);
+    const seen = new Set();
+    const out = [];
+    for (const g of raw) {
+        const ref = String(
+            (g && typeof g === 'object' ? (g.ref || g.gate || g.name || g.stand) : g) || ''
+        ).trim().slice(0, 20);
+        if (!ref) continue;
+        const key = ref.toUpperCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const lat = g && typeof g === 'object' ? Number(g.lat ?? g.latitude) : NaN;
+        const lon = g && typeof g === 'object' ? Number(g.lon ?? g.lng ?? g.longitude) : NaN;
+        out.push({
+            ref,
+            lat: Number.isFinite(lat) ? lat : null,
+            lon: Number.isFinite(lon) ? lon : null,
+            kind: 'gate',
+        });
+    }
+    return out;
+}
+
 // A gate clash, in the words of the person who just lost the race. The store
 // tells us which uniqueness bit (see Postgrest.explain), so "that stand has
 // just gone" is never guessed — a pilot who is simply already signed up gets
@@ -3154,7 +3191,7 @@ app.get('/api/crew/:slug/events/:id/gates', async (req, res) => {
         let gates = [];
         let source = 'osm';
         try {
-            gates = await crewEvents.fetchAirportGates(icao, gateCoordsFor);
+            gates = await crewEvents.fetchAirportGates(icao, gateCoordsFor, localAirportGates);
         } catch (err) {
             // OpenStreetMap being slow or blocked must not take the board with
             // it. The stands pilots have already claimed are ours, not OSM's,
@@ -5062,6 +5099,121 @@ app.get('/api/crew/:slug/store/usage', async (req, res) => {
 // is 500 MB of database; a deployment whose VAs are on paid plans can raise it.
 // Only ever a reference line — nothing enforces it, and the screen says so.
 const CREW_STORAGE_LIMIT_MB = parseInt(process.env.CREW_STORAGE_LIMIT_MB, 10) || 500;
+
+/* ===========================================================================
+ * THE VA'S OWN DATA — what is in it, and getting rid of what they don't want
+ *
+ * The storage screen has been telling VAs "old flight reports are almost always
+ * the biggest thing, export them and remove them" while giving them no way to
+ * remove them except one bin at a time. This is that way.
+ *
+ * Owner only, deliberately. Every dataset here is one a staff role can already
+ * edit row by row — but "delete four years of flight reports" is not the same
+ * decision as "delete this flight report", and it is not one to hand to a
+ * capability that was granted for day-to-day work.
+ * ========================================================================= */
+
+/** Owner (or Inflight) on the right crew center. The gate every route here uses. */
+function requireCrewOwner(req, slug, what) {
+    const p = verifyCrewRequest(req);
+    if (!p) return { status: 401, error: 'Not authenticated.' };
+    if (!(p.kind === 'inflight' || p.role === 'owner')) {
+        return { status: 403, error: `Only the VA owner can ${what}.` };
+    }
+    if (p.kind !== 'inflight' && p.slug && p.slug !== String(slug).toLowerCase()) {
+        return { status: 403, error: 'Wrong crew center.' };
+    }
+    return { p };
+}
+
+// How old a purge can be asked to reach. Anything under a week is almost
+// certainly a mistyped number rather than an intention, and "older than 0 days"
+// is a wipe wearing a purge's clothes — that has its own, confirmed route.
+const PURGE_MIN_DAYS = 7;
+
+// What's in the VA's data, dataset by dataset, and how much of it a purge at the
+// requested age would take. Read-only: this is the screen that lets somebody
+// decide, and it must be safe to open.
+app.get('/api/crew/:slug/data', async (req, res) => {
+    const gate = requireCrewOwner(req, req.params.slug, 'manage the crew center’s data');
+    if (gate.status) return res.status(gate.status).json({ error: gate.error });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const days = Math.max(0, parseInt(req.query.olderThanDays, 10) || 0);
+        const before = days ? new Date(Date.now() - days * 86400000).toISOString() : null;
+
+        // One dataset failing must not blank the whole screen — a project on an
+        // older schema simply has no crew_events table, and the honest answer
+        // for that row is "not in this database", not a 500 for the other four.
+        const datasets = await Promise.all(Object.entries(crewStore.PURGE_DATASETS).map(async ([id, set]) => {
+            const base = { id, label: set.label, dateColumn: set.dateColumn };
+            try {
+                const total = await store.countPurgeable(id, {});
+                const matching = before ? await store.countPurgeable(id, { before }) : total;
+                return {
+                    ...base,
+                    total: total.count,
+                    totalCapped: !!total.capped,
+                    matching: matching.count,
+                    matchingCapped: !!matching.capped,
+                    unsupported: !!total.unsupported,
+                };
+            } catch (err) {
+                return { ...base, total: 0, matching: 0, unavailable: true, reason: err.message || '' };
+            }
+        }));
+
+        res.set('Cache-Control', 'no-store');
+        res.json({ datasets, olderThanDays: days, before, minDays: PURGE_MIN_DAYS, storeKind: store.kind });
+    } catch (err) { crewFail(res, err, { log: 'crew data summary error', message: 'Could not read what is in your data.' }); }
+});
+
+// Delete part of a dataset by age, or all of it.
+//
+// A wipe (`all: true`) must name the dataset back to us in `confirm`. That is
+// not ceremony: the by-age path and the wipe path differ by one field, and a
+// client bug that dropped `olderThanDays` would otherwise silently become
+// "delete everything".
+app.post('/api/crew/:slug/data/:dataset/purge', async (req, res) => {
+    const gate = requireCrewOwner(req, req.params.slug, 'delete data in bulk');
+    if (gate.status) return res.status(gate.status).json({ error: gate.error });
+
+    const dataset = String(req.params.dataset || '');
+    const set = crewStore.PURGE_DATASETS[dataset];
+    if (!set) return res.status(400).json({ error: 'Unknown dataset.', code: 'unknown_dataset' });
+
+    const all = req.body && req.body.all === true;
+    const days = Math.max(0, parseInt(req.body && req.body.olderThanDays, 10) || 0);
+
+    if (all) {
+        const confirm = String((req.body && req.body.confirm) || '');
+        if (confirm !== dataset) {
+            return res.status(400).json({
+                error: `Type “${dataset}” to confirm deleting all of it.`,
+                code: 'confirm_required',
+            });
+        }
+    } else if (days < PURGE_MIN_DAYS) {
+        return res.status(400).json({
+            error: `Pick an age of at least ${PURGE_MIN_DAYS} days, or choose to delete all of it.`,
+            code: 'purge_window_too_small',
+        });
+    }
+
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const before = all ? null : new Date(Date.now() - days * 86400000).toISOString();
+        const out = await store.purge(dataset, { before });
+
+        console.log(`crew data purge: ${req.params.slug} ${dataset} ${all ? 'ALL' : `older than ${days}d`} -> ${out.deleted} row(s)`);
+        res.json({
+            ...out,
+            label: set.label,
+            olderThanDays: all ? 0 : days,
+            all,
+        });
+    } catch (err) { crewFail(res, err, { log: 'crew data purge error', message: 'Could not delete that data.' }); }
+});
 
 // Move a VA's remaining managed data into their own project. Owner (or
 // Inflight) only — this is the one-way door out of our storage.
