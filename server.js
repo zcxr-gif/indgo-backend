@@ -74,6 +74,7 @@ const crewRanks = require('./crewRanks');
 // stand. Everything that is a decision rather than a database write lives
 // there — including where the stands themselves come from. See crewEvents.js.
 const crewEvents = require('./crewEvents');
+const crewInsights = require('./crewInsights');
 
 // The airline's ordinary week: which legs are flown when, and who has taken
 // them. Events gather everyone at one departure; a schedule is many departures
@@ -4997,6 +4998,57 @@ function scopeStats(payload, isManager) {
     MANAGER_ONLY_STATS.forEach((k) => delete stats[k]);
     return { ...payload, stats };
 }
+
+/* ===========================================================================
+ * INSIGHTS — what this airline's flying actually looks like
+ *
+ * Separate from /stats on purpose. That endpoint answers "how big is this VA"
+ * for a public homepage, is computed in Postgres by crew_stats() and cached.
+ * This answers the questions a VA asks about its OWN operation — most flown
+ * route, who is carrying the airline this month, which published routes nobody
+ * has ever touched — every one of which is a GROUP BY that crew_stats does not
+ * do.
+ *
+ * Computed in JS rather than added to the SQL so it needs no schema bump: it
+ * works today on every VA, including those on an older schema and those still
+ * on legacy managed storage.
+ *
+ * Staff-facing, gated on flights.review — this names individual pilots and
+ * ranks them, which is roster business rather than something for the public
+ * page. The window is the caller's choice; 0 means all time.
+ * ========================================================================= */
+app.get('/api/crew/:slug/insights', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'flights.review');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const allowed = [0, 30, 90, 365];
+        const asked = parseInt(req.query.days, 10);
+        const days = allowed.includes(asked) ? asked : 90;
+
+        // A big read, so it is done once and sliced in memory rather than
+        // re-queried per section. The ceiling is high enough for any VA that
+        // exists and low enough that one request cannot hold their project open.
+        const [pireps, members, routes, notices] = await Promise.all([
+            store.listPireps({ status: '', limit: 5000 }),
+            store.listMembers({ limit: 5000 }),
+            store.listRoutes({ limit: 5000 }),
+            // Best-effort: a project predating the noticeboard still has flying
+            // worth reporting, and the crew-activity block is the only part
+            // that needs these.
+            Promise.resolve(store.listAnnouncements({ limit: 500 })).catch(() => []),
+        ]);
+
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            ok: true,
+            ...crewInsights.build({ pireps, members, routes, notices, days }),
+            // So the screen can say "of 1,284 reports, 903 are approved" rather
+            // than quietly reporting a subset as the whole.
+            counted: { approved: pireps.filter((p) => p.status === 'approved').length, reports: pireps.length },
+        });
+    } catch (err) { crewFail(res, err, { log: 'crew insights error', message: 'Could not work out your statistics.' }); }
+});
 
 app.get('/api/crew/:slug/stats', async (req, res) => {
     const slug = String(req.params.slug || '').trim().toLowerCase();
