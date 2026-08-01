@@ -74,6 +74,7 @@ const crewRanks = require('./crewRanks');
 // stand. Everything that is a decision rather than a database write lives
 // there — including where the stands themselves come from. See crewEvents.js.
 const crewEvents = require('./crewEvents');
+const crewInsights = require('./crewInsights');
 
 // The airline's ordinary week: which legs are flown when, and who has taken
 // them. Events gather everyone at one departure; a schedule is many departures
@@ -3038,6 +3039,43 @@ const canManageEvents = async (req, slug) => !(await requireCap(req, slug, 'even
 // for a field the coordinate set has never heard of.
 const gateCoordsFor = (icao) => AIRPORT_COORDS[icao] || null;
 
+/**
+ * Our own stands for an airport, used only when every Overpass mirror has
+ * refused.
+ *
+ * This dataset was already here — /api/gates/:icao serves it to the tracker —
+ * and the gate board simply never asked it. The shapes differ (ours is a bare
+ * list of names, or objects with a gate/name/ref field), so it is normalised to
+ * what buildGateBoard expects. No lat/lon: these rows are not geocoded, and a
+ * stand with no coordinates renders in the list and is marked off-map rather
+ * than being dropped.
+ */
+async function localAirportGates(icao) {
+    const doc = await AirportGate.findOne({ airportCode: String(icao).toUpperCase() }).lean();
+    if (!doc || !doc.gates) return [];
+    const raw = Array.isArray(doc.gates) ? doc.gates : Object.values(doc.gates);
+    const seen = new Set();
+    const out = [];
+    for (const g of raw) {
+        const ref = String(
+            (g && typeof g === 'object' ? (g.ref || g.gate || g.name || g.stand) : g) || ''
+        ).trim().slice(0, 20);
+        if (!ref) continue;
+        const key = ref.toUpperCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const lat = g && typeof g === 'object' ? Number(g.lat ?? g.latitude) : NaN;
+        const lon = g && typeof g === 'object' ? Number(g.lon ?? g.lng ?? g.longitude) : NaN;
+        out.push({
+            ref,
+            lat: Number.isFinite(lat) ? lat : null,
+            lon: Number.isFinite(lon) ? lon : null,
+            kind: 'gate',
+        });
+    }
+    return out;
+}
+
 // A gate clash, in the words of the person who just lost the race. The store
 // tells us which uniqueness bit (see Postgrest.explain), so "that stand has
 // just gone" is never guessed — a pilot who is simply already signed up gets
@@ -3154,7 +3192,7 @@ app.get('/api/crew/:slug/events/:id/gates', async (req, res) => {
         let gates = [];
         let source = 'osm';
         try {
-            gates = await crewEvents.fetchAirportGates(icao, gateCoordsFor);
+            gates = await crewEvents.fetchAirportGates(icao, gateCoordsFor, localAirportGates);
         } catch (err) {
             // OpenStreetMap being slow or blocked must not take the board with
             // it. The stands pilots have already claimed are ours, not OSM's,
@@ -4082,6 +4120,78 @@ const publicPirep = (p) => ({
     source: p.source, status: p.status, flownAt: p.flownAt, createdAt: p.createdAt,
 });
 
+/* ===========================================================================
+ * THE PILOT'S OWN FLYING
+ *
+ * The pilot home showed four invented Air Canada legs — CYYZ→CYVR, CYYZ→EGLL,
+ * CYUL→KLGA, CYVR→RJTT — hardcoded into the page, plus a rank card reading
+ * "First Officer → Captain, 214h of 250h". Every pilot at every VA saw the same
+ * four flights and the same 214 hours, over a logbook that contained none of it.
+ *
+ * That is the same bug crewNotices.js was written to remove from the owner
+ * dashboard's activity feed. It was fixed there and never here, which meant the
+ * half of the product MOST people actually use was a mockup.
+ *
+ * One endpoint rather than four, because this is one screen: who the caller is,
+ * what rank that makes them, what they have flown, and the totals underneath.
+ * A page that has to stitch that together from /me/pilot + /pireps + /roster is
+ * a page that renders three different half-truths while it waits.
+ * ========================================================================= */
+app.get('/api/crew/:slug/me/flying', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const me = await crewPilot(req, store);
+
+        // Not signed in, or signed in as somebody with no roster identity. Not
+        // an error: the page shows its "link your pilot record" state, exactly
+        // as the staff dashboard's My flying card does.
+        if (!me || !me.memberId) {
+            return res.json({ pilot: null, rank: null, flights: [], totals: null });
+        }
+
+        const member = await store.getMember(me.memberId);
+        const hours = member ? Number(member.hours) || 0 : me.hours;
+        const flights = await store.listPirepsForMember(me.memberId);
+
+        // Totals from the pilot's OWN reports rather than the roster's hours
+        // column, and approved-only — a pending report is not yet time flown,
+        // and counting it would have the number drop when staff reject one.
+        const approved = flights.filter((f) => f.status === 'approved');
+        const since30d = Date.now() - 30 * 86400000;
+        const minutes = (list) => list.reduce((s, f) => s + (Number(f.durationMin) || 0), 0);
+        const recent = approved.filter((f) => {
+            const t = new Date(f.flownAt || f.createdAt).getTime();
+            return Number.isFinite(t) && t >= since30d;
+        });
+
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            pilot: {
+                memberId: me.memberId,
+                name: me.name,
+                callsign: me.callsign || '',
+                hours,
+                status: (member && member.status) || 'active',
+            },
+            // The whole ladder question answered server-side. The page draws a
+            // bar; deciding what "next rank" means — including a pilot who has
+            // the hours but is waiting on a check-ride — is not a thing to
+            // reimplement in markup that cannot see the ladder.
+            rank: crewRanks.memberRank(va.ranks, hours, member && member.checksPassed),
+            flights: flights.map(publicPirep),
+            totals: {
+                flights: approved.length,
+                pending: flights.filter((f) => f.status === 'pending').length,
+                rejected: flights.filter((f) => f.status === 'rejected').length,
+                minutes: minutes(approved),
+                minutes30d: minutes(recent),
+                flights30d: recent.length,
+                lastFlightAt: approved.length ? (approved[0].flownAt || approved[0].createdAt) : null,
+            },
+        });
+    } catch (err) { crewFail(res, err, { log: 'me/flying error', message: 'Could not load your flying.' }); }
+});
+
 // List PIREPs. Managers (flights.review) see everything and can filter by status;
 // everyone else sees the approved flights only — a public flight log.
 app.get('/api/crew/:slug/pireps', async (req, res) => {
@@ -4889,6 +4999,57 @@ function scopeStats(payload, isManager) {
     return { ...payload, stats };
 }
 
+/* ===========================================================================
+ * INSIGHTS — what this airline's flying actually looks like
+ *
+ * Separate from /stats on purpose. That endpoint answers "how big is this VA"
+ * for a public homepage, is computed in Postgres by crew_stats() and cached.
+ * This answers the questions a VA asks about its OWN operation — most flown
+ * route, who is carrying the airline this month, which published routes nobody
+ * has ever touched — every one of which is a GROUP BY that crew_stats does not
+ * do.
+ *
+ * Computed in JS rather than added to the SQL so it needs no schema bump: it
+ * works today on every VA, including those on an older schema and those still
+ * on legacy managed storage.
+ *
+ * Staff-facing, gated on flights.review — this names individual pilots and
+ * ranks them, which is roster business rather than something for the public
+ * page. The window is the caller's choice; 0 means all time.
+ * ========================================================================= */
+app.get('/api/crew/:slug/insights', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'flights.review');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const allowed = [0, 30, 90, 365];
+        const asked = parseInt(req.query.days, 10);
+        const days = allowed.includes(asked) ? asked : 90;
+
+        // A big read, so it is done once and sliced in memory rather than
+        // re-queried per section. The ceiling is high enough for any VA that
+        // exists and low enough that one request cannot hold their project open.
+        const [pireps, members, routes, notices] = await Promise.all([
+            store.listPireps({ status: '', limit: 5000 }),
+            store.listMembers({ limit: 5000 }),
+            store.listRoutes({ limit: 5000 }),
+            // Best-effort: a project predating the noticeboard still has flying
+            // worth reporting, and the crew-activity block is the only part
+            // that needs these.
+            Promise.resolve(store.listAnnouncements({ limit: 500 })).catch(() => []),
+        ]);
+
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            ok: true,
+            ...crewInsights.build({ pireps, members, routes, notices, days }),
+            // So the screen can say "of 1,284 reports, 903 are approved" rather
+            // than quietly reporting a subset as the whole.
+            counted: { approved: pireps.filter((p) => p.status === 'approved').length, reports: pireps.length },
+        });
+    } catch (err) { crewFail(res, err, { log: 'crew insights error', message: 'Could not work out your statistics.' }); }
+});
+
 app.get('/api/crew/:slug/stats', async (req, res) => {
     const slug = String(req.params.slug || '').trim().toLowerCase();
     try {
@@ -5062,6 +5223,121 @@ app.get('/api/crew/:slug/store/usage', async (req, res) => {
 // is 500 MB of database; a deployment whose VAs are on paid plans can raise it.
 // Only ever a reference line — nothing enforces it, and the screen says so.
 const CREW_STORAGE_LIMIT_MB = parseInt(process.env.CREW_STORAGE_LIMIT_MB, 10) || 500;
+
+/* ===========================================================================
+ * THE VA'S OWN DATA — what is in it, and getting rid of what they don't want
+ *
+ * The storage screen has been telling VAs "old flight reports are almost always
+ * the biggest thing, export them and remove them" while giving them no way to
+ * remove them except one bin at a time. This is that way.
+ *
+ * Owner only, deliberately. Every dataset here is one a staff role can already
+ * edit row by row — but "delete four years of flight reports" is not the same
+ * decision as "delete this flight report", and it is not one to hand to a
+ * capability that was granted for day-to-day work.
+ * ========================================================================= */
+
+/** Owner (or Inflight) on the right crew center. The gate every route here uses. */
+function requireCrewOwner(req, slug, what) {
+    const p = verifyCrewRequest(req);
+    if (!p) return { status: 401, error: 'Not authenticated.' };
+    if (!(p.kind === 'inflight' || p.role === 'owner')) {
+        return { status: 403, error: `Only the VA owner can ${what}.` };
+    }
+    if (p.kind !== 'inflight' && p.slug && p.slug !== String(slug).toLowerCase()) {
+        return { status: 403, error: 'Wrong crew center.' };
+    }
+    return { p };
+}
+
+// How old a purge can be asked to reach. Anything under a week is almost
+// certainly a mistyped number rather than an intention, and "older than 0 days"
+// is a wipe wearing a purge's clothes — that has its own, confirmed route.
+const PURGE_MIN_DAYS = 7;
+
+// What's in the VA's data, dataset by dataset, and how much of it a purge at the
+// requested age would take. Read-only: this is the screen that lets somebody
+// decide, and it must be safe to open.
+app.get('/api/crew/:slug/data', async (req, res) => {
+    const gate = requireCrewOwner(req, req.params.slug, 'manage the crew center’s data');
+    if (gate.status) return res.status(gate.status).json({ error: gate.error });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const days = Math.max(0, parseInt(req.query.olderThanDays, 10) || 0);
+        const before = days ? new Date(Date.now() - days * 86400000).toISOString() : null;
+
+        // One dataset failing must not blank the whole screen — a project on an
+        // older schema simply has no crew_events table, and the honest answer
+        // for that row is "not in this database", not a 500 for the other four.
+        const datasets = await Promise.all(Object.entries(crewStore.PURGE_DATASETS).map(async ([id, set]) => {
+            const base = { id, label: set.label, dateColumn: set.dateColumn };
+            try {
+                const total = await store.countPurgeable(id, {});
+                const matching = before ? await store.countPurgeable(id, { before }) : total;
+                return {
+                    ...base,
+                    total: total.count,
+                    totalCapped: !!total.capped,
+                    matching: matching.count,
+                    matchingCapped: !!matching.capped,
+                    unsupported: !!total.unsupported,
+                };
+            } catch (err) {
+                return { ...base, total: 0, matching: 0, unavailable: true, reason: err.message || '' };
+            }
+        }));
+
+        res.set('Cache-Control', 'no-store');
+        res.json({ datasets, olderThanDays: days, before, minDays: PURGE_MIN_DAYS, storeKind: store.kind });
+    } catch (err) { crewFail(res, err, { log: 'crew data summary error', message: 'Could not read what is in your data.' }); }
+});
+
+// Delete part of a dataset by age, or all of it.
+//
+// A wipe (`all: true`) must name the dataset back to us in `confirm`. That is
+// not ceremony: the by-age path and the wipe path differ by one field, and a
+// client bug that dropped `olderThanDays` would otherwise silently become
+// "delete everything".
+app.post('/api/crew/:slug/data/:dataset/purge', async (req, res) => {
+    const gate = requireCrewOwner(req, req.params.slug, 'delete data in bulk');
+    if (gate.status) return res.status(gate.status).json({ error: gate.error });
+
+    const dataset = String(req.params.dataset || '');
+    const set = crewStore.PURGE_DATASETS[dataset];
+    if (!set) return res.status(400).json({ error: 'Unknown dataset.', code: 'unknown_dataset' });
+
+    const all = req.body && req.body.all === true;
+    const days = Math.max(0, parseInt(req.body && req.body.olderThanDays, 10) || 0);
+
+    if (all) {
+        const confirm = String((req.body && req.body.confirm) || '');
+        if (confirm !== dataset) {
+            return res.status(400).json({
+                error: `Type “${dataset}” to confirm deleting all of it.`,
+                code: 'confirm_required',
+            });
+        }
+    } else if (days < PURGE_MIN_DAYS) {
+        return res.status(400).json({
+            error: `Pick an age of at least ${PURGE_MIN_DAYS} days, or choose to delete all of it.`,
+            code: 'purge_window_too_small',
+        });
+    }
+
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const before = all ? null : new Date(Date.now() - days * 86400000).toISOString();
+        const out = await store.purge(dataset, { before });
+
+        console.log(`crew data purge: ${req.params.slug} ${dataset} ${all ? 'ALL' : `older than ${days}d`} -> ${out.deleted} row(s)`);
+        res.json({
+            ...out,
+            label: set.label,
+            olderThanDays: all ? 0 : days,
+            all,
+        });
+    } catch (err) { crewFail(res, err, { log: 'crew data purge error', message: 'Could not delete that data.' }); }
+});
 
 // Move a VA's remaining managed data into their own project. Owner (or
 // Inflight) only — this is the one-way door out of our storage.
@@ -8379,6 +8655,81 @@ app.get('/api/public/va/:id/events', async (req, res) => {
 // request per partner on a map that may be showing dozens. Only events with a
 // departure airport are returned, since a map pin has to go somewhere.
 //   ?window=<hours>  how far ahead to look (default 72, max 336)
+/* ---------------------------------------------------------------------------
+ * Crew centre events, for the live map
+ *
+ * The feed below has only ever carried VaEvent rows — the ones a VA creates on
+ * its directory listing. A VA that runs a crew centre builds its calendar
+ * THERE, in its own Supabase project, and none of it reached the map. Two event
+ * systems, one of them invisible.
+ *
+ * Reading them means one query per connected VA, which is why this is cached
+ * hard and bounded: the map asks on every load, and a hundred partner VAs must
+ * not become a hundred round trips to a hundred different databases behind one
+ * public request.
+ *
+ * Failure is per-VA and silent. One airline's project being asleep is not a
+ * reason for the map to lose everybody else's events.
+ * ------------------------------------------------------------------------- */
+let _crewMapEventCache = { at: 0, events: [] };
+const CREW_MAP_EVENT_TTL_MS = 5 * 60 * 1000;
+const CREW_MAP_EVENT_VA_CAP = 120;      // partner VAs read per refresh
+const CREW_MAP_EVENT_CONCURRENCY = 8;
+
+async function crewCentreMapEvents(sinceMs, untilMs) {
+    if (Date.now() - _crewMapEventCache.at < CREW_MAP_EVENT_TTL_MS) return _crewMapEventCache.events;
+
+    const vas = await VirtualAirlineAd.find({
+        status: 'approved',
+        slug: { $nin: ['', null] },
+        supabaseUrl: { $nin: ['', null] },
+    }).select('_id name slug logoUrl callsign supabaseUrl supabaseServiceKey').limit(CREW_MAP_EVENT_VA_CAP).lean();
+
+    const out = [];
+    for (let i = 0; i < vas.length; i += CREW_MAP_EVENT_CONCURRENCY) {
+        const batch = vas.slice(i, i + CREW_MAP_EVENT_CONCURRENCY);
+        await Promise.all(batch.map(async (va) => {
+            try {
+                const store = await crewStore.forVaOrNull(va);
+                if (!store) return;
+                const events = await store.listEvents({ upcomingOnly: true });
+                for (const e of events || []) {
+                    if (e.status !== 'published') continue;      // drafts are not public
+                    const t = new Date(e.startsAt).getTime();
+                    if (!Number.isFinite(t) || t < sinceMs || t > untilMs) continue;
+                    const icao = crewEvents.gateAirport(e);
+                    if (!icao) continue;                          // a pin has to go somewhere
+                    out.push({
+                        id: `crew:${va.slug}:${e._id}`,
+                        source: 'crew',
+                        title: e.title,
+                        description: e.description || '',
+                        // Straight to the event in the VA's own crew centre.
+                        link: `/crew/${encodeURIComponent(va.slug)}?event=${encodeURIComponent(e._id)}`,
+                        departureIcao: String(icao).toUpperCase(),
+                        arrivalIcao: String(e.destination || '').toUpperCase(),
+                        bannerUrl: e.bannerUrl || '',
+                        groupCode: '',
+                        startsAt: e.startsAt,
+                        aircraft: e.aircraft || '',
+                        flightNumber: e.flightNumber || '',
+                        // What makes a crew-centre event worth pinning rather
+                        // than merely listing: you can see the stands.
+                        gates: { open: !!e.gatesOpen, locked: !!e.gatesLocked, icao: String(icao).toUpperCase() },
+                        va: {
+                            id: String(va._id), slug: va.slug, name: va.name,
+                            logo: va.logoUrl || '', callsign: va.callsign || '',
+                        },
+                    });
+                }
+            } catch (_) { /* one VA's project being down is not everyone's problem */ }
+        }));
+    }
+
+    _crewMapEventCache = { at: Date.now(), events: out };
+    return out;
+}
+
 app.get('/api/public/va-events/upcoming', async (req, res) => {
     try {
         const hours = Math.max(1, Math.min(336, parseInt(req.query.window, 10) || 72));
@@ -8392,7 +8743,12 @@ app.get('/api/public/va-events/upcoming', async (req, res) => {
             departureIcao: { $nin: ['', null] },
         }).sort({ startsAt: 1 }).limit(300).lean();
 
-        if (!events.length) {
+        // The other half of the calendar: events VAs build in their own crew
+        // centres. Best-effort — the directory events are already in hand and
+        // must not be lost because somebody's Supabase project timed out.
+        const crewList = await crewCentreMapEvents(since.getTime(), until.getTime()).catch(() => []);
+
+        if (!events.length && !crewList.length) {
             res.set('Cache-Control', 'public, max-age=60');
             return res.json({ events: [] });
         }
@@ -8400,34 +8756,53 @@ app.get('/api/public/va-events/upcoming', async (req, res) => {
         // One lookup for every VA involved, rather than one per event.
         const vaIds = [...new Set(events.map(e => String(e.vaAdId)).filter(Boolean))];
         const ads = await VirtualAirlineAd.find({ _id: { $in: vaIds }, status: 'approved' })
-            .select('_id name logoUrl callsign').lean();
+            .select('_id name logoUrl callsign slug').lean();
         const adById = new Map(ads.map(a => [String(a._id), a]));
+
+        const directory = events
+            // Drop events whose VA is gone or no longer approved — the map
+            // shouldn't advertise a listing the directory won't show.
+            .filter(e => adById.has(String(e.vaAdId)))
+            .map(e => {
+                const ad = adById.get(String(e.vaAdId));
+                return {
+                    id: String(e._id),
+                    source: 'directory',
+                    title: e.title,
+                    description: e.description || '',
+                    link: e.link || '',
+                    departureIcao: e.departureIcao || '',
+                    arrivalIcao: '',
+                    bannerUrl: e.bannerUrl || '',
+                    groupCode: e.groupCode || '',
+                    startsAt: e.startsAt,
+                    aircraft: '',
+                    flightNumber: '',
+                    gates: null,
+                    va: {
+                        id: String(ad._id),
+                        slug: ad.slug || '',
+                        name: ad.name,
+                        logo: ad.logoUrl || '',
+                        callsign: ad.callsign || '',
+                    },
+                };
+            });
+
+        // Both calendars, soonest first. A VA that runs both a listing and a
+        // crew centre can legitimately have an event in each — they are not
+        // de-duplicated, because we cannot tell whether two events at the same
+        // field an hour apart are one thing entered twice or two things.
+        const all = [...directory, ...crewList]
+            .sort((a, b) => new Date(a.startsAt) - new Date(b.startsAt));
 
         res.set('Cache-Control', 'public, max-age=60');
         res.json({
-            events: events
-                // Drop events whose VA is gone or no longer approved — the map
-                // shouldn't advertise a listing the directory won't show.
-                .filter(e => adById.has(String(e.vaAdId)))
-                .map(e => {
-                    const ad = adById.get(String(e.vaAdId));
-                    return {
-                        id: String(e._id),
-                        title: e.title,
-                        description: e.description || '',
-                        link: e.link || '',
-                        departureIcao: e.departureIcao || '',
-                        bannerUrl: e.bannerUrl || '',
-                        groupCode: e.groupCode || '',
-                        startsAt: e.startsAt,
-                        va: {
-                            id: String(ad._id),
-                            name: ad.name,
-                            logo: ad.logoUrl || '',
-                            callsign: ad.callsign || '',
-                        },
-                    };
-                }),
+            events: all,
+            // So the map can offer "show only these airlines" without a second
+            // request, and show the list even while no events are near you.
+            vas: [...new Map(all.map(e => [e.va.id, e.va])).values()]
+                .sort((a, b) => String(a.name).localeCompare(String(b.name))),
         });
     } catch (error) {
         console.error('Upcoming VA events error:', error);

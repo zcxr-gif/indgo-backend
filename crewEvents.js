@@ -43,7 +43,24 @@
 
 const axios = require('axios');
 
-const OVERPASS_ENDPOINT = process.env.OVERPASS_ENDPOINT || 'https://overpass-api.de/api/interpreter';
+// The mirrors, tried in order.
+//
+// The public overpass-api.de endpoint rate-limits hard and sheds load by
+// timing out — on an event evening, when a whole VA opens the same gate board
+// at once, it is the single most likely thing here to fail. One endpoint with
+// no alternative meant every one of those pilots got "OpenStreetMap is
+// unreachable" and an empty board. Kumi and France are independent instances
+// of the same data, so a refusal from one says nothing about the next.
+//
+// OVERPASS_ENDPOINT still wins outright when set, so a deployment pointing at
+// its own instance does not silently fan out to public ones.
+const OVERPASS_ENDPOINTS = process.env.OVERPASS_ENDPOINT
+    ? [process.env.OVERPASS_ENDPOINT]
+    : [
+        'https://overpass-api.de/api/interpreter',
+        'https://overpass.kumi.systems/api/interpreter',
+        'https://overpass.osm.ch/api/interpreter',
+    ];
 // 7 km covers sprawling fields (KDFW, OMDB, KORD) where remote hardstands sit
 // well outside the terminal core. The same radius the tracker's dispatch gate
 // picker uses, so the two agree about what "this airport's stands" means.
@@ -347,7 +364,7 @@ function parseOverpassGates(elements) {
  * know where the backend keeps its airport coordinates (and so a test can
  * supply its own).
  */
-async function fetchAirportGates(icaoCode, coordsFor) {
+async function fetchAirportGates(icaoCode, coordsFor, localGatesFor) {
     const code = String(icaoCode || '').trim().toUpperCase();
     if (!/^[A-Z0-9]{3,4}$/.test(code)) return [];
 
@@ -355,11 +372,45 @@ async function fetchAirportGates(icaoCode, coordsFor) {
     if (hit && (Date.now() - hit.at) < GATE_CACHE_TTL_MS) return hit.gates;
 
     const coords = typeof coordsFor === 'function' ? coordsFor(code) : null;
-    const res = await axios.post(OVERPASS_ENDPOINT, 'data=' + encodeURIComponent(gateQuery(code, coords)), {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        timeout: OVERPASS_TIMEOUT_MS,
-    });
-    const gates = parseOverpassGates(res.data && res.data.elements);
+    const body = 'data=' + encodeURIComponent(gateQuery(code, coords));
+
+    let gates = null;
+    let lastErr = null;
+    for (const endpoint of OVERPASS_ENDPOINTS) {
+        try {
+            const res = await axios.post(endpoint, body, {
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                timeout: OVERPASS_TIMEOUT_MS,
+            });
+            const parsed = parseOverpassGates(res.data && res.data.elements);
+            // An empty answer is a real answer for a field with no mapped
+            // stands — but it is also what a rate-limited mirror returns while
+            // pretending to be fine. Only an endpoint that found something ends
+            // the loop; an empty one falls through to the next, and if they all
+            // come back empty we take that as the truth.
+            gates = parsed;
+            if (parsed.length) break;
+        } catch (err) {
+            lastErr = err;
+        }
+    }
+
+    // Every mirror refused. Before giving up, ask our own gate dataset — the
+    // one /api/gates/:icao already serves. It has no coordinates for a map pin
+    // at every field, but a named stand a pilot can pick off the list is worth
+    // far more than an empty board and an apology.
+    if (gates === null && typeof localGatesFor === 'function') {
+        try {
+            const local = await localGatesFor(code);
+            if (Array.isArray(local) && local.length) {
+                // Not cached: this is the degraded answer, and caching it for a
+                // day would keep serving it long after Overpass came back.
+                return local;
+            }
+        } catch { /* the fallback failing is not worth reporting over the original */ }
+    }
+
+    if (gates === null) throw lastErr || new Error('Overpass unavailable.');
 
     _gateCache.set(code, { at: Date.now(), gates });
     // Oldest-first eviction. A Map keeps insertion order, so the first key is
