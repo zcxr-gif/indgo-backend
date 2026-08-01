@@ -2741,6 +2741,22 @@ app.get('/api/crew/:slug/partnership', async (req, res) => {
     }
     try {
         const { TOS_VERSION, TOS_EFFECTIVE_DATE, TOS_PAGE_PATH, TOS_PDF_PATH, getWarningLevel } = require('./vaTos');
+        // Every link below has to be ABSOLUTE, and this is why.
+        //
+        // The portal and the Terms page are served by THIS process. The crew
+        // center that reads this response is not — it is a static site on the
+        // tracker's origin. A path like "/va-portal.html" therefore resolves
+        // against the tracker, where no such page exists, and the owner who
+        // presses "Open the portal" gets a blank tab. Same for the Terms link,
+        // which landed on the tracker's own unrelated terms page.
+        //
+        // Built from the request rather than from a configured base URL on
+        // purpose: this request arrived at the host that serves the portal, so
+        // its own origin is the answer by construction and cannot drift out of
+        // step with wherever the backend is deployed. `trust proxy` is set, so
+        // protocol and host are the client-facing ones, not the internal hop.
+        const selfOrigin = `${req.protocol}://${req.get('host')}`.replace(/\/+$/, '');
+        const onBackend = (p) => `${selfOrigin}${p}`;
         // Resolved the way every other crew route resolves a VA, then re-read
         // for the partnership fields specifically: crewStore.SELECT is the set
         // the crew center needs to run an airline, and none of standing,
@@ -2818,8 +2834,8 @@ app.get('/api/crew/:slug/partnership', async (req, res) => {
             terms: {
                 version: TOS_VERSION,
                 effectiveDate: TOS_EFFECTIVE_DATE,
-                pageUrl: TOS_PAGE_PATH,
-                pdfUrl: TOS_PDF_PATH,
+                pageUrl: onBackend(TOS_PAGE_PATH),
+                pdfUrl: onBackend(TOS_PDF_PATH),
                 // Acknowledgement is recorded against a PORTAL ACCOUNT, not the
                 // VA — so the honest question here is "has anybody on this VA
                 // accepted the current version?", and the answer names them.
@@ -2837,11 +2853,13 @@ app.get('/api/crew/:slug/partnership', async (req, res) => {
             },
             // Where each of these is actually changed. Sent rather than hardcoded
             // in the browser so moving the portal does not strand a crew center.
+            // /va-portal, not /va-portal.html: the route is the documented one,
+            // and it is what the rest of the product links to.
             portal: {
-                url: '/va-portal.html',
-                submissionsUrl: '/va-portal.html#submissions',
-                warningsUrl: '/va-portal.html#warnings',
-                termsUrl: '/va-portal.html#terms',
+                url: onBackend('/va-portal'),
+                submissionsUrl: onBackend('/va-portal#submissions'),
+                warningsUrl: onBackend('/va-portal#warnings'),
+                termsUrl: onBackend('/va-portal#terms'),
             },
         });
     } catch (err) {
