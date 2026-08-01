@@ -8655,6 +8655,81 @@ app.get('/api/public/va/:id/events', async (req, res) => {
 // request per partner on a map that may be showing dozens. Only events with a
 // departure airport are returned, since a map pin has to go somewhere.
 //   ?window=<hours>  how far ahead to look (default 72, max 336)
+/* ---------------------------------------------------------------------------
+ * Crew centre events, for the live map
+ *
+ * The feed below has only ever carried VaEvent rows — the ones a VA creates on
+ * its directory listing. A VA that runs a crew centre builds its calendar
+ * THERE, in its own Supabase project, and none of it reached the map. Two event
+ * systems, one of them invisible.
+ *
+ * Reading them means one query per connected VA, which is why this is cached
+ * hard and bounded: the map asks on every load, and a hundred partner VAs must
+ * not become a hundred round trips to a hundred different databases behind one
+ * public request.
+ *
+ * Failure is per-VA and silent. One airline's project being asleep is not a
+ * reason for the map to lose everybody else's events.
+ * ------------------------------------------------------------------------- */
+let _crewMapEventCache = { at: 0, events: [] };
+const CREW_MAP_EVENT_TTL_MS = 5 * 60 * 1000;
+const CREW_MAP_EVENT_VA_CAP = 120;      // partner VAs read per refresh
+const CREW_MAP_EVENT_CONCURRENCY = 8;
+
+async function crewCentreMapEvents(sinceMs, untilMs) {
+    if (Date.now() - _crewMapEventCache.at < CREW_MAP_EVENT_TTL_MS) return _crewMapEventCache.events;
+
+    const vas = await VirtualAirlineAd.find({
+        status: 'approved',
+        slug: { $nin: ['', null] },
+        supabaseUrl: { $nin: ['', null] },
+    }).select('_id name slug logoUrl callsign supabaseUrl supabaseServiceKey').limit(CREW_MAP_EVENT_VA_CAP).lean();
+
+    const out = [];
+    for (let i = 0; i < vas.length; i += CREW_MAP_EVENT_CONCURRENCY) {
+        const batch = vas.slice(i, i + CREW_MAP_EVENT_CONCURRENCY);
+        await Promise.all(batch.map(async (va) => {
+            try {
+                const store = await crewStore.forVaOrNull(va);
+                if (!store) return;
+                const events = await store.listEvents({ upcomingOnly: true });
+                for (const e of events || []) {
+                    if (e.status !== 'published') continue;      // drafts are not public
+                    const t = new Date(e.startsAt).getTime();
+                    if (!Number.isFinite(t) || t < sinceMs || t > untilMs) continue;
+                    const icao = crewEvents.gateAirport(e);
+                    if (!icao) continue;                          // a pin has to go somewhere
+                    out.push({
+                        id: `crew:${va.slug}:${e._id}`,
+                        source: 'crew',
+                        title: e.title,
+                        description: e.description || '',
+                        // Straight to the event in the VA's own crew centre.
+                        link: `/crew/${encodeURIComponent(va.slug)}?event=${encodeURIComponent(e._id)}`,
+                        departureIcao: String(icao).toUpperCase(),
+                        arrivalIcao: String(e.destination || '').toUpperCase(),
+                        bannerUrl: e.bannerUrl || '',
+                        groupCode: '',
+                        startsAt: e.startsAt,
+                        aircraft: e.aircraft || '',
+                        flightNumber: e.flightNumber || '',
+                        // What makes a crew-centre event worth pinning rather
+                        // than merely listing: you can see the stands.
+                        gates: { open: !!e.gatesOpen, locked: !!e.gatesLocked, icao: String(icao).toUpperCase() },
+                        va: {
+                            id: String(va._id), slug: va.slug, name: va.name,
+                            logo: va.logoUrl || '', callsign: va.callsign || '',
+                        },
+                    });
+                }
+            } catch (_) { /* one VA's project being down is not everyone's problem */ }
+        }));
+    }
+
+    _crewMapEventCache = { at: Date.now(), events: out };
+    return out;
+}
+
 app.get('/api/public/va-events/upcoming', async (req, res) => {
     try {
         const hours = Math.max(1, Math.min(336, parseInt(req.query.window, 10) || 72));
@@ -8668,7 +8743,12 @@ app.get('/api/public/va-events/upcoming', async (req, res) => {
             departureIcao: { $nin: ['', null] },
         }).sort({ startsAt: 1 }).limit(300).lean();
 
-        if (!events.length) {
+        // The other half of the calendar: events VAs build in their own crew
+        // centres. Best-effort — the directory events are already in hand and
+        // must not be lost because somebody's Supabase project timed out.
+        const crewList = await crewCentreMapEvents(since.getTime(), until.getTime()).catch(() => []);
+
+        if (!events.length && !crewList.length) {
             res.set('Cache-Control', 'public, max-age=60');
             return res.json({ events: [] });
         }
@@ -8676,34 +8756,53 @@ app.get('/api/public/va-events/upcoming', async (req, res) => {
         // One lookup for every VA involved, rather than one per event.
         const vaIds = [...new Set(events.map(e => String(e.vaAdId)).filter(Boolean))];
         const ads = await VirtualAirlineAd.find({ _id: { $in: vaIds }, status: 'approved' })
-            .select('_id name logoUrl callsign').lean();
+            .select('_id name logoUrl callsign slug').lean();
         const adById = new Map(ads.map(a => [String(a._id), a]));
+
+        const directory = events
+            // Drop events whose VA is gone or no longer approved — the map
+            // shouldn't advertise a listing the directory won't show.
+            .filter(e => adById.has(String(e.vaAdId)))
+            .map(e => {
+                const ad = adById.get(String(e.vaAdId));
+                return {
+                    id: String(e._id),
+                    source: 'directory',
+                    title: e.title,
+                    description: e.description || '',
+                    link: e.link || '',
+                    departureIcao: e.departureIcao || '',
+                    arrivalIcao: '',
+                    bannerUrl: e.bannerUrl || '',
+                    groupCode: e.groupCode || '',
+                    startsAt: e.startsAt,
+                    aircraft: '',
+                    flightNumber: '',
+                    gates: null,
+                    va: {
+                        id: String(ad._id),
+                        slug: ad.slug || '',
+                        name: ad.name,
+                        logo: ad.logoUrl || '',
+                        callsign: ad.callsign || '',
+                    },
+                };
+            });
+
+        // Both calendars, soonest first. A VA that runs both a listing and a
+        // crew centre can legitimately have an event in each — they are not
+        // de-duplicated, because we cannot tell whether two events at the same
+        // field an hour apart are one thing entered twice or two things.
+        const all = [...directory, ...crewList]
+            .sort((a, b) => new Date(a.startsAt) - new Date(b.startsAt));
 
         res.set('Cache-Control', 'public, max-age=60');
         res.json({
-            events: events
-                // Drop events whose VA is gone or no longer approved — the map
-                // shouldn't advertise a listing the directory won't show.
-                .filter(e => adById.has(String(e.vaAdId)))
-                .map(e => {
-                    const ad = adById.get(String(e.vaAdId));
-                    return {
-                        id: String(e._id),
-                        title: e.title,
-                        description: e.description || '',
-                        link: e.link || '',
-                        departureIcao: e.departureIcao || '',
-                        bannerUrl: e.bannerUrl || '',
-                        groupCode: e.groupCode || '',
-                        startsAt: e.startsAt,
-                        va: {
-                            id: String(ad._id),
-                            name: ad.name,
-                            logo: ad.logoUrl || '',
-                            callsign: ad.callsign || '',
-                        },
-                    };
-                }),
+            events: all,
+            // So the map can offer "show only these airlines" without a second
+            // request, and show the list even while no events are near you.
+            vas: [...new Map(all.map(e => [e.va.id, e.va])).values()]
+                .sort((a, b) => String(a.name).localeCompare(String(b.name))),
         });
     } catch (error) {
         console.error('Upcoming VA events error:', error);
