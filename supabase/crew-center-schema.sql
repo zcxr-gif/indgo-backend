@@ -122,11 +122,28 @@ create table if not exists crew_members (
     -- gets promoted" rather than "the pilot is stuck and nobody knows why".
     -- ------------------------------------------------------------------------
     checks_passed text[] not null default '{}',
+    -- ------------------------------------------------------------------------
+    -- v10. The roster sweep.
+    --
+    -- When this pilot was last warned that they were running out of time —
+    -- either to fly their first flight inside the VA's probation window, or to
+    -- fly at all inside its inactivity window. Null means never warned.
+    --
+    -- It is never cleared. The sweep compares it against the anchor for the
+    -- state the pilot is in (their join date on probation, their last flight
+    -- otherwise), so a warning recorded before that anchor belongs to a cycle
+    -- that has already ended — which is what "they flew, then went quiet again"
+    -- looks like. Flying moves the anchor past the old warning and the next
+    -- silence warns afresh, with nothing to reset.
+    -- ------------------------------------------------------------------------
+    retention_warned_at timestamptz,
     created_at  timestamptz not null default now(),
     updated_at  timestamptz not null default now()
 );
 -- v7. Added separately so a project provisioned at v1–v6 picks it up on re-run.
 alter table crew_members add column if not exists checks_passed text[] not null default '{}';
+-- v10. Same, for the roster sweep's warning stamp.
+alter table crew_members add column if not exists retention_warned_at timestamptz;
 create index if not exists crew_members_va_idx      on crew_members (va_slug);
 create index if not exists crew_members_hours_idx   on crew_members (va_slug, hours desc);
 create index if not exists crew_members_if_idx      on crew_members (va_slug, if_user_id) where if_user_id <> '';
@@ -1136,5 +1153,5 @@ end $$;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 9)
+insert into crew_schema_info (id, version) values (1, 10)
 on conflict (id) do update set version = excluded.version, updated_at = now();

@@ -54,7 +54,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 9;
+const EXPECTED_SCHEMA_VERSION = 10;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -104,7 +104,7 @@ const STORAGE_SCHEMA_VERSION = 9;
 // ---------------------------------------------------------------------------
 const LATE_COLUMNS = {
     crew_routes: new Set(['kind', 'partner_name', 'partner_logo', 'min_rank']),
-    crew_members: new Set(['checks_passed']),
+    crew_members: new Set(['checks_passed', 'retention_warned_at']),
     crew_events: new Set(['route_id']),
     crew_pireps: new Set(['event_id', 'schedule_id']),
     crew_applications: new Set([
@@ -116,6 +116,7 @@ const LATE_COLUMNS = {
 // What each dropped column costs, in words a VA reads rather than column names.
 const DRIFT_LABELS = {
     'crew_members.checks_passed': 'check-ride sign-offs',
+    'crew_members.retention_warned_at': 'roster sweep warnings',
     'crew_events.route_id': 'events tied to a route',
     'crew_pireps.event_id': 'flights logged against an event',
     'crew_pireps.schedule_id': 'flights logged against a scheduled departure',
@@ -237,6 +238,12 @@ const memberFromRow = (r) => r && {
     // v7. The rungs this pilot has been signed off for. Names, not indexes —
     // see the schema, and crewRanks' header, for why.
     checksPassed: Array.isArray(r.checks_passed) ? r.checks_passed : [],
+    // v10. When the retention sweep last warned this pilot that they were
+    // running out of time — either to fly their first flight, or to fly at all.
+    // Compared against the join date / last flight rather than cleared, so
+    // flying moves the anchor past it and the next silence warns afresh. See
+    // crewRetention.alreadyWarned.
+    retentionWarnedAt: date(r.retention_warned_at),
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
 };
@@ -252,6 +259,7 @@ const memberToRow = (m) => {
     pick(m, out, 'ifcName', 'ifc_name', (v) => str(v, 60));
     pick(m, out, 'checksPassed', 'checks_passed', (v) => (Array.isArray(v)
         ? [...new Set(v.map((c) => str(c, 40)).filter(Boolean))].slice(0, 40) : []));
+    pick(m, out, 'retentionWarnedAt', 'retention_warned_at', (v) => (v ? new Date(v).toISOString() : null));
     return out;
 };
 
