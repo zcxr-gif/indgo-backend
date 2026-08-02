@@ -29,6 +29,7 @@ const crewInvite = require('./crewInvite');
 // The schedule's rules are normalised by the module that enforces them, so the
 // bounds a VA can save and the bounds the endpoints apply are one definition.
 const crewSchedules = require('./crewSchedules');
+const crewRetention = require('./crewRetention');
 
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString('hex');
 
@@ -569,6 +570,7 @@ function registerCrewAuthRoutes(app) {
             const touchesTeam = body.staffRoles !== undefined || body.staffAssignments !== undefined;
             const touchesOps = body.pirepAutoApprove !== undefined;
             const touchesSchedule = body.schedule !== undefined;
+            const touchesRetention = body.retention !== undefined;
             if (touchesBranding && !can('settings.branding')) return res.status(403).json({ error: 'You don’t have permission to change appearance.' });
             if (touchesRecruit && !can('settings.recruitment')) return res.status(403).json({ error: 'You don’t have permission to change recruitment settings.' });
             if (touchesTeam && !(isInflight || p.role === 'owner')) return res.status(403).json({ error: 'Only the owner can manage staff roles.' });
@@ -578,6 +580,13 @@ function registerCrewAuthRoutes(app) {
             // how it is bid for; one who is not should not be able to switch
             // self-service booking off for the whole airline.
             if (touchesSchedule && !can('schedules.manage')) return res.status(403).json({ error: 'You don’t have permission to change the schedule settings.' });
+            // Owner only, and not delegable. These settings remove pilots from
+            // the roster on a timer; that is the one thing in the crew center a
+            // staff member should not be able to switch on for the whole
+            // airline, however much of the day-to-day they otherwise run.
+            if (touchesRetention && !(isInflight || p.role === 'owner')) {
+                return res.status(403).json({ error: 'Only the owner can change the roster sweep.' });
+            }
 
             if (typeof req.body?.layout === 'string') {
                 const layout = req.body.layout.toLowerCase();
@@ -636,6 +645,18 @@ function registerCrewAuthRoutes(app) {
                     rules.minRank = '';
                 }
                 ad.crewSchedule = rules;
+            }
+            // The roster sweep. Merged and normalised the same way the schedule
+            // rules are, and by the module that ENFORCES them — a settings
+            // screen with its own idea of the bounds is how "90 days" gets
+            // saved and "7" gets applied.
+            if (req.body?.retention !== undefined && req.body.retention !== null) {
+                const incoming = req.body.retention;
+                if (typeof incoming !== 'object') {
+                    return res.status(400).json({ error: 'Retention settings must be an object.' });
+                }
+                const merged = { ...crewRetention.normalizeRules(ad.crewRetention), ...incoming };
+                ad.crewRetention = crewRetention.normalizeRules(merged);
             }
             if (typeof req.body?.joinMode === 'string' && ['free', 'application'].includes(req.body.joinMode)) {
                 ad.joinMode = req.body.joinMode;

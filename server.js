@@ -81,6 +81,7 @@ const crewInsights = require('./crewInsights');
 // each flown by one pilot. Seat allocation, repetition and what a departure is
 // allowed to say live there. See crewSchedules.js.
 const crewSchedules = require('./crewSchedules');
+const crewRetention = require('./crewRetention');
 
 // One-paste setup for a VA's Supabase project: given a Supabase access token we
 // install the schema, read the project's keys back and store the connection
@@ -320,6 +321,34 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
         cancelHoursBefore: { type: Number, default: 0, min: 0, max: 336 },
     },
 
+    // How this VA keeps its roster honest — the probation window a new recruit
+    // has to fly their first flight in, and the silence after which an
+    // established pilot stops counting as active. Stored here beside the rank
+    // ladder and the schedule rules because it is the same class of thing: a
+    // definition of how the airline is run, not operational data.
+    //
+    // OFF unless a VA switches it on, and every sub-rule off inside that. This
+    // is the one settings block in the product that DELETES PEOPLE, so it does
+    // not get a helpful default. Bounds are enforced again in crewRetention's
+    // normalizeRules — the module that also applies them — so a value saved
+    // here cannot mean something different when it runs.
+    crewRetention: {
+        enabled: { type: Boolean, default: false },
+        // Probation: fly and log one flight within firstFlightDays of joining.
+        firstFlight: { type: Boolean, default: false },
+        firstFlightDays: { type: Number, default: 7, min: 1, max: 90 },
+        firstFlightAction: { type: String, enum: ['remove', 'inactive'], default: 'remove' },
+        firstFlightWarnDays: { type: Number, default: 2, min: 0, max: 30 },
+        // Inactivity: no validated flight in inactivityDays.
+        inactivity: { type: Boolean, default: false },
+        inactivityDays: { type: Number, default: 30, min: 7, max: 365 },
+        inactivityAction: { type: String, enum: ['remove', 'inactive'], default: 'inactive' },
+        inactivityWarnDays: { type: Number, default: 7, min: 0, max: 60 },
+        // A VA's own staff are not swept by default; running the airline is not
+        // the same as flying it.
+        exemptStaff: { type: Boolean, default: true },
+    },
+
     // --- Recruitment / join settings ---
     // joinMode: 'free' = instant account; 'application' = staff review.
     joinMode: { type: String, enum: ['free', 'application'], default: 'application' },
@@ -362,6 +391,13 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
             // signups: a popular event would fire forty embeds in an evening,
             // which is how a channel gets muted.
             events:      { type: String, trim: true, default: '' },
+            // The roster sweep: first-flight warnings and deadlines, inactivity
+            // warnings and deadlines. Its own feed rather than riding
+            // recruitment, because the audience is different — recruitment is
+            // "somebody wants in", this is "somebody is on their way out", and
+            // a VA usually wants the second one where staff will actually see
+            // it rather than in the channel that pings on every application.
+            retention:   { type: String, trim: true, default: '' },
         }, { _id: false }),
         default: () => ({}),
         select: false,
@@ -935,7 +971,7 @@ function crewCredentialsHtml({ username, password, signInUrl }) {
 
 // The feeds a VA can point at a Discord channel. Adding one here is most of the
 // work of adding a new notification category.
-const CREW_FEEDS = ['recruitment', 'pireps', 'routes', 'events'];
+const CREW_FEEDS = ['recruitment', 'pireps', 'routes', 'events', 'retention'];
 
 /**
  * Load a VA's (secret) webhook URL for one feed.
@@ -1273,6 +1309,184 @@ function postScheduleNotice(va, action, schedule, actor, count = 1) {
             ].filter(Boolean),
         }))
         .catch(() => {});
+}
+
+// ---- The roster sweep ----
+//
+// crewRetention.js decides WHO is due; this applies it. Kept apart on purpose:
+// the decisions are pure and tested against a table of fixtures, and everything
+// with a side effect — a delete, a status change, a webhook — is here, where it
+// can be read in one sitting.
+//
+// Every action posts to the VA's retention feed BEFORE it happens, and the post
+// is not awaited: a Discord outage must not stop a sweep, and a sweep must not
+// wait on Discord. What it must never do is act without saying so, which is why
+// the notice is fired first.
+
+const RETENTION_COLORS = { warn: 0xD97706, removed: 0xDC2626, inactive: 0x6E685D, summary: 0x1C1A16 };
+
+function postRetentionNotice(va, kind, payload) {
+    if (!va) return;
+    crewWebhookUrlFor(va._id, 'retention')
+        .then((hook) => hook && postCrewNotice(hook, { ...payload, color: RETENTION_COLORS[kind] }))
+        .catch(() => {});
+}
+
+/** "Rae Okafor (TVA101)" — how a pilot is named in a notice. */
+const pilotLabel = (m) => [m.name || 'A pilot', m.callsign ? `(${m.callsign})` : ''].filter(Boolean).join(' ');
+
+/**
+ * Run the sweep for one VA.
+ *
+ * `dryRun` does everything except write and post, and returns the same shape —
+ * which is the whole point of it. This feature removes people, and an owner
+ * about to switch it on should be able to see exactly who the first run would
+ * take before it takes them.
+ */
+async function runRetentionSweep(va, { dryRun = false, now = Date.now() } = {}) {
+    const rules = crewRetention.normalizeRules(va.crewRetention);
+    const result = {
+        slug: va.slug || String(va._id), rules, dryRun,
+        warned: [], removed: [], deactivated: [], failed: [], checked: 0, skipped: '',
+    };
+    if (!rules.enabled || (!rules.firstFlight && !rules.inactivity)) {
+        result.skipped = 'not enabled';
+        return result;
+    }
+
+    let store;
+    try { store = await crewStore.forVa(va); } catch (err) {
+        result.skipped = `no store (${err && err.code ? err.code : 'error'})`;
+        return result;
+    }
+
+    let members = [];
+    let pireps = [];
+    try {
+        [members, pireps] = await Promise.all([
+            store.listMembers({ limit: 5000 }),
+            store.listPireps({ status: 'approved', limit: 20000 }),
+        ]);
+    } catch (err) {
+        // A VA whose project is unreachable or on an older shape is skipped
+        // whole. Sweeping a partial roster is how you delete the pilots whose
+        // flights did not come back.
+        result.skipped = `store read failed (${err && err.code ? err.code : err && err.message})`;
+        return result;
+    }
+
+    const due = crewRetention.assess({ members, pireps, rules, now });
+    result.checked = due.checked;
+
+    // Warnings first, and only warnings. A pilot warned on this run has not
+    // also run out of time on it — assess() puts them in one list or the other.
+    for (const w of [...due.probationWarn, ...due.inactivityWarn]) {
+        const m = w.member;
+        const first = due.probationWarn.includes(w);
+        result.warned.push({ id: m._id, name: m.name, callsign: m.callsign, rule: first ? 'first-flight' : 'inactivity', days: w.days });
+        if (dryRun) continue;
+        try {
+            await store.updateMember(m._id, { retentionWarnedAt: new Date(now).toISOString() });
+            postRetentionNotice(va, 'warn', {
+                title: `⏳ ${pilotLabel(m)} — ${w.days} day${w.days === 1 ? '' : 's'} left`,
+                description: first
+                    ? `They joined ${rules.firstFlightDays} days ago and have not logged a flight yet. If none arrives by <t:${Math.floor(w.dueAt.getTime() / 1000)}:D> their account will be ${w.action === 'remove' ? 'removed' : 'marked inactive'}.`
+                    : `No flight logged in ${rules.inactivityDays} days. If none arrives by <t:${Math.floor(w.dueAt.getTime() / 1000)}:D> they will be ${w.action === 'remove' ? 'removed' : 'marked inactive'}.`,
+                fields: [{ name: 'Rule', value: first ? 'First flight' : 'Inactivity', inline: true }],
+            });
+        } catch (err) {
+            result.failed.push({ id: m._id, name: m.name, stage: 'warn', error: err && err.message });
+        }
+    }
+
+    // Then the deadlines.
+    for (const d of [...due.probationDue, ...due.inactivityDue]) {
+        const m = d.member;
+        const first = due.probationDue.includes(d);
+        const remove = d.action === 'remove';
+        const row = { id: m._id, name: m.name, callsign: m.callsign, rule: first ? 'first-flight' : 'inactivity', hours: m.hours };
+        (remove ? result.removed : result.deactivated).push(row);
+        if (dryRun) continue;
+        try {
+            if (remove) {
+                // The login goes with the pilot. Leaving an account behind
+                // whose member row is gone is an account that can sign in to a
+                // crew center it is no longer on.
+                const acct = await store.getAccountByMember(m._id).catch(() => null);
+                if (acct) await store.deleteAccount(acct._id).catch(() => {});
+                await store.deleteMember(m._id);
+            } else {
+                await store.updateMember(m._id, { status: 'inactive' });
+            }
+            postRetentionNotice(va, remove ? 'removed' : 'inactive', {
+                title: remove
+                    ? `🗑️ ${pilotLabel(m)} removed from the roster`
+                    : `💤 ${pilotLabel(m)} marked inactive`,
+                description: first
+                    ? `No first flight within ${rules.firstFlightDays} days of joining.`
+                    : `No flight logged in ${rules.inactivityDays} days.`,
+                fields: [
+                    { name: 'Rule', value: first ? 'First flight' : 'Inactivity', inline: true },
+                    Number(m.hours) ? { name: 'Hours', value: String(Math.round(Number(m.hours) * 10) / 10), inline: true } : null,
+                ].filter(Boolean),
+            });
+        } catch (err) {
+            result.failed.push({ id: m._id, name: m.name, stage: remove ? 'remove' : 'deactivate', error: err && err.message });
+        }
+    }
+
+    // One summary when anything happened, so a VA reading only their Discord
+    // still knows a sweep ran and what it did.
+    if (!dryRun && (result.removed.length || result.deactivated.length)) {
+        postRetentionNotice(va, 'summary', {
+            title: '🧹 Roster sweep',
+            description: crewRetention.summarize(due),
+            fields: [
+                result.removed.length ? { name: 'Removed', value: String(result.removed.length), inline: true } : null,
+                result.deactivated.length ? { name: 'Marked inactive', value: String(result.deactivated.length), inline: true } : null,
+                result.warned.length ? { name: 'Warned', value: String(result.warned.length), inline: true } : null,
+            ].filter(Boolean),
+        });
+    }
+    return result;
+}
+
+/**
+ * Sweep every VA that has switched this on.
+ *
+ * Serial, not parallel: each VA is a separate Supabase project and a burst of
+ * concurrent connections buys nothing here — this runs on a timer with no user
+ * waiting on it, and being polite to a hundred small projects matters more than
+ * finishing a minute sooner.
+ */
+async function runRetentionSweepAll({ now = Date.now() } = {}) {
+    let vas = [];
+    try {
+        vas = await VirtualAirlineAd.find({
+            status: 'approved',
+            'crewRetention.enabled': true,
+        }).select(crewStore.SELECT + ' crewRetention').lean();
+    } catch (err) {
+        console.error('[retention] could not list VAs:', err && err.message);
+        return { vas: 0, removed: 0, deactivated: 0, warned: 0 };
+    }
+    const totals = { vas: 0, removed: 0, deactivated: 0, warned: 0 };
+    for (const va of vas) {
+        try {
+            const r = await runRetentionSweep(va, { now });
+            totals.vas += 1;
+            totals.removed += r.removed.length;
+            totals.deactivated += r.deactivated.length;
+            totals.warned += r.warned.length;
+            if (r.skipped) console.log(`[retention] ${r.slug}: skipped — ${r.skipped}`);
+            else if (r.removed.length || r.deactivated.length || r.warned.length || r.failed.length) {
+                console.log(`[retention] ${r.slug}: ${r.checked} checked, ${r.warned.length} warned, ${r.removed.length} removed, ${r.deactivated.length} inactive, ${r.failed.length} failed`);
+            }
+        } catch (err) {
+            console.error(`[retention] ${va.slug || va._id} sweep failed:`, err && err.message);
+        }
+    }
+    return totals;
 }
 
 function evaluateRequirements(reqs, stats, agreed) {
@@ -5035,6 +5249,72 @@ function scopeStats(payload, isManager) {
  * ranks them, which is roster business rather than something for the public
  * page. The window is the caller's choice; 0 means all time.
  * ========================================================================= */
+
+/* ===========================================================================
+ * THE ROSTER SWEEP
+ *
+ * Two endpoints, and the difference between them is the whole safety story.
+ *
+ *   GET  /retention   answers "who would this take?" and changes nothing.
+ *   POST /retention/run  actually runs it, now, off the timer.
+ *
+ * The preview exists because an owner cannot reasonably be asked to switch on
+ * something that deletes pilots and find out afterwards who it took. It is the
+ * same code path as the real sweep with dryRun set, so the list it shows is the
+ * list that would go — not a second implementation that could disagree.
+ *
+ * Owner-only, both of them, matching the settings gate in crewAuth.
+ * ========================================================================= */
+app.get('/api/crew/:slug/retention', async (req, res) => {
+    const p = verifyCrewRequest(req);
+    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+    if (!(p.kind === 'inflight' || p.role === 'owner')) {
+        return res.status(403).json({ error: 'Only the owner can see the roster sweep.' });
+    }
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const preview = await runRetentionSweep(va, { dryRun: true });
+        res.json({
+            rules: crewRetention.publicRules(va.crewRetention),
+            // What a run right now would do. Empty lists on a VA that has the
+            // feature switched off, which is the honest answer rather than an
+            // error — the settings screen shows this next to the switches.
+            preview: {
+                checked: preview.checked,
+                skipped: preview.skipped || '',
+                warned: preview.warned,
+                removed: preview.removed,
+                deactivated: preview.deactivated,
+            },
+        });
+    } catch (err) { crewFail(res, err, { log: 'retention preview error', message: 'Could not read the roster sweep.' }); }
+});
+
+app.post('/api/crew/:slug/retention/run', async (req, res) => {
+    const p = verifyCrewRequest(req);
+    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+    if (!(p.kind === 'inflight' || p.role === 'owner')) {
+        return res.status(403).json({ error: 'Only the owner can run the roster sweep.' });
+    }
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const rules = crewRetention.normalizeRules(va.crewRetention);
+        if (!rules.enabled) return res.status(400).json({ error: 'The roster sweep is switched off.' });
+        const out = await runRetentionSweep(va, { dryRun: false });
+        res.json({
+            ok: true,
+            checked: out.checked,
+            skipped: out.skipped || '',
+            warned: out.warned,
+            removed: out.removed,
+            deactivated: out.deactivated,
+            failed: out.failed,
+        });
+    } catch (err) { crewFail(res, err, { log: 'retention run error', message: 'Could not run the roster sweep.' }); }
+});
+
 app.get('/api/crew/:slug/insights', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'flights.review');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
@@ -10194,6 +10474,43 @@ setInterval(() => {
         console.log(line);
     }
 }, 5 * 60 * 1000).unref();
+
+// ---- The roster sweep, on a timer ----
+//
+// Every six hours, and the interval is deliberately not shorter. The rules are
+// day-granular, so running more often cannot change an outcome — it would only
+// mean touching every VA's Supabase project four times as much for the same
+// answer. Nothing here is time-critical: a pilot whose window closed at 02:00
+// being removed at 06:00 is the same removal.
+//
+// Re-running is safe by construction. A removed member is not there to remove
+// twice; a member already inactive is exempt; a warning is not repeated because
+// its timestamp is compared against an anchor that only flying moves. That is
+// what lets this be a plain interval rather than a scheduler with state.
+//
+// The first run waits a few minutes after boot so a deploy that crash-loops
+// cannot sweep a roster on every restart. RETENTION_SWEEP_DISABLED=1 turns it
+// off entirely, which is the switch to reach for if a VA ever reports something
+// unexpected — the endpoints stay available for a manual, supervised run.
+const RETENTION_SWEEP_MS = 6 * 3600 * 1000;
+const RETENTION_FIRST_RUN_MS = 5 * 60 * 1000;
+if (String(process.env.RETENTION_SWEEP_DISABLED || '').toLowerCase() !== '1') {
+    let sweeping = false;
+    const sweep = async () => {
+        // A sweep across many projects can outlast the interval. Overlapping
+        // runs would double every webhook and race two deletes of the same row.
+        if (sweeping) return console.warn('[retention] previous sweep still running — skipping this tick');
+        sweeping = true;
+        const started = Date.now();
+        try {
+            const t = await runRetentionSweepAll();
+            if (t.vas) console.log(`[retention] swept ${t.vas} VA(s) in ${Math.round((Date.now() - started) / 1000)}s — ${t.warned} warned, ${t.removed} removed, ${t.deactivated} inactive`);
+        } catch (err) {
+            console.error('[retention] sweep failed:', err && err.message);
+        } finally { sweeping = false; }
+    };
+    setTimeout(() => { sweep(); setInterval(sweep, RETENTION_SWEEP_MS).unref(); }, RETENTION_FIRST_RUN_MS).unref();
+}
 
 // Boot the live diagnostics sampler and feed it the two external state sources
 // the terminal reports on: the Discord client (gateway health + cache sizes +
