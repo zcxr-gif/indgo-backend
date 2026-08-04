@@ -60,6 +60,9 @@ const TOKEN_TTL = '7d';
 // Known layout presets + login looks (mirrors the crew center front-end).
 const CREW_LAYOUTS = ['editorial', 'console', 'split', 'classic'];
 const LOGIN_LOOKS = ['center', 'split'];
+// How a topic opens in the crew center: a slide-over on the dashboard, or a
+// page of its own with its own link. Mirrors CrewTopics.MODES in the tracker.
+const CREW_TOPIC_MODES = ['sheet', 'page'];
 
 const isHexColor = (c) => /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(c || '');
 const clampStr = (s, n) => String(s == null ? '' : s).trim().slice(0, n);
@@ -565,7 +568,7 @@ function registerCrewAuthRoutes(app) {
             const caps = effectiveCaps(ad, p);
             const can = (c) => caps.includes(c);
             const body = req.body || {};
-            const touchesBranding = ['layout', 'accent', 'loginLook', 'ranks', 'roles', 'fleet'].some(f => body[f] !== undefined);
+            const touchesBranding = ['layout', 'accent', 'loginLook', 'topicMode', 'ranks', 'roles', 'fleet'].some(f => body[f] !== undefined);
             const touchesRecruit = ['joinMode', 'minGrade', 'callsignPrefix', 'discordInvite', 'applicationForm', 'joinRequirements'].some(f => body[f] !== undefined);
             const touchesTeam = body.staffRoles !== undefined || body.staffAssignments !== undefined;
             const touchesOps = body.pirepAutoApprove !== undefined;
@@ -603,6 +606,16 @@ function registerCrewAuthRoutes(app) {
                     return res.status(400).json({ error: 'Enter a valid hex colour like #1c1a16.' });
                 }
                 ad.crewAccent = a; // '' clears it (falls back to the derived accent)
+            }
+            // How a topic opens in the crew center. Stored as the crew's
+            // default only: the dashboard lets a device override it, so this
+            // is what somebody's first visit gets, not what they are held to.
+            if (typeof req.body?.topicMode === 'string') {
+                const mode = req.body.topicMode.toLowerCase();
+                if (!CREW_TOPIC_MODES.includes(mode)) {
+                    return res.status(400).json({ error: 'Unknown way of opening topics.' });
+                }
+                ad.crewTopicMode = mode;
             }
             if (typeof req.body?.loginLook === 'string') {
                 const look = req.body.loginLook.toLowerCase();
@@ -699,7 +712,8 @@ function registerCrewAuthRoutes(app) {
             res.set('Cache-Control', 'no-store');
             res.json({
                 layout: ad.layout, allowedLayouts: ad.allowedLayouts, accent: ad.crewAccent || '',
-                loginLook: ad.loginLook || 'center', ranks: ad.ranks || [], roles: ad.roles || [], fleet: ad.crewFleet || [],
+                loginLook: ad.loginLook || 'center', topicMode: ad.crewTopicMode || 'sheet',
+                ranks: ad.ranks || [], roles: ad.roles || [], fleet: ad.crewFleet || [],
                 joinMode: ad.joinMode, minGrade: ad.minGrade, callsignPrefix: ad.callsignPrefix || '',
                 discordInvite: ad.crewDiscordInvite || '',
                 applicationForm: ad.applicationForm || [], joinRequirements: ad.joinRequirements || [],

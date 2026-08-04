@@ -252,6 +252,11 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     allowedLayouts: { type: [String], default: ['editorial', 'console', 'split', 'classic'] },
     // Which login-page look the VA uses (owner-chosen). See the crew.html looks.
     loginLook: { type: String, default: 'center' },
+    // How a crew center topic opens: 'sheet' (a slide-over on the dashboard) or
+    // 'page' (the topic takes the window and gets its own link). Owner-chosen,
+    // and only the crew's default — a device that has picked for itself keeps
+    // its choice. See crewTopicWindows.js in the tracker.
+    crewTopicMode: { type: String, default: 'sheet' },
     // Owner/staff-chosen accent for the crew center + login. Overrides the accent
     // otherwise derived from the VA's embed config. '' = fall back to that.
     crewAccent: { type: String, trim: true, default: '' },
@@ -8246,7 +8251,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewAccent ranks roles crewFleet crewPirepAutoApprove crewSchedule joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewTopicMode crewAccent ranks roles crewFleet crewPirepAutoApprove crewSchedule joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -8282,6 +8287,10 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             allowedLayouts: (Array.isArray(ad.allowedLayouts) && ad.allowedLayouts.length)
                 ? ad.allowedLayouts : ['editorial', 'console', 'split', 'classic'],
             loginLook: ad.loginLook || 'center',
+            // The crew's default for how a topic opens. Public for the same
+            // reason the layout is: the crew center reads it before it has a
+            // session, and it decides how the page is laid out on first paint.
+            topicMode: ad.crewTopicMode || 'sheet',
             ranks: Array.isArray(ad.ranks) ? ad.ranks : [],
             roles: Array.isArray(ad.roles) ? ad.roles : [],
             fleet: Array.isArray(ad.crewFleet) ? ad.crewFleet : [],
