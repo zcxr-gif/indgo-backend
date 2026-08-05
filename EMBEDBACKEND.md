@@ -172,14 +172,44 @@ grabbing every callsign that merely ends in a common tag like `VA`.
   airline callsigns alongside your tagged members. Alias in preview URLs:
   `callsigns`.
 
+- **Match mode** (`callsignMatch`) — `"strict"` (default) or `"broad"`. Chooses
+  which mistake the VA would rather live with; see the limitation below.
+  `"broad"` waives the suffix requirement in step 2, so a declared prefix is
+  enough on its own even when tags are configured.
+
 **How they combine (per flight):**
 
 1. If it prefix-matches any `regularCallsigns` → **included** (no tag needed).
 2. Else if it prefix-matches any `callsignPrefixes`:
    - no `callsignSuffixes` set → **included** (prefix-only mode)
    - `callsignSuffixes` set → included **only** if a tag is on one of the last
-     two tokens.
+     two tokens — **unless** `callsignMatch` is `"broad"`, which includes it on
+     the prefix alone.
 3. Otherwise → not this VA.
+
+### A limit worth stating plainly
+
+The only thing a live flight gives us is the callsign the pilot typed. Nothing
+else about the aircraft says which VA the pilot belongs to. Two consequences
+follow, and neither can be engineered away:
+
+- **A member on a codeshare leg is invisible.** They type the partner airline's
+  callsign, with no VA tag on it, so there is nothing to match. Mixing codeshare
+  callsigns with your own prefix means some of your pilots will not appear on the
+  map, however the rules are set.
+- **A stranger can look like a member.** `VA` is a near-universal tag, so a pilot
+  flying for a *different* airline's VA on a similar callsign is, by pattern
+  alone, indistinguishable from one of yours.
+
+`callsignMatch` is the choice between those two errors, not a fix for either:
+
+| Mode | What the map shows | What it costs |
+|---|---|---|
+| `strict` (default) | Only callsigns fitting your registered patterns | Members on codeshare or unregistered callsigns are missing |
+| `broad` | Also the bare prefix, catching more of your members | Somebody else's pilot can appear as one of yours |
+
+Strict is the default because showing another airline's pilot as yours is the
+error a VA has not agreed to.
 
 Suffix examples (`prefixes: ["Air Canada"]`, `suffixes: ["VA"]`):
 

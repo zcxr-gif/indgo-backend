@@ -267,6 +267,35 @@
                     <p class="text-xs text-zinc-400 mt-1">Untagged callsigns matched by name only and <em>always</em> included — even when suffixes run in tag mode. Use for staff / charter / plain airline callsigns.</p>
                 </div>
 
+                <!-- The honest bit. A VA setting this up will otherwise read a
+                     missing pilot as a bug in the map, and a stranger on the map
+                     as a bug in the matching. Both are the same limit. -->
+                <div>
+                    <label class="block text-sm font-semibold mb-1.5">Who appears on the map</label>
+                    <select id="f_callsignMatch" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                        <option value="strict">Only my VA callsigns — no one else's pilots</option>
+                        <option value="broad">Catch more of my pilots — may include someone else's</option>
+                    </select>
+                    <div class="mt-2 rounded-xl border-2 border-amber-200 dark:border-amber-900/60 bg-amber-50 dark:bg-amber-950/30 p-3">
+                        <p class="text-xs font-semibold text-amber-800 dark:text-amber-300">A limit worth knowing about</p>
+                        <p class="text-xs text-amber-800/90 dark:text-amber-300/80 mt-1 leading-relaxed">
+                            The only thing a live flight tells us is the callsign the pilot typed —
+                            nothing else says which VA they fly for. So a member on a <strong>codeshare
+                            leg</strong> types the partner airline's callsign, carries no tag of yours, and
+                            <strong>cannot</strong> be shown as one of yours. And because
+                            <strong>VA</strong> is a tag almost everyone uses, a pilot flying for a
+                            different airline's VA on a similar callsign looks exactly like one of yours.
+                        </p>
+                        <p class="text-xs text-amber-800/90 dark:text-amber-300/80 mt-2 leading-relaxed">
+                            <strong>Only my VA callsigns</strong> shows nobody who isn't yours, but members
+                            flying codeshare or unregistered callsigns will be missing.
+                            <strong>Catch more of my pilots</strong> finds those members, and accepts that
+                            somebody else's pilot may occasionally appear as one of yours.
+                            This is a choice between the two, not a setting that fixes either.
+                        </p>
+                    </div>
+                </div>
+
                 <div>
                     <label class="block text-sm font-semibold mb-1.5">Hubs (ICAO)</label>
                     <input id="f_hubs" placeholder="CYYZ, CYUL, CYVR" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
@@ -1085,6 +1114,7 @@
             document.getElementById('f_prefixes').value = (c.callsignPrefixes || []).join(', ');
             document.getElementById('f_suffixes').value = (c.callsignSuffixes || []).join(', ');
             document.getElementById('f_regulars').value = (c.regularCallsigns || []).join(', ');
+            document.getElementById('f_callsignMatch').value = c.callsignMatch === 'broad' ? 'broad' : 'strict';
             document.getElementById('f_hubs').value = (c.hubs || []).join(', ');
             document.getElementById('f_mode').value = c.mode || 'roster';
             document.getElementById('f_provider').value = c.provider || '';
@@ -1161,6 +1191,7 @@
                 callsignPrefixes: v('f_prefixes'),
                 callsignSuffixes: v('f_suffixes'),
                 regularCallsigns: v('f_regulars'),
+                callsignMatch: v('f_callsignMatch'),
                 hubs: v('f_hubs'),
                 mode: v('f_mode'),
                 provider: v('f_provider'),

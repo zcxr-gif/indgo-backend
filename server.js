@@ -1624,6 +1624,26 @@ const EmbedConfigSchema = new mongoose.Schema({
     // that fly alongside the tagged members. See EMBEDBACKEND.md §2c.
     regularCallsigns: { type: [String], default: [] },
 
+    /* How hard the widget should work to find this VA's pilots.
+     *
+     * There is a real limit here and it cannot be engineered away: the only
+     * thing a live flight gives us is the callsign the pilot typed. A member
+     * flying a codeshare leg types the partner airline's callsign and no VA
+     * tag at all, so nothing in it says which VA they belong to — and a
+     * stranger flying some OTHER airline's VA, whose callsign also happens to
+     * end in "VA", is indistinguishable from a member by pattern alone.
+     *
+     * A VA cannot have both, so it chooses which error it prefers:
+     *
+     *   'strict' — only callsigns that fit this VA's configured patterns. The
+     *     map shows nobody who isn't yours. Members on codeshare callsigns, or
+     *     any shape not registered here, will be missing.
+     *   'broad'  — also accept the prefix without the VA's own tag, catching
+     *     members whose callsign doesn't fit. The cost is that somebody flying
+     *     for a different VA on a similar callsign can appear as one of yours.
+     */
+    callsignMatch: { type: String, enum: ['strict', 'broad'], default: 'strict' },
+
     // Hub ICAOs. Each becomes a map marker whose window lists the VA's inbound
     // pilots. Stored uppercase, e.g. ["CYYZ", "CYUL", "CYVR"].
     hubs: { type: [String], default: [] },
@@ -10162,6 +10182,10 @@ const toResolvePayload = (cfg) => ({
     callsignPrefixes: (cfg.callsignPrefixes && cfg.callsignPrefixes.length) ? cfg.callsignPrefixes : [cfg.va.code],
     callsignSuffixes: cfg.callsignSuffixes || [],
     regularCallsigns: cfg.regularCallsigns || [],
+    // 'strict' = only this VA's registered callsign shapes; 'broad' = also the
+    // bare prefix, which finds more members and can also find somebody else's.
+    // See the field's note on the schema for why this is a choice and not a fix.
+    callsignMatch: cfg.callsignMatch === 'broad' ? 'broad' : 'strict',
     hubs: cfg.hubs || [],
     mode: cfg.mode || 'roster',
     provider: cfg.provider || (cfg.mapboxToken ? 'mapbox' : 'free'),
@@ -10262,6 +10286,12 @@ const applyEmbedFields = (cfg, body) => {
     // alias too. Full names, case preserved — matched like prefixes, never tags.
     if (body.regularCallsigns !== undefined || body.callsigns !== undefined) {
         cfg.regularCallsigns = toStringList(body.regularCallsigns ?? body.callsigns);
+    }
+    // Which error this VA would rather have on its map. Anything unrecognised
+    // means 'strict', because showing somebody else's pilot as yours is the
+    // error a VA has not agreed to.
+    if (body.callsignMatch !== undefined) {
+        cfg.callsignMatch = String(body.callsignMatch) === 'broad' ? 'broad' : 'strict';
     }
     // hubs accepts the body keys "hubs", "icao" or "hub"; stored uppercase ICAO.
     if (body.hubs !== undefined || body.icao !== undefined || body.hub !== undefined) {
