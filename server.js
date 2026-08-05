@@ -9823,27 +9823,61 @@ const resolveVaEventPartner = async (e) => {
     // just need the ONE VA listing that owns the webhook to post to (the webhook
     // lives on the listing, not in the event). So match the listing off that
     // attribution — its code/name — and only fall back to the raw callsign.
-    const codeBases = [...new Set([
+    //
+    // The two signals are NOT equivalent and must not share one $or.
+    //
+    // The sender's attribution (e.va.code / e.va.name) is authoritative: it says
+    // which VA this flight was flown for. The raw callsign is a guess, and a bad
+    // one on its own, because callsignAirlineBase throws the trailing tag away —
+    // "OCEAN 12XY" and "OCEAN 12VA" both reduce to "OCEAN". Pooled into a single
+    // query, a pilot flying for somebody else — or for nobody — landed in the
+    // webhook of whichever VA happened to own that base. That is the whole bug:
+    // VAs were getting other airlines' pilots posted into their feed.
+    //
+    // So attribution is tried first and trusted. The callsign is a fallback, and
+    // one that has to earn it: the live callsign must actually fit one of THAT
+    // listing's stored callsigns, tag and all ("<BASE> <number>VA"), not merely
+    // share a base with it.
+    const attrBases = [...new Set([
         normalizeCallsignBase(e.va?.code),
         callsignAirlineBase(e.va?.code),
+    ].filter(Boolean))];
+    const callsignBases = [...new Set([
         normalizeCallsignBase(e.callsign),
         callsignAirlineBase(e.callsign),
     ].filter(Boolean))];
+    const codeBases = [...new Set([...attrBases, ...callsignBases])]; // logging only
     const names = [...new Set([e.va?.name, e.va?.code]
         .map(s => String(s || '').trim()).filter(Boolean))];
 
-    const or = [];
-    if (codeBases.length) or.push({ callsigns: { $in: callsignQueryVariants(codeBases) } });
-    for (const n of names) or.push({ name: new RegExp('^' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
-
-    let ad = null;
-    if (or.length) {
+    const findPartner = async (or) => {
+        if (!or.length) return null;
         try {
-            ad = await VirtualAirlineAd.findOne({ $and: [{ $or: or }, OPTED_IN_PARTNER_FILTER] })
+            return await VirtualAirlineAd.findOne({ $and: [{ $or: or }, OPTED_IN_PARTNER_FILTER] })
                 .select(PARTNER_SELECT).lean();
         } catch (err) {
             console.error('[va-events] partner lookup failed:', err.message);
-            ad = null;
+            return null;
+        }
+    };
+
+    // 1. The sender said who this is. No callsign gate — re-checking the sender's
+    //    own answer against a strict "<base> ###VA" pattern is what used to drop
+    //    legitimate flights, codeshare legs above all.
+    const attrOr = [];
+    if (attrBases.length) attrOr.push({ callsigns: { $in: callsignQueryVariants(attrBases) } });
+    for (const n of names) attrOr.push({ name: new RegExp('^' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
+    let ad = await findPartner(attrOr);
+
+    // 2. Nothing attributed. Now the callsign may speak — but only if it really
+    //    is one of this listing's callsigns, tag included. A pilot flying
+    //    "OCEAN 12" or "OCEAN 12XY" is not flying for the VA that owns "OCEAN".
+    if (!ad && callsignBases.length) {
+        const guess = await findPartner([{ callsigns: { $in: callsignQueryVariants(callsignBases) } }]);
+        if (guess && matchVaCallsign(e.callsign, guess.callsigns || [])) {
+            ad = guess;
+        } else if (guess) {
+            console.log(`[va-events] callsign "${e.callsign}" shares a base with "${guess.name}" but carries no matching VA tag — not delivering`);
         }
     }
 
@@ -9853,9 +9887,12 @@ const resolveVaEventPartner = async (e) => {
     // to blindly). A bad URL here means SKIP, not roster-fallback: the sender was
     // explicit about which VA this is, so we don't hand its flight to another.
     //
-    // NOTE: we deliberately DON'T re-check the live callsign against the VA's
-    // stored callsigns — the sender already identified the VA; a second strict
-    // "<base> ###VA" gate used to drop legitimate flights.
+    // NOTE: no callsign re-check happens here. Where `ad` came from the sender's
+    // attribution the sender already identified the VA, and a second strict
+    // "<base> ###VA" gate used to drop legitimate flights — codeshare legs above
+    // all, since those carry the partner airline's callsign and not the VA tag.
+    // Where `ad` came from the callsign fallback the gate has already been
+    // applied, up in step 2, which is the only place it belongs.
     if (ad && ad.flightEventsWebhookUrl) {
         if (isDiscordWebhookUrl(ad.flightEventsWebhookUrl)) return ad;
         console.warn('[va-events] partner webhook not a valid Discord webhook, skipping:', ad.name);
