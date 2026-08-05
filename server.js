@@ -2693,13 +2693,60 @@ app.get('/api/crew/:slug/route-map', async (req, res) => {
             return { icao, lat, lon, dep: c.dep, arr: c.arr, routes: c.dep + c.arr, mapped: true };
         }).sort((a, b) => b.routes - a.routes || a.icao.localeCompare(b.icao));
 
+        /* What the crew is actually flying, for whoever plans the network.
+         *
+         * A published route network is a plan; the flight log is what happened.
+         * The gap between them is the question a route manager actually has —
+         * "we have flown FAOR-SBGR eleven times and it isn't in our network" —
+         * and until now the only way to see it was to read the PIREP list and
+         * the route list side by side.
+         *
+         * Gated on routes.manage rather than public: aggregate counts are not
+         * especially sensitive, but this exists to be acted on by the people
+         * who maintain the network, and the public response stays exactly as
+         * it was for everybody else.
+         */
+        const canManage = !(await requireCap(req, req.params.slug, 'routes.manage')).error;
+        let flown = null;
+        if (canManage) {
+            // Approved only. A pending report is a claim, and a rejected one is
+            // a claim the VA has already turned down — neither is evidence that
+            // the airline flies a city pair.
+            const pireps = await store.listPireps({ status: 'approved', limit: 5000 });
+            const published = new Set(out.map((r) => `${r.origin}>${r.destination}`));
+            const pairs = new Map();
+            for (const p of pireps) {
+                const origin = String(p.origin || '').trim().toUpperCase();
+                const destination = String(p.destination || '').trim().toUpperCase();
+                if (!origin || !destination || origin === destination) continue;
+                const key = `${origin}>${destination}`;
+                const e = pairs.get(key) || { origin, destination, flights: 0, minutes: 0 };
+                e.flights += 1;
+                e.minutes += Number(p.durationMin) || 0;
+                pairs.set(key, e);
+            }
+            flown = [...pairs.entries()].map(([key, e]) => {
+                const o = coordsFor(e.origin), d = coordsFor(e.destination);
+                return { ...e, o, d, mapped: !!(o && d), published: published.has(key) };
+            }).sort((a, b) => b.flights - a.flights);
+        }
+
         const mapped = out.filter((r) => r.mapped).length;
         res.json({
             routes: out,
             airports,
+            // Null rather than [] for a viewer who cannot see it, so the map can
+            // tell "no flying yet" apart from "not yours to look at".
+            flown,
             // `unmapped` is drawn as a warning chip on the map, so it counts
             // routes the VA can act on — a leg with an ICAO we cannot place.
-            stats: { mapped, unmapped: out.length - mapped, airports: airports.length },
+            stats: {
+                mapped,
+                unmapped: out.length - mapped,
+                airports: airports.length,
+                // City pairs the crew has flown that the network does not list.
+                unpublished: flown ? flown.filter((f) => !f.published).length : 0,
+            },
         });
     } catch (err) { crewFail(res, err, { log: 'route map error', message: 'Could not load the route map.' }); }
 });
