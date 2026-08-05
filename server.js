@@ -1624,6 +1624,26 @@ const EmbedConfigSchema = new mongoose.Schema({
     // that fly alongside the tagged members. See EMBEDBACKEND.md §2c.
     regularCallsigns: { type: [String], default: [] },
 
+    /* How hard the widget should work to find this VA's pilots.
+     *
+     * There is a real limit here and it cannot be engineered away: the only
+     * thing a live flight gives us is the callsign the pilot typed. A member
+     * flying a codeshare leg types the partner airline's callsign and no VA
+     * tag at all, so nothing in it says which VA they belong to — and a
+     * stranger flying some OTHER airline's VA, whose callsign also happens to
+     * end in "VA", is indistinguishable from a member by pattern alone.
+     *
+     * A VA cannot have both, so it chooses which error it prefers:
+     *
+     *   'strict' — only callsigns that fit this VA's configured patterns. The
+     *     map shows nobody who isn't yours. Members on codeshare callsigns, or
+     *     any shape not registered here, will be missing.
+     *   'broad'  — also accept the prefix without the VA's own tag, catching
+     *     members whose callsign doesn't fit. The cost is that somebody flying
+     *     for a different VA on a similar callsign can appear as one of yours.
+     */
+    callsignMatch: { type: String, enum: ['strict', 'broad'], default: 'strict' },
+
     // Hub ICAOs. Each becomes a map marker whose window lists the VA's inbound
     // pilots. Stored uppercase, e.g. ["CYYZ", "CYUL", "CYVR"].
     hubs: { type: [String], default: [] },
@@ -2629,6 +2649,128 @@ app.get('/api/crew/:slug/routes', async (req, res) => {
         });
     } catch (err) { crewFail(res, err, { log: 'routes list error', message: 'Could not load routes.' }); }
 });
+/* Public: the same network, joined to real airport coordinates so it can be
+ * drawn rather than listed.
+ *
+ * The crew center's network map has always asked for this. Until now nothing
+ * answered, so it fell back to a thirty-airport table compiled into the page —
+ * which meant a VA flying anywhere outside the world's majors watched its own
+ * network render as a handful of arcs and a row of "unmapped" chips. The
+ * coordinates were here the whole time: data/airport-coords.json is the same
+ * ~5,900-field index the flight-event card draws its route map from.
+ *
+ * Shape is dictated by what the map already reads (see rmFetch in
+ * crew-dashboard.html): every route carries `o`/`d` as [lat, lon] plus a
+ * `mapped` flag, and `airports` is the same set aggregated per field with its
+ * departure and arrival counts, which is what sizes the dots.
+ *
+ * Public for the reason /routes is: a route network is what a VA advertises,
+ * and `publicRoute` still decides per-viewer what is locked.
+ *
+ * (AIRPORT_COORDS and routeDistanceNm are initialized further down this file.
+ * Both are read at request time, long after the module has finished loading.)
+ */
+app.get('/api/crew/:slug/route-map', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const routes = await store.listRoutes();
+        const viewer = await crewViewer(req, store);
+
+        const coordsFor = (icao) => {
+            const v = AIRPORT_COORDS[String(icao || '').trim().toUpperCase()];
+            return (Array.isArray(v) && v.length === 2 && v.every(Number.isFinite)) ? v : null;
+        };
+
+        // icao -> { dep, arr } as we walk the network, so a field's size on the
+        // map is how much of the operation actually touches it.
+        const touched = new Map();
+        const bump = (icao, key) => {
+            if (!icao) return;
+            const e = touched.get(icao) || { dep: 0, arr: 0 };
+            e[key] += 1;
+            touched.set(icao, e);
+        };
+
+        const out = routes.map((r) => {
+            const pub = publicRoute(r, va.ranks, viewer);
+            const o = coordsFor(pub.origin);
+            const d = coordsFor(pub.destination);
+            if (o) bump(pub.origin, 'dep');
+            if (d) bump(pub.destination, 'arr');
+            return {
+                ...pub,
+                // A VA that never typed a distance still gets one on the map,
+                // computed from the two ends we just resolved — the same
+                // great-circle figure the flight-event card quotes.
+                distanceNm: pub.distanceNm || (o && d ? (routeDistanceNm(pub.origin, pub.destination) || 0) : 0),
+                o, d,
+                mapped: !!(o && d),
+            };
+        });
+
+        const airports = [...touched.entries()].map(([icao, c]) => {
+            const [lat, lon] = coordsFor(icao);
+            return { icao, lat, lon, dep: c.dep, arr: c.arr, routes: c.dep + c.arr, mapped: true };
+        }).sort((a, b) => b.routes - a.routes || a.icao.localeCompare(b.icao));
+
+        /* What the crew is actually flying, for whoever plans the network.
+         *
+         * A published route network is a plan; the flight log is what happened.
+         * The gap between them is the question a route manager actually has —
+         * "we have flown FAOR-SBGR eleven times and it isn't in our network" —
+         * and until now the only way to see it was to read the PIREP list and
+         * the route list side by side.
+         *
+         * Gated on routes.manage rather than public: aggregate counts are not
+         * especially sensitive, but this exists to be acted on by the people
+         * who maintain the network, and the public response stays exactly as
+         * it was for everybody else.
+         */
+        const canManage = !(await requireCap(req, req.params.slug, 'routes.manage')).error;
+        let flown = null;
+        if (canManage) {
+            // Approved only. A pending report is a claim, and a rejected one is
+            // a claim the VA has already turned down — neither is evidence that
+            // the airline flies a city pair.
+            const pireps = await store.listPireps({ status: 'approved', limit: 5000 });
+            const published = new Set(out.map((r) => `${r.origin}>${r.destination}`));
+            const pairs = new Map();
+            for (const p of pireps) {
+                const origin = String(p.origin || '').trim().toUpperCase();
+                const destination = String(p.destination || '').trim().toUpperCase();
+                if (!origin || !destination || origin === destination) continue;
+                const key = `${origin}>${destination}`;
+                const e = pairs.get(key) || { origin, destination, flights: 0, minutes: 0 };
+                e.flights += 1;
+                e.minutes += Number(p.durationMin) || 0;
+                pairs.set(key, e);
+            }
+            flown = [...pairs.entries()].map(([key, e]) => {
+                const o = coordsFor(e.origin), d = coordsFor(e.destination);
+                return { ...e, o, d, mapped: !!(o && d), published: published.has(key) };
+            }).sort((a, b) => b.flights - a.flights);
+        }
+
+        const mapped = out.filter((r) => r.mapped).length;
+        res.json({
+            routes: out,
+            airports,
+            // Null rather than [] for a viewer who cannot see it, so the map can
+            // tell "no flying yet" apart from "not yours to look at".
+            flown,
+            // `unmapped` is drawn as a warning chip on the map, so it counts
+            // routes the VA can act on — a leg with an ICAO we cannot place.
+            stats: {
+                mapped,
+                unmapped: out.length - mapped,
+                airports: airports.length,
+                // City pairs the crew has flown that the network does not list.
+                unpublished: flown ? flown.filter((f) => !f.published).length : 0,
+            },
+        });
+    } catch (err) { crewFail(res, err, { log: 'route map error', message: 'Could not load the route map.' }); }
+});
+
 app.post('/api/crew/:slug/routes', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'routes.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
@@ -9281,6 +9423,9 @@ const {
     buildVaEventPayload, extractRoute, isHttpUrl: isHttpImageUrl, clip: clipEmbed,
     trackUrl, resolveAccent, normalizeCardOptions, DEFAULT_CARD_OPTIONS,
     PUBLIC_BASE_URL: CARD_PUBLIC_BASE_URL,
+    // Also read by the crew route-map endpoint, so a VA's network map quotes
+    // the same leg distances the flight-event card does.
+    routeDistanceNm,
 } = require('./vaEventCard');
 const { renderVaEventCard, renderVaRouteMapImage } = require('./vaEventCardImage');
 const { RouteMapCache } = require('./routeMapCache');
@@ -9698,27 +9843,61 @@ const resolveVaEventPartner = async (e) => {
     // just need the ONE VA listing that owns the webhook to post to (the webhook
     // lives on the listing, not in the event). So match the listing off that
     // attribution — its code/name — and only fall back to the raw callsign.
-    const codeBases = [...new Set([
+    //
+    // The two signals are NOT equivalent and must not share one $or.
+    //
+    // The sender's attribution (e.va.code / e.va.name) is authoritative: it says
+    // which VA this flight was flown for. The raw callsign is a guess, and a bad
+    // one on its own, because callsignAirlineBase throws the trailing tag away —
+    // "OCEAN 12XY" and "OCEAN 12VA" both reduce to "OCEAN". Pooled into a single
+    // query, a pilot flying for somebody else — or for nobody — landed in the
+    // webhook of whichever VA happened to own that base. That is the whole bug:
+    // VAs were getting other airlines' pilots posted into their feed.
+    //
+    // So attribution is tried first and trusted. The callsign is a fallback, and
+    // one that has to earn it: the live callsign must actually fit one of THAT
+    // listing's stored callsigns, tag and all ("<BASE> <number>VA"), not merely
+    // share a base with it.
+    const attrBases = [...new Set([
         normalizeCallsignBase(e.va?.code),
         callsignAirlineBase(e.va?.code),
+    ].filter(Boolean))];
+    const callsignBases = [...new Set([
         normalizeCallsignBase(e.callsign),
         callsignAirlineBase(e.callsign),
     ].filter(Boolean))];
+    const codeBases = [...new Set([...attrBases, ...callsignBases])]; // logging only
     const names = [...new Set([e.va?.name, e.va?.code]
         .map(s => String(s || '').trim()).filter(Boolean))];
 
-    const or = [];
-    if (codeBases.length) or.push({ callsigns: { $in: callsignQueryVariants(codeBases) } });
-    for (const n of names) or.push({ name: new RegExp('^' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
-
-    let ad = null;
-    if (or.length) {
+    const findPartner = async (or) => {
+        if (!or.length) return null;
         try {
-            ad = await VirtualAirlineAd.findOne({ $and: [{ $or: or }, OPTED_IN_PARTNER_FILTER] })
+            return await VirtualAirlineAd.findOne({ $and: [{ $or: or }, OPTED_IN_PARTNER_FILTER] })
                 .select(PARTNER_SELECT).lean();
         } catch (err) {
             console.error('[va-events] partner lookup failed:', err.message);
-            ad = null;
+            return null;
+        }
+    };
+
+    // 1. The sender said who this is. No callsign gate — re-checking the sender's
+    //    own answer against a strict "<base> ###VA" pattern is what used to drop
+    //    legitimate flights, codeshare legs above all.
+    const attrOr = [];
+    if (attrBases.length) attrOr.push({ callsigns: { $in: callsignQueryVariants(attrBases) } });
+    for (const n of names) attrOr.push({ name: new RegExp('^' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
+    let ad = await findPartner(attrOr);
+
+    // 2. Nothing attributed. Now the callsign may speak — but only if it really
+    //    is one of this listing's callsigns, tag included. A pilot flying
+    //    "OCEAN 12" or "OCEAN 12XY" is not flying for the VA that owns "OCEAN".
+    if (!ad && callsignBases.length) {
+        const guess = await findPartner([{ callsigns: { $in: callsignQueryVariants(callsignBases) } }]);
+        if (guess && matchVaCallsign(e.callsign, guess.callsigns || [])) {
+            ad = guess;
+        } else if (guess) {
+            console.log(`[va-events] callsign "${e.callsign}" shares a base with "${guess.name}" but carries no matching VA tag — not delivering`);
         }
     }
 
@@ -9728,9 +9907,12 @@ const resolveVaEventPartner = async (e) => {
     // to blindly). A bad URL here means SKIP, not roster-fallback: the sender was
     // explicit about which VA this is, so we don't hand its flight to another.
     //
-    // NOTE: we deliberately DON'T re-check the live callsign against the VA's
-    // stored callsigns — the sender already identified the VA; a second strict
-    // "<base> ###VA" gate used to drop legitimate flights.
+    // NOTE: no callsign re-check happens here. Where `ad` came from the sender's
+    // attribution the sender already identified the VA, and a second strict
+    // "<base> ###VA" gate used to drop legitimate flights — codeshare legs above
+    // all, since those carry the partner airline's callsign and not the VA tag.
+    // Where `ad` came from the callsign fallback the gate has already been
+    // applied, up in step 2, which is the only place it belongs.
     if (ad && ad.flightEventsWebhookUrl) {
         if (isDiscordWebhookUrl(ad.flightEventsWebhookUrl)) return ad;
         console.warn('[va-events] partner webhook not a valid Discord webhook, skipping:', ad.name);
@@ -10000,6 +10182,10 @@ const toResolvePayload = (cfg) => ({
     callsignPrefixes: (cfg.callsignPrefixes && cfg.callsignPrefixes.length) ? cfg.callsignPrefixes : [cfg.va.code],
     callsignSuffixes: cfg.callsignSuffixes || [],
     regularCallsigns: cfg.regularCallsigns || [],
+    // 'strict' = only this VA's registered callsign shapes; 'broad' = also the
+    // bare prefix, which finds more members and can also find somebody else's.
+    // See the field's note on the schema for why this is a choice and not a fix.
+    callsignMatch: cfg.callsignMatch === 'broad' ? 'broad' : 'strict',
     hubs: cfg.hubs || [],
     mode: cfg.mode || 'roster',
     provider: cfg.provider || (cfg.mapboxToken ? 'mapbox' : 'free'),
@@ -10100,6 +10286,12 @@ const applyEmbedFields = (cfg, body) => {
     // alias too. Full names, case preserved — matched like prefixes, never tags.
     if (body.regularCallsigns !== undefined || body.callsigns !== undefined) {
         cfg.regularCallsigns = toStringList(body.regularCallsigns ?? body.callsigns);
+    }
+    // Which error this VA would rather have on its map. Anything unrecognised
+    // means 'strict', because showing somebody else's pilot as yours is the
+    // error a VA has not agreed to.
+    if (body.callsignMatch !== undefined) {
+        cfg.callsignMatch = String(body.callsignMatch) === 'broad' ? 'broad' : 'strict';
     }
     // hubs accepts the body keys "hubs", "icao" or "hub"; stored uppercase ICAO.
     if (body.hubs !== undefined || body.icao !== undefined || body.hub !== undefined) {
