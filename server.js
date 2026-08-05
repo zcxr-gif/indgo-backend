@@ -9283,6 +9283,116 @@ const {
     PUBLIC_BASE_URL: CARD_PUBLIC_BASE_URL,
 } = require('./vaEventCard');
 const { renderVaEventCard, renderVaRouteMapImage } = require('./vaEventCardImage');
+const { RouteMapCache } = require('./routeMapCache');
+
+/* --- Public route map image ---------------------------------------------------
+ *
+ * GET /api/route-map?dep=EGLL&arr=KJFK
+ *      [&lat=&lon=]                     live aircraft position, drawn as a dot
+ *      [&deplat=&deplon=&arrlat=&arrlon=]  explicit endpoints (see below)
+ *      [&style=dark|midnight|light|mono]
+ *      [&line=%23rrggbb]                route/marker colour
+ *      [&size=banner|og]                1200x420 (default) or 1200x630
+ *
+ * The same renderer the Discord webhook uses, exposed as a plain PNG so the
+ * tracker can show a flight's route without shipping a map provider or a key.
+ * Public and unauthenticated on purpose — a link-preview crawler cannot present
+ * a credential, and the image reveals nothing that isn't already on the map.
+ *
+ * Three things keep it from becoming a way to burn the container down:
+ *
+ *  1. A cache, because a shared link is fetched by many crawlers within seconds
+ *     of being posted and they all want the identical image. Entries with a live
+ *     aircraft position expire quickly; a bare route is fixed geometry and is
+ *     held far longer.
+ *  2. In-flight de-duplication, so a burst on a cold key renders ONCE and every
+ *     waiter is served that render rather than queueing a render each.
+ *  3. A ceiling on concurrent misses. Renders funnel through the process-wide
+ *     single-slot queue that webhook delivery also uses (see queueRender in
+ *     vaEventCardImage.js), so an unbounded miss storm would sit in front of real
+ *     flight events. Past the ceiling this sheds load with a 503 instead.
+ */
+const ROUTE_MAP_TTL_LIVE_MS = 5 * 60 * 1000;         // has a moving aircraft on it
+const ROUTE_MAP_TTL_STATIC_MS = 12 * 60 * 60 * 1000; // route geometry only
+
+const routeMapCache = new RouteMapCache({ max: 300, maxInflight: 4 });
+
+const ICAO_PARAM_RE = /^[A-Z0-9]{3,4}$/;
+const numParam = (v, limit) => {
+    const n = Number(v);
+    return (Number.isFinite(n) && Math.abs(n) <= limit) ? n : null;
+};
+
+app.get('/api/route-map', async (req, res) => {
+    try {
+        const q = req.query || {};
+        const dep = String(q.dep || '').trim().toUpperCase();
+        const arr = String(q.arr || '').trim().toUpperCase();
+        if (!ICAO_PARAM_RE.test(dep) || !ICAO_PARAM_RE.test(arr)) {
+            return res.status(400).json({ message: 'dep and arr must be 3-4 character airport codes.' });
+        }
+
+        const depLat = numParam(q.deplat, 90), depLon = numParam(q.deplon, 180);
+        const arrLat = numParam(q.arrlat, 90), arrLon = numParam(q.arrlon, 180);
+        const posLat = numParam(q.lat, 90), posLon = numParam(q.lon, 180);
+        const hasPos = posLat !== null && posLon !== null;
+
+        // normalizeCardOptions validates style/size/colour and falls back to the
+        // defaults, so an unknown value is ignored rather than rejected — a
+        // crawler following a stale link still gets an image.
+        const opts = normalizeCardOptions({
+            mapStyle: q.style,
+            mapSize: q.size,
+            mapLine: q.line,
+        });
+
+        // Round the position into the cache key. A cache keyed on raw decimals
+        // never hits: the aircraft moves a few metres between two crawlers and
+        // they each pay for a render of a visually identical map.
+        const r2 = (n) => (n === null ? '' : n.toFixed(2));
+        const key = [
+            dep, arr, opts.mapStyle, opts.mapSize, opts.mapLine || '',
+            r2(depLat), r2(depLon), r2(arrLat), r2(arrLon), r2(posLat), r2(posLon),
+        ].join('|');
+
+        const send = (buf) => {
+            const maxAge = Math.floor((hasPos ? ROUTE_MAP_TTL_LIVE_MS : ROUTE_MAP_TTL_STATIC_MS) / 1000);
+            res.set('Content-Type', 'image/png');
+            res.set('Cache-Control', `public, max-age=${maxAge}`);
+            res.set('Access-Control-Allow-Origin', '*');
+            res.send(buf);
+        };
+
+        const ttl = hasPos ? ROUTE_MAP_TTL_LIVE_MS : ROUTE_MAP_TTL_STATIC_MS;
+        const { value: png, status } = await routeMapCache.run(
+            key,
+            () => renderVaRouteMapImage({
+                departureIcao: dep,
+                arrivalIcao: arr,
+                depCoords: (depLat !== null && depLon !== null) ? [depLat, depLon] : undefined,
+                arrCoords: (arrLat !== null && arrLon !== null) ? [arrLat, arrLon] : undefined,
+                position: hasPos ? { lat: posLat, lon: posLon } : undefined,
+            }, opts),
+            // A miss is not cached: an unmappable route is cheap to re-answer,
+            // and caching the null would keep serving 404 for a field that has
+            // since been added to the coords index.
+            (buf) => (buf ? ttl : 0),
+        );
+
+        if (status === 'shed') {
+            res.set('Retry-After', '5');
+            return res.status(503).json({ message: 'Route map renderer is busy — try again shortly.' });
+        }
+        // Null means neither endpoint could be placed. That is a legitimate
+        // answer, not a server fault: the caller falls back to its own image.
+        if (!png) return res.status(404).json({ message: 'Route could not be mapped.' });
+
+        send(png);
+    } catch (error) {
+        console.error('Route map render error:', error.message);
+        res.status(500).json({ message: 'Could not render the route map.' });
+    }
+});
 
 // Shared roster helpers (parse/normalize usernames + thin DB ops on the VaPilot
 // model). Same module backs the VA portal so both surfaces behave identically.

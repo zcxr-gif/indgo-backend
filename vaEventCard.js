@@ -65,6 +65,11 @@ const PHOTO_SIDES = ['right', 'left'];
 // Route-map basemap looks. The concrete colour palettes live in the image
 // renderer; here we only validate the chosen key.
 const MAP_STYLES = ['dark', 'midnight', 'light', 'mono'];
+// Output shapes for the standalone route-map image. `banner` is the wide strip
+// posted under the Discord card and stays the default, so nothing about webhook
+// delivery changes. `og` is the 1.91:1 rectangle link-preview crawlers expect,
+// so a shared flight can unfurl as its own route.
+const MAP_SIZES = ['banner', 'og'];
 
 // A validated "#rrggbb" hex or '' (meaning: use the event's default colour).
 // Accepts "#rgb"/"#rrggbb" with or without the leading '#'.
@@ -107,6 +112,7 @@ const normalizeCardOptions = (raw = {}) => {
         showPhoto: o.showPhoto === undefined ? true : !!o.showPhoto,
         photoSide: PHOTO_SIDES.includes(o.photoSide) ? o.photoSide : 'right',
         mapStyle: MAP_STYLES.includes(o.mapStyle) ? o.mapStyle : 'dark',
+        mapSize: MAP_SIZES.includes(o.mapSize) ? o.mapSize : 'banner',
         mapLine: normalizeColor(o.mapLine),
         title: String(o.title == null ? '' : o.title).trim().slice(0, 240),
         fields: fields.length ? fields : DEFAULT_CARD_FIELDS.slice(),
@@ -351,7 +357,7 @@ module.exports = {
     // Derived route figures (shared with the image renderer).
     routeDistanceNm, eteMinutes, formatDuration, eteTextFor,
     // Card customization vocabulary + helpers (shared with the API/UI/renderer).
-    CARD_FIELD_KEYS, DEFAULT_CARD_FIELDS, CARD_LAYOUTS, CARD_IMAGE_STYLES, PHOTO_SIDES, MAP_STYLES,
+    CARD_FIELD_KEYS, DEFAULT_CARD_FIELDS, CARD_LAYOUTS, CARD_IMAGE_STYLES, PHOTO_SIDES, MAP_STYLES, MAP_SIZES,
     DEFAULT_CARD_OPTIONS, normalizeCardOptions, resolveAccent, resolveMapLine,
     normalizeHex, normalizeColor,
 };

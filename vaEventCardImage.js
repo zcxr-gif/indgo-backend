@@ -71,6 +71,26 @@ const coordsOf = (icao) => {
     return (Array.isArray(v) && v.length === 2 && v.every(Number.isFinite)) ? v : null;
 };
 
+// A usable [lat, lon] pair. Range-checked, not just finite: a caller that swaps
+// the two would otherwise hand us a longitude as a latitude and get a map
+// centred somewhere plausible-looking but wrong.
+const isLatLon = (v) => Array.isArray(v) && v.length === 2
+    && Number.isFinite(v[0]) && Number.isFinite(v[1])
+    && Math.abs(v[0]) <= 90 && Math.abs(v[1]) <= 180;
+
+// Great-circle distance in whole nautical miles between two [lat, lon] pairs.
+// routeDistanceNm() answers the same question from ICAO codes via the bundled
+// index; this is the form used when the endpoints came from the caller.
+const haversineNm = (a, b) => {
+    if (!isLatLon(a) || !isLatLon(b)) return null;
+    const r = (d) => d * Math.PI / 180;
+    const dLat = r(b[0] - a[0]), dLon = r(b[1] - a[1]);
+    const h = Math.sin(dLat / 2) ** 2
+        + Math.cos(r(a[0])) * Math.cos(r(b[0])) * Math.sin(dLon / 2) ** 2;
+    const nm = Math.round(3440.065 * 2 * Math.asin(Math.min(1, Math.sqrt(h))));
+    return nm > 0 ? nm : null;
+};
+
 // Leg distance (nm) is computed by the shared vaEventCard module so the image
 // card and the JSON embed can never disagree; `routeDistanceNm` is imported above.
 
@@ -170,9 +190,16 @@ const contain = async (buf, w, h) => {
 const LOGO = { x: 28, y: 28, w: 300, h: 56 };       // OUR brand logo (top-left)
 const PHOTO = { x: 488, y: 184, w: 688, h: 300 };   // aircraft photo (original size, centred)
 
-// Standalone route-map image dimensions (a wide banner that sits below the
-// card in the same Discord message).
-const MAP_IMG = { w: 1200, h: 420 };
+// Standalone route-map image dimensions. `banner` is the wide strip that sits
+// below the card in the same Discord message and remains the default; `og` is
+// the taller 1.91:1 shape a link-preview crawler wants. The geometry is
+// identical either way — buildRouteMapSvg fits the view to whatever panel rect
+// it is handed — so this is purely the output rectangle.
+const MAP_SIZE_PX = {
+    banner: { w: 1200, h: 420 },
+    og:     { w: 1200, h: 630 },
+};
+const MAP_IMG = MAP_SIZE_PX.banner;
 
 // --- Route map (offline SVG mini-map) ----------------------------------------
 const rad = (d) => d * Math.PI / 180;
@@ -217,7 +244,12 @@ const greatCirclePoints = (a, b, n = 64) => {
 // Build the route-map SVG fragment for the given panel rect, or null when
 // either endpoint is missing from the coords index. Pure string building.
 const buildRouteMapSvg = (route, pos, lineColor, pal, MAP) => {
-    const a = coordsOf(route.dep), b = coordsOf(route.arr);
+    // Explicit endpoint coordinates win over the bundled index. data/airport-
+    // coords.json holds ~5,900 fields, so a caller with a fuller database (the
+    // tracker ships every ICAO in airports.json) can map routes this module
+    // would otherwise have to refuse.
+    const a = route.depCoords || coordsOf(route.dep);
+    const b = route.arrCoords || coordsOf(route.arr);
     if (!a || !b) return null;
 
     const arc = greatCirclePoints(a, b);
@@ -350,19 +382,29 @@ const renderVaRouteMapImageImpl = async (e = {}, opts) => {
     try {
         const o = normalizeCardOptions(opts || {});
         const route = extractRoute(e);
+        // Caller-supplied endpoint coordinates, when it knows the fields better
+        // than data/airport-coords.json does.
+        if (isLatLon(e.depCoords)) route.depCoords = e.depCoords;
+        if (isLatLon(e.arrCoords)) route.arrCoords = e.arrCoords;
+
+        const dim = MAP_SIZE_PX[o.mapSize] || MAP_IMG;
         const line = resolveMapLine(e, o);
         const pal = paletteFor(o.mapStyle);
-        const inner = buildRouteMapSvg(route, e.position, line, pal, { x: 0, y: 0, w: MAP_IMG.w, h: MAP_IMG.h });
+        const inner = buildRouteMapSvg(route, e.position, line, pal, { x: 0, y: 0, w: dim.w, h: dim.h });
         if (!inner) return null;
 
-        // Corner chip: DEP → ARR plus the leg distance when we know it.
-        const distNm = routeDistanceNm(route.dep, route.arr);
+        // Corner chip: DEP → ARR plus the leg distance when we know it. With
+        // overridden endpoints the bundled index can't answer, so the distance
+        // is measured off the coordinates actually being drawn.
+        const distNm = (route.depCoords || route.arrCoords)
+            ? haversineNm(route.depCoords || coordsOf(route.dep), route.arrCoords || coordsOf(route.arr))
+            : routeDistanceNm(route.dep, route.arr);
         const chipTxt = `${clipText(route.dep, 5)} → ${clipText(route.arr, 5)}`
             + (distNm == null ? '' : `  ·  ≈ ${distNm.toLocaleString('en-US')} NM`);
         const chipW = Math.round(estTextW(chipTxt, 20)) + 44;
         const chip = `
-            <rect x="${MAP_IMG.w - chipW - 20}" y="20" width="${chipW}" height="40" rx="20" fill="${pal.chipBg}" fill-opacity="0.82"/>
-            <text x="${MAP_IMG.w - 20 - chipW / 2}" y="46" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="20" font-weight="bold" fill="${pal.chipText}">${esc(chipTxt)}</text>`;
+            <rect x="${dim.w - chipW - 20}" y="20" width="${chipW}" height="40" rx="20" fill="${pal.chipBg}" fill-opacity="0.82"/>
+            <text x="${dim.w - 20 - chipW / 2}" y="46" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="20" font-weight="bold" fill="${pal.chipText}">${esc(chipTxt)}</text>`;
 
         // Inflight logo, top-left, on a translucent pill (always shown — the map
         // is branded just like the card). Falls back to a wordmark if the asset
@@ -375,7 +417,7 @@ const renderVaRouteMapImageImpl = async (e = {}, opts) => {
         const wordmark = brand ? '' :
             `<text x="${MAP_LOGO.x}" y="${MAP_LOGO.y + 28}" font-family="DejaVu Sans, Arial, sans-serif" font-size="26" font-weight="bold" fill="#eef2f7">Inflight</text>`;
 
-        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${MAP_IMG.w}" height="${MAP_IMG.h}">${inner}${pill}${wordmark}${chip}</svg>`;
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${dim.w}" height="${dim.h}">${inner}${pill}${wordmark}${chip}</svg>`;
         const base = await sharp(Buffer.from(svg)).png().toBuffer();
         if (!brand) return base;
         const meta = await sharp(brand).metadata();
