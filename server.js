@@ -2629,6 +2629,81 @@ app.get('/api/crew/:slug/routes', async (req, res) => {
         });
     } catch (err) { crewFail(res, err, { log: 'routes list error', message: 'Could not load routes.' }); }
 });
+/* Public: the same network, joined to real airport coordinates so it can be
+ * drawn rather than listed.
+ *
+ * The crew center's network map has always asked for this. Until now nothing
+ * answered, so it fell back to a thirty-airport table compiled into the page —
+ * which meant a VA flying anywhere outside the world's majors watched its own
+ * network render as a handful of arcs and a row of "unmapped" chips. The
+ * coordinates were here the whole time: data/airport-coords.json is the same
+ * ~5,900-field index the flight-event card draws its route map from.
+ *
+ * Shape is dictated by what the map already reads (see rmFetch in
+ * crew-dashboard.html): every route carries `o`/`d` as [lat, lon] plus a
+ * `mapped` flag, and `airports` is the same set aggregated per field with its
+ * departure and arrival counts, which is what sizes the dots.
+ *
+ * Public for the reason /routes is: a route network is what a VA advertises,
+ * and `publicRoute` still decides per-viewer what is locked.
+ *
+ * (AIRPORT_COORDS and routeDistanceNm are initialized further down this file.
+ * Both are read at request time, long after the module has finished loading.)
+ */
+app.get('/api/crew/:slug/route-map', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const routes = await store.listRoutes();
+        const viewer = await crewViewer(req, store);
+
+        const coordsFor = (icao) => {
+            const v = AIRPORT_COORDS[String(icao || '').trim().toUpperCase()];
+            return (Array.isArray(v) && v.length === 2 && v.every(Number.isFinite)) ? v : null;
+        };
+
+        // icao -> { dep, arr } as we walk the network, so a field's size on the
+        // map is how much of the operation actually touches it.
+        const touched = new Map();
+        const bump = (icao, key) => {
+            if (!icao) return;
+            const e = touched.get(icao) || { dep: 0, arr: 0 };
+            e[key] += 1;
+            touched.set(icao, e);
+        };
+
+        const out = routes.map((r) => {
+            const pub = publicRoute(r, va.ranks, viewer);
+            const o = coordsFor(pub.origin);
+            const d = coordsFor(pub.destination);
+            if (o) bump(pub.origin, 'dep');
+            if (d) bump(pub.destination, 'arr');
+            return {
+                ...pub,
+                // A VA that never typed a distance still gets one on the map,
+                // computed from the two ends we just resolved — the same
+                // great-circle figure the flight-event card quotes.
+                distanceNm: pub.distanceNm || (o && d ? (routeDistanceNm(pub.origin, pub.destination) || 0) : 0),
+                o, d,
+                mapped: !!(o && d),
+            };
+        });
+
+        const airports = [...touched.entries()].map(([icao, c]) => {
+            const [lat, lon] = coordsFor(icao);
+            return { icao, lat, lon, dep: c.dep, arr: c.arr, routes: c.dep + c.arr, mapped: true };
+        }).sort((a, b) => b.routes - a.routes || a.icao.localeCompare(b.icao));
+
+        const mapped = out.filter((r) => r.mapped).length;
+        res.json({
+            routes: out,
+            airports,
+            // `unmapped` is drawn as a warning chip on the map, so it counts
+            // routes the VA can act on — a leg with an ICAO we cannot place.
+            stats: { mapped, unmapped: out.length - mapped, airports: airports.length },
+        });
+    } catch (err) { crewFail(res, err, { log: 'route map error', message: 'Could not load the route map.' }); }
+});
+
 app.post('/api/crew/:slug/routes', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'routes.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
@@ -9281,6 +9356,9 @@ const {
     buildVaEventPayload, extractRoute, isHttpUrl: isHttpImageUrl, clip: clipEmbed,
     trackUrl, resolveAccent, normalizeCardOptions, DEFAULT_CARD_OPTIONS,
     PUBLIC_BASE_URL: CARD_PUBLIC_BASE_URL,
+    // Also read by the crew route-map endpoint, so a VA's network map quotes
+    // the same leg distances the flight-event card does.
+    routeDistanceNm,
 } = require('./vaEventCard');
 const { renderVaEventCard, renderVaRouteMapImage } = require('./vaEventCardImage');
 const { RouteMapCache } = require('./routeMapCache');
