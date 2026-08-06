@@ -271,10 +271,15 @@ const VALUE_BASELINE = 102;
 // through the corners whatever theme the reader is using, which a card faking
 // round corners with its own background colour cannot do.
 const CARD_RADIUS = 28;
-// The favourite-aircraft photo, full-bleed across the bottom of the card. Wide
-// and shallow because that is the shape an aircraft is; a squarer crop spends
-// its height on sky and tarmac.
-const PHOTO_H = 300;
+// The favourite-aircraft photo. It is a PANEL, inset to the same margins as the
+// tiles and rounded to the same radius, so it reads as one more thing in the
+// grid rather than as a picture the card happens to end on. Wide and shallow
+// because that is the shape an aircraft is; a squarer crop spends its height on
+// sky and tarmac.
+const PHOTO_H = 268;
+const PHOTO_RADIUS = 20;
+// It sits in the grid, so it is exactly as wide as the grid.
+const PHOTO_W = WIDTH - PAD * 2;
 // The VA badge's mark. Height is fixed; width follows the logo's aspect up to
 // the ceiling, so a wordmark gets room and a roundel stays square.
 const VA_LOGO_H = 62;
@@ -398,12 +403,13 @@ async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, pho
     const gridW = WIDTH - PAD * 2;
     const tileW = Math.floor((gridW - TILE_GAP * (cols - 1)) / cols);
 
-    // With a photo the footer rides ON the band rather than under it — the band
-    // is full-bleed to the card's bottom edge, so there is nowhere below it to
-    // put anything.
+    // The photo panel is just another row of the grid: same left/right margins,
+    // same gap above it, and the footer sits below it in its own strip exactly
+    // as it does on a card that has no photo at all.
     const gridBottom = HEADER_H + rows * TILE_H + (rows - 1) * TILE_GAP;
-    const photoTop = photo ? gridBottom + PAD - 12 : 0;
-    const height = photo ? photoTop + PHOTO_H : gridBottom + FOOTER_H + PAD;
+    const photoTop = photo ? gridBottom + TILE_GAP : 0;
+    const contentBottom = photo ? photoTop + PHOTO_H : gridBottom;
+    const height = contentBottom + FOOTER_H + PAD;
 
     const parts = [];
 
@@ -508,18 +514,24 @@ async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, pho
     });
 
     // --- Footer ---
-    // Without a photo it sits in its own strip. With one it sits over the band's
-    // scrim, in light ink — a dark-grey footer on a photograph is unreadable
-    // whatever the theme, because the theme stops applying the moment there is a
-    // picture underneath.
-    const footY = photo ? height - 26 : height - FOOTER_H + 34;
-    const footFill = photo ? 'rgba(255,255,255,0.72)' : pal.faint;
-    const footerSvg = `
-        <text x="${PAD}" y="${footY}" font-family="${FONT}" font-size="17" fill="${footFill}">
+    // Always its own strip on the card's background, in theme ink — the photo
+    // is a panel now, so nothing is ever printed over a photograph and the
+    // footer can stay the same line on every card.
+    const footY = height - FOOTER_H + 34;
+    parts.push(`
+        <text x="${PAD}" y="${footY}" font-family="${FONT}" font-size="17" fill="${pal.faint}">
             inflight.info</text>
         <text x="${WIDTH - PAD}" y="${footY}" text-anchor="end" font-family="${FONT}" font-size="17"
-              fill="${footFill}">${esc(pro ? `Updated monthly · ${stamp(statsAt)}` : `As of ${stamp(statsAt)}`)}</text>`;
-    if (!photo) parts.push(footerSvg);
+              fill="${pal.faint}">${esc(pro ? `Updated monthly · ${stamp(statsAt)}` : `As of ${stamp(statsAt)}`)}</text>`);
+
+    // The plate the photo is composited onto. Drawn even though the picture
+    // covers it, so a photo that fetches but fails to decode leaves a tile-shaped
+    // panel rather than a hole in the grid.
+    if (photo) {
+        parts.push(`
+            <rect x="${PAD}" y="${photoTop}" width="${PHOTO_W}" height="${PHOTO_H}" rx="${PHOTO_RADIUS}"
+                  fill="${pal.tile}" stroke="${pal.tileLine}" stroke-width="1.5"/>`);
+    }
 
     const defs = `
         <defs>
@@ -560,63 +572,64 @@ async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, pho
     }
 
     // --- The favourite aircraft, photographed ---
-    // Three layers, in order: the photo itself (masked so the card's bottom
-    // corners survive it), a scrim so text on top of an arbitrary photograph is
-    // always readable, then the aircraft name and the footer.
+    // Three layers, in order: the photo itself (rounded to the panel's corners),
+    // a scrim so text on top of an arbitrary photograph is readable, then the
+    // aircraft name and the panel's hairline border.
     if (photo) {
         const band = await sharp(photo)
-            .resize(WIDTH, PHOTO_H, { fit: 'cover', position: 'attention' })
-            .composite([{ input: bandCornerMask(height - photoTop), blend: 'dest-in' }])
+            .resize(PHOTO_W, PHOTO_H, { fit: 'cover', position: 'attention' })
+            .composite([{ input: panelMask(), blend: 'dest-in' }])
             .png().toBuffer();
 
         const label = s.fav?.aircraft ? clamp(s.fav.aircraft, 30) : null;
         const sub = s.fav?.livery ? clamp(s.fav.livery, 34) : null;
+        // Text is inset from the PANEL's edge, not the card's, so the caption
+        // has the same breathing room inside its container that a tile's label
+        // has inside its own.
+        const textX = PAD + 30;
         const overlay = Buffer.from(`
             <svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${height}">
               <defs>
                 <linearGradient id="scrim" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stop-color="#000" stop-opacity="0.62"/>
-                  <stop offset="42%" stop-color="#000" stop-opacity="0.18"/>
-                  <stop offset="100%" stop-color="#000" stop-opacity="0.80"/>
+                  <stop offset="0%" stop-color="#000" stop-opacity="0.68"/>
+                  <stop offset="60%" stop-color="#000" stop-opacity="0.16"/>
+                  <stop offset="100%" stop-color="#000" stop-opacity="0.34"/>
                 </linearGradient>
-                <clipPath id="cardClip2"><rect x="0" y="0" width="${WIDTH}" height="${height}" rx="${CARD_RADIUS}"/></clipPath>
+                <clipPath id="photoClip">
+                  <rect x="${PAD}" y="${photoTop}" width="${PHOTO_W}" height="${PHOTO_H}" rx="${PHOTO_RADIUS}"/>
+                </clipPath>
               </defs>
-              <g clip-path="url(#cardClip2)">
-                <rect x="0" y="${photoTop}" width="${WIDTH}" height="${PHOTO_H}" fill="url(#scrim)"/>
-                ${label ? `<text x="${PAD}" y="${photoTop + 52}" font-family="${FONT}" font-size="15"
+              <g clip-path="url(#photoClip)">
+                <rect x="${PAD}" y="${photoTop}" width="${PHOTO_W}" height="${PHOTO_H}" fill="url(#scrim)"/>
+                ${label ? `<text x="${textX}" y="${photoTop + 48}" font-family="${FONT}" font-size="15"
                         font-weight="bold" letter-spacing="2.2" fill="rgba(255,255,255,0.66)">FAVOURITE AIRCRAFT</text>
-                    <text x="${PAD}" y="${photoTop + 100}" font-family="${FONT}" font-size="40"
+                    <text x="${textX}" y="${photoTop + 96}" font-family="${FONT}" font-size="40"
                         font-weight="bold" fill="#ffffff">${esc(label)}</text>` : ''}
-                ${label && sub ? `<text x="${PAD}" y="${photoTop + 132}" font-family="${FONT}" font-size="20"
+                ${label && sub ? `<text x="${textX}" y="${photoTop + 128}" font-family="${FONT}" font-size="20"
                         fill="rgba(255,255,255,0.80)">${esc(sub)}</text>` : ''}
-                ${footerSvg}
               </g>
+              <rect x="${PAD}" y="${photoTop}" width="${PHOTO_W}" height="${PHOTO_H}" rx="${PHOTO_RADIUS}"
+                    fill="none" stroke="${pal.tileLine}" stroke-width="1.5"/>
             </svg>`);
 
         out = sharp(await out.png().toBuffer())
-            .composite([{ input: band, left: 0, top: photoTop }, { input: overlay, left: 0, top: 0 }]);
+            .composite([{ input: band, left: PAD, top: photoTop }, { input: overlay, left: 0, top: 0 }]);
     }
 
     return out.png().toBuffer();
 }
 
 /**
- * An alpha mask that rounds only the BOTTOM corners of the photo band.
+ * An alpha mask that rounds all four corners of the photo panel.
  *
- * The band is full-bleed and runs to the card's bottom edge, so its lower
- * corners are the card's corners and have to be cut out of the photo — the
- * SVG clip path cannot reach it, because the photo is composited as a raster
- * layer after the SVG has already been rasterized.
- *
- * @param {number} bandH how much of the band lies below `photoTop`
+ * The SVG clip path cannot reach the photo, because the photo is composited as
+ * a raster layer after the SVG has already been rasterized — so the rounding
+ * has to be cut out of the pixels themselves.
  */
-function bandCornerMask(bandH) {
-    const r = CARD_RADIUS;
-    // Drawn as a rounded rect pulled upward by `r` so only its bottom corners
-    // land inside the band; the top edge is squared off against the tiles.
+function panelMask() {
     return Buffer.from(
-        `<svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${PHOTO_H}">
-           <rect x="0" y="${-r}" width="${WIDTH}" height="${Math.min(bandH, PHOTO_H) + r}" rx="${r}" fill="#fff"/>
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${PHOTO_W}" height="${PHOTO_H}">
+           <rect x="0" y="0" width="${PHOTO_W}" height="${PHOTO_H}" rx="${PHOTO_RADIUS}" fill="#fff"/>
          </svg>`);
 }
 
