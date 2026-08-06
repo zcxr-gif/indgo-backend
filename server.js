@@ -10138,7 +10138,38 @@ const { RouteMapCache } = require('./routeMapCache');
 const ROUTE_MAP_TTL_LIVE_MS = 5 * 60 * 1000;         // has a moving aircraft on it
 const ROUTE_MAP_TTL_STATIC_MS = 12 * 60 * 60 * 1000; // route geometry only
 
-const routeMapCache = new RouteMapCache({ max: 300, maxInflight: 4 });
+/*
+ * The image caches' memory budgets.
+ *
+ * These hold PNG Buffers, which live in Node's EXTERNAL memory — outside the V8
+ * heap, so `--max-old-space-size` does not cap them and the container's limit
+ * kills the process with no heap error and no stack to read afterwards.
+ *
+ * An entry-count ceiling alone does not bound that, because these values are not
+ * remotely uniform: a route map is flat colour and lines, while an IFC card
+ * carrying a photograph of an aircraft is a LOSSLESS encoding of a photograph.
+ * Measured, that is 6 KB against 1.1 MB — so "200 cards" was somewhere between
+ * 1 MB and 200 MB depending entirely on which pilots happened to be viewed, and
+ * the two caches together could retain a quarter of a gigabyte without either
+ * one exceeding its documented limit.
+ *
+ * That is the shape of failure the card endpoint was showing: fine for hours,
+ * then the container is killed, because the total climbs as DISTINCT keys are
+ * viewed rather than with request volume.
+ *
+ * 48 MB each. Chosen against what they actually hold rather than as a round
+ * number: 48 MB is roughly 50 photo-bearing cards or several hundred maps, which
+ * covers the hot set either endpoint has at any moment — a burst is
+ * simultaneous views of ONE image, which the in-flight de-duplication already
+ * collapses, not fifty distinct ones. Overridable so a bigger container can use
+ * what it has.
+ */
+const IMAGE_CACHE_BYTES = Math.max(
+    4 * 1024 * 1024,
+    (Number(process.env.IMAGE_CACHE_MB) || 48) * 1024 * 1024,
+);
+
+const routeMapCache = new RouteMapCache({ max: 300, maxInflight: 4, maxBytes: IMAGE_CACHE_BYTES });
 
 const ICAO_PARAM_RE = /^[A-Z0-9]{3,4}$/;
 const numParam = (v, limit) => {
@@ -10387,7 +10418,14 @@ const ifCardSlug = () => require('crypto').randomBytes(9).toString('base64url');
 // proxy sits between), and every one of them would otherwise queue a render
 // behind live VA webhook cards. Same cache class, same load-shedding, as the
 // route map above.
-const ifCardRenderCache = new RouteMapCache({ max: 200, maxInflight: 3 });
+//
+// `max` is down from 200 to 120 alongside the byte budget. The count was set
+// against "how many distinct pilots might be viewed", which is the wrong
+// question — the photo band makes a single card as expensive as a hundred maps,
+// so the bytes are the real ceiling and the count is only a cheap second guard.
+const ifCardRenderCache = new RouteMapCache({
+    max: 120, maxInflight: 3, maxBytes: IMAGE_CACHE_BYTES,
+});
 const IF_CARD_RENDER_TTL_MS = 10 * 60 * 1000;
 // Browser/CDN caching. Deliberately modest: it has to be long enough that a
 // popular profile is not re-rendering constantly, and short enough that a
@@ -12161,12 +12199,77 @@ app.get(/(.*)/, requireAuthPage, (req, res) => {
 // container's memory cap to enable the threshold warning (logging runs regardless).
 const MEMORY_LIMIT_MB = parseInt(process.env.MEMORY_LIMIT_MB, 10) || 0;
 const MEMORY_WARN_RATIO = 0.85;
+// Past this share of the cap the image caches are dropped. Above the warn ratio
+// on purpose: a warning is "watch this", and this is "we are about to be killed".
+const MEMORY_SHED_RATIO = 0.92;
 const mb = (bytes) => Math.round(bytes / 1024 / 1024);
+
+/**
+ * What the image caches are holding, for the memory line.
+ *
+ * `external` already tells us Buffers are growing, but not WHICH buffers, and
+ * these two caches are the largest deliberate retention in the process — a card
+ * bearing a photograph of an aircraft is a lossless encoding of a photograph,
+ * about 1.1 MB against a route map's 6 KB. Naming them turns "external is
+ * climbing" into "the card cache is at 47 of 48 MB", which is the difference
+ * between knowing there is a leak and knowing where it is.
+ */
+const imageCacheLine = () => {
+    const parts = [];
+    for (const [name, cache] of [['maps', routeMapCache], ['cards', ifCardRenderCache]]) {
+        try {
+            const s = cache.stats();
+            parts.push(`${name}=${s.entries}/${mb(s.bytes)}MB`);
+        } catch { /* a cache that cannot report is not worth failing the log for */ }
+    }
+    return parts.length ? ' ' + parts.join(' ') : '';
+};
+
+/**
+ * Give the memory back rather than be killed for it.
+ *
+ * The container OOM-kills with no application log, so the cost of being wrong
+ * here is a crash loop that looks like the service "just disappearing" — which
+ * is precisely how the IFC profile card presented: fine for hours, then a broken
+ * image on every profile at once, because the process that draws it was gone.
+ *
+ * These caches are pure memos. Dropping them costs one render per hot key and
+ * nothing else — no state is lost, nothing is inconsistent afterwards. Against
+ * being killed, that is not a close call, so at 92% of the cap they go.
+ *
+ * Reported loudly and with the figures, because a process quietly dumping its
+ * caches every few minutes is itself a finding: it means the budgets above are
+ * too big for this container, or something else in here is growing.
+ */
+let memoryShedCount = 0;
+const shedImageCaches = (rssMb) => {
+    const before = imageCacheLine();
+    let freed = 0;
+    for (const cache of [routeMapCache, ifCardRenderCache]) {
+        try { freed += cache.bytes; cache.clear(); } catch { /* nothing to do */ }
+    }
+    memoryShedCount += 1;
+    console.warn(
+        `⚠️  [mem] rss=${rssMb}MB is ${Math.round((rssMb / MEMORY_LIMIT_MB) * 100)}% of the `
+        + `${MEMORY_LIMIT_MB}MB cap — dropped the image caches (${mb(freed)}MB,${before}). `
+        + `Shed ${memoryShedCount} time(s) since boot. Cards and maps will re-render on demand; `
+        + 'if this repeats, lower IMAGE_CACHE_MB or give the container more memory.',
+    );
+    // If the process was started with --expose-gc (it is; see package.json's
+    // start script) the freed buffers can be returned to the OS now rather than
+    // whenever V8 next feels like it — which is the whole point of doing this
+    // before the cap rather than after.
+    if (typeof global.gc === 'function') { try { global.gc(); } catch { /* best effort */ } }
+};
+
 setInterval(() => {
     const m = process.memoryUsage();
     const rssMb = mb(m.rss);
-    const line = `[mem] rss=${rssMb}MB heapUsed=${mb(m.heapUsed)}MB heapTotal=${mb(m.heapTotal)}MB external=${mb(m.external)}MB`;
-    if (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_WARN_RATIO) {
+    const line = `[mem] rss=${rssMb}MB heapUsed=${mb(m.heapUsed)}MB heapTotal=${mb(m.heapTotal)}MB`
+        + ` external=${mb(m.external)}MB${imageCacheLine()}`;
+    if (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_SHED_RATIO) {
+        shedImageCaches(rssMb);
+    } else if (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_WARN_RATIO) {
         console.warn(`⚠️  ${line} — near ${MEMORY_LIMIT_MB}MB cap (${Math.round((rssMb / MEMORY_LIMIT_MB) * 100)}%)`);
     } else {
         console.log(line);
