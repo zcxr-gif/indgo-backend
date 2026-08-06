@@ -275,6 +275,10 @@ const CARD_RADIUS = 28;
 // and shallow because that is the shape an aircraft is; a squarer crop spends
 // its height on sky and tarmac.
 const PHOTO_H = 300;
+// The VA badge's mark. Height is fixed; width follows the logo's aspect up to
+// the ceiling, so a wordmark gets room and a roundel stays square.
+const VA_LOGO_H = 62;
+const VA_LOGO_MAX_W = 160;
 
 /**
  * How many tiles per row, for a given number of them.
@@ -333,7 +337,7 @@ const stamp = (d) => {
  *                                   The CALLER resolves this — the renderer has
  *                                   no database and should not grow one.
  */
-async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, photoUrl } = {}) {
+async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, photoUrl, va } = {}) {
     const s = stats || {};
     const pal = themeFor(normalizeTheme(theme));
     const keys = normalizeFields(fields);
@@ -341,7 +345,27 @@ async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, pho
     // The photo is fetched BEFORE the layout is sized, because a photo we cannot
     // get is a band we must not leave a gap for. Everything downstream keys off
     // `photo` being non-null rather than off the URL having been supplied.
-    const photo = photoUrl ? await fetchPhoto(photoUrl) : null;
+    const photo = photoUrl ? await fetchImage(photoUrl) : null;
+    // The VA badge is likewise resolved up front — a logo we cannot fetch still
+    // leaves the VA's NAME, which is the part that matters, so the badge falls
+    // back to text rather than disappearing with the picture.
+    const vaLogo = va?.logoUrl ? await fetchImage(va.logoUrl) : null;
+
+    // The plate takes the logo's shape rather than forcing the logo into a
+    // square. VA marks are wordmarks about as often as they are roundels, and a
+    // 3:1 wordmark letterboxed into 62x62 renders about a fifth of the plate
+    // with the airline's name too small to read. Height is fixed so the badge
+    // still lines up with the pilot's name whatever shape arrives.
+    let vaLogoW = VA_LOGO_H;
+    if (vaLogo) {
+        try {
+            const meta = await sharp(vaLogo).metadata();
+            if (meta.width && meta.height) {
+                const aspect = meta.width / meta.height;
+                vaLogoW = Math.round(Math.min(Math.max(VA_LOGO_H * aspect, VA_LOGO_H), VA_LOGO_MAX_W));
+            }
+        } catch (_) { /* undecodable; the square fallback plate is drawn below */ }
+    }
 
     // Resolve to drawable tiles first: the grid is sized from what SURVIVES,
     // not from what was asked for, so a missing stat costs no empty square.
@@ -405,10 +429,43 @@ async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, pho
         <text x="${PAD}" y="${104}" font-family="${FONT}" font-size="44" font-weight="bold"
               fill="${pal.ink}">${esc(handle)}</text>`);
 
+    // --- The VA badge ---
+    // Top-right, because a VA is who the pilot flies FOR — identity, alongside
+    // their name, rather than a statistic among statistics. Only ever drawn from
+    // a VA the caller has already confirmed the pilot is on the roster of; this
+    // function has no database and takes the claim as settled.
+    const vaName = va?.name ? clamp(va.name, 26) : null;
+    const logoX = WIDTH - PAD - vaLogoW;
+    const logoY = 46;
+    if (vaName) {
+        // The name is right-aligned into the gap left of the logo, so a long VA
+        // name grows leftwards into empty header rather than into the mark.
+        const nameRight = logoX - 18;
+        parts.push(`
+            <text x="${nameRight}" y="${logoY + 26}" text-anchor="end" font-family="${FONT}" font-size="13"
+                  font-weight="bold" letter-spacing="2.4" fill="${pal.faint}">FLIES FOR</text>
+            <text x="${nameRight}" y="${logoY + 52}" text-anchor="end" font-family="${FONT}" font-size="22"
+                  font-weight="bold" fill="${pal.ink}">${esc(vaName)}</text>`);
+        // The plate is drawn ALWAYS, not just when the logo is missing. A logo
+        // is letterboxed into the square (see below) so the plate is the
+        // backing it sits on, and drawing it unconditionally also means a logo
+        // that fetches but fails to decode still leaves a badge rather than a
+        // hole. Only the initial is conditional.
+        parts.push(`
+            <rect x="${logoX}" y="${logoY}" width="${vaLogoW}" height="${VA_LOGO_H}" rx="16"
+                  fill="${pal.tile}" stroke="${pal.tileLine}" stroke-width="1.5"/>`);
+        if (!vaLogo) {
+            parts.push(`
+                <text x="${logoX + vaLogoW / 2}" y="${logoY + 42}" text-anchor="middle" font-family="${FONT}"
+                      font-size="28" font-weight="bold" fill="${pal.muted}">${esc(vaName.charAt(0).toUpperCase())}</text>`);
+        }
+    }
+
     // Grade rides in the top-right as a pill whenever the pilot did not already
     // put it in the grid — it is the one number every IFC reader looks for, and
-    // duplicating it would just spend a tile.
-    if (s.grade != null && !keys.includes('grade')) {
+    // duplicating it would just spend a tile. The VA badge holds that corner
+    // when there is one, and identity beats a number the grid can carry.
+    if (s.grade != null && !keys.includes('grade') && !vaName) {
         const txt = `GRADE ${s.grade}`;
         const pillW = 34 + txt.length * 13;
         parts.push(`
@@ -478,6 +535,30 @@ async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, pho
 
     let out = sharp(Buffer.from(svg));
 
+    // --- The VA logo ---
+    // `contain` rather than `cover`: VA logos are wordmarks as often as they are
+    // roundels, and cropping one to fill a square cuts the airline's name in
+    // half. Letterboxed onto a transparent background it keeps its aspect and
+    // sits inside the rounded plate.
+    if (vaName && vaLogo) {
+        try {
+            const mark = await sharp(vaLogo)
+                .resize(vaLogoW, VA_LOGO_H, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
+                .composite([{
+                    input: Buffer.from(
+                        `<svg xmlns="http://www.w3.org/2000/svg" width="${vaLogoW}" height="${VA_LOGO_H}"><rect width="${vaLogoW}" height="${VA_LOGO_H}" rx="16" fill="#fff"/></svg>`),
+                    blend: 'dest-in',
+                }])
+                .png().toBuffer();
+            out = sharp(await out.png().toBuffer())
+                .composite([{ input: mark, left: logoX, top: logoY }]);
+        } catch (err) {
+            // A logo sharp cannot decode is not worth losing the card over — the
+            // SVG already drew the fallback plate underneath.
+            console.error('[if-card] VA logo render failed:', err?.message || err);
+        }
+    }
+
     // --- The favourite aircraft, photographed ---
     // Three layers, in order: the photo itself (masked so the card's bottom
     // corners survive it), a scrim so text on top of an arbitrary photograph is
@@ -540,14 +621,15 @@ function bandCornerMask(bandH) {
 }
 
 /**
- * The photo bytes behind a community aircraft image URL, or null.
+ * The bytes behind a remote image URL, or null.
  *
- * Best-effort in every direction: a timeout, a size ceiling, and a content-type
- * check, because this URL came out of a database row that a contributor filled
- * in and the renderer must not be the thing that hangs on it. Null simply means
- * no band, and the card is complete without one.
+ * Used for both the aircraft photo and the VA logo. Best-effort in every
+ * direction: a timeout, a size ceiling, and a content-type check, because these
+ * URLs come out of database rows that a contributor or a VA filled in, and the
+ * renderer must not be the thing that hangs on one. Null simply means that
+ * element is absent, and the card is complete without any of them.
  */
-async function fetchPhoto(url) {
+async function fetchImage(url) {
     if (!/^https?:\/\//i.test(String(url || ''))) return null;
     try {
         const resp = await axios.get(url, {
@@ -560,7 +642,7 @@ async function fetchPhoto(url) {
         if (!/^image\//i.test(type)) return null;
         return Buffer.from(resp.data);
     } catch (err) {
-        console.error('[if-card] photo fetch failed:', err?.message || err);
+        console.error(`[if-card] image fetch failed (${url}):`, err?.message || err);
         return null;
     }
 }
