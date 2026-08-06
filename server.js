@@ -799,10 +799,16 @@ async function verifyIfUser(name) {
         try {
             const resp = await axios.get(`${ACARS_BACKEND_URL}/api/users/${encodeURIComponent(out.userId)}/stats`, { timeout: 8000 });
             const s = resp?.data?.stats || resp?.data?.gradeInfo || resp?.data || {};
+            // gradeIndex is the pilot's ZERO-BASED index into gradeDetails.grades[],
+            // not their grade — grades[2] is "Grade 3". Taken raw it under-reports
+            // every pilot by one, which on a gated feature reads as "you are not
+            // good enough yet" to someone who is. calculatedGrade is the backend's
+            // own +1 of the same number, and s.grade is already 1–5.
             const gi = s?.gradeDetails?.gradeIndex;
             if (out.grade == null) {
-                if (Number.isFinite(gi)) out.grade = Number(gi);
+                if (Number.isFinite(s?.calculatedGrade)) out.grade = Number(s.calculatedGrade);
                 else if (Number.isFinite(s?.grade)) out.grade = Number(s.grade);
+                else if (Number.isFinite(gi)) out.grade = Number(gi) + 1;
             }
             const viol = Number.isFinite(s?.violations) ? Number(s.violations)
                 : ((s?.violationCountByLevel?.level1 || 0) + (s?.violationCountByLevel?.level2 || 0) + (s?.violationCountByLevel?.level3 || 0));

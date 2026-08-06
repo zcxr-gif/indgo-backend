@@ -187,6 +187,27 @@ function normalizeFavourites(input) {
  * ------------------------------------------------------------------------- */
 
 /**
+ * The pilot's grade, 1–5, from whichever shape answered.
+ *
+ * `gradeDetails.gradeIndex` is NOT the grade — it is the pilot's index into
+ * `gradeDetails.grades[]`, which is zero-based, so `grades[2].name` is
+ * "Grade 3". Read straight, it reports every pilot one grade too low and calls
+ * a Grade 1 pilot "Grade 0". The other two spellings are already the grade:
+ * `grade` off POST /users is documented 1–5, and `calculatedGrade` is our own
+ * backend having done this same +1 (live_flights.cjs).
+ *
+ * The 1–5 fields are preferred over the index because they need no arithmetic
+ * to be right; the index is the fallback, corrected.
+ */
+function resolveGrade(detail, user) {
+    const num = (v) => (Number.isFinite(Number(v)) && v !== null && v !== '' ? Number(v) : null);
+    const direct = num(user?.grade) ?? num(detail?.calculatedGrade) ?? num(detail?.grade);
+    if (direct != null) return direct;
+    const idx = num(detail?.gradeDetails?.gradeIndex);
+    return idx == null ? null : idx + 1;
+}
+
+/**
  * The pilot's Infinite Flight account, by community username.
  *
  * Two calls, because the two endpoints know different things and neither is
@@ -243,7 +264,7 @@ async function fetchIfStats(username) {
     return {
         userId: String(user.userId),
         username: String(user.discourseUsername || name),
-        grade: numOrNull(pick(detail?.gradeDetails?.gradeIndex, detail?.grade, user?.grade)),
+        grade: resolveGrade(detail, user),
         xp: numOrNull(pick(detail?.totalXP, detail?.xp, user?.totalXP, user?.xp)),
         minutes: numOrNull(pick(detail?.flightTime, user?.flightTime)),
         landings: numOrNull(pick(detail?.landingCount, user?.landingCount)),
