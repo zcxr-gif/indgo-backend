@@ -9576,7 +9576,7 @@ app.get('/api/route-map', async (req, res) => {
  * a client-sent `pro: true` would make the paywall a suggestion.
  */
 const {
-    renderIfProfileCard, fetchIfStats, normalizeFields, normalizeTheme,
+    renderIfProfileCard, fetchIfStats, normalizeFields, normalizeTheme, normalizeFavourites,
     needsRefresh, refreshDueAt,
     FIELDS: IF_CARD_FIELDS, DEFAULT_FIELDS: IF_CARD_DEFAULT_FIELDS,
     MAX_FIELDS: IF_CARD_MAX_FIELDS, THEME_KEYS: IF_CARD_THEMES, DEFAULT_THEME: IF_CARD_DEFAULT_THEME,
@@ -9592,6 +9592,12 @@ const IfProfileCardSchema = new mongoose.Schema({
     ifUserId:    { type: String, default: null },
     fields:      { type: [String], default: () => [...IF_CARD_DEFAULT_FIELDS] },
     theme:       { type: String, default: IF_CARD_DEFAULT_THEME },
+    // The pilot's own answers, not the API's. Stored on the card rather than
+    // folded into `stats` because a refresh replaces the stat block wholesale
+    // and must not take their favourites down with it.
+    favourites:  { type: mongoose.Schema.Types.Mixed, default: null },
+    // A favourite aircraft is drawn as a photo band unless they ask otherwise.
+    showPhoto:   { type: Boolean, default: true },
     // Pro-only, and re-checked against Supabase on every save — a lapsed
     // membership must stop the refresh, not keep it running off a stale flag.
     autoRefresh: { type: Boolean, default: false },
@@ -9682,7 +9688,44 @@ const IF_CARD_MAX_AGE_S = 900;
 const ifCardCacheKey = (c) => [
     c.slug || 'preview', c.theme, (c.fields || []).join('.'), c.pro ? 'p' : 'f',
     c.statsAt ? new Date(c.statsAt).getTime() : 0,
+    // The photo is part of the picture, so it has to be part of the key — two
+    // cards identical but for their favourite aircraft are not the same PNG.
+    c.photoUrl || '',
 ].join('|');
+
+/**
+ * The community photo URL for a favourite aircraft, or null.
+ *
+ * Reads `CommunityAircraft` directly rather than calling our own
+ * /api/aircraft/lookup over HTTP: it is the same process and the same
+ * collection, and a server that fetches itself is a request that can time out
+ * for no reason.
+ *
+ * Matching mirrors that endpoint — type is required, livery narrows it, and an
+ * exact livery match wins over a loose one — so the photo a pilot gets here is
+ * the photo they would see anywhere else in the product.
+ */
+async function ifCardPhotoUrl(fav) {
+    const type = String(fav?.aircraft || '').trim();
+    if (!type) return null;
+    const livery = String(fav?.livery || '').trim();
+    try {
+        const esc = (v) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const query = { aircraftType: { $regex: esc(type), $options: 'i' } };
+        if (livery) query.liveryName = { $regex: esc(livery), $options: 'i' };
+        const rows = await CommunityAircraft.find(query).lean().limit(20);
+        if (!rows.length) return null;
+        const exact = livery
+            ? rows.find((r) => String(r.liveryName || '').toLowerCase() === livery.toLowerCase())
+            : null;
+        const pick = exact || rows[0];
+        const url = pick.imageUrl || (Array.isArray(pick.imageUrls) ? pick.imageUrls[0] : null);
+        return url || null;
+    } catch (err) {
+        console.error('[if-card] photo lookup failed:', err?.message || err);
+        return null;
+    }
+}
 
 /** Render + reply, with the cache and shedding in front. Shared by both GETs. */
 async function sendIfCard(res, card) {
@@ -9733,12 +9776,21 @@ app.get('/api/if-card/preview', async (req, res) => {
         const stats = await fetchIfStats(username);
         if (!stats) return res.status(404).json({ message: `No Infinite Flight account found for “${username}”.` });
 
+        const fav = normalizeFavourites({
+            airport: req.query.favAirport,
+            airportName: req.query.favAirportName,
+            aircraft: req.query.favAircraft,
+            livery: req.query.favLivery,
+        });
+        const photoUrl = req.query.photo === '0' ? null : await ifCardPhotoUrl(fav);
+
         return await sendIfCard(res, {
-            stats,
+            stats: { ...stats, fav },
             fields: normalizeFields(req.query.fields),
             theme: normalizeTheme(req.query.theme),
             pro: req.query.pro === '1',
             statsAt: new Date(),
+            photoUrl,
         });
     } catch (error) {
         console.error('IF card preview error:', error.message);
@@ -9772,11 +9824,14 @@ app.post('/api/if-card', async (req, res) => {
         }
 
         const wantsRefresh = req.body?.autoRefresh === true;
+        const favourites = normalizeFavourites(req.body?.favourites);
         const update = {
             ifUsername: stats.username,
             ifUserId: stats.userId,
             fields: normalizeFields(req.body?.fields),
             theme: normalizeTheme(req.body?.theme),
+            favourites,
+            showPhoto: req.body?.showPhoto !== false,
             pro: caller.isPro,
             autoRefresh: wantsRefresh && caller.isPro,
             stats,
@@ -9798,6 +9853,12 @@ app.post('/api/if-card', async (req, res) => {
             imageUrl: `${req.protocol}://${req.get('host')}/api/if-card/${card.slug}.png`,
             fields: card.fields,
             theme: card.theme,
+            favourites: card.favourites,
+            showPhoto: card.showPhoto,
+            // Whether their favourite aircraft actually has a photo behind it.
+            // The page can then say "we have no photo of that one" instead of
+            // leaving them wondering why the band never appeared.
+            photoFound: card.showPhoto ? !!(await ifCardPhotoUrl(card.favourites)) : false,
             pro: card.pro,
             autoRefresh: card.autoRefresh,
             // Told plainly rather than silently ignored.
@@ -9825,6 +9886,7 @@ app.get('/api/if-card/mine', async (req, res) => {
                 slug: card.slug,
                 imageUrl: `${req.protocol}://${req.get('host')}/api/if-card/${card.slug}.png`,
                 fields: card.fields, theme: card.theme,
+                favourites: card.favourites, showPhoto: card.showPhoto,
                 pro: card.pro, autoRefresh: card.autoRefresh,
                 statsAt: card.statsAt,
                 nextRefresh: card.autoRefresh ? refreshDueAt(card.statsAt) : null,
@@ -9882,6 +9944,7 @@ app.get('/api/if-card/:file', async (req, res) => {
                 ok: true,
                 slug: card.slug, ifUsername: card.ifUsername,
                 fields: card.fields, theme: card.theme,
+                favourites: card.favourites, showPhoto: card.showPhoto,
                 pro: card.pro, autoRefresh: card.autoRefresh,
                 statsAt: card.statsAt,
                 nextRefresh: card.autoRefresh ? refreshDueAt(card.statsAt) : null,
@@ -9895,11 +9958,14 @@ app.get('/api/if-card/:file', async (req, res) => {
 
         return await sendIfCard(res, {
             slug: card.slug,
-            stats: card.stats,
+            // Favourites live beside the stat block rather than inside it, so a
+            // monthly refresh replacing `stats` cannot quietly drop them.
+            stats: { ...(card.stats || {}), fav: normalizeFavourites(card.favourites) },
             fields: card.fields,
             theme: card.theme,
             pro: card.pro && card.autoRefresh,
             statsAt: card.statsAt,
+            photoUrl: card.showPhoto ? await ifCardPhotoUrl(card.favourites) : null,
         });
     } catch (error) {
         console.error('IF card render error:', error.message);

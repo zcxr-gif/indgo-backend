@@ -108,6 +108,15 @@ const FIELDS = {
     atcOps:     { label: 'ATC OPERATIONS',           get: (s) => (s.atcOperations == null ? null : fmtInt(s.atcOperations)) },
     atcRank:    { label: 'ATC RANK',                 get: (s) => s.atcRank || null },
     org:        { label: 'ORGANISATION',             get: (s) => s.virtualOrganization || null },
+    // The two the pilot tells us rather than the two we can measure. They ride
+    // on the stat block under `fav` so a tile is still a tile — the renderer
+    // does not care where a value came from, only that there is one.
+    favAirport: { label: 'FAVOURITE AIRPORT', accent: true,
+                  get: (s) => s.fav?.airport || null,
+                  sub: (s) => s.fav?.airportName || null },
+    favAircraft:{ label: 'FAVOURITE AIRCRAFT',
+                  get: (s) => s.fav?.aircraft || null,
+                  sub: (s) => s.fav?.livery || null },
 };
 const FIELD_KEYS = Object.keys(FIELDS);
 const DEFAULT_FIELDS = ['grade', 'xp', 'landings', 'hours'];
@@ -134,6 +143,44 @@ function normalizeFields(input) {
 }
 
 const normalizeTheme = (t) => (THEMES[String(t || '').trim()] ? String(t).trim() : DEFAULT_THEME);
+
+/* ---------------------------------------------------------------------------
+ * Favourites
+ *
+ * These are the only things on the card the pilot asserts rather than the
+ * Infinite Flight API reporting. That is the point — "favourite" means the one
+ * you love, which is not always the one you grind — but it does mean the values
+ * arrive as free text and have to be treated as such: length-capped, stripped
+ * of anything that isn't plausibly a name, and never trusted into markup.
+ * ------------------------------------------------------------------------- */
+const ICAO_RE = /^[A-Z0-9]{3,4}$/;
+// Deliberately permissive: aircraft and livery names in the wild carry digits,
+// hyphens, slashes, apostrophes and dots (`A350-900`, `787-9`, `Boeing House`,
+// `TAP Air Portugal`). Anything outside that is dropped rather than rejected,
+// so a stray character costs a character and not the whole field.
+const NAME_SAFE_RE = /[^A-Za-z0-9 .\-/'&()+]/g;
+
+const cleanName = (v, max) => String(v == null ? '' : v)
+    .replace(NAME_SAFE_RE, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, max);
+
+/**
+ * The pilot's favourites, normalized. Any field that does not survive comes
+ * back absent, and an absent favourite simply has no tile — the same contract
+ * every other stat has.
+ */
+function normalizeFavourites(input) {
+    const src = input || {};
+    const airport = String(src.airport || '').trim().toUpperCase();
+    return {
+        airport: ICAO_RE.test(airport) ? airport : null,
+        airportName: cleanName(src.airportName, 28) || null,
+        aircraft: cleanName(src.aircraft, 28) || null,
+        livery: cleanName(src.livery, 28) || null,
+    };
+}
 
 /* ---------------------------------------------------------------------------
  * Reading the account
@@ -219,6 +266,15 @@ const TILE_GAP = 18;
 const FOOTER_H = 66;
 // Shared by every value in every tile — see the note at the draw site.
 const VALUE_BASELINE = 102;
+// The card's own corner radius. The PNG is transparent outside it, so the
+// rounding is real rather than painted-on — on IFC the forum background shows
+// through the corners whatever theme the reader is using, which a card faking
+// round corners with its own background colour cannot do.
+const CARD_RADIUS = 28;
+// The favourite-aircraft photo, full-bleed across the bottom of the card. Wide
+// and shallow because that is the shape an aircraft is; a squarer crop spends
+// its height on sky and tarmac.
+const PHOTO_H = 300;
 
 /**
  * How many tiles per row, for a given number of them.
@@ -273,16 +329,29 @@ const stamp = (d) => {
  * @param {string}   card.theme     palette key
  * @param {boolean}  card.pro       drives the "updated monthly" footer line
  * @param {Date}     card.statsAt   when the numbers were read
+ * @param {string}   [card.photoUrl] community photo of the favourite aircraft.
+ *                                   The CALLER resolves this — the renderer has
+ *                                   no database and should not grow one.
  */
-async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt } = {}) {
+async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, photoUrl } = {}) {
     const s = stats || {};
     const pal = themeFor(normalizeTheme(theme));
     const keys = normalizeFields(fields);
+
+    // The photo is fetched BEFORE the layout is sized, because a photo we cannot
+    // get is a band we must not leave a gap for. Everything downstream keys off
+    // `photo` being non-null rather than off the URL having been supplied.
+    const photo = photoUrl ? await fetchPhoto(photoUrl) : null;
 
     // Resolve to drawable tiles first: the grid is sized from what SURVIVES,
     // not from what was asked for, so a missing stat costs no empty square.
     const tiles = [];
     for (const key of keys) {
+        // The photo band already names the favourite aircraft, in 40px over its
+        // own picture. A tile repeating it underneath spends a slot saying the
+        // same thing worse, so the band wins and the tile stands down — the
+        // same trade the grade pill makes in the header.
+        if (key === 'favAircraft' && photo) continue;
         const spec = FIELDS[key];
         const value = spec.get(s);
         if (value == null || value === '') continue;
@@ -304,15 +373,26 @@ async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt } = 
     const rows = Math.ceil(tiles.length / cols);
     const gridW = WIDTH - PAD * 2;
     const tileW = Math.floor((gridW - TILE_GAP * (cols - 1)) / cols);
-    const height = HEADER_H + rows * TILE_H + (rows - 1) * TILE_GAP + FOOTER_H + PAD;
+
+    // With a photo the footer rides ON the band rather than under it — the band
+    // is full-bleed to the card's bottom edge, so there is nowhere below it to
+    // put anything.
+    const gridBottom = HEADER_H + rows * TILE_H + (rows - 1) * TILE_GAP;
+    const photoTop = photo ? gridBottom + PAD - 12 : 0;
+    const height = photo ? photoTop + PHOTO_H : gridBottom + FOOTER_H + PAD;
 
     const parts = [];
 
     // --- Background: flat fill, then two soft colour fields. The same ambient
-    // wash month.html drifts behind the report, held still. ---
-    parts.push(`<rect width="${WIDTH}" height="${height}" fill="${pal.bg}"/>`);
+    // wash month.html drifts behind the report, held still.
+    //
+    // Everything is inside a rounded clip so the PNG's corners come out
+    // TRANSPARENT. That is what makes the card sit on an IFC profile as a card
+    // rather than as a rectangle with a painted-on radius that only matches one
+    // forum theme. ---
+    parts.push(`<rect x="0" y="0" width="${WIDTH}" height="${height}" rx="${CARD_RADIUS}" fill="${pal.bg}"/>`);
     parts.push(`
-        <g opacity="0.34">
+        <g opacity="0.34" clip-path="url(#cardClip)">
           <circle cx="120" cy="40" r="330" fill="url(#glowA)"/>
           <circle cx="${WIDTH - 90}" cy="${height - 40}" r="300" fill="url(#glowB)"/>
         </g>`);
@@ -370,23 +450,119 @@ async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt } = 
         }
     });
 
-    // --- Footer: where it came from, and how honest the numbers are ---
-    const footY = height - FOOTER_H + 34;
-    parts.push(`
-        <text x="${PAD}" y="${footY}" font-family="${FONT}" font-size="17" fill="${pal.faint}">
+    // --- Footer ---
+    // Without a photo it sits in its own strip. With one it sits over the band's
+    // scrim, in light ink — a dark-grey footer on a photograph is unreadable
+    // whatever the theme, because the theme stops applying the moment there is a
+    // picture underneath.
+    const footY = photo ? height - 26 : height - FOOTER_H + 34;
+    const footFill = photo ? 'rgba(255,255,255,0.72)' : pal.faint;
+    const footerSvg = `
+        <text x="${PAD}" y="${footY}" font-family="${FONT}" font-size="17" fill="${footFill}">
             inflight.info</text>
         <text x="${WIDTH - PAD}" y="${footY}" text-anchor="end" font-family="${FONT}" font-size="17"
-              fill="${pal.faint}">${esc(pro ? `Updated monthly · ${stamp(statsAt)}` : `As of ${stamp(statsAt)}`)}</text>`);
+              fill="${footFill}">${esc(pro ? `Updated monthly · ${stamp(statsAt)}` : `As of ${stamp(statsAt)}`)}</text>`;
+    if (!photo) parts.push(footerSvg);
 
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${height}" viewBox="0 0 ${WIDTH} ${height}">
+    const defs = `
         <defs>
           <radialGradient id="glowA"><stop offset="0%" stop-color="${pal.glowA}" stop-opacity="0.85"/><stop offset="100%" stop-color="${pal.glowA}" stop-opacity="0"/></radialGradient>
           <radialGradient id="glowB"><stop offset="0%" stop-color="${pal.glowB}" stop-opacity="0.85"/><stop offset="100%" stop-color="${pal.glowB}" stop-opacity="0"/></radialGradient>
-        </defs>
+          <clipPath id="cardClip"><rect x="0" y="0" width="${WIDTH}" height="${height}" rx="${CARD_RADIUS}"/></clipPath>
+        </defs>`;
+
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${height}" viewBox="0 0 ${WIDTH} ${height}">
+        ${defs}
         ${parts.join('\n')}
     </svg>`;
 
-    return sharp(Buffer.from(svg)).png().toBuffer();
+    let out = sharp(Buffer.from(svg));
+
+    // --- The favourite aircraft, photographed ---
+    // Three layers, in order: the photo itself (masked so the card's bottom
+    // corners survive it), a scrim so text on top of an arbitrary photograph is
+    // always readable, then the aircraft name and the footer.
+    if (photo) {
+        const band = await sharp(photo)
+            .resize(WIDTH, PHOTO_H, { fit: 'cover', position: 'attention' })
+            .composite([{ input: bandCornerMask(height - photoTop), blend: 'dest-in' }])
+            .png().toBuffer();
+
+        const label = s.fav?.aircraft ? clamp(s.fav.aircraft, 30) : null;
+        const sub = s.fav?.livery ? clamp(s.fav.livery, 34) : null;
+        const overlay = Buffer.from(`
+            <svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${height}">
+              <defs>
+                <linearGradient id="scrim" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#000" stop-opacity="0.62"/>
+                  <stop offset="42%" stop-color="#000" stop-opacity="0.18"/>
+                  <stop offset="100%" stop-color="#000" stop-opacity="0.80"/>
+                </linearGradient>
+                <clipPath id="cardClip2"><rect x="0" y="0" width="${WIDTH}" height="${height}" rx="${CARD_RADIUS}"/></clipPath>
+              </defs>
+              <g clip-path="url(#cardClip2)">
+                <rect x="0" y="${photoTop}" width="${WIDTH}" height="${PHOTO_H}" fill="url(#scrim)"/>
+                ${label ? `<text x="${PAD}" y="${photoTop + 52}" font-family="${FONT}" font-size="15"
+                        font-weight="bold" letter-spacing="2.2" fill="rgba(255,255,255,0.66)">FAVOURITE AIRCRAFT</text>
+                    <text x="${PAD}" y="${photoTop + 100}" font-family="${FONT}" font-size="40"
+                        font-weight="bold" fill="#ffffff">${esc(label)}</text>` : ''}
+                ${label && sub ? `<text x="${PAD}" y="${photoTop + 132}" font-family="${FONT}" font-size="20"
+                        fill="rgba(255,255,255,0.80)">${esc(sub)}</text>` : ''}
+                ${footerSvg}
+              </g>
+            </svg>`);
+
+        out = sharp(await out.png().toBuffer())
+            .composite([{ input: band, left: 0, top: photoTop }, { input: overlay, left: 0, top: 0 }]);
+    }
+
+    return out.png().toBuffer();
+}
+
+/**
+ * An alpha mask that rounds only the BOTTOM corners of the photo band.
+ *
+ * The band is full-bleed and runs to the card's bottom edge, so its lower
+ * corners are the card's corners and have to be cut out of the photo — the
+ * SVG clip path cannot reach it, because the photo is composited as a raster
+ * layer after the SVG has already been rasterized.
+ *
+ * @param {number} bandH how much of the band lies below `photoTop`
+ */
+function bandCornerMask(bandH) {
+    const r = CARD_RADIUS;
+    // Drawn as a rounded rect pulled upward by `r` so only its bottom corners
+    // land inside the band; the top edge is squared off against the tiles.
+    return Buffer.from(
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${PHOTO_H}">
+           <rect x="0" y="${-r}" width="${WIDTH}" height="${Math.min(bandH, PHOTO_H) + r}" rx="${r}" fill="#fff"/>
+         </svg>`);
+}
+
+/**
+ * The photo bytes behind a community aircraft image URL, or null.
+ *
+ * Best-effort in every direction: a timeout, a size ceiling, and a content-type
+ * check, because this URL came out of a database row that a contributor filled
+ * in and the renderer must not be the thing that hangs on it. Null simply means
+ * no band, and the card is complete without one.
+ */
+async function fetchPhoto(url) {
+    if (!/^https?:\/\//i.test(String(url || ''))) return null;
+    try {
+        const resp = await axios.get(url, {
+            responseType: 'arraybuffer',
+            timeout: 6000,
+            maxContentLength: 8 * 1024 * 1024,
+            maxRedirects: 3,
+        });
+        const type = String(resp.headers?.['content-type'] || '');
+        if (!/^image\//i.test(type)) return null;
+        return Buffer.from(resp.data);
+    } catch (err) {
+        console.error('[if-card] photo fetch failed:', err?.message || err);
+        return null;
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -428,6 +604,7 @@ module.exports = {
     fetchIfStats,
     normalizeFields,
     normalizeTheme,
+    normalizeFavourites,
     refreshDueAt,
     needsRefresh,
     FIELDS,
