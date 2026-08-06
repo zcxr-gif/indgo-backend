@@ -15,7 +15,8 @@
 -- they have logged, every flight report, every membership application, the
 -- applicant's email address, every EVENT and who signed up for it, every
 -- SCHEDULED DEPARTURE and who booked it, every OPERATIONS DOCUMENT the VA
--- publishes to its crew, every MESSAGE sent to a pilot, and every
+-- publishes to its crew, every QUICK LINK it points them at, every MESSAGE sent
+-- to a pilot, and every
 -- PILOT ACCOUNT (see crew_accounts) — is
 -- created here, in this file's tables, inside the VA's project. If the VA
 -- leaves the platform they keep the lot and we have nothing to hand back,
@@ -894,6 +895,92 @@ create index if not exists crew_notifications_member_idx
     on crew_notifications (va_slug, member_id) where member_id is not null;
 
 -- ----------------------------------------------------------------------------
+-- Quick links. v12.
+--
+-- Where the crew is sent: the Discord, the IFC thread, SimBrief, the charts
+-- site, the livery pack, the leave form. Today that lives in a Discord pinned
+-- message — invisible to anyone who has not joined Discord, invisible to a pilot
+-- on the web, scrolled past within a week, and kept up to date by hand or by a
+-- bot the VA has to run and host. A crew center already IS where pilots go, so
+-- the links belong here and no bot is involved.
+--
+-- WHY THIS IS NOT crew_documents. A document is something to READ: long, with
+-- revisions, where knowing which version you read is the point. A link is
+-- somewhere to GO: one line, never revised, and the only questions about it are
+-- whether the address still works and whether anyone uses it. Collapsing them
+-- would give a library full of one-line rows needing a reader, or a link list
+-- carrying revision machinery it never touches. A link may of course POINT at a
+-- document, which is what crew_documents.link_url does from the other side.
+--
+-- `url` is stored as the URL parser's own normalised output, never as the string
+-- staff typed — see crewLinks.safeUrl, which refuses everything that is not http
+-- or https. That is enforced in the backend rather than by a check constraint
+-- here because the rule needs a URL parser, and a regex approximating one is how
+-- `java<TAB>script:` gets through.
+--
+-- `sort_order` is 1-based where staff have arranged a tile, and 0 — the default —
+-- means NEVER ARRANGED. Those sort last, not first; see crewLinks.boardFor for
+-- why an ORDER BY alone gets this backwards.
+--
+-- `opens` is how often the crew actually used a link, which is the number that
+-- tells a VA their charts link is dead weight and their leave form is not. It is
+-- a usage HINT: the increment is not an authenticated act (opening a link is not
+-- session-bearing), so it is good for "which of these matters" and not for
+-- anything that has to be exact.
+-- ----------------------------------------------------------------------------
+create table if not exists crew_links (
+    id             uuid primary key default gen_random_uuid(),
+    va_slug        text not null,
+    title          text not null default '',
+    url            text not null default '',
+    description    text not null default '',
+    category       text not null default 'other'
+                   check (category in ('community','tools','charts','downloads',
+                                       'training','forms','social','other')),
+    icon           text not null default 'link',
+    min_rank       text not null default '',
+    pinned         boolean not null default false,
+    -- No 'archived' here, unlike a document. A superseded manual is worth keeping
+    -- because somebody may ask what it used to say; a dead link has nothing to
+    -- say. Staff either fix the address or remove the tile.
+    status         text not null default 'published' check (status in ('published','draft')),
+    sort_order     int not null default 0 check (sort_order >= 0),
+    opens          bigint not null default 0 check (opens >= 0),
+    last_opened_at timestamptz,
+    author_name    text not null default '',
+    created_at     timestamptz not null default now(),
+    updated_at     timestamptz not null default now()
+);
+-- The board as it is drawn.
+create index if not exists crew_links_va_idx
+    on crew_links (va_slug, status, pinned desc, sort_order);
+-- And as staff review it: what is actually being used.
+create index if not exists crew_links_opens_idx
+    on crew_links (va_slug, opens desc);
+
+-- v12. Counting an open.
+--
+-- A function rather than a PATCH because `opens = opens + 1` is not something
+-- PostgREST can express, and a read-then-write from the backend would lose
+-- counts whenever two pilots tap the same tile at once — which, for the Discord
+-- link right after a notice goes out, is the normal case rather than the edge.
+--
+-- NOT security definer, and execute is NOT granted to anon: the backend calls
+-- this with the service key after it has checked that the caller may actually see
+-- the link, so a browser key has no reason to reach it. `status = 'published'`
+-- is belt and braces on top of that — a draft nobody can see cannot be counted.
+create or replace function crew_link_open(p_va_slug text, p_link_id uuid)
+returns bigint
+language sql
+volatile
+as $$
+    update crew_links
+       set opens = opens + 1, last_opened_at = now()
+     where va_slug = p_va_slug and id = p_link_id and status = 'published'
+    returning opens;
+$$;
+
+-- ----------------------------------------------------------------------------
 -- updated_at maintenance
 -- ----------------------------------------------------------------------------
 create or replace function crew_touch_updated_at() returns trigger
@@ -907,7 +994,7 @@ $$;
 do $$
 declare t text;
 begin
-    foreach t in array array['crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps','crew_events','crew_event_signups','crew_announcements','crew_schedules','crew_bookings','crew_documents','crew_notifications','crew_schema_info']
+    foreach t in array array['crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps','crew_events','crew_event_signups','crew_announcements','crew_schedules','crew_bookings','crew_documents','crew_notifications','crew_links','crew_schema_info']
     loop
         execute format('drop trigger if exists %I on %I', t || '_touch', t);
         execute format(
@@ -1019,6 +1106,14 @@ as $$
                              and min_rank <> '')              as documents_gated
         from crew_documents where va_slug = p_va_slug
     ),
+    -- v12. The links board, plus how much it is actually used — the figure that
+    -- tells a VA whether the resources they curated are earning their place.
+    lnk as (
+        select
+            count(*) filter (where status = 'published')      as links,
+            coalesce(sum(opens), 0)                           as link_opens
+        from crew_links where va_slug = p_va_slug
+    ),
     -- A small "top pilots by hours" board. Names only, and only pilots who have
     -- actually flown, so an empty roster doesn't produce a wall of zeroes.
     top as (
@@ -1065,10 +1160,12 @@ as $$
         'seatsBooked',          bk.booked_upcoming,
         'documents',            doc.documents,
         'documentsGated',       doc.documents_gated,
+        'links',                lnk.links,
+        'linkOpens',            lnk.link_opens,
         'topPilots',            top.top_pilots,
         'generatedAt',          now()
     )
-    from m, p, r, a, ev, sch, bk, doc, top;
+    from m, p, r, a, ev, sch, bk, doc, lnk, top;
 $$;
 
 -- ============================================================================
@@ -1104,7 +1201,7 @@ declare
     crew_tables text[] := array[
         'crew_members','crew_accounts','crew_applications','crew_routes','crew_pireps',
         'crew_events','crew_event_signups','crew_announcements','crew_schedules',
-        'crew_bookings','crew_documents','crew_notifications','crew_schema_info'];
+        'crew_bookings','crew_documents','crew_notifications','crew_links','crew_schema_info'];
     t              text;
     rel            regclass;
     tbl_bytes      bigint;
@@ -1205,6 +1302,7 @@ alter table crew_schedules     enable row level security;
 alter table crew_bookings      enable row level security;
 alter table crew_documents     enable row level security;
 alter table crew_notifications enable row level security;
+alter table crew_links         enable row level security;
 alter table crew_schema_info   enable row level security;
 
 drop policy if exists crew_members_public_read on crew_members;
@@ -1290,6 +1388,16 @@ drop policy if exists crew_documents_public_read on crew_documents;
 create policy crew_documents_public_read on crew_documents
     for select to anon, authenticated using (status = 'published' and min_rank = '');
 
+-- v12. Quick links, treated exactly like documents and for the same reason: a
+-- rank-gated link's ADDRESS is the thing being gated, so "visible but locked"
+-- would be no gate. The browser key gets published, ungated tiles — which is
+-- most of them, and is what makes the board work on a VA's public crew center
+-- with nobody signed in. A gated one goes through the backend, which checks the
+-- pilot's rung before returning the URL.
+drop policy if exists crew_links_public_read on crew_links;
+create policy crew_links_public_read on crew_links
+    for select to anon, authenticated using (status = 'published' and min_rank = '');
+
 -- crew_notifications gets NO policy at all, and no grant below.
 --
 -- A notification is addressed to ONE pilot. There is no filter available here
@@ -1306,7 +1414,7 @@ create policy crew_schema_info_public_read on crew_schema_info
 
 grant usage on schema public to anon, authenticated;
 grant select on crew_members, crew_routes, crew_pireps, crew_events, crew_event_signups,
-    crew_announcements, crew_schedules, crew_bookings, crew_documents, crew_schema_info to anon, authenticated;
+    crew_announcements, crew_schedules, crew_bookings, crew_documents, crew_links, crew_schema_info to anon, authenticated;
 -- Deliberately NOT granted on crew_applications or crew_accounts. The first
 -- holds applicant emails and unclaimed invitation passwords, the second holds
 -- password hashes; neither has a policy above, and revoking the grant means a
@@ -1316,6 +1424,18 @@ revoke all on crew_accounts     from anon, authenticated;
 -- v11. Same treatment, for the reason spelt out at crew_notifications' absent
 -- policy: one shared browser credential cannot express "only mine".
 revoke all on crew_notifications from anon, authenticated;
+
+-- v12. crew_link_open increments a counter and is reached only through the
+-- backend's service key, after IT has decided the caller may see the link. A
+-- browser key that could call this could inflate any VA's figures at will, and
+-- there is no reason for a page to reach it directly.
+revoke all on function crew_link_open(text, uuid) from public, anon, authenticated;
+do $$
+begin
+    if exists (select 1 from pg_roles where rolname = 'service_role') then
+        execute 'grant execute on function crew_link_open(text, uuid) to service_role';
+    end if;
+end $$;
 
 -- crew_stats is security definer so it can aggregate rows the caller cannot
 -- read row-by-row (pending reports feed the "awaiting review" counter). It
@@ -1338,5 +1458,5 @@ end $$;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 11)
+insert into crew_schema_info (id, version) values (1, 12)
 on conflict (id) do update set version = excluded.version, updated_at = now();

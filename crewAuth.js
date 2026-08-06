@@ -227,6 +227,12 @@ const CREW_CAPABILITIES = [
     // them. A VA may well want somebody who writes notices but does not message
     // pilots individually, and the reverse.
     { id: 'members.message',        group: 'Communications', label: 'Message pilots individually or by rank' },
+    // v12. The quick-links board. Shares documents.manage's reasoning — a
+    // rank-gated link is an access control decision — but is its own capability
+    // because the jobs differ in practice: the person who curates "where do I get
+    // the liveries" is rarely the person who writes the operations manual, and a
+    // VA should be able to hand out the first without the second.
+    { id: 'links.manage',           group: 'Communications', label: 'Curate the quick-links board' },
 ];
 const CREW_CAP_IDS = CREW_CAPABILITIES.map(c => c.id);
 
@@ -297,9 +303,9 @@ const CREW_ROLE_PRESETS = [
         id: 'comms',
         name: 'Communications',
         color: '#0891B2',
-        description: 'Writes to the crew, keeps the manuals, looks after Discord & email.',
+        description: 'Writes to the crew, keeps the manuals & links, looks after Discord & email.',
         permissions: ['announcements.manage', 'members.message', 'documents.manage',
-            'settings.notifications', 'events.manage'],
+            'links.manage', 'settings.notifications', 'events.manage'],
     },
     {
         id: 'brand-manager',

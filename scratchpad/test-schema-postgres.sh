@@ -162,6 +162,14 @@ insert into crew_documents (va_slug,title,body,status,min_rank)
 -- credential to "mine", so the table must be refused outright.
 insert into crew_notifications (va_slug,title,body)
     values ('amv','Your application was accepted','Welcome aboard.');
+-- v12. The links board's three cases, same shape as the library's: the gate is
+-- enforced by RLS because a gated link's ADDRESS is the gated thing.
+insert into crew_links (va_slug,title,url,category,status,min_rank)
+    values ('amv','Discord','https://discord.gg/abc','community','published','');
+insert into crew_links (va_slug,title,url,category,status,min_rank)
+    values ('amv','Staff toolkit','https://example.com/staff','tools','published','Captain');
+insert into crew_links (va_slug,title,url,category,status,min_rank)
+    values ('amv','Unfinished','https://example.com/wip','other','draft','');
 SQL
 
 asanon() { $PSQL -d fresh -tAc "set role anon; $1" 2>/dev/null; }
@@ -191,6 +199,14 @@ is "a rank-gated document's body is NOT" \
    "$(asanon 'select count(*) from crew_documents')" "1"
 is "…and neither is a draft one" \
    "$(asanon "select count(*) from crew_documents where status='draft'")" "0"
+is "a published, ungated link is public" \
+   "$(asanon "select count(*) from crew_links where title='Discord'")" "1"
+is "a rank-gated link's address is NOT" \
+   "$(asanon 'select count(*) from crew_links')" "1"
+is "…and neither is a draft one" \
+   "$(asanon "select count(*) from crew_links where status='draft'")" "0"
+is "a browser key cannot inflate the open counter" \
+   "$(saidno "select crew_link_open('amv', (select id from crew_links limit 1))")" "yes"
 is "a pilot's inbox is refused at the door" "$(saidno 'select 1 from crew_notifications')" "yes"
 is "pilot logins are refused at the door" "$(saidno 'select 1 from crew_accounts')" "yes"
 is "so are applications (emails, invites)" "$(saidno 'select 1 from crew_applications')" "yes"

@@ -53,6 +53,7 @@ const axios = require('axios');
 // this one, so there is no cycle.
 const crewDocs = require('./crewDocs');
 const crewInbox = require('./crewInbox');
+const crewLinks = require('./crewLinks');
 
 const TIMEOUT_MS = parseInt(process.env.CREW_STORE_TIMEOUT_MS, 10) || 8000;
 const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').toLowerCase() !== 'false';
@@ -62,7 +63,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 11;
+const EXPECTED_SCHEMA_VERSION = 12;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -96,6 +97,12 @@ const DOCUMENTS_SCHEMA_VERSION = 11;
 // independently in the one case that matters: a VA who ran a partial script. A
 // library that works while the inbox does not should say exactly that.
 const NOTIFICATIONS_SCHEMA_VERSION = 11;
+
+// The version that introduced crew_links and crew_link_open(). Its own constant
+// for the same reason the others have one: the links board is a whole feature a
+// pre-v12 project has not got, and the panel offers the update button itself
+// rather than reporting a broken store over a VA whose everything else answers.
+const LINKS_SCHEMA_VERSION = 12;
 
 // ---------------------------------------------------------------------------
 // Columns that arrived after the first release
@@ -760,6 +767,47 @@ const notificationToRow = (n) => {
     pick(n, out, 'linkUrl', 'link_url', (v) => str(v, 600));
     pick(n, out, 'senderName', 'sender_name', (v) => str(v, 80));
     pick(n, out, 'readAt', 'read_at', (v) => (v ? new Date(v).toISOString() : null));
+    return out;
+};
+
+// v12. A tile on the VA's quick-links board. Every decision about it — whether
+// the URL is one we will send a pilot to, what category it belongs in, who may
+// see it — lives in crewLinks.js; this is the column mapping only.
+//
+// `opens` and `lastOpenedAt` are read here and never written: they belong to
+// crew_link_open(), which increments atomically because a read-then-write would
+// lose counts the moment two pilots tap the Discord tile together.
+const linkFromRow = (r) => r && {
+    _id: r.id,
+    title: r.title || '',
+    url: r.url || '',
+    description: r.description || '',
+    category: r.category || 'other',
+    icon: r.icon || 'link',
+    minRank: r.min_rank || '',
+    pinned: !!r.pinned,
+    status: r.status || 'published',
+    sortOrder: Number(r.sort_order) || 0,
+    opens: Number(r.opens) || 0,
+    lastOpenedAt: date(r.last_opened_at),
+    authorName: r.author_name || '',
+    createdAt: date(r.created_at),
+    updatedAt: date(r.updated_at),
+};
+const linkToRow = (l) => {
+    const out = {};
+    pick(l, out, 'title', 'title', (v) => str(v, 80));
+    // Already normalised by crewLinks.safeUrl at the route — capped here too, so
+    // a caller that skipped that step cannot commit an unbounded string.
+    pick(l, out, 'url', 'url', (v) => str(v, 2000));
+    pick(l, out, 'description', 'description', (v) => str(v, 240));
+    pick(l, out, 'category', 'category', (v) => (crewLinks.CATEGORIES.includes(v) ? v : 'other'));
+    pick(l, out, 'icon', 'icon', (v) => str(v, 40));
+    pick(l, out, 'minRank', 'min_rank', (v) => str(v, 40));
+    pick(l, out, 'pinned', 'pinned', (v) => !!v);
+    pick(l, out, 'status', 'status', (v) => (crewLinks.STATUSES.includes(v) ? v : 'published'));
+    pick(l, out, 'sortOrder', 'sort_order', (v) => int(v, 0, 9999));
+    pick(l, out, 'authorName', 'author_name', (v) => str(v, 80));
     return out;
 };
 
@@ -1609,6 +1657,73 @@ class SupabaseStore {
         return this.notifications(async () => { await this.db.remove('crew_notifications', this.ident(id)); return true; });
     }
 
+    // --- The quick-links board (v12) ---
+    async links(fn) {
+        try { return await fn(); } catch (err) {
+            if (err instanceof CrewStoreError && err.code === 'store_schema_missing') {
+                throw new CrewStoreError(
+                    'This crew center’s project does not have the quick-links board yet. Re-run the setup SQL (Settings → Data store) to add it.',
+                    { status: 409, code: 'store_links_missing', detail: err.detail });
+            }
+            throw err;
+        }
+    }
+
+    /**
+     * The board.
+     *
+     * Ordered only enough to be deterministic; the order a READER wants (pinned,
+     * then staff's arrangement, then alphabetical, with sort_order 0 meaning
+     * "never arranged" and sorting LAST) is crewLinks.boardFor's job — see the
+     * note there for why an ORDER BY gets it backwards.
+     */
+    listLinks({ status = '', limit = 300 } = {}) {
+        return this.links(async () => {
+            const q = { ...this.scope, order: 'pinned.desc,sort_order.asc,title.asc', limit };
+            if (status) q.status = `eq.${status}`;
+            const rows = await this.db.select('crew_links', q);
+            return (rows || []).map(linkFromRow);
+        });
+    }
+    getLink(id) {
+        return this.links(() => this.one('crew_links', this.ident(id), linkFromRow));
+    }
+    createLink(data) {
+        return this.links(async () => {
+            const [row] = await this.db.insert('crew_links', { va_slug: this.slug, ...linkToRow(data) });
+            return linkFromRow(row);
+        });
+    }
+    updateLink(id, patch) {
+        return this.links(async () => {
+            const [row] = await this.db.update('crew_links', this.ident(id), linkToRow(patch));
+            return row ? linkFromRow(row) : null;
+        });
+    }
+    deleteLink(id) {
+        return this.links(async () => { await this.db.remove('crew_links', this.ident(id)); return true; });
+    }
+
+    /**
+     * Count an open.
+     *
+     * Through the RPC rather than a PATCH, because `opens = opens + 1` is not
+     * something PostgREST can express and a read-then-write would lose counts
+     * under exactly the traffic this counter exists to measure.
+     *
+     * Best-effort by design: a pilot's tap must open the link whether or not the
+     * counter moved, so the caller is free to ignore a failure here. A project on
+     * a pre-v12 schema has no function to call, and that is a reason to skip the
+     * tally, never to refuse the click.
+     */
+    async noteLinkOpen(id) {
+        if (!id) return 0;
+        try {
+            const out = await this.db.rpc('crew_link_open', { p_va_slug: this.slug, p_link_id: id });
+            return Number(Array.isArray(out) ? out[0] : out) || 0;
+        } catch { return 0; }
+    }
+
     // --- Aggregates ---
     // One round trip via the schema's crew_stats() function. If the project is
     // on an older schema that predates it, fall back to counting client-side so
@@ -1687,6 +1802,7 @@ class SupabaseStore {
                 // implying the other is broken too.
                 documents: version >= DOCUMENTS_SCHEMA_VERSION,
                 notifications: version >= NOTIFICATIONS_SCHEMA_VERSION,
+                links: version >= LINKS_SCHEMA_VERSION,
                 installedAt: (rows && rows[0] && rows[0].installed_at) || null,
             };
         } catch (err) {
@@ -1701,6 +1817,7 @@ class SupabaseStore {
                 storage: false,
                 documents: false,
                 notifications: false,
+                links: false,
                 code: err.code || 'store_error',
                 error: err.message,
                 detail: err.detail || '',
@@ -2100,6 +2217,20 @@ class LegacyStore {
     markNotificationsRead() { return this.notifications(); }
     deleteNotification() { return this.notifications(); }
 
+    links() {
+        return Promise.reject(new CrewStoreError(
+            'The quick-links board needs your VA’s own database. Connect one in Crew Center → Settings → Data store.',
+            { status: 409, code: 'store_links_unsupported' }));
+    }
+    listLinks() { return this.links(); }
+    getLink() { return this.links(); }
+    createLink() { return this.links(); }
+    updateLink() { return this.links(); }
+    deleteLink() { return this.links(); }
+    // Not a refusal: the counter is best-effort everywhere, and a legacy VA
+    // clicking a link they do not have should not see an error for a tally.
+    noteLinkOpen() { return Promise.resolve(0); }
+
     async stats() {
         const [members, pireps, routes, applications] = await Promise.all([
             this.listMembers({ limit: 5000 }),
@@ -2298,5 +2429,6 @@ module.exports = {
     STORAGE_SCHEMA_VERSION,
     DOCUMENTS_SCHEMA_VERSION,
     NOTIFICATIONS_SCHEMA_VERSION,
+    LINKS_SCHEMA_VERSION,
     REQUIRE_OWN_STORE,
 };

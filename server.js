@@ -91,6 +91,12 @@ const crewRetention = require('./crewRetention');
 const crewDocs = require('./crewDocs');
 const crewInbox = require('./crewInbox');
 
+// The quick-links board — where the crew is sent, and the one place a staff
+// member's raw string becomes an <a href> on every pilot's dashboard. crewLinks
+// holds the URL allowlist (parsed protocol, not a spelling blocklist) and the
+// same rank gate the library uses.
+const crewLinks = require('./crewLinks');
+
 // One-paste setup for a VA's Supabase project: given a Supabase access token we
 // install the schema, read the project's keys back and store the connection
 // ourselves, so nobody has to hand-copy three values between two dashboards.
@@ -3523,6 +3529,173 @@ app.delete('/api/crew/:slug/inbox/:id', async (req, res) => {
     } catch (err) { crewFail(res, err, { log: 'inbox delete error', message: 'Could not remove the message.' }); }
 });
 
+/* ===========================================================================
+ * The quick-links board (v12)
+ *
+ * The Discord, the IFC thread, SimBrief, the livery pack, the leave form — the
+ * handful of places a VA's pilots need constantly, and which today live in a
+ * Discord pinned message that is invisible on the web, scrolled past within a
+ * week, and maintained by hand or by a bot the VA has to run.
+ *
+ * TWO THINGS TO BE CAREFUL ABOUT HERE.
+ *
+ * The URL. Every one of these becomes an <a href> on a page the whole roster
+ * loads, and it arrives as a string typed by whoever holds links.manage.
+ * crewLinks.safeUrl is the only thing between those two facts: it PARSES the URL
+ * and stores the parser's normalised href, accepting http and https and nothing
+ * else. Not a blocklist — "java<TAB>script:" defeats those, and the browser will
+ * happily strip that tab back out at navigation time.
+ *
+ * The gate. Same shape as a document and for the same reason: a gated link's
+ * ADDRESS is the gated thing, so crewLinks.visibleTo removes it rather than
+ * marking the tile locked and sending it anyway.
+ * ======================================================================== */
+
+const canManageLinks = async (req, slug) => !(await requireCap(req, slug, 'links.manage')).error;
+
+const publicLink = (l) => ({
+    id: l._id,
+    title: l.title, url: l.url, description: l.description,
+    category: l.category, icon: l.icon,
+    minRank: l.minRank || '',
+    locked: !!l.locked,
+    hoursUntilUnlock: l.hoursUntilUnlock || 0,
+    pinned: !!l.pinned,
+    status: l.status,
+    sortOrder: l.sortOrder || 0,
+    // The usage hint. Shown to staff so they can tell a curated resource from
+    // dead weight; harmless to a pilot, and it costs nothing to send.
+    opens: l.opens || 0,
+    lastOpenedAt: l.lastOpenedAt || null,
+    host: crewLinks.hostOf(l.url || ''),
+    createdAt: l.createdAt,
+});
+
+app.get('/api/crew/:slug/links', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const canManage = await canManageLinks(req, req.params.slug);
+        const list = await store.listLinks(canManage ? {} : { status: 'published' });
+        const viewer = await crewViewer(req, store);
+        const opts = { viewer, staff: canManage, ranks: va.ranks };
+        const visible = crewLinks.boardFor(list, opts);
+        res.json({
+            links: visible.map(publicLink),
+            // Grouped as well as flat: the board is drawn in sections and having
+            // the server say which is in which keeps the category order in one
+            // place instead of duplicated into every front-end that draws it.
+            sections: crewLinks.sectionsFor(list, opts)
+                .map((s) => ({ category: s.category, links: s.links.map(publicLink) })),
+            summary: crewLinks.summarize(visible),
+            categories: crewLinks.CATEGORIES,
+            canManage,
+        });
+    } catch (err) { crewFail(res, err, { log: 'links list error', message: 'Could not load the links.' }); }
+});
+
+app.post('/api/crew/:slug/links', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'links.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        // The URL check is the whole of the validation, and it reports its own
+        // reason — "that doesn't look like a link" and "links have to start with
+        // http://" are different problems and the person pasting wants to know
+        // which.
+        const out = crewLinks.normalizeLink(req.body);
+        if (!out.ok) return res.status(400).json({ error: out.reason });
+        const saved = await store.createLink({ ...out.link, authorName: (gate.p && gate.p.name) || '' });
+        res.status(201).json(withDrift(store, { link: publicLink(saved) }));
+    } catch (err) { crewFail(res, err, { log: 'link add error', message: 'Could not save the link.' }); }
+});
+
+app.patch('/api/crew/:slug/links/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'links.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const existing = await store.getLink(req.params.id);
+        if (!existing) return res.status(404).json({ error: 'Link not found.' });
+        // Merged through normalize so an edit is held to the same URL rule as a
+        // create — otherwise PATCH is a way round safeUrl, which is the only
+        // check that matters here.
+        const out = crewLinks.normalizeLink({ ...existing, ...(req.body || {}) });
+        if (!out.ok) return res.status(400).json({ error: out.reason });
+        const saved = await store.updateLink(existing._id, out.link);
+        res.json(withDrift(store, { link: publicLink(saved) }));
+    } catch (err) { crewFail(res, err, { log: 'link edit error', message: 'Could not update the link.' }); }
+});
+
+app.delete('/api/crew/:slug/links/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'links.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        await store.deleteLink(req.params.id);
+        res.json({ ok: true });
+    } catch (err) { crewFail(res, err, { log: 'link delete error', message: 'Could not remove the link.' }); }
+});
+
+/**
+ * Reorder the board in one call.
+ *
+ * One request for the whole arrangement rather than a PATCH per tile: dragging a
+ * tile to the top renumbers everything below it, and twelve round trips would
+ * leave the board half-reordered if any of them failed. Positions are 1-based,
+ * because 0 is the column default and means "never arranged" (see
+ * crewLinks.boardFor).
+ */
+app.post('/api/crew/:slug/links/order', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'links.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const ids = Array.isArray(req.body?.ids) ? req.body.ids.slice(0, 300).map((i) => String(i)) : [];
+        if (!ids.length) return res.status(400).json({ error: 'Send the order you want.' });
+        // Serially, so a project rate-limiting writes is not hammered, and
+        // best-effort per tile: one id that has since been deleted must not
+        // abandon the rest of the arrangement half-applied.
+        let moved = 0;
+        for (let i = 0; i < ids.length; i++) {
+            try {
+                const row = await store.updateLink(ids[i], { sortOrder: i + 1 });
+                if (row) moved += 1;
+            } catch (err) { console.warn('link reorder skipped', ids[i], err?.message || err); }
+        }
+        res.json(withDrift(store, { ok: true, moved }));
+    } catch (err) { crewFail(res, err, { log: 'link reorder error', message: 'Could not save the order.' }); }
+});
+
+/**
+ * A pilot opened a link.
+ *
+ * Counted server-side rather than trusted from the page, and only for a link the
+ * caller may actually SEE — otherwise a stranger could inflate the figures on a
+ * VA's staff-only tiles, which is the one thing this counter must not report.
+ *
+ * Always 200, even when the tally fails. The page has already navigated by the
+ * time this lands; refusing it would put an error in the console behind a link
+ * that worked, and the counter is explicitly a usage hint (see the schema).
+ */
+app.post('/api/crew/:slug/links/:id/open', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const canManage = await canManageLinks(req, req.params.slug);
+        const link = await store.getLink(req.params.id);
+        if (!link) return res.json({ ok: false });
+        const viewer = await crewViewer(req, store);
+        const visible = crewLinks.visibleTo(link, { viewer, staff: canManage, ranks: va.ranks });
+        // Not visible, or visible-but-locked: no address was handed over, so no
+        // open happened and there is nothing honest to count.
+        if (!visible || visible.locked) return res.json({ ok: false });
+        const opens = await store.noteLinkOpen(link._id);
+        res.json({ ok: true, opens });
+    } catch (err) {
+        console.warn('link open tally skipped —', err?.message || err);
+        res.json({ ok: false });
+    }
+});
+
 // ---- The Inflight partnership, as the VA's own crew center sees it ----
 //
 // A partnered VA has a relationship with us that lives in three places they
@@ -6101,6 +6274,7 @@ app.get('/api/crew/:slug/store', async (req, res) => {
             storageSchemaVersion: crewStore.STORAGE_SCHEMA_VERSION,
             documentsSchemaVersion: crewStore.DOCUMENTS_SCHEMA_VERSION,
             notificationsSchemaVersion: crewStore.NOTIFICATIONS_SCHEMA_VERSION,
+            linksSchemaVersion: crewStore.LINKS_SCHEMA_VERSION,
             // The saved access token, described but never disclosed.
             token: tokenState(tokenMeta),
             // Set when this very request brought the project up to date, so the
