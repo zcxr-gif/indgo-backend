@@ -43,6 +43,41 @@ const normalizePilotUsername = (raw) => {
     return { username: s, usernameLower: s.toLowerCase() };
 };
 
+/**
+ * Every `usernameLower` a given IFC name could plausibly have been written down
+ * as, for matching a pilot against rosters somebody else typed.
+ *
+ * The two sides of that match are entered by different people from different
+ * sources: the roster is pasted in by VA staff (often out of a spreadsheet, a
+ * Discord list, or a Discourse export), while the other side is the pilot's
+ * actual `discourseUsername` off the Infinite Flight API. IFC itself writes a
+ * username with underscores where the display name has spaces, and staff
+ * variously paste the spaced form, the dotted form, or the run-together one. A
+ * plain `toLowerCase()` on both sides therefore misses a pilot who is genuinely
+ * on the roster — which reads to them as "the VA feature is broken".
+ *
+ * So the separators are treated as interchangeable and the name is expanded
+ * into the handful of forms it can appear in. Returned as a list rather than
+ * folded into one stored key because rosters already in the database hold the
+ * simple lowercase form, and an `$in` over these still rides the
+ * `usernameLower` index rather than forcing a collection scan.
+ */
+const rosterMatchKeys = (raw) => {
+    const base = String(raw == null ? '' : raw)
+        .trim()
+        .replace(/^@+/, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+    if (!base) return [];
+    // Once separators are normalized to spaces every other form is one join
+    // away, so this is the shape all the variants are generated from.
+    const spaced = base.replace(/[_.\-]+/g, ' ').replace(/\s+/g, ' ').trim();
+    const keys = new Set([base, spaced]);
+    for (const join of ['_', '-', '.', '']) keys.add(spaced.split(' ').join(join));
+    return [...keys].filter(Boolean);
+};
+
 // Object keys we treat as "this field holds the username", best first — used
 // when a VA hands us an array of objects (JSON export, spreadsheet-as-JSON).
 const USERNAME_KEYS = ['username', 'user', 'ifc', 'ifn', 'ign', 'pilot', 'callsign', 'name'];
@@ -256,7 +291,7 @@ const clearPilots = async (VaPilot, vaAdId) => {
 };
 
 module.exports = {
-    normalizePilotUsername, parsePilotUsernames,
+    normalizePilotUsername, parsePilotUsernames, rosterMatchKeys,
     countPilots, listPilots, addPilots, removePilot, clearPilots,
     MAX_USERNAME_LEN, MAX_BULK,
 };
