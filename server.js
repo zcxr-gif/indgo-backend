@@ -9881,6 +9881,11 @@ app.get('/api/if-card/options', (_req, res) => {
         defaults: { fields: IF_CARD_DEFAULT_FIELDS, theme: IF_CARD_DEFAULT_THEME },
         maxFields: IF_CARD_MAX_FIELDS,
         maxVas: IF_CARD_MAX_VAS,
+        // How long a card an IFC reader has already loaded stays cached in
+        // their browser. Published so the generator page can TELL a pilot how
+        // soon an edit reaches their profile, instead of the page carrying its
+        // own copy of the number to drift out of sync with the header above.
+        refreshMinutes: Math.round(IF_CARD_MAX_AGE_S / 60),
     });
 });
 
