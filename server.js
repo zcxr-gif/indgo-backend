@@ -49,6 +49,7 @@ const vaStats = require('./vaStats');
 // the two backends (their Postgres, or our legacy managed collections for VAs
 // that have not migrated yet) is answering. See crewStore.js.
 const crewStore = require('./crewStore');
+const { resolveGrade } = require('./ifGrade');
 
 // Pilot logins. A pilot's account is the VA's data like their hours are, so it
 // is created in and read from the VA's own project through crewStore — Inflight
@@ -799,11 +800,10 @@ async function verifyIfUser(name) {
         try {
             const resp = await axios.get(`${ACARS_BACKEND_URL}/api/users/${encodeURIComponent(out.userId)}/stats`, { timeout: 8000 });
             const s = resp?.data?.stats || resp?.data?.gradeInfo || resp?.data || {};
-            const gi = s?.gradeDetails?.gradeIndex;
-            if (out.grade == null) {
-                if (Number.isFinite(gi)) out.grade = Number(gi);
-                else if (Number.isFinite(s?.grade)) out.grade = Number(s.grade);
-            }
+            // gradeDetails.gradeIndex is an array index, not the grade —
+            // resolveGrade maps it back to the 1-5 number the requirements
+            // below are written against.
+            if (out.grade == null) out.grade = resolveGrade(s);
             const viol = Number.isFinite(s?.violations) ? Number(s.violations)
                 : ((s?.violationCountByLevel?.level1 || 0) + (s?.violationCountByLevel?.level2 || 0) + (s?.violationCountByLevel?.level3 || 0));
             out.stats = {
