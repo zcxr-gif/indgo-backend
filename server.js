@@ -10254,7 +10254,8 @@ app.get('/api/route-map', async (req, res) => {
  * a client-sent `pro: true` would make the paywall a suggestion.
  */
 const {
-    renderIfProfileCard, fetchIfStats, normalizeFields, normalizeTheme, normalizeFavourites,
+    renderIfProfileCard, renderIfCardError,
+    fetchIfStats, normalizeFields, normalizeTheme, normalizeFavourites,
     needsRefresh, refreshDueAt,
     FIELDS: IF_CARD_FIELDS, DEFAULT_FIELDS: IF_CARD_DEFAULT_FIELDS,
     MAX_FIELDS: IF_CARD_MAX_FIELDS, THEME_KEYS: IF_CARD_THEMES, DEFAULT_THEME: IF_CARD_DEFAULT_THEME,
@@ -10530,6 +10531,41 @@ async function ifCardPhotoUrl(fav) {
     }
 }
 
+/**
+ * Answer a card request that cannot be satisfied — with an IMAGE.
+ *
+ * This route is an <img src> on a public IFC profile and IFC hotlinks it, so a
+ * JSON error body reaches the reader as a broken-image icon and nothing else.
+ * Every way of failing then looks identical from the outside, which is how a
+ * card that had been fine for hours becomes an unexplainable grey box.
+ *
+ * The status code is kept honest (404 stays 404) — it is only the BODY that
+ * becomes a picture, so anything reading this programmatically is unaffected.
+ * `no-store`, because the reason must disappear the instant the real card can be
+ * drawn again; a cached error would outlive the fault that caused it.
+ *
+ * `.json` callers still get JSON: that surface is read by our own page, which
+ * wants the machine-readable answer.
+ */
+async function failIfCard(res, { status, code, title, detail, theme, wantsImage = true }) {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Cache-Control', 'no-store');
+    if (!wantsImage) return res.status(status).json({ message: detail, code });
+    try {
+        const png = await renderIfCardError({ title, detail, theme });
+        res.set('Content-Type', 'image/png');
+        // Named in a header as well as drawn, so `curl -I` on the URL answers
+        // "why" without anybody having to look at the picture.
+        res.set('X-Card-Error', code);
+        return res.status(status).send(png);
+    } catch (err) {
+        // The error card itself could not be drawn, which means sharp is the
+        // problem. Nothing left to render with, so say it plainly.
+        console.error('[if-card] error card render failed:', err?.message || err);
+        return res.status(status).json({ message: detail, code });
+    }
+}
+
 /** Render + reply, with the cache and shedding in front. Shared by both GETs. */
 async function sendIfCard(res, card) {
     const { value: png, status } = await ifCardRenderCache.run(
@@ -10539,9 +10575,21 @@ async function sendIfCard(res, card) {
     );
     if (status === 'shed') {
         res.set('Retry-After', '5');
-        return res.status(503).json({ message: 'Card renderer is busy — try again shortly.' });
+        return failIfCard(res, {
+            status: 503, code: 'renderer_busy',
+            title: 'Busy right now',
+            detail: 'Too many cards being drawn at once. This will come back on its own — reload in a minute.',
+            theme: card.theme,
+        });
     }
-    if (!png) return res.status(500).json({ message: 'Could not render the card.' });
+    if (!png) {
+        return failIfCard(res, {
+            status: 500, code: 'render_failed',
+            title: 'This card couldn’t be drawn',
+            detail: 'Something went wrong on our side. Nothing is lost — try again shortly.',
+            theme: card.theme,
+        });
+    }
     res.set('Content-Type', 'image/png');
     res.set('Cache-Control', `public, max-age=${IF_CARD_MAX_AGE_S}, stale-while-revalidate=${IF_CARD_SWR_S}`);
     res.set('Access-Control-Allow-Origin', '*');
@@ -10784,14 +10832,29 @@ app.get('/api/if-card/mine', async (req, res) => {
  * costs a render or an API call. The pilot's own profile view is the tick.
  */
 app.get('/api/if-card/:file', async (req, res) => {
+    // Decided before the try, because the catch needs to know whether the caller
+    // is a browser expecting a picture or our own page expecting JSON.
+    const raw = String(req.params.file || '');
+    const m = raw.match(/^([A-Za-z0-9_-]{4,32})\.(png|json)$/);
+    const wantsImage = !m || m[2] === 'png';
     try {
-        const raw = String(req.params.file || '');
-        const m = raw.match(/^([A-Za-z0-9_-]{4,32})\.(png|json)$/);
-        if (!m) return res.status(404).json({ message: 'No such card.' });
+        if (!m) {
+            return await failIfCard(res, {
+                status: 404, code: 'bad_slug', wantsImage,
+                title: 'That isn’t a card address',
+                detail: 'Check the link in your profile — it should end in .png.',
+            });
+        }
         const [, slug, ext] = m;
 
         const card = await IfProfileCard.findOne({ slug });
-        if (!card) return res.status(404).json({ message: 'No such card.' });
+        if (!card) {
+            return await failIfCard(res, {
+                status: 404, code: 'no_such_card', wantsImage,
+                title: 'This card no longer exists',
+                detail: 'It may have been deleted. Make a new one at inflight.info/card.',
+            });
+        }
 
         // Re-read the numbers when the month has turned over. Failure is
         // deliberately quiet and non-destructive: we keep serving the stats we
@@ -10845,8 +10908,21 @@ app.get('/api/if-card/:file', async (req, res) => {
             vas: await ifCardVasFor(card),
         });
     } catch (error) {
-        console.error('IF card render error:', error.message);
-        res.status(500).json({ message: 'Could not render the card.' });
+        // Everything the render itself touches — the VA roster lookup, the photo
+        // lookup, each remote image, the monthly stats re-read — catches its own
+        // failure and degrades, so reaching here means something structural: the
+        // database is unreachable, or sharp died. Both of those break EVERY card
+        // at once and stay broken until the process or the connection recovers,
+        // which is exactly the "it worked for hours and then vanished" shape.
+        //
+        // So it is logged with the slug, and answered with a picture that says a
+        // human should wait rather than that the pilot did something wrong.
+        console.error(`IF card render error (${raw}):`, error?.message || error);
+        await failIfCard(res, {
+            status: 500, code: 'card_unavailable', wantsImage,
+            title: 'Stats are unavailable right now',
+            detail: 'This is on our side, not yours — your card and its settings are safe. It’ll be back shortly.',
+        });
     }
 });
 
