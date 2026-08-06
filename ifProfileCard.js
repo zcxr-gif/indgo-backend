@@ -277,7 +277,12 @@ const CARD_RADIUS = 28;
 // grid rather than as a picture the card happens to end on. Wide and shallow
 // because that is the shape an aircraft is; a squarer crop spends its height on
 // sky and tarmac.
-const PHOTO_H = 268;
+//
+// The height was raised from 268: at that depth a 3:2 photograph cropped to the
+// panel's 4.1:1 was throwing away most of the aircraft, and the band read as a
+// stripe rather than as a picture. 330 is about 3.4:1 — still the shape an
+// airliner is, with enough room to actually see one.
+const PHOTO_H = 330;
 const PHOTO_RADIUS = 20;
 // It sits in the grid, so it is exactly as wide as the grid.
 const PHOTO_W = WIDTH - PAD * 2;
@@ -285,6 +290,16 @@ const PHOTO_W = WIDTH - PAD * 2;
 // the ceiling, so a wordmark gets room and a roundel stays square.
 const VA_LOGO_H = 62;
 const VA_LOGO_MAX_W = 160;
+// A pilot flying for several VAs gets a row of marks instead of one mark and a
+// name, so each is allowed less width — three 160px wordmarks would run into
+// the pilot's own name.
+const VA_LOGO_MULTI_MAX_W = 118;
+const VA_BADGE_GAP = 12;
+// What the badge row may take out of the header. The rest is the pilot's name,
+// which is the thing the card is actually about.
+const VA_ROW_MAX_W = 560;
+// Past three the header stops being a header. The API enforces the same ceiling.
+const MAX_VAS = 3;
 
 /**
  * How many tiles per row, for a given number of them.
@@ -342,8 +357,12 @@ const stamp = (d) => {
  * @param {string}   [card.photoUrl] community photo of the favourite aircraft.
  *                                   The CALLER resolves this — the renderer has
  *                                   no database and should not grow one.
+ * @param {object[]} [card.vas]     the VAs the pilot flies for, in their chosen
+ *                                   order. The CALLER has already verified each
+ *                                   against the roster — this function has no
+ *                                   database and takes the claim as settled.
  */
-async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, photoUrl, va } = {}) {
+async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, photoUrl, vas, va } = {}) {
     const s = stats || {};
     const pal = themeFor(normalizeTheme(theme));
     const keys = normalizeFields(fields);
@@ -352,25 +371,59 @@ async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, pho
     // get is a band we must not leave a gap for. Everything downstream keys off
     // `photo` being non-null rather than off the URL having been supplied.
     const photo = photoUrl ? await fetchImage(photoUrl) : null;
-    // The VA badge is likewise resolved up front — a logo we cannot fetch still
-    // leaves the VA's NAME, which is the part that matters, so the badge falls
-    // back to text rather than disappearing with the picture.
-    const vaLogo = va?.logoUrl ? await fetchImage(va.logoUrl) : null;
 
-    // The plate takes the logo's shape rather than forcing the logo into a
+    // `va` is the single-VA shape the first version of this card took. Folded in
+    // rather than dropped so an older caller still renders a badge.
+    const wearing = (Array.isArray(vas) ? vas : (va ? [va] : []))
+        .filter((v) => v && v.name)
+        .slice(0, MAX_VAS);
+
+    // The badges are resolved up front — a logo we cannot fetch still leaves the
+    // VA's NAME, which is the part that matters, so a badge falls back to its
+    // initial rather than disappearing with the picture.
+    //
+    // Each plate takes its logo's shape rather than forcing the logo into a
     // square. VA marks are wordmarks about as often as they are roundels, and a
     // 3:1 wordmark letterboxed into 62x62 renders about a fifth of the plate
-    // with the airline's name too small to read. Height is fixed so the badge
-    // still lines up with the pilot's name whatever shape arrives.
-    let vaLogoW = VA_LOGO_H;
-    if (vaLogo) {
-        try {
-            const meta = await sharp(vaLogo).metadata();
-            if (meta.width && meta.height) {
-                const aspect = meta.width / meta.height;
-                vaLogoW = Math.round(Math.min(Math.max(VA_LOGO_H * aspect, VA_LOGO_H), VA_LOGO_MAX_W));
-            }
-        } catch (_) { /* undecodable; the square fallback plate is drawn below */ }
+    // with the airline's name too small to read. Height is fixed so a row of
+    // them still lines up whatever shapes arrive.
+    const badges = [];
+    for (const v of wearing) {
+        const logo = v.logoUrl ? await fetchImage(v.logoUrl) : null;
+        let w = VA_LOGO_H;
+        if (logo) {
+            try {
+                const meta = await sharp(logo).metadata();
+                if (meta.width && meta.height) {
+                    const ceiling = wearing.length > 1 ? VA_LOGO_MULTI_MAX_W : VA_LOGO_MAX_W;
+                    const aspect = meta.width / meta.height;
+                    w = Math.round(Math.min(Math.max(VA_LOGO_H * aspect, VA_LOGO_H), ceiling));
+                }
+            } catch (_) { /* undecodable; the fallback plate is drawn below */ }
+        }
+        badges.push({ name: clamp(v.name, 26), logo, w });
+    }
+
+    // Laid out right-aligned in the header, and any badge that would push the
+    // row past its budget is dropped rather than allowed to collide with the
+    // pilot's name. Wide wordmarks are the case this is guarding against.
+    const worn = [];
+    let rowW = 0;
+    for (const b of badges) {
+        const need = worn.length ? rowW + VA_BADGE_GAP + b.w : b.w;
+        if (need > VA_ROW_MAX_W) break;
+        rowW = need;
+        worn.push(b);
+    }
+    // One badge keeps the VA's name beside its mark; several share the corner as
+    // marks alone under a single caption, because three names do not fit and a
+    // logo is what a VA is recognised by anyway.
+    const vaY = worn.length > 1 ? 56 : 46;
+    let vaX = WIDTH - PAD - rowW;
+    for (const b of worn) {
+        b.x = vaX;
+        b.y = vaY;
+        vaX += b.w + VA_BADGE_GAP;
     }
 
     // Resolve to drawable tiles first: the grid is sized from what SURVIVES,
@@ -429,50 +482,70 @@ async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, pho
         </g>`);
 
     // --- Header: who this is, and whose product it is ---
-    const handle = clamp(s.username || 'Unknown pilot', 26);
+    // The handle is clamped to whatever the badges have left it, rather than to
+    // a fixed count: one roundel and three wordmarks take very different
+    // amounts of the header, and a single figure is either too generous for the
+    // wide case (name and logos meet in the middle) or too mean for the narrow
+    // one. Measuring properly would mean shipping font metrics; the per-
+    // character estimate below is the same trick valueFontSize plays, with a
+    // gutter that absorbs its error.
+    const CHAR_W = 29;             // 44px DejaVu Sans Bold, mixed case, generous
+    const HEADER_GUTTER = 24;      // the gap the name must never close
+    const vaBlockW = worn.length === 1
+        // One badge also prints the VA's NAME to its left, at 22px.
+        ? rowW + 18 + worn[0].name.length * 12
+        : rowW;
+    const handleRoom = WIDTH - PAD * 2 - vaBlockW - (worn.length ? HEADER_GUTTER : 0);
+    const handleMax = Math.max(8, Math.min(26, Math.floor(handleRoom / CHAR_W)));
+    const handle = clamp(s.username || 'Unknown pilot', handleMax);
     parts.push(`
         <text x="${PAD}" y="${52}" font-family="${FONT}" font-size="17" font-weight="bold"
               letter-spacing="3.4" fill="${pal.faint}">INFLIGHT</text>
         <text x="${PAD}" y="${104}" font-family="${FONT}" font-size="44" font-weight="bold"
               fill="${pal.ink}">${esc(handle)}</text>`);
 
-    // --- The VA badge ---
+    // --- The VA badges ---
     // Top-right, because a VA is who the pilot flies FOR — identity, alongside
     // their name, rather than a statistic among statistics. Only ever drawn from
-    // a VA the caller has already confirmed the pilot is on the roster of; this
+    // VAs the caller has already confirmed the pilot is on the roster of; this
     // function has no database and takes the claim as settled.
-    const vaName = va?.name ? clamp(va.name, 26) : null;
-    const logoX = WIDTH - PAD - vaLogoW;
-    const logoY = 46;
-    if (vaName) {
+    if (worn.length === 1) {
         // The name is right-aligned into the gap left of the logo, so a long VA
         // name grows leftwards into empty header rather than into the mark.
-        const nameRight = logoX - 18;
+        const [b] = worn;
+        const nameRight = b.x - 18;
         parts.push(`
-            <text x="${nameRight}" y="${logoY + 26}" text-anchor="end" font-family="${FONT}" font-size="13"
+            <text x="${nameRight}" y="${b.y + 26}" text-anchor="end" font-family="${FONT}" font-size="13"
                   font-weight="bold" letter-spacing="2.4" fill="${pal.faint}">FLIES FOR</text>
-            <text x="${nameRight}" y="${logoY + 52}" text-anchor="end" font-family="${FONT}" font-size="22"
-                  font-weight="bold" fill="${pal.ink}">${esc(vaName)}</text>`);
-        // The plate is drawn ALWAYS, not just when the logo is missing. A logo
-        // is letterboxed into the square (see below) so the plate is the
-        // backing it sits on, and drawing it unconditionally also means a logo
-        // that fetches but fails to decode still leaves a badge rather than a
-        // hole. Only the initial is conditional.
+            <text x="${nameRight}" y="${b.y + 52}" text-anchor="end" font-family="${FONT}" font-size="22"
+                  font-weight="bold" fill="${pal.ink}">${esc(b.name)}</text>`);
+    } else if (worn.length > 1) {
+        // One caption over the row rather than one per mark: the marks are the
+        // content, and repeating "flies for" three times is noise.
         parts.push(`
-            <rect x="${logoX}" y="${logoY}" width="${vaLogoW}" height="${VA_LOGO_H}" rx="16"
+            <text x="${WIDTH - PAD}" y="44" text-anchor="end" font-family="${FONT}" font-size="13"
+                  font-weight="bold" letter-spacing="2.4" fill="${pal.faint}">FLIES FOR</text>`);
+    }
+    // The plates are drawn ALWAYS, not just when a logo is missing. A logo is
+    // letterboxed onto its plate (see below), and drawing them unconditionally
+    // also means a logo that fetches but fails to decode still leaves a badge
+    // rather than a hole. Only the initial is conditional.
+    for (const b of worn) {
+        parts.push(`
+            <rect x="${b.x}" y="${b.y}" width="${b.w}" height="${VA_LOGO_H}" rx="16"
                   fill="${pal.tile}" stroke="${pal.tileLine}" stroke-width="1.5"/>`);
-        if (!vaLogo) {
+        if (!b.logo) {
             parts.push(`
-                <text x="${logoX + vaLogoW / 2}" y="${logoY + 42}" text-anchor="middle" font-family="${FONT}"
-                      font-size="28" font-weight="bold" fill="${pal.muted}">${esc(vaName.charAt(0).toUpperCase())}</text>`);
+                <text x="${b.x + b.w / 2}" y="${b.y + 42}" text-anchor="middle" font-family="${FONT}"
+                      font-size="28" font-weight="bold" fill="${pal.muted}">${esc(b.name.charAt(0).toUpperCase())}</text>`);
         }
     }
 
     // Grade rides in the top-right as a pill whenever the pilot did not already
     // put it in the grid — it is the one number every IFC reader looks for, and
-    // duplicating it would just spend a tile. The VA badge holds that corner
-    // when there is one, and identity beats a number the grid can carry.
-    if (s.grade != null && !keys.includes('grade') && !vaName) {
+    // duplicating it would just spend a tile. The VA badges hold that corner
+    // when there are any, and identity beats a number the grid can carry.
+    if (s.grade != null && !keys.includes('grade') && !worn.length) {
         const txt = `GRADE ${s.grade}`;
         const pillW = 34 + txt.length * 13;
         parts.push(`
@@ -516,8 +589,8 @@ async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, pho
 
     // --- Footer ---
     // Always its own strip on the card's background, in theme ink — the photo
-    // is a panel now, so nothing is ever printed over a photograph and the
-    // footer can stay the same line on every card.
+    // is a panel, so nothing is ever printed over a photograph and the footer
+    // can stay the same line on every card.
     const footY = height - FOOTER_H + 34;
     parts.push(`
         <text x="${PAD}" y="${footY}" font-family="${FONT}" font-size="17" fill="${pal.faint}">
@@ -548,29 +621,37 @@ async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, pho
 
     let out = sharp(Buffer.from(svg));
 
-    // --- The VA logo ---
+    // --- The VA logos ---
     // `contain` rather than `cover`: VA logos are wordmarks as often as they are
-    // roundels, and cropping one to fill a square cuts the airline's name in
-    // half. Letterboxed onto a transparent background it keeps its aspect and
-    // sits inside the rounded plate.
-    if (vaName && vaLogo) {
+    // roundels, and cropping one to fill its plate cuts the airline's name in
+    // half. Letterboxed onto a transparent background each keeps its aspect and
+    // sits inside its rounded plate.
+    //
+    // Collected into ONE composite rather than one per badge, so three VAs cost
+    // a single re-encode of the card rather than three.
+    const marks = [];
+    for (const b of worn) {
+        if (!b.logo) continue;
         try {
-            const mark = await sharp(vaLogo)
-                .resize(vaLogoW, VA_LOGO_H, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
-                .composite([{
-                    input: Buffer.from(
-                        `<svg xmlns="http://www.w3.org/2000/svg" width="${vaLogoW}" height="${VA_LOGO_H}"><rect width="${vaLogoW}" height="${VA_LOGO_H}" rx="16" fill="#fff"/></svg>`),
-                    blend: 'dest-in',
-                }])
-                .png().toBuffer();
-            out = sharp(await out.png().toBuffer())
-                .composite([{ input: mark, left: logoX, top: logoY }]);
+            marks.push({
+                input: await sharp(b.logo)
+                    .resize(b.w, VA_LOGO_H, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
+                    .composite([{
+                        input: Buffer.from(
+                            `<svg xmlns="http://www.w3.org/2000/svg" width="${b.w}" height="${VA_LOGO_H}"><rect width="${b.w}" height="${VA_LOGO_H}" rx="16" fill="#fff"/></svg>`),
+                        blend: 'dest-in',
+                    }])
+                    .png().toBuffer(),
+                left: b.x,
+                top: b.y,
+            });
         } catch (err) {
             // A logo sharp cannot decode is not worth losing the card over — the
             // SVG already drew the fallback plate underneath.
             console.error('[if-card] VA logo render failed:', err?.message || err);
         }
     }
+    if (marks.length) out = sharp(await out.png().toBuffer()).composite(marks);
 
     // --- The favourite aircraft, photographed ---
     // Three layers, in order: the photo itself (rounded to the panel's corners),
@@ -637,7 +718,7 @@ function panelMask() {
 /**
  * The bytes behind a remote image URL, or null.
  *
- * Used for both the aircraft photo and the VA logo. Best-effort in every
+ * Used for both the aircraft photo and the VA logos. Best-effort in every
  * direction: a timeout, a size ceiling, and a content-type check, because these
  * URLs come out of database rows that a contributor or a VA filled in, and the
  * renderer must not be the thing that hangs on one. Null simply means that
@@ -707,6 +788,7 @@ module.exports = {
     FIELD_KEYS,
     DEFAULT_FIELDS,
     MAX_FIELDS,
+    MAX_VAS,
     THEME_KEYS,
     DEFAULT_THEME,
 };

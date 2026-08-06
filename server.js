@@ -9580,6 +9580,7 @@ const {
     needsRefresh, refreshDueAt,
     FIELDS: IF_CARD_FIELDS, DEFAULT_FIELDS: IF_CARD_DEFAULT_FIELDS,
     MAX_FIELDS: IF_CARD_MAX_FIELDS, THEME_KEYS: IF_CARD_THEMES, DEFAULT_THEME: IF_CARD_DEFAULT_THEME,
+    MAX_VAS: IF_CARD_MAX_VAS,
 } = require('./ifProfileCard');
 
 const IfProfileCardSchema = new mongoose.Schema({
@@ -9598,11 +9599,16 @@ const IfProfileCardSchema = new mongoose.Schema({
     favourites:  { type: mongoose.Schema.Types.Mixed, default: null },
     // A favourite aircraft is drawn as a photo band unless they ask otherwise.
     showPhoto:   { type: Boolean, default: true },
-    // The VA whose colours the pilot flies. Stored as the listing's id rather
-    // than its name, so a VA that renames itself renames on every card at once
-    // — and so the roster re-check at render time has something exact to match.
+    // The VAs whose colours the pilot flies, in the order they want them worn.
+    // Stored as listing ids rather than names, so a VA that renames itself
+    // renames on every card at once — and so the roster re-check at render time
+    // has something exact to match. An empty list is "no VA on the card"; there
+    // is no separate show/hide flag because unticking every VA already says it.
+    vaAdIds:     { type: [String], default: () => [] },
+    // The single-VA field these cards were born with. Kept readable so a card
+    // saved before multi-VA still wears its badge until the pilot next saves;
+    // nothing writes it any more.
     vaAdId:      { type: String, default: null },
-    showVa:      { type: Boolean, default: true },
     // Pro-only, and re-checked against Supabase on every save — a lapsed
     // membership must stop the refresh, not keep it running off a stale flag.
     autoRefresh: { type: Boolean, default: false },
@@ -9633,10 +9639,23 @@ const IF_CARD_SUPABASE_ANON = process.env.SUPABASE_ANON_KEY
  * session fails here exactly as it would anywhere else, rather than continuing
  * to pass a local signature check until it expires on paper.
  *
- * `is_pro` is read with the caller's OWN token, so the existing row-level
+ * `profiles` is read with the caller's OWN token, so the existing row-level
  * policy that lets a member read their own profile is the whole authorization
- * story. A failure to read it is treated as not-Pro: the wrong answer in the
- * safe direction.
+ * story.
+ *
+ * ENTITLEMENT IS THE APP'S RULE, NOT A STRICTER ONE OF OUR OWN. This route used
+ * to answer `profiles.is_pro === true` and nothing else, which is why a paying
+ * pilot could hold Pro everywhere in Inflight and still be told the card's
+ * monthly refresh needs Pro. `profiles.is_pro` is documented in the tracker as
+ * frequently null or false for real paying accounts (see refreshProStatus in
+ * flight.js, and the same rule in authUI.js and MobileDashboardUI.js): it is
+ * trusted only as an explicit true, and a FREE account is identified positively
+ * instead, by the `user_metadata.is_pro === false` stamp that free sign-up
+ * writes. Anything else signed in is a legacy or paid Pro account.
+ *
+ * Two surfaces disagreeing about who is Pro is worse than either answer, so
+ * this now matches the client rather than second-guessing it. The stakes here
+ * are one monthly stat re-read, and the same rule already gates far more.
  *
  * @returns {Promise<{id,email,ifUsername,isPro}|null>} null when unauthenticated
  */
@@ -9655,15 +9674,22 @@ async function supabaseCaller(req) {
     } catch (_) { return null; }
     if (!user || !user.id) return null;
 
-    let isPro = false;
+    let profilePro = null;   // null = we could not read the row at all
     try {
         const resp = await axios.get(`${IF_CARD_SUPABASE_URL}/rest/v1/profiles`, {
             timeout: 8000,
             params: { id: `eq.${user.id}`, select: 'is_pro' },
             headers: { apikey: IF_CARD_SUPABASE_ANON, Authorization: `Bearer ${token}` },
         });
-        isPro = resp?.data?.[0]?.is_pro === true;
-    } catch (_) { /* not Pro, as far as we can tell */ }
+        profilePro = resp?.data?.[0]?.is_pro === true;
+    } catch (_) { /* falls through to the metadata stamp below */ }
+
+    // A stamped-free account is the only thing that is definitely not Pro. An
+    // unreadable profiles row therefore does not demote anybody — it just leaves
+    // the stamp as the deciding evidence, which is the same failure direction
+    // the client takes.
+    const stampedFree = user.user_metadata?.is_pro === false;
+    const isPro = profilePro === true ? true : !stampedFree;
 
     return {
         id: String(user.id),
@@ -9688,17 +9714,31 @@ const IF_CARD_RENDER_TTL_MS = 10 * 60 * 1000;
 // popular profile is not re-rendering constantly, and short enough that a
 // pilot who has just changed their card sees the change without being told to
 // clear anything.
-const IF_CARD_MAX_AGE_S = 900;
+//
+// Fifteen minutes turned out to be the wrong side of that trade. The pilot's
+// own browser is the one holding the stale copy, and a pilot who has just
+// edited their card goes straight to their IFC profile to look at it — waiting
+// a quarter of an hour there is indistinguishable from the card being broken.
+// Five minutes fresh, then served stale while we re-render behind it, keeps the
+// render load roughly where it was without the wait being the pilot's problem.
+const IF_CARD_MAX_AGE_S = 300;
+const IF_CARD_SWR_S = 900;
 
 const ifCardCacheKey = (c) => [
-    c.slug || 'preview', c.theme, (c.fields || []).join('.'), c.pro ? 'p' : 'f',
+    // Previews all share the 'preview' slug, so the username has to be in the
+    // key or two of them rendered in the same millisecond could serve each
+    // other's card.
+    c.slug || 'preview', c.stats?.username || '',
+    c.theme, (c.fields || []).join('.'), c.pro ? 'p' : 'f',
     c.statsAt ? new Date(c.statsAt).getTime() : 0,
-    // The photo is part of the picture, so it has to be part of the key — two
-    // cards identical but for their favourite aircraft are not the same PNG.
+    // The favourites are part of the picture — as tiles, and as the photo band's
+    // caption — so they have to be part of the key. Two cards identical but for
+    // a favourite airport are not the same PNG.
+    ['airport', 'airportName', 'aircraft', 'livery'].map((k) => c.stats?.fav?.[k] || '').join('~'),
     c.photoUrl || '',
-    // Same for the VA badge. Keyed on the resolved name+logo rather than the id
+    // Same for the VA badges. Keyed on the resolved name+logo rather than the id
     // so a VA changing either one invalidates every card wearing it.
-    c.va ? `${c.va.name}~${c.va.logoUrl || ''}` : '',
+    (c.vas || []).map((v) => `${v.name}~${v.logoUrl || ''}`).join('+'),
 ].join('|');
 
 /**
@@ -9714,14 +9754,20 @@ const ifCardCacheKey = (c) => [
  * approved listings, because a pending or rejected one is not a VA anyone
  * should be wearing.
  *
+ * The lookup goes through `rosterMatchKeys` rather than a bare `toLowerCase()`.
+ * A roster is typed by VA staff and the name we match it against comes off the
+ * Infinite Flight API, so the two disagree about separators far more often than
+ * they disagree about the pilot — see the note on that helper. Matching on the
+ * raw lowercase alone is what made a pilot who IS on a roster see no VA at all.
+ *
  * Returns [] on any failure — the badge is the thing that disappears, never the
  * card.
  */
 async function ifCardVaOptions(ifUsername) {
-    const u = String(ifUsername || '').trim().toLowerCase();
-    if (!u) return [];
+    const keys = vaPilots.rosterMatchKeys(ifUsername);
+    if (!keys.length) return [];
     try {
-        const rows = await VaPilot.find({ usernameLower: u }).select('vaAdId').lean();
+        const rows = await VaPilot.find({ usernameLower: { $in: keys } }).select('vaAdId').lean();
         const ids = [...new Set(rows.map((r) => String(r.vaAdId)))];
         if (!ids.length) return [];
         const ads = await VirtualAirlineAd.find({ _id: { $in: ids }, status: 'approved' })
@@ -9734,18 +9780,42 @@ async function ifCardVaOptions(ifUsername) {
 }
 
 /**
- * The VA a card should actually display, re-checked against the roster.
+ * The VA ids a card asks for, tolerant of the single-id shape older cards hold.
+ *
+ * Capped at the renderer's own ceiling (IF_CARD_MAX_VAS) — a pilot can fly for
+ * more VAs than a card header can hold marks for, and the limit belongs beside
+ * the layout that imposes it rather than duplicated here.
+ */
+const ifCardWantedVaIds = (src) => {
+    const raw = Array.isArray(src?.vaAdIds) && src.vaAdIds.length
+        ? src.vaAdIds
+        : (src?.vaAdId ? [src.vaAdId] : []);
+    const out = [];
+    for (const v of raw) {
+        const id = String(v || '').trim();
+        if (id && !out.includes(id)) out.push(id);
+        if (out.length >= IF_CARD_MAX_VAS) break;
+    }
+    return out;
+};
+
+/**
+ * The VAs a card should actually display, re-checked against the roster.
  *
  * Deliberately re-resolved on every render rather than trusted from the saved
  * card: a pilot who leaves a VA stops repping it, without anybody having to
  * remember to clear the field. The render cache bounds how often this runs, so
- * the badge follows roster changes within that TTL rather than instantly —
+ * the badges follow roster changes within that TTL rather than instantly —
  * which is the right trade for a picture on a forum profile.
+ *
+ * Returned in the pilot's chosen order, so the VA they put first is the one
+ * that leads the header.
  */
-async function ifCardVaFor(card) {
-    if (!card || !card.showVa || !card.vaAdId) return null;
+async function ifCardVasFor(card) {
+    const wanted = ifCardWantedVaIds(card);
+    if (!wanted.length) return [];
     const options = await ifCardVaOptions(card.ifUsername);
-    return options.find((o) => o.id === String(card.vaAdId)) || null;
+    return wanted.map((id) => options.find((o) => o.id === id)).filter(Boolean);
 }
 
 /**
@@ -9795,7 +9865,7 @@ async function sendIfCard(res, card) {
     }
     if (!png) return res.status(500).json({ message: 'Could not render the card.' });
     res.set('Content-Type', 'image/png');
-    res.set('Cache-Control', `public, max-age=${IF_CARD_MAX_AGE_S}`);
+    res.set('Cache-Control', `public, max-age=${IF_CARD_MAX_AGE_S}, stale-while-revalidate=${IF_CARD_SWR_S}`);
     res.set('Access-Control-Allow-Origin', '*');
     return res.send(png);
 }
@@ -9810,7 +9880,34 @@ app.get('/api/if-card/options', (_req, res) => {
         themes: IF_CARD_THEMES,
         defaults: { fields: IF_CARD_DEFAULT_FIELDS, theme: IF_CARD_DEFAULT_THEME },
         maxFields: IF_CARD_MAX_FIELDS,
+        maxVas: IF_CARD_MAX_VAS,
     });
+});
+
+/*
+ * Which VAs a given community username may wear.
+ *
+ * Public and username-taking, for the same reason the preview is: the generator
+ * page has to answer "are you on anyone's roster?" the moment a name is typed,
+ * before there is a session or a card. Without this the picker could only ever
+ * be filled from /mine — so a pilot who typed their username saw NO VA options
+ * at all, however many rosters they were on, which is exactly the "it doesn't
+ * show up" this fixes.
+ *
+ * It reveals nothing a VA has not already published: the listings are the public
+ * partner directory, and the answer is only ever "this name appears on these
+ * approved rosters".
+ */
+app.get('/api/if-card/vas', async (req, res) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    try {
+        const username = String(req.query.user || '').trim();
+        if (!username) return res.status(400).json({ message: 'A community username is required.' });
+        res.json({ ok: true, username, maxVas: IF_CARD_MAX_VAS, vaOptions: await ifCardVaOptions(username) });
+    } catch (error) {
+        console.error('IF card VA lookup error:', error.message);
+        res.status(500).json({ message: 'Could not check your VA rosters.' });
+    }
 });
 
 /*
@@ -9842,9 +9939,10 @@ app.get('/api/if-card/preview', async (req, res) => {
         // The preview verifies the roster exactly as a save would. A pilot
         // cannot preview themselves into a VA they are not on — which matters,
         // because a preview is a PNG somebody could otherwise link to directly.
-        const va = req.query.va
-            ? await ifCardVaFor({ showVa: true, vaAdId: req.query.va, ifUsername: stats.username })
-            : null;
+        const vas = await ifCardVasFor({
+            vaAdIds: String(req.query.va || '').split(',').map((v) => v.trim()).filter(Boolean),
+            ifUsername: stats.username,
+        });
 
         return await sendIfCard(res, {
             stats: { ...stats, fav },
@@ -9853,7 +9951,7 @@ app.get('/api/if-card/preview', async (req, res) => {
             pro: req.query.pro === '1',
             statsAt: new Date(),
             photoUrl,
-            va,
+            vas,
         });
     } catch (error) {
         console.error('IF card preview error:', error.message);
@@ -9892,8 +9990,8 @@ app.post('/api/if-card', async (req, res) => {
         // Verified against the roster here, not taken on the client's word — a
         // VA logo is a claim about somebody else's organisation.
         const vaOptions = await ifCardVaOptions(stats.username);
-        const wantedVa = String(req.body?.vaAdId || '').trim();
-        const vaChoice = wantedVa && vaOptions.some((o) => o.id === wantedVa) ? wantedVa : null;
+        const wantedVas = ifCardWantedVaIds(req.body);
+        const vaChoices = wantedVas.filter((id) => vaOptions.some((o) => o.id === id));
         const update = {
             ifUsername: stats.username,
             ifUserId: stats.userId,
@@ -9901,11 +9999,15 @@ app.post('/api/if-card', async (req, res) => {
             theme: normalizeTheme(req.body?.theme),
             favourites,
             showPhoto: req.body?.showPhoto !== false,
-            // Only a VA this pilot is genuinely on the roster of survives the
-            // save; anything else is stored as null rather than rejected, so a
-            // pilot whose roster entry was removed still gets their card.
-            vaAdId: vaChoice,
-            showVa: req.body?.showVa !== false,
+            // Only VAs this pilot is genuinely on the roster of survive the
+            // save; anything else is dropped rather than rejected, so a pilot
+            // whose roster entry was removed still gets their card.
+            vaAdIds: vaChoices,
+            // The card no longer writes the single-id field, but leaving a
+            // stale value behind would resurrect a badge the pilot has just
+            // taken off, since that field is still read as a fallback. Cleared
+            // on every save.
+            vaAdId: null,
             pro: caller.isPro,
             autoRefresh: wantsRefresh && caller.isPro,
             stats,
@@ -9933,12 +10035,12 @@ app.post('/api/if-card', async (req, res) => {
             // The page can then say "we have no photo of that one" instead of
             // leaving them wondering why the band never appeared.
             photoFound: card.showPhoto ? !!(await ifCardPhotoUrl(card.favourites)) : false,
-            vaAdId: card.vaAdId, showVa: card.showVa,
+            vaAdIds: card.vaAdIds,
             vaOptions,
-            // Asked for a VA and did not get it: they are not on that roster.
-            // Said plainly, because the alternative is a badge that silently
-            // never appears.
-            vaDenied: !!wantedVa && !vaChoice,
+            // Asked for VAs and did not get all of them: they are not on those
+            // rosters. Said plainly, because the alternative is a badge that
+            // silently never appears.
+            vaDenied: wantedVas.length > vaChoices.length,
             pro: card.pro,
             autoRefresh: card.autoRefresh,
             // Told plainly rather than silently ignored.
@@ -9965,13 +10067,16 @@ app.get('/api/if-card/mine', async (req, res) => {
             ok: true,
             isPro: caller.isPro,
             ifUsername: caller.ifUsername || null,
+            maxVas: IF_CARD_MAX_VAS,
             vaOptions,
             card: card ? {
                 slug: card.slug,
                 imageUrl: `${req.protocol}://${req.get('host')}/api/if-card/${card.slug}.png`,
                 fields: card.fields, theme: card.theme,
                 favourites: card.favourites, showPhoto: card.showPhoto,
-                vaAdId: card.vaAdId, showVa: card.showVa,
+                // Old single-VA cards fold into the list, so a pilot returning
+                // to one sees their VA already ticked rather than blank.
+                vaAdIds: ifCardWantedVaIds(card),
                 pro: card.pro, autoRefresh: card.autoRefresh,
                 statsAt: card.statsAt,
                 nextRefresh: card.autoRefresh ? refreshDueAt(card.statsAt) : null,
@@ -10030,7 +10135,7 @@ app.get('/api/if-card/:file', async (req, res) => {
                 slug: card.slug, ifUsername: card.ifUsername,
                 fields: card.fields, theme: card.theme,
                 favourites: card.favourites, showPhoto: card.showPhoto,
-                vaAdId: card.vaAdId, showVa: card.showVa,
+                vaAdIds: ifCardWantedVaIds(card),
                 pro: card.pro, autoRefresh: card.autoRefresh,
                 statsAt: card.statsAt,
                 nextRefresh: card.autoRefresh ? refreshDueAt(card.statsAt) : null,
@@ -10054,7 +10159,7 @@ app.get('/api/if-card/:file', async (req, res) => {
             photoUrl: card.showPhoto ? await ifCardPhotoUrl(card.favourites) : null,
             // Re-checked against the roster on every render, so leaving a VA
             // takes its colours off the card without the pilot doing anything.
-            va: await ifCardVaFor(card),
+            vas: await ifCardVasFor(card),
         });
     } catch (error) {
         console.error('IF card render error:', error.message);
