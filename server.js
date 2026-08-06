@@ -9539,6 +9539,374 @@ app.get('/api/route-map', async (req, res) => {
     }
 });
 
+/* --- IFC profile stats card ---------------------------------------------------
+ *
+ * A pilot's Infinite Flight stats as a PNG they can paste into their Infinite
+ * Flight Community "About me". IFC is Discourse; a bio holds markdown and
+ * nothing else, so an image at a stable URL is the only way stats can live
+ * there at all.
+ *
+ * Three routes, and the split between them is the product:
+ *
+ *   POST /api/if-card          make/replace MY card   (Supabase bearer required)
+ *   GET  /api/if-card/preview  render without saving  (the generator's preview)
+ *   GET  /api/if-card/:file    serve <slug>.png or <slug>.json  (public)
+ *
+ * The image is public and unauthenticated because it has to be: the fetcher is
+ * a forum, a CDN, or a stranger's browser, none of which can present a
+ * credential. Nothing on the card is private — it is the same stat block the IF
+ * API hands out for any community username — and the slug is unguessable, so a
+ * card that is never pasted anywhere is never seen.
+ *
+ * THE REFRESH ACTUALLY REACHES THE PROFILE, and that is not luck. Discourse
+ * rehosts hotlinked images (download_remote_images_to_local) via a job that
+ * operates strictly on Post — there is no equivalent for user profiles, and
+ * CookedPostProcessor, which builds lightboxes and thumbnails, does not run on
+ * a bio either. A bio keeps the bare <img> pointing here, so every viewer's
+ * browser fetches the current card from us and the only staleness in the
+ * system is the Cache-Control below. If Discourse ever changes that, a Pro
+ * card silently freezes at whatever the forum cached, and this comment is the
+ * thing to re-check.
+ *
+ * WRITING is a different matter, and is where the Supabase session comes in. A
+ * card is minted from the IF username on the requester's own Inflight account,
+ * never from a name in the request body, so nobody can mint a card in someone
+ * else's name. The same verified session is what tells us whether they are Pro,
+ * which decides whether the numbers are allowed to refresh themselves. Trusting
+ * a client-sent `pro: true` would make the paywall a suggestion.
+ */
+const {
+    renderIfProfileCard, fetchIfStats, normalizeFields, normalizeTheme,
+    needsRefresh, refreshDueAt,
+    FIELDS: IF_CARD_FIELDS, DEFAULT_FIELDS: IF_CARD_DEFAULT_FIELDS,
+    MAX_FIELDS: IF_CARD_MAX_FIELDS, THEME_KEYS: IF_CARD_THEMES, DEFAULT_THEME: IF_CARD_DEFAULT_THEME,
+} = require('./ifProfileCard');
+
+const IfProfileCardSchema = new mongoose.Schema({
+    slug:        { type: String, required: true, unique: true, index: true },
+    // The Supabase account that owns the card. One card per account: the URL
+    // ends up pasted into a profile, so re-generating has to update THAT card
+    // rather than mint a second one and silently leave the pasted one stale.
+    ownerId:     { type: String, required: true, unique: true, index: true },
+    ifUsername:  { type: String, required: true },
+    ifUserId:    { type: String, default: null },
+    fields:      { type: [String], default: () => [...IF_CARD_DEFAULT_FIELDS] },
+    theme:       { type: String, default: IF_CARD_DEFAULT_THEME },
+    // Pro-only, and re-checked against Supabase on every save — a lapsed
+    // membership must stop the refresh, not keep it running off a stale flag.
+    autoRefresh: { type: Boolean, default: false },
+    pro:         { type: Boolean, default: false },
+    // The snapshot the image is drawn from. Free cards keep the one they were
+    // born with; Pro cards have it replaced at the turn of each month.
+    stats:       { type: mongoose.Schema.Types.Mixed, default: null },
+    statsAt:     { type: Date, default: Date.now },
+    // Bookkeeping so a card that stops refreshing can be explained.
+    lastRefreshAttempt: { type: Date, default: null },
+    views:       { type: Number, default: 0 },
+}, { timestamps: true });
+const IfProfileCard = mongoose.models.IfProfileCard || mongoose.model('IfProfileCard', IfProfileCardSchema);
+
+// Supabase holds Inflight accounts and the is_pro flag. Both values below are
+// public by design (the anon key ships in the tracker's HTML); the private half
+// of this exchange is the CALLER's access token, which is what actually proves
+// who they are.
+const IF_CARD_SUPABASE_URL = (process.env.SUPABASE_URL || 'https://lcgaoiqwwpyqndaucyzu.supabase.co').replace(/\/+$/, '');
+const IF_CARD_SUPABASE_ANON = process.env.SUPABASE_ANON_KEY
+    || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxjZ2FvaXF3d3B5cW5kYXVjeXp1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIwNjkyOTksImV4cCI6MjA4NzY0NTI5OX0.9TO21knXR_P9E80pea7gUOu-gTjb17sCGk7BYgRRe3U';
+
+/**
+ * Who is calling, according to Supabase.
+ *
+ * We do not verify the JWT ourselves — we spend the token at Supabase and let
+ * it answer. That means no JWT secret on this box, and a revoked or expired
+ * session fails here exactly as it would anywhere else, rather than continuing
+ * to pass a local signature check until it expires on paper.
+ *
+ * `is_pro` is read with the caller's OWN token, so the existing row-level
+ * policy that lets a member read their own profile is the whole authorization
+ * story. A failure to read it is treated as not-Pro: the wrong answer in the
+ * safe direction.
+ *
+ * @returns {Promise<{id,email,ifUsername,isPro}|null>} null when unauthenticated
+ */
+async function supabaseCaller(req) {
+    const header = String(req.get('authorization') || '');
+    const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+    if (!token) return null;
+
+    let user;
+    try {
+        const resp = await axios.get(`${IF_CARD_SUPABASE_URL}/auth/v1/user`, {
+            timeout: 8000,
+            headers: { apikey: IF_CARD_SUPABASE_ANON, Authorization: `Bearer ${token}` },
+        });
+        user = resp?.data;
+    } catch (_) { return null; }
+    if (!user || !user.id) return null;
+
+    let isPro = false;
+    try {
+        const resp = await axios.get(`${IF_CARD_SUPABASE_URL}/rest/v1/profiles`, {
+            timeout: 8000,
+            params: { id: `eq.${user.id}`, select: 'is_pro' },
+            headers: { apikey: IF_CARD_SUPABASE_ANON, Authorization: `Bearer ${token}` },
+        });
+        isPro = resp?.data?.[0]?.is_pro === true;
+    } catch (_) { /* not Pro, as far as we can tell */ }
+
+    return {
+        id: String(user.id),
+        email: user.email || null,
+        ifUsername: String(user.user_metadata?.if_username || '').trim(),
+        isPro,
+    };
+}
+
+// Slugs are the card's whole privacy story, so they are drawn from crypto and
+// long enough that guessing one is not a strategy.
+const ifCardSlug = () => require('crypto').randomBytes(9).toString('base64url');
+
+// Rendered PNGs, memoized. A profile view can fan out into several fetches of
+// the identical image (the reader's browser, the forum's own preview, whatever
+// proxy sits between), and every one of them would otherwise queue a render
+// behind live VA webhook cards. Same cache class, same load-shedding, as the
+// route map above.
+const ifCardRenderCache = new RouteMapCache({ max: 200, maxInflight: 3 });
+const IF_CARD_RENDER_TTL_MS = 10 * 60 * 1000;
+// Browser/CDN caching. Deliberately modest: it has to be long enough that a
+// popular profile is not re-rendering constantly, and short enough that a
+// pilot who has just changed their card sees the change without being told to
+// clear anything.
+const IF_CARD_MAX_AGE_S = 900;
+
+const ifCardCacheKey = (c) => [
+    c.slug || 'preview', c.theme, (c.fields || []).join('.'), c.pro ? 'p' : 'f',
+    c.statsAt ? new Date(c.statsAt).getTime() : 0,
+].join('|');
+
+/** Render + reply, with the cache and shedding in front. Shared by both GETs. */
+async function sendIfCard(res, card) {
+    const { value: png, status } = await ifCardRenderCache.run(
+        ifCardCacheKey(card),
+        () => renderIfProfileCard(card),
+        () => IF_CARD_RENDER_TTL_MS,
+    );
+    if (status === 'shed') {
+        res.set('Retry-After', '5');
+        return res.status(503).json({ message: 'Card renderer is busy — try again shortly.' });
+    }
+    if (!png) return res.status(500).json({ message: 'Could not render the card.' });
+    res.set('Content-Type', 'image/png');
+    res.set('Cache-Control', `public, max-age=${IF_CARD_MAX_AGE_S}`);
+    res.set('Access-Control-Allow-Origin', '*');
+    return res.send(png);
+}
+
+// The catalogue, so the generator page offers exactly what the renderer can
+// draw instead of keeping its own copy of the list to drift out of sync.
+app.get('/api/if-card/options', (_req, res) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.json({
+        ok: true,
+        fields: Object.entries(IF_CARD_FIELDS).map(([key, spec]) => ({ key, label: spec.label })),
+        themes: IF_CARD_THEMES,
+        defaults: { fields: IF_CARD_DEFAULT_FIELDS, theme: IF_CARD_DEFAULT_THEME },
+        maxFields: IF_CARD_MAX_FIELDS,
+    });
+});
+
+/*
+ * Live preview for the generator page: render whatever the pilot is currently
+ * ticking, save nothing.
+ *
+ * Unauthenticated and takes a username, because it is used before a card
+ * exists and the page has to show something the moment a name is typed. That
+ * is safe precisely because it writes nothing and reveals nothing the IF API
+ * would not hand over for the same name — and the `pro` flag here only ever
+ * changes a line of footer text, never whether a stored card may refresh.
+ */
+app.get('/api/if-card/preview', async (req, res) => {
+    try {
+        const username = String(req.query.user || '').trim();
+        if (!username) return res.status(400).json({ message: 'A community username is required.' });
+
+        const stats = await fetchIfStats(username);
+        if (!stats) return res.status(404).json({ message: `No Infinite Flight account found for “${username}”.` });
+
+        return await sendIfCard(res, {
+            stats,
+            fields: normalizeFields(req.query.fields),
+            theme: normalizeTheme(req.query.theme),
+            pro: req.query.pro === '1',
+            statsAt: new Date(),
+        });
+    } catch (error) {
+        console.error('IF card preview error:', error.message);
+        res.status(500).json({ message: 'Could not render the preview.' });
+    }
+});
+
+/**
+ * Create or update the caller's card.
+ *
+ * Body: { fields?: string[], theme?: string, autoRefresh?: boolean }
+ *
+ * The IF username comes from the verified account, not the body. `autoRefresh`
+ * is honoured only for a Pro member; asking for it without Pro is not an error
+ * (the card is still made) but the response says plainly that it was not
+ * granted, so the page can show the upsell rather than a lie.
+ */
+app.post('/api/if-card', async (req, res) => {
+    try {
+        const caller = await supabaseCaller(req);
+        if (!caller) return res.status(401).json({ message: 'Sign in to Inflight to make your card.' });
+        if (!caller.ifUsername) {
+            return res.status(400).json({ message: 'Add your Infinite Flight Community username to your Inflight profile first.' });
+        }
+
+        const stats = await fetchIfStats(caller.ifUsername);
+        if (!stats) {
+            return res.status(404).json({
+                message: `We couldn't find an Infinite Flight account for “${caller.ifUsername}”. Check the username on your profile.`,
+            });
+        }
+
+        const wantsRefresh = req.body?.autoRefresh === true;
+        const update = {
+            ifUsername: stats.username,
+            ifUserId: stats.userId,
+            fields: normalizeFields(req.body?.fields),
+            theme: normalizeTheme(req.body?.theme),
+            pro: caller.isPro,
+            autoRefresh: wantsRefresh && caller.isPro,
+            stats,
+            statsAt: new Date(),
+        };
+
+        // Upsert on the owner, minting a slug only when there isn't one — the
+        // pilot's existing URL is already pasted into their IFC bio and must
+        // survive every edit they ever make.
+        const card = await IfProfileCard.findOneAndUpdate(
+            { ownerId: caller.id },
+            { $set: update, $setOnInsert: { ownerId: caller.id, slug: ifCardSlug() } },
+            { new: true, upsert: true, setDefaultsOnInsert: true },
+        );
+
+        res.json({
+            ok: true,
+            slug: card.slug,
+            imageUrl: `${req.protocol}://${req.get('host')}/api/if-card/${card.slug}.png`,
+            fields: card.fields,
+            theme: card.theme,
+            pro: card.pro,
+            autoRefresh: card.autoRefresh,
+            // Told plainly rather than silently ignored.
+            refreshDenied: wantsRefresh && !caller.isPro,
+            nextRefresh: card.autoRefresh ? refreshDueAt(card.statsAt) : null,
+            statsAt: card.statsAt,
+        });
+    } catch (error) {
+        console.error('IF card save error:', error.message);
+        res.status(500).json({ message: 'Could not save your card.' });
+    }
+});
+
+/** The caller's own card, or null. Lets the generator page resume where it left off. */
+app.get('/api/if-card/mine', async (req, res) => {
+    try {
+        const caller = await supabaseCaller(req);
+        if (!caller) return res.status(401).json({ message: 'Sign in to Inflight to see your card.' });
+        const card = await IfProfileCard.findOne({ ownerId: caller.id }).lean();
+        res.json({
+            ok: true,
+            isPro: caller.isPro,
+            ifUsername: caller.ifUsername || null,
+            card: card ? {
+                slug: card.slug,
+                imageUrl: `${req.protocol}://${req.get('host')}/api/if-card/${card.slug}.png`,
+                fields: card.fields, theme: card.theme,
+                pro: card.pro, autoRefresh: card.autoRefresh,
+                statsAt: card.statsAt,
+                nextRefresh: card.autoRefresh ? refreshDueAt(card.statsAt) : null,
+            } : null,
+        });
+    } catch (error) {
+        console.error('IF card read error:', error.message);
+        res.status(500).json({ message: 'Could not read your card.' });
+    }
+});
+
+/*
+ * The card itself: `<slug>.png` for the image, `<slug>.json` for its state.
+ *
+ * One route rather than two because a path parameter followed by a literal
+ * extension is exactly the pattern that behaves differently across
+ * path-to-regexp versions; splitting the suffix here is unambiguous and stays
+ * that way across an Express upgrade.
+ *
+ * THE MONTHLY REFRESH LIVES HERE. Being lazy is what makes it free: no
+ * scheduler, no queue of cards to sweep, and a card nobody ever looks at never
+ * costs a render or an API call. The pilot's own profile view is the tick.
+ */
+app.get('/api/if-card/:file', async (req, res) => {
+    try {
+        const raw = String(req.params.file || '');
+        const m = raw.match(/^([A-Za-z0-9_-]{4,32})\.(png|json)$/);
+        if (!m) return res.status(404).json({ message: 'No such card.' });
+        const [, slug, ext] = m;
+
+        const card = await IfProfileCard.findOne({ slug });
+        if (!card) return res.status(404).json({ message: 'No such card.' });
+
+        // Re-read the numbers when the month has turned over. Failure is
+        // deliberately quiet and non-destructive: we keep serving the stats we
+        // already hold, and `lastRefreshAttempt` stops a persistently
+        // unreachable API from being re-asked on every single view.
+        const RETRY_FLOOR_MS = 60 * 60 * 1000;
+        const recentlyTried = card.lastRefreshAttempt
+            && (Date.now() - card.lastRefreshAttempt.getTime()) < RETRY_FLOOR_MS;
+        if (needsRefresh(card) && !recentlyTried) {
+            card.lastRefreshAttempt = new Date();
+            const fresh = await fetchIfStats(card.ifUsername);
+            if (fresh) {
+                card.stats = fresh;
+                card.statsAt = new Date();
+                card.ifUserId = fresh.userId;
+            }
+            await card.save().catch(() => {});
+        }
+
+        if (ext === 'json') {
+            res.set('Access-Control-Allow-Origin', '*');
+            return res.json({
+                ok: true,
+                slug: card.slug, ifUsername: card.ifUsername,
+                fields: card.fields, theme: card.theme,
+                pro: card.pro, autoRefresh: card.autoRefresh,
+                statsAt: card.statsAt,
+                nextRefresh: card.autoRefresh ? refreshDueAt(card.statsAt) : null,
+                stats: card.stats,
+            });
+        }
+
+        // A view counter, incremented without waiting and without letting a
+        // write failure cost the pilot their image.
+        IfProfileCard.updateOne({ _id: card._id }, { $inc: { views: 1 } }).catch(() => {});
+
+        return await sendIfCard(res, {
+            slug: card.slug,
+            stats: card.stats,
+            fields: card.fields,
+            theme: card.theme,
+            pro: card.pro && card.autoRefresh,
+            statsAt: card.statsAt,
+        });
+    } catch (error) {
+        console.error('IF card render error:', error.message);
+        res.status(500).json({ message: 'Could not render the card.' });
+    }
+});
+
 // Shared roster helpers (parse/normalize usernames + thin DB ops on the VaPilot
 // model). Same module backs the VA portal so both surfaces behave identically.
 const vaPilots = require('./vaPilots');
