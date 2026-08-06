@@ -9558,6 +9558,16 @@ app.get('/api/route-map', async (req, res) => {
  * API hands out for any community username — and the slug is unguessable, so a
  * card that is never pasted anywhere is never seen.
  *
+ * THE REFRESH ACTUALLY REACHES THE PROFILE, and that is not luck. Discourse
+ * rehosts hotlinked images (download_remote_images_to_local) via a job that
+ * operates strictly on Post — there is no equivalent for user profiles, and
+ * CookedPostProcessor, which builds lightboxes and thumbnails, does not run on
+ * a bio either. A bio keeps the bare <img> pointing here, so every viewer's
+ * browser fetches the current card from us and the only staleness in the
+ * system is the Cache-Control below. If Discourse ever changes that, a Pro
+ * card silently freezes at whatever the forum cached, and this comment is the
+ * thing to re-check.
+ *
  * WRITING is a different matter, and is where the Supabase session comes in. A
  * card is minted from the IF username on the requester's own Inflight account,
  * never from a name in the request body, so nobody can mint a card in someone
