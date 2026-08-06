@@ -126,6 +126,105 @@ const size = async (buf) => { const m = await sharp(buf).metadata(); return `${m
         ok('re-setting a key refreshes its recency', c.get('a') !== null);
     }
 
+    head('Cache: the byte budget');
+    {
+        // What this cache actually holds is PNG Buffers, and they are nowhere near
+        // uniform: a route map is flat colour and lines, an IFC card carrying a
+        // photograph is a lossless encoding of a photograph. Measured, 6 KB
+        // against 1.1 MB. So an entry-count ceiling does not bound MEMORY at all,
+        // and these buffers live in Node's external memory where the heap limit
+        // cannot reach them and the container's limit kills the process instead.
+        const KB = (n) => Buffer.alloc(n * 1024);
+        const c = new RouteMapCache({ max: 100, maxBytes: 100 * 1024 });
+
+        c.set('a', KB(40), 10_000);
+        c.set('b', KB(40), 10_000);
+        ok('bytes are counted as entries land', c.bytes === 80 * 1024, String(c.bytes));
+
+        c.set('c', KB(40), 10_000);
+        ok('the byte budget evicts, though the entry count is nowhere near max',
+            c.bytes <= 100 * 1024, String(c.bytes));
+        ok('…coldest first', c.get('a') === null);
+        ok('…and the newest survives', c.get('c') !== null);
+        ok('the entry count reflects the eviction', c.size === 2, String(c.size));
+
+        // The case that would make the cache useless: one value bigger than the
+        // whole budget. Evicting it would mean never caching it, and re-rendering
+        // it on every single request — the opposite of the point.
+        const big = new RouteMapCache({ max: 10, maxBytes: 10 * 1024 });
+        big.set('huge', KB(500), 10_000);
+        ok('a single value over the whole budget is still kept',
+            big.get('huge') !== null, String(big.bytes));
+        big.set('small', KB(1), 10_000);
+        ok('…and is the first thing dropped when anything else arrives',
+            big.get('huge') === null && big.get('small') !== null);
+
+        // Re-setting a key must not double-count, or the total drifts up until the
+        // cache evicts everything and the budget silently becomes zero.
+        const re = new RouteMapCache({ max: 10, maxBytes: 1024 * 1024 });
+        re.set('k', KB(10), 10_000);
+        re.set('k', KB(10), 10_000);
+        re.set('k', KB(10), 10_000);
+        ok('re-setting a key does not double-count its bytes',
+            re.bytes === 10 * 1024, String(re.bytes));
+
+        const off = new RouteMapCache({ max: 2 });
+        off.set('a', KB(500), 10_000);
+        off.set('b', KB(500), 10_000);
+        ok('with no maxBytes the byte bound is inert (old behaviour)',
+            off.size === 2 && off.bytes === 1000 * 1024);
+
+        const strings = new RouteMapCache({ max: 10, maxBytes: 1024 });
+        strings.set('s', 'not a buffer', 10_000);
+        ok('a non-Buffer value weighs nothing rather than throwing',
+            strings.get('s') === 'not a buffer' && strings.bytes === 0);
+    }
+
+    head('Cache: sweeping what has expired');
+    {
+        // `get` drops an expired entry it happens to look at, which is enough for
+        // correctness — a stale value is never served. It is not enough for
+        // MEMORY: an entry nobody asks for again was never looked at again, so a
+        // cache with a ten-minute TTL kept its full complement of buffers
+        // resident hours after the traffic stopped.
+        const KB = (n) => Buffer.alloc(n * 1024);
+        const c = new RouteMapCache({ max: 100, maxBytes: 10 * 1024 * 1024 });
+        // 20 entries written, every one already past its TTL. Because the sweep
+        // runs on the write path, they cannot pile up in the first place: each
+        // `set` clears the corpses left by the ones before it, so the cache never
+        // holds more than the one just added.
+        for (let i = 0; i < 20; i++) c.set(`dead${i}`, KB(50), -1);
+        ok('dead entries never accumulate — 20 expired writes leave 1 behind',
+            c.size === 1, String(c.size));
+        ok('…so their bytes are not held either', c.bytes === 50 * 1024, String(c.bytes));
+
+        c.set('live', KB(1), 10_000);
+        ok('the last dead entry goes on the next write', c.size === 1, String(c.size));
+        ok('…and its bytes are returned', c.bytes === 1024, String(c.bytes));
+        ok('…leaving the live one alone', c.get('live') !== null);
+
+        // The ordering that matters: dead entries must go BEFORE the budget starts
+        // evicting, or a cache full of expired values throws away the live ones to
+        // make room for the newcomer.
+        const d = new RouteMapCache({ max: 100, maxBytes: 100 * 1024 });
+        d.set('hot', KB(40), 10_000);
+        for (let i = 0; i < 5; i++) d.set(`cold${i}`, KB(40), -1);
+        d.set('new', KB(40), 10_000);
+        ok('the live entry survives a cache full of expired ones',
+            d.get('hot') !== null && d.get('new') !== null, JSON.stringify(d.stats()));
+
+        ok('stats report what is held', (() => {
+            const st = d.stats();
+            return typeof st.entries === 'number' && typeof st.bytes === 'number'
+                && st.maxBytes === 100 * 1024 && st.swept >= 5;
+        })(), JSON.stringify(d.stats()));
+
+        const cl = new RouteMapCache({ max: 10, maxBytes: 1024 * 1024 });
+        cl.set('x', KB(10), 10_000);
+        cl.clear();
+        ok('clear() resets the byte total too', cl.size === 0 && cl.bytes === 0);
+    }
+
     head('Cache: de-duplicating a crawler burst');
     {
         const c = new RouteMapCache({ max: 10, maxInflight: 4 });

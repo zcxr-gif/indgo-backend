@@ -743,6 +743,57 @@ async function fetchImage(url) {
 }
 
 /* ---------------------------------------------------------------------------
+ * When the card cannot be drawn
+ *
+ * This endpoint is an <img src> on a public Discourse profile, and IFC hotlinks
+ * it — every reader's browser fetches it directly, on every view. So the ONLY
+ * thing a reader (or the pilot, or we) ever sees of a failure is whatever the
+ * response body renders as.
+ *
+ * Answering a failure with JSON, which is what this route did, means all four
+ * ways a card can fail — no such slug, renderer busy, render threw, database
+ * unreachable — arrive at the browser as one identical broken-image icon. The
+ * pilot's profile shows a grey box with a question mark and there is no way,
+ * from the outside, to tell which of the four happened or whether it is even
+ * our fault. A card that had been fine for hours simply "disappeared".
+ *
+ * So a failure renders a CARD too. Same width, same corner radius, same fonts,
+ * so it sits on the profile like the real one and reads as a status rather than
+ * as breakage: a line saying what went wrong, and a line saying whether the
+ * pilot needs to do anything. It is the difference between a mystery and a
+ * message.
+ *
+ * Deliberately NOT cached (the caller sends no-store): the whole point is that
+ * it vanishes of its own accord the moment the real card can be drawn again.
+ * ------------------------------------------------------------------------- */
+const ERROR_H = 260;
+
+/**
+ * A small card carrying a reason.
+ *
+ * `theme` is honoured when the caller knows it — a pilot running the daylight
+ * theme should not get a black rectangle dropped into their profile — and falls
+ * back to midnight when there is no card to read it from (a slug that does not
+ * exist has no theme).
+ */
+async function renderIfCardError({ title, detail, theme } = {}) {
+    const pal = THEMES[theme] || THEMES.midnight;
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${ERROR_H}"
+        viewBox="0 0 ${WIDTH} ${ERROR_H}">
+        <rect x="0" y="0" width="${WIDTH}" height="${ERROR_H}" rx="${CARD_RADIUS}" fill="${pal.bg}"/>
+        <rect x="1" y="1" width="${WIDTH - 2}" height="${ERROR_H - 2}" rx="${CARD_RADIUS - 1}"
+              fill="none" stroke="${pal.tileLine}" stroke-width="2"/>
+        <text x="${PAD}" y="86" font-family="${FONT}" font-size="30" font-weight="700"
+              fill="${pal.ink}">${esc(title || 'This card can’t be shown right now')}</text>
+        <text x="${PAD}" y="134" font-family="${FONT}" font-size="21" fill="${pal.muted}"
+              >${esc(detail || 'Try again in a few minutes.')}</text>
+        <text x="${PAD}" y="196" font-family="${FONT}" font-size="17" fill="${pal.faint}"
+              >Infinite Flight stats card</text>
+    </svg>`;
+    return sharp(Buffer.from(svg)).png().toBuffer();
+}
+
+/* ---------------------------------------------------------------------------
  * Render serialization
  *
  * sharp renders allocate large native buffers, and these cards are fetched by
@@ -778,6 +829,7 @@ function needsRefresh(card, now = Date.now()) {
 
 module.exports = {
     renderIfProfileCard,
+    renderIfCardError,
     fetchIfStats,
     normalizeFields,
     normalizeTheme,

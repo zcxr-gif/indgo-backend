@@ -84,6 +84,19 @@ const crewInsights = require('./crewInsights');
 const crewSchedules = require('./crewSchedules');
 const crewRetention = require('./crewRetention');
 
+// The document library, and messages addressed to one pilot. Both are pure
+// decision modules in the crewRetention mould: crewDocs decides who may read a
+// document (and strips the content when they may not), crewInbox decides who a
+// send reaches. The routes below hold the I/O and nothing else.
+const crewDocs = require('./crewDocs');
+const crewInbox = require('./crewInbox');
+
+// The quick-links board — where the crew is sent, and the one place a staff
+// member's raw string becomes an <a href> on every pilot's dashboard. crewLinks
+// holds the URL allowlist (parsed protocol, not a spelling blocklist) and the
+// same rank gate the library uses.
+const crewLinks = require('./crewLinks');
+
 // One-paste setup for a VA's Supabase project: given a Supabase access token we
 // install the schema, read the project's keys back and store the connection
 // ourselves, so nobody has to hand-copy three values between two dashboards.
@@ -1111,6 +1124,18 @@ function postCheckRideDueNotice(va, member, rung, actor) {
         refId: member._id,
         authorName: (actor && actor.name) || '',
     });
+    // And the pilot, in the second person. This is the notice that most needed an
+    // inbox: "they have the hours and are waiting on a sign-off" is addressed to
+    // staff, and the pilot's version — what to do next — had nowhere to go.
+    notifyPilot(va, member, {
+        kind: 'checkride',
+        title: `You’re ready for your ${rung.name} check-ride`,
+        body: rung.checkNote
+            ? String(rung.checkNote).slice(0, 600)
+            : 'You have the hours — the rank is waiting on a sign-off from staff.',
+        refId: member._id,
+        senderName: (actor && actor.name) || '',
+    });
 }
 
 /**
@@ -1133,6 +1158,59 @@ function postAnnouncement(va, { kind = 'notice', title, body = '', refId = null,
             });
         })
         .catch((err) => console.warn('announcement skipped —', err?.message || err));
+}
+
+/**
+ * Put a message in one pilot's inbox. v11.
+ *
+ * The addressed counterpart to postAnnouncement, and fire-and-forget for exactly
+ * the same reason: a promotion that happened must not be reported as a failure
+ * because the message about it could not be written. A VA on a pre-v11 schema has
+ * no crew_notifications table at all, and that is a reason to skip the message,
+ * never to fail the thing that caused it.
+ *
+ * Called with the roster row, so the message follows the pilot by `memberId` even
+ * before they have signed in for the first time and got an `accountId`. See the
+ * store's listNotifications for why both are matched on the way out.
+ *
+ * Deduped against what the pilot already has, because several of the callers run
+ * more than once — a sweep that re-checks, staff pressing approve twice on a slow
+ * connection. crewInbox.withoutDuplicates holds that rule; being told three times
+ * that you made Captain is how a pilot learns to ignore the inbox.
+ */
+function notifyPilot(va, member, { kind = 'system', title, body = '', refId = null, linkUrl = '', senderName = '' }) {
+    if (!va || !member || !title) return;
+    Promise.resolve()
+        .then(async () => {
+            const store = await crewStore.forVaOrNull(va);
+            if (!store || typeof store.createNotifications !== 'function') return;
+            // Callers hand us a roster row, which does not know its own login (the
+            // link runs the other way). Resolve it so the message lands on the
+            // indexed path, and carry on without it if accounts are unavailable —
+            // member id alone still delivers.
+            let accountId = member.accountId || null;
+            if (!accountId && member._id) {
+                try {
+                    const accounts = await store.listAccounts({ limit: 5000 });
+                    const hit = (accounts || []).find((a) => String(a.memberId || '') === String(member._id));
+                    accountId = hit ? hit._id : null;
+                } catch { accountId = null; }
+            }
+            const row = {
+                accountId,
+                memberId: member._id || null,
+                kind, title, body, refId, linkUrl, senderName,
+            };
+            // Only this pilot's recent messages are read back — enough to catch a
+            // repeat without pulling an inbox across the wire to write one row.
+            const recent = await store.listNotifications({
+                accountId: row.accountId || '', memberId: row.memberId || '', limit: 50,
+            });
+            const fresh = crewInbox.withoutDuplicates([row], recent);
+            if (!fresh.length) return;
+            await store.createNotifications(fresh);
+        })
+        .catch((err) => console.warn('pilot message skipped —', err?.message || err));
 }
 
 // ---- Route network notices ----
@@ -2508,6 +2586,16 @@ app.post('/api/crew/:slug/roster/:id/checkride', async (req, res) => {
                 body: `Signed off after their ${rung.name} check-ride.`,
                 refId: saved._id,
             });
+            // And tell the pilot. The board announces it to the crew; this is the
+            // one addressed to the person it happened to, which is the half that
+            // used to go unsaid unless a staff member remembered to DM them.
+            notifyPilot(va, saved, {
+                kind: 'promotion',
+                title: `You’re now ${promotion.to.name}`,
+                body: `Signed off after your ${rung.name} check-ride.`,
+                refId: saved._id,
+                senderName: (gate.p && gate.p.name) || '',
+            });
         }
         res.json(withDrift(store, { member: publicMember(saved, va.ranks), promoted: !!promotion }));
     } catch (err) { crewFail(res, err, { log: 'checkride error', message: 'Could not record the check-ride.' }); }
@@ -3062,6 +3150,550 @@ app.delete('/api/crew/:slug/announcements/:id', async (req, res) => {
         await store.deleteAnnouncement(req.params.id);
         res.json({ ok: true });
     } catch (err) { crewFail(res, err, { log: 'announcement delete error', message: 'Could not remove the notice.' }); }
+});
+
+/* ===========================================================================
+ * The document library (v11)
+ *
+ * Where a VA keeps the operations manual, the SOPs and the handbook, instead of
+ * a Google Doc in a Discord pin nobody can search.
+ *
+ * THE GATE IS ENFORCED IN THREE PLACES AND THIS IS THE MIDDLE ONE.
+ * RLS refuses a rank-gated row to a browser key outright (see the schema's note
+ * on why a document is unlike a route here). crewDocs.visibleTo decides what a
+ * signed-in pilot may have and STRIPS the body, the link and the file URL when
+ * the answer is no. The panel draws the lock.
+ *
+ * Every read below goes through crewDocs.visibleTo rather than returning rows —
+ * these handlers hold the service key, so RLS is not in the way and this is the
+ * only thing standing between a Captains-only SOP and whoever asked for it.
+ * ======================================================================== */
+
+const canManageDocs = async (req, slug) => !(await requireCap(req, slug, 'documents.manage')).error;
+
+/** A document as it goes over the wire. `locked` and `hoursUntilUnlock` are set
+ *  by crewDocs.visibleTo, which has already removed the content if it had to. */
+const publicDocument = (d) => ({
+    id: d._id,
+    title: d.title, summary: d.summary, kind: d.kind, source: d.source,
+    body: d.body, linkUrl: d.linkUrl,
+    fileUrl: d.fileUrl, fileName: d.fileName, fileSize: d.fileSize,
+    minRank: d.minRank || '',
+    locked: !!d.locked,
+    hoursUntilUnlock: d.hoursUntilUnlock || 0,
+    pinned: !!d.pinned,
+    status: d.status,
+    revision: d.revision || '',
+    revisedAt: d.revisedAt || null,
+    authorName: d.authorName || '',
+    createdAt: d.createdAt,
+    updatedAt: d.updatedAt,
+});
+
+app.get('/api/crew/:slug/documents', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const canManage = await canManageDocs(req, req.params.slug);
+        // Staff need the drafts and the archive; nobody else does, and fetching
+        // published-only keeps a VA's archived manual off every pilot's page load.
+        const list = await store.listDocuments(canManage ? {} : { status: 'published' });
+        const viewer = await crewViewer(req, store);
+        const visible = crewDocs.libraryFor(list, { viewer, staff: canManage, ranks: va.ranks });
+        res.json({
+            documents: visible.map(publicDocument),
+            summary: crewDocs.summarize(visible),
+            canManage,
+        });
+    } catch (err) { crewFail(res, err, { log: 'documents list error', message: 'Could not load the library.' }); }
+});
+
+// One document, read long. Separate from the list because a text document's body
+// can be an entire operations manual, and sending every one of those in the list
+// would make opening the library slow for the sake of the one being read.
+app.get('/api/crew/:slug/documents/:id', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const canManage = await canManageDocs(req, req.params.slug);
+        const doc = await store.getDocument(req.params.id);
+        if (!doc) return res.status(404).json({ error: 'Document not found.' });
+        const viewer = await crewViewer(req, store);
+        const visible = crewDocs.visibleTo(doc, { viewer, staff: canManage, ranks: va.ranks });
+        // null means this viewer may not know it exists — a draft, or a gated
+        // document with nobody signed in. 404 rather than 403: telling a stranger
+        // "that exists but you may not read it" is itself the leak.
+        if (!visible) return res.status(404).json({ error: 'Document not found.' });
+        res.json({ document: publicDocument(visible), canManage });
+    } catch (err) { crewFail(res, err, { log: 'document read error', message: 'Could not open the document.' }); }
+});
+
+app.post('/api/crew/:slug/documents', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'documents.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const doc = crewDocs.normalizeDocument(req.body);
+        if (!doc.title) return res.status(400).json({ error: 'Give the document a title.' });
+        // Publishing straight away has to clear the same bar as publishing later.
+        if (doc.status === 'published') {
+            const problem = crewDocs.publishProblem(doc);
+            if (problem) return res.status(400).json({ error: problem });
+        }
+        const saved = await store.createDocument({
+            ...doc,
+            // A new document's first revision is stamped now: there is no earlier
+            // version for a reader to have already seen.
+            revisedAt: new Date().toISOString(),
+            authorName: (gate.p && gate.p.name) || '',
+        });
+        res.status(201).json(withDrift(store, { document: publicDocument(saved) }));
+    } catch (err) { crewFail(res, err, { log: 'document add error', message: 'Could not save the document.' }); }
+});
+
+app.patch('/api/crew/:slug/documents/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'documents.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const existing = await store.getDocument(req.params.id);
+        if (!existing) return res.status(404).json({ error: 'Document not found.' });
+
+        // Merged through normalize so the one-source-only rule holds on an edit
+        // too: switching a written document to a link has to clear the body here
+        // exactly as it does on create, or the old text stays as a second version.
+        const merged = crewDocs.normalizeDocument({ ...existing, ...(req.body || {}) });
+        if (!merged.title) return res.status(400).json({ error: 'Give the document a title.' });
+        if (merged.status === 'published') {
+            const problem = crewDocs.publishProblem(merged);
+            if (problem) return res.status(400).json({ error: problem });
+        }
+
+        const patch = { ...merged };
+        // Whether this counts as a new revision is crewDocs' decision, not the
+        // store's — a retitle must not mark the manual unread for the whole
+        // roster. See isSubstantiveChange.
+        const substantive = crewDocs.isSubstantiveChange(existing, req.body || {});
+        if (substantive) patch.revisedAt = new Date().toISOString();
+
+        const saved = await store.updateDocument(existing._id, patch);
+
+        // Publishing a document, or revising a published one, is worth telling the
+        // crew about — and the noticeboard is the right place for that, not the
+        // library trying to be a feed. Gated documents are announced only to the
+        // extent of their title, which is already what a short-of-the-rung pilot
+        // is allowed to see.
+        const nowPublished = saved.status === 'published';
+        const wasPublished = existing.status === 'published';
+        if (nowPublished && (!wasPublished || substantive)) {
+            postAnnouncement(va, {
+                kind: 'notice',
+                title: wasPublished
+                    ? `${saved.title} has been updated`
+                    : `New in the library: ${saved.title}`,
+                body: saved.revision ? `Revision ${saved.revision}.` : (saved.summary || ''),
+                refId: saved._id,
+                authorName: (gate.p && gate.p.name) || '',
+            });
+        }
+        res.json(withDrift(store, { document: publicDocument(saved) }));
+    } catch (err) { crewFail(res, err, { log: 'document edit error', message: 'Could not update the document.' }); }
+});
+
+app.delete('/api/crew/:slug/documents/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'documents.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const existing = await store.getDocument(req.params.id);
+        // The hosted copy goes with the row. Non-fatal: an orphaned object in the
+        // bucket is untidy, a delete that fails because of one is worse.
+        if (existing && existing.fileUrl) await deleteVaImage(s3Client, existing.fileUrl);
+        await store.deleteDocument(req.params.id);
+        res.json({ ok: true });
+    } catch (err) { crewFail(res, err, { log: 'document delete error', message: 'Could not remove the document.' }); }
+});
+
+/**
+ * Upload the file a document IS.
+ *
+ * Not the image path (uploadVaImage): that runs everything through sharp to a
+ * webp, which is right for a badge and would destroy a PDF. A document is stored
+ * byte-for-byte, so the type has to be checked at the door instead of being
+ * normalised away — see DOCUMENT_TYPES.
+ */
+const DOCUMENT_TYPES = {
+    'application/pdf': 'pdf',
+    'text/plain': 'txt',
+    'text/markdown': 'md',
+    'application/msword': 'doc',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+};
+const DOCUMENT_MAX_BYTES = 25 * 1024 * 1024;
+
+app.post('/api/crew/:slug/documents/:id/file', upload.single('file'), async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'documents.manage');
+    if (gate.error) {
+        if (req.file && req.file.path) fs.unlink(req.file.path, () => {});
+        return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    }
+    const cleanup = () => { if (req.file && req.file.path) fs.unlink(req.file.path, () => {}); };
+    try {
+        if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
+        const ext = DOCUMENT_TYPES[req.file.mimetype];
+        if (!ext) {
+            cleanup();
+            return res.status(415).json({
+                error: 'That file type can’t be hosted here. PDF, Word or plain text — or link to it instead.',
+            });
+        }
+        if (req.file.size > DOCUMENT_MAX_BYTES) {
+            cleanup();
+            return res.status(413).json({ error: 'That file is larger than 25 MB. Link to it instead.' });
+        }
+
+        const { store } = await resolveCrewStore(req.params.slug);
+        const existing = await store.getDocument(req.params.id);
+        if (!existing) { cleanup(); return res.status(404).json({ error: 'Document not found.' }); }
+
+        const body = req.file.path ? fs.readFileSync(req.file.path) : req.file.buffer;
+        const key = `va-documents/${encodeURIComponent(String(req.params.slug).toLowerCase())}/`
+            + `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+        await s3Client.send(new PutObjectCommand({
+            Bucket: process.env.AWS_S3_BUCKET_NAME,
+            Key: key,
+            Body: body,
+            ContentType: req.file.mimetype,
+            // Inline so a pilot tapping the ops manual reads it rather than
+            // downloading it, with the VA's own filename on it either way.
+            ContentDisposition: `inline; filename="${String(req.file.originalname || `document.${ext}`).replace(/[^\w.\- ]/g, '_')}"`,
+        }));
+        const url = `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+
+        // The previous file, if this replaces one. Same non-fatal treatment as
+        // the delete route.
+        if (existing.fileUrl && existing.fileUrl !== url) await deleteVaImage(s3Client, existing.fileUrl);
+
+        const saved = await store.updateDocument(existing._id, {
+            source: 'file',
+            fileUrl: url,
+            fileName: String(req.file.originalname || '').slice(0, 200),
+            fileSize: req.file.size,
+            // Switching to a file is a different document to read even if it says
+            // the same thing, so the other two sources are cleared and the
+            // revision stamp moves. crewDocs.isSubstantiveChange agrees.
+            body: '',
+            linkUrl: '',
+            revisedAt: new Date().toISOString(),
+        });
+        cleanup();
+        res.json(withDrift(store, { document: publicDocument(saved) }));
+    } catch (err) {
+        cleanup();
+        crewFail(res, err, { log: 'document upload error', message: 'Could not upload the file.' });
+    }
+});
+
+/* ===========================================================================
+ * The pilot's inbox (v11)
+ *
+ * The noticeboard is the airline talking to everybody at once. This is the other
+ * half — the things addressed to ONE pilot, which a board either broadcasts to
+ * the whole roster or never says at all. See crewInbox.js.
+ * ======================================================================== */
+
+const publicNotification = (n) => ({
+    id: n._id,
+    title: n.title, body: n.body, kind: n.kind,
+    refId: n.refId || null,
+    linkUrl: n.linkUrl || '',
+    senderName: n.senderName || '',
+    readAt: n.readAt || null,
+    createdAt: n.createdAt,
+});
+
+/**
+ * The pilot asking, and the ids their inbox is addressed by.
+ *
+ * Unlike crewViewer this is about IDENTITY rather than rank, and it deliberately
+ * refuses anybody who is not a signed-in pilot of this crew center. Staff have no
+ * inbox — they read the dashboard — and there is no "whose inbox?" parameter
+ * anywhere in this section, which is what makes it impossible for one pilot to
+ * ask for another's.
+ */
+async function inboxOwner(req, store) {
+    const p = verifyCrewRequest(req);
+    if (!p || p.kind !== 'crew') return null;
+    if (p.slug && p.slug !== String(req.params.slug).toLowerCase()) return null;
+    try {
+        const account = await store.getAccount(p.sub);
+        if (!account) return null;
+        return { accountId: account._id, memberId: account.memberId || '' };
+    } catch { return null; }
+}
+
+// A pilot's own inbox. There is no staff view of somebody else's — see above.
+app.get('/api/crew/:slug/inbox', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const who = await inboxOwner(req, store);
+        if (!who) return res.status(401).json({ error: 'Sign in to read your messages.' });
+        const list = await store.listNotifications({ ...who, limit: 100 });
+        // `latest` is dropped: it is a whole row the list already carries, and
+        // sending it twice would have the badge and the list disagree the moment
+        // one of them is filtered.
+        const { total, unread, badge } = crewInbox.unreadSummary(list);
+        res.json({ messages: list.map(publicNotification), total, unread, badge });
+    } catch (err) { crewFail(res, err, { log: 'inbox list error', message: 'Could not load your messages.' }); }
+});
+
+// Mark read — either the ids given, or everything. Scoped to the reader's own
+// rows in the store, so an id belonging to somebody else matches nothing.
+app.post('/api/crew/:slug/inbox/read', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const who = await inboxOwner(req, store);
+        if (!who) return res.status(401).json({ error: 'Sign in to read your messages.' });
+        const b = req.body || {};
+        const ids = Array.isArray(b.ids) ? b.ids.slice(0, 200).map((i) => String(i)) : [];
+        const marked = await store.markNotificationsRead({ ...who, ids, all: !!b.all });
+        res.json({ ok: true, marked });
+    } catch (err) { crewFail(res, err, { log: 'inbox read error', message: 'Could not update your messages.' }); }
+});
+
+/**
+ * Staff send a message.
+ *
+ * `kind` is forced to 'message' by STAFF_KINDS. A hand-written 'promotion' would
+ * be indistinguishable in the inbox from one that actually happened, which is the
+ * same rule the noticeboard applies to its generated rows and for the same
+ * reason: a record that can be forged is not a record.
+ */
+app.post('/api/crew/:slug/inbox/send', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'members.message');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const b = req.body || {};
+        const audience = String(b.audience || 'active');
+        const minRank = String(b.minRank || '').trim().slice(0, 40);
+        const memberIds = Array.isArray(b.memberIds) ? b.memberIds.slice(0, 500).map((i) => String(i)) : [];
+        const title = String(b.title || '').trim().slice(0, 160);
+
+        const problem = crewInbox.sendProblem({ audience, minRank, memberIds, title });
+        if (problem) return res.status(400).json({ error: problem });
+
+        // A roster row does not know which login belongs to it — the link runs the
+        // other way — so the account ids are resolved here and attached. Without
+        // this every message would be addressed by member id alone: still
+        // delivered, but off the partial index the unread badge reads. Best-effort
+        // because a VA on a pre-v3 schema has no accounts table, and a send that
+        // reaches pilots by roster row is much better than one that fails.
+        const [members, accounts] = await Promise.all([
+            store.listMembers({ limit: 5000 }),
+            store.listAccounts({ limit: 5000 }).catch(() => []),
+        ]);
+        const accountFor = new Map(
+            (accounts || []).filter((a) => a.memberId).map((a) => [String(a.memberId), a._id]),
+        );
+        const addressable = members.map((m) => ({ ...m, accountId: accountFor.get(String(m._id)) || null }));
+
+        const rows = crewInbox.rowsFor(
+            addressable,
+            { title, body: b.body, linkUrl: b.linkUrl, senderName: (gate.p && gate.p.name) || '' },
+            { audience, minRank, memberIds, allowKinds: crewInbox.STAFF_KINDS },
+            va.ranks,
+        );
+        if (!rows.length) {
+            return res.status(400).json({ error: 'Nobody on the roster matches that — the message wasn’t sent.' });
+        }
+        const saved = await store.createNotifications(rows);
+        res.status(201).json(withDrift(store, { sent: (saved || rows).length }));
+    } catch (err) { crewFail(res, err, { log: 'inbox send error', message: 'Could not send the message.' }); }
+});
+
+// A pilot clearing something out of their own inbox. Scoped by reading the row
+// back first: a delete filtered only by id would let a pilot who guessed one
+// remove somebody else's message.
+app.delete('/api/crew/:slug/inbox/:id', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const who = await inboxOwner(req, store);
+        if (!who) return res.status(401).json({ error: 'Sign in to read your messages.' });
+        const row = await store.getNotification(req.params.id);
+        const mine = row && (
+            (row.accountId && row.accountId === who.accountId)
+            || (row.memberId && who.memberId && row.memberId === who.memberId)
+        );
+        if (!mine) return res.status(404).json({ error: 'Message not found.' });
+        await store.deleteNotification(row._id);
+        res.json({ ok: true });
+    } catch (err) { crewFail(res, err, { log: 'inbox delete error', message: 'Could not remove the message.' }); }
+});
+
+/* ===========================================================================
+ * The quick-links board (v12)
+ *
+ * The Discord, the IFC thread, SimBrief, the livery pack, the leave form — the
+ * handful of places a VA's pilots need constantly, and which today live in a
+ * Discord pinned message that is invisible on the web, scrolled past within a
+ * week, and maintained by hand or by a bot the VA has to run.
+ *
+ * TWO THINGS TO BE CAREFUL ABOUT HERE.
+ *
+ * The URL. Every one of these becomes an <a href> on a page the whole roster
+ * loads, and it arrives as a string typed by whoever holds links.manage.
+ * crewLinks.safeUrl is the only thing between those two facts: it PARSES the URL
+ * and stores the parser's normalised href, accepting http and https and nothing
+ * else. Not a blocklist — "java<TAB>script:" defeats those, and the browser will
+ * happily strip that tab back out at navigation time.
+ *
+ * The gate. Same shape as a document and for the same reason: a gated link's
+ * ADDRESS is the gated thing, so crewLinks.visibleTo removes it rather than
+ * marking the tile locked and sending it anyway.
+ * ======================================================================== */
+
+const canManageLinks = async (req, slug) => !(await requireCap(req, slug, 'links.manage')).error;
+
+const publicLink = (l) => ({
+    id: l._id,
+    title: l.title, url: l.url, description: l.description,
+    category: l.category, icon: l.icon,
+    minRank: l.minRank || '',
+    locked: !!l.locked,
+    hoursUntilUnlock: l.hoursUntilUnlock || 0,
+    pinned: !!l.pinned,
+    status: l.status,
+    sortOrder: l.sortOrder || 0,
+    // The usage hint. Shown to staff so they can tell a curated resource from
+    // dead weight; harmless to a pilot, and it costs nothing to send.
+    opens: l.opens || 0,
+    lastOpenedAt: l.lastOpenedAt || null,
+    host: crewLinks.hostOf(l.url || ''),
+    createdAt: l.createdAt,
+});
+
+app.get('/api/crew/:slug/links', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const canManage = await canManageLinks(req, req.params.slug);
+        const list = await store.listLinks(canManage ? {} : { status: 'published' });
+        const viewer = await crewViewer(req, store);
+        const opts = { viewer, staff: canManage, ranks: va.ranks };
+        const visible = crewLinks.boardFor(list, opts);
+        res.json({
+            links: visible.map(publicLink),
+            // Grouped as well as flat: the board is drawn in sections and having
+            // the server say which is in which keeps the category order in one
+            // place instead of duplicated into every front-end that draws it.
+            sections: crewLinks.sectionsFor(list, opts)
+                .map((s) => ({ category: s.category, links: s.links.map(publicLink) })),
+            summary: crewLinks.summarize(visible),
+            categories: crewLinks.CATEGORIES,
+            canManage,
+        });
+    } catch (err) { crewFail(res, err, { log: 'links list error', message: 'Could not load the links.' }); }
+});
+
+app.post('/api/crew/:slug/links', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'links.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        // The URL check is the whole of the validation, and it reports its own
+        // reason — "that doesn't look like a link" and "links have to start with
+        // http://" are different problems and the person pasting wants to know
+        // which.
+        const out = crewLinks.normalizeLink(req.body);
+        if (!out.ok) return res.status(400).json({ error: out.reason });
+        const saved = await store.createLink({ ...out.link, authorName: (gate.p && gate.p.name) || '' });
+        res.status(201).json(withDrift(store, { link: publicLink(saved) }));
+    } catch (err) { crewFail(res, err, { log: 'link add error', message: 'Could not save the link.' }); }
+});
+
+app.patch('/api/crew/:slug/links/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'links.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const existing = await store.getLink(req.params.id);
+        if (!existing) return res.status(404).json({ error: 'Link not found.' });
+        // Merged through normalize so an edit is held to the same URL rule as a
+        // create — otherwise PATCH is a way round safeUrl, which is the only
+        // check that matters here.
+        const out = crewLinks.normalizeLink({ ...existing, ...(req.body || {}) });
+        if (!out.ok) return res.status(400).json({ error: out.reason });
+        const saved = await store.updateLink(existing._id, out.link);
+        res.json(withDrift(store, { link: publicLink(saved) }));
+    } catch (err) { crewFail(res, err, { log: 'link edit error', message: 'Could not update the link.' }); }
+});
+
+app.delete('/api/crew/:slug/links/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'links.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        await store.deleteLink(req.params.id);
+        res.json({ ok: true });
+    } catch (err) { crewFail(res, err, { log: 'link delete error', message: 'Could not remove the link.' }); }
+});
+
+/**
+ * Reorder the board in one call.
+ *
+ * One request for the whole arrangement rather than a PATCH per tile: dragging a
+ * tile to the top renumbers everything below it, and twelve round trips would
+ * leave the board half-reordered if any of them failed. Positions are 1-based,
+ * because 0 is the column default and means "never arranged" (see
+ * crewLinks.boardFor).
+ */
+app.post('/api/crew/:slug/links/order', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'links.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const ids = Array.isArray(req.body?.ids) ? req.body.ids.slice(0, 300).map((i) => String(i)) : [];
+        if (!ids.length) return res.status(400).json({ error: 'Send the order you want.' });
+        // Serially, so a project rate-limiting writes is not hammered, and
+        // best-effort per tile: one id that has since been deleted must not
+        // abandon the rest of the arrangement half-applied.
+        let moved = 0;
+        for (let i = 0; i < ids.length; i++) {
+            try {
+                const row = await store.updateLink(ids[i], { sortOrder: i + 1 });
+                if (row) moved += 1;
+            } catch (err) { console.warn('link reorder skipped', ids[i], err?.message || err); }
+        }
+        res.json(withDrift(store, { ok: true, moved }));
+    } catch (err) { crewFail(res, err, { log: 'link reorder error', message: 'Could not save the order.' }); }
+});
+
+/**
+ * A pilot opened a link.
+ *
+ * Counted server-side rather than trusted from the page, and only for a link the
+ * caller may actually SEE — otherwise a stranger could inflate the figures on a
+ * VA's staff-only tiles, which is the one thing this counter must not report.
+ *
+ * Always 200, even when the tally fails. The page has already navigated by the
+ * time this lands; refusing it would put an error in the console behind a link
+ * that worked, and the counter is explicitly a usage hint (see the schema).
+ */
+app.post('/api/crew/:slug/links/:id/open', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const canManage = await canManageLinks(req, req.params.slug);
+        const link = await store.getLink(req.params.id);
+        if (!link) return res.json({ ok: false });
+        const viewer = await crewViewer(req, store);
+        const visible = crewLinks.visibleTo(link, { viewer, staff: canManage, ranks: va.ranks });
+        // Not visible, or visible-but-locked: no address was handed over, so no
+        // open happened and there is nothing honest to count.
+        if (!visible || visible.locked) return res.json({ ok: false });
+        const opens = await store.noteLinkOpen(link._id);
+        res.json({ ok: true, opens });
+    } catch (err) {
+        console.warn('link open tally skipped —', err?.message || err);
+        res.json({ ok: false });
+    }
 });
 
 // ---- The Inflight partnership, as the VA's own crew center sees it ----
@@ -4358,7 +4990,7 @@ app.post('/api/crew/:slug/schedules/:id/bookings', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'schedules.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
+        const { va, store } = await resolveCrewStore(req.params.slug);
         const schedule = await store.getSchedule(req.params.id);
         if (!schedule) return res.status(404).json({ error: 'Departure not found.' });
 
@@ -4377,6 +5009,24 @@ app.post('/api/crew/:slug/schedules/:id/bookings', async (req, res) => {
             status: 'booked',
         });
         if (full) return res.status(409).json({ error: 'Every seat on this departure has gone.', code: 'full' });
+        // Staff put them on this leg — the pilot did not, so this is the only way
+        // they find out short of noticing it on the schedule. Only for a pilot on
+        // the roster: a guest crew assigned by name has no inbox to write to.
+        if (member) {
+            const leg = [schedule.origin, schedule.destination].filter(Boolean).join('–');
+            notifyPilot(va, member, {
+                kind: 'booking',
+                title: `You’re flying ${schedule.flightNumber || leg || 'a scheduled departure'}`,
+                body: [
+                    leg && `${leg}.`,
+                    schedule.departsAt && `Departs ${new Date(schedule.departsAt).toUTCString()}.`,
+                    booking.seat > 1 ? `Seat ${booking.seat}.` : '',
+                    String(b.note || '').trim().slice(0, 200),
+                ].filter(Boolean).join(' '),
+                refId: schedule._id,
+                senderName: (gate.p && gate.p.name) || '',
+            });
+        }
         res.status(201).json(withDrift(store, { booking: crewSchedules.publicBooking(booking) }));
     } catch (err) {
         if (bookingConflict(err, res, { byStaff: true })) return;
@@ -4461,6 +5111,16 @@ async function applyPirepHours(store, pirep, va) {
                     postAnnouncement(va, {
                         kind: 'promotion',
                         title: `${after.name || 'A pilot'} is now ${promotion.to.name}`,
+                        body: promotion.from ? `Up from ${promotion.from.name}.` : '',
+                        refId: after._id,
+                    });
+                    // The pilot's own copy. This path is the one a pilot is least
+                    // likely to notice unaided — the promotion happens when their
+                    // flight report is approved, which may be days after they flew
+                    // it and nowhere near the crew center.
+                    notifyPilot(va, after, {
+                        kind: 'promotion',
+                        title: `You’re now ${promotion.to.name}`,
                         body: promotion.from ? `Up from ${promotion.from.name}.` : '',
                         refId: after._id,
                     });
@@ -5153,6 +5813,21 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
                     body: member.callsign ? `Flying as ${member.callsign}.` : '',
                     refId: member._id,
                 });
+                // Waiting for them when they first sign in. The acceptance email
+                // is the thing they are told at the time; this is the copy that is
+                // still there a week later when they have lost the email, and it
+                // is addressed by member id because the login below does not exist
+                // yet (see the store's listNotifications for why that still finds
+                // it).
+                notifyPilot(va, member, {
+                    kind: 'application',
+                    title: `Welcome to ${va.name || 'the airline'}`,
+                    body: member.callsign
+                        ? `Your application was accepted. You’re flying as ${member.callsign}.`
+                        : 'Your application was accepted.',
+                    refId: member._id,
+                    senderName: (gate.p && gate.p.name) || '',
+                });
             }
 
             // A crew center login, when the reviewer asked for one. It is
@@ -5597,6 +6272,9 @@ app.get('/api/crew/:slug/store', async (req, res) => {
             accountsSchemaVersion: crewStore.ACCOUNTS_SCHEMA_VERSION,
             eventsSchemaVersion: crewStore.EVENTS_SCHEMA_VERSION,
             storageSchemaVersion: crewStore.STORAGE_SCHEMA_VERSION,
+            documentsSchemaVersion: crewStore.DOCUMENTS_SCHEMA_VERSION,
+            notificationsSchemaVersion: crewStore.NOTIFICATIONS_SCHEMA_VERSION,
+            linksSchemaVersion: crewStore.LINKS_SCHEMA_VERSION,
             // The saved access token, described but never disclosed.
             token: tokenState(tokenMeta),
             // Set when this very request brought the project up to date, so the
@@ -9460,7 +10138,38 @@ const { RouteMapCache } = require('./routeMapCache');
 const ROUTE_MAP_TTL_LIVE_MS = 5 * 60 * 1000;         // has a moving aircraft on it
 const ROUTE_MAP_TTL_STATIC_MS = 12 * 60 * 60 * 1000; // route geometry only
 
-const routeMapCache = new RouteMapCache({ max: 300, maxInflight: 4 });
+/*
+ * The image caches' memory budgets.
+ *
+ * These hold PNG Buffers, which live in Node's EXTERNAL memory — outside the V8
+ * heap, so `--max-old-space-size` does not cap them and the container's limit
+ * kills the process with no heap error and no stack to read afterwards.
+ *
+ * An entry-count ceiling alone does not bound that, because these values are not
+ * remotely uniform: a route map is flat colour and lines, while an IFC card
+ * carrying a photograph of an aircraft is a LOSSLESS encoding of a photograph.
+ * Measured, that is 6 KB against 1.1 MB — so "200 cards" was somewhere between
+ * 1 MB and 200 MB depending entirely on which pilots happened to be viewed, and
+ * the two caches together could retain a quarter of a gigabyte without either
+ * one exceeding its documented limit.
+ *
+ * That is the shape of failure the card endpoint was showing: fine for hours,
+ * then the container is killed, because the total climbs as DISTINCT keys are
+ * viewed rather than with request volume.
+ *
+ * 48 MB each. Chosen against what they actually hold rather than as a round
+ * number: 48 MB is roughly 50 photo-bearing cards or several hundred maps, which
+ * covers the hot set either endpoint has at any moment — a burst is
+ * simultaneous views of ONE image, which the in-flight de-duplication already
+ * collapses, not fifty distinct ones. Overridable so a bigger container can use
+ * what it has.
+ */
+const IMAGE_CACHE_BYTES = Math.max(
+    4 * 1024 * 1024,
+    (Number(process.env.IMAGE_CACHE_MB) || 48) * 1024 * 1024,
+);
+
+const routeMapCache = new RouteMapCache({ max: 300, maxInflight: 4, maxBytes: IMAGE_CACHE_BYTES });
 
 const ICAO_PARAM_RE = /^[A-Z0-9]{3,4}$/;
 const numParam = (v, limit) => {
@@ -9576,7 +10285,8 @@ app.get('/api/route-map', async (req, res) => {
  * a client-sent `pro: true` would make the paywall a suggestion.
  */
 const {
-    renderIfProfileCard, fetchIfStats, normalizeFields, normalizeTheme, normalizeFavourites,
+    renderIfProfileCard, renderIfCardError,
+    fetchIfStats, normalizeFields, normalizeTheme, normalizeFavourites,
     needsRefresh, refreshDueAt,
     FIELDS: IF_CARD_FIELDS, DEFAULT_FIELDS: IF_CARD_DEFAULT_FIELDS,
     MAX_FIELDS: IF_CARD_MAX_FIELDS, THEME_KEYS: IF_CARD_THEMES, DEFAULT_THEME: IF_CARD_DEFAULT_THEME,
@@ -9708,7 +10418,14 @@ const ifCardSlug = () => require('crypto').randomBytes(9).toString('base64url');
 // proxy sits between), and every one of them would otherwise queue a render
 // behind live VA webhook cards. Same cache class, same load-shedding, as the
 // route map above.
-const ifCardRenderCache = new RouteMapCache({ max: 200, maxInflight: 3 });
+//
+// `max` is down from 200 to 120 alongside the byte budget. The count was set
+// against "how many distinct pilots might be viewed", which is the wrong
+// question — the photo band makes a single card as expensive as a hundred maps,
+// so the bytes are the real ceiling and the count is only a cheap second guard.
+const ifCardRenderCache = new RouteMapCache({
+    max: 120, maxInflight: 3, maxBytes: IMAGE_CACHE_BYTES,
+});
 const IF_CARD_RENDER_TTL_MS = 10 * 60 * 1000;
 // Browser/CDN caching. Deliberately modest: it has to be long enough that a
 // popular profile is not re-rendering constantly, and short enough that a
@@ -9852,6 +10569,41 @@ async function ifCardPhotoUrl(fav) {
     }
 }
 
+/**
+ * Answer a card request that cannot be satisfied — with an IMAGE.
+ *
+ * This route is an <img src> on a public IFC profile and IFC hotlinks it, so a
+ * JSON error body reaches the reader as a broken-image icon and nothing else.
+ * Every way of failing then looks identical from the outside, which is how a
+ * card that had been fine for hours becomes an unexplainable grey box.
+ *
+ * The status code is kept honest (404 stays 404) — it is only the BODY that
+ * becomes a picture, so anything reading this programmatically is unaffected.
+ * `no-store`, because the reason must disappear the instant the real card can be
+ * drawn again; a cached error would outlive the fault that caused it.
+ *
+ * `.json` callers still get JSON: that surface is read by our own page, which
+ * wants the machine-readable answer.
+ */
+async function failIfCard(res, { status, code, title, detail, theme, wantsImage = true }) {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Cache-Control', 'no-store');
+    if (!wantsImage) return res.status(status).json({ message: detail, code });
+    try {
+        const png = await renderIfCardError({ title, detail, theme });
+        res.set('Content-Type', 'image/png');
+        // Named in a header as well as drawn, so `curl -I` on the URL answers
+        // "why" without anybody having to look at the picture.
+        res.set('X-Card-Error', code);
+        return res.status(status).send(png);
+    } catch (err) {
+        // The error card itself could not be drawn, which means sharp is the
+        // problem. Nothing left to render with, so say it plainly.
+        console.error('[if-card] error card render failed:', err?.message || err);
+        return res.status(status).json({ message: detail, code });
+    }
+}
+
 /** Render + reply, with the cache and shedding in front. Shared by both GETs. */
 async function sendIfCard(res, card) {
     const { value: png, status } = await ifCardRenderCache.run(
@@ -9861,9 +10613,21 @@ async function sendIfCard(res, card) {
     );
     if (status === 'shed') {
         res.set('Retry-After', '5');
-        return res.status(503).json({ message: 'Card renderer is busy — try again shortly.' });
+        return failIfCard(res, {
+            status: 503, code: 'renderer_busy',
+            title: 'Busy right now',
+            detail: 'Too many cards being drawn at once. This will come back on its own — reload in a minute.',
+            theme: card.theme,
+        });
     }
-    if (!png) return res.status(500).json({ message: 'Could not render the card.' });
+    if (!png) {
+        return failIfCard(res, {
+            status: 500, code: 'render_failed',
+            title: 'This card couldn’t be drawn',
+            detail: 'Something went wrong on our side. Nothing is lost — try again shortly.',
+            theme: card.theme,
+        });
+    }
     res.set('Content-Type', 'image/png');
     res.set('Cache-Control', `public, max-age=${IF_CARD_MAX_AGE_S}, stale-while-revalidate=${IF_CARD_SWR_S}`);
     res.set('Access-Control-Allow-Origin', '*');
@@ -10106,14 +10870,29 @@ app.get('/api/if-card/mine', async (req, res) => {
  * costs a render or an API call. The pilot's own profile view is the tick.
  */
 app.get('/api/if-card/:file', async (req, res) => {
+    // Decided before the try, because the catch needs to know whether the caller
+    // is a browser expecting a picture or our own page expecting JSON.
+    const raw = String(req.params.file || '');
+    const m = raw.match(/^([A-Za-z0-9_-]{4,32})\.(png|json)$/);
+    const wantsImage = !m || m[2] === 'png';
     try {
-        const raw = String(req.params.file || '');
-        const m = raw.match(/^([A-Za-z0-9_-]{4,32})\.(png|json)$/);
-        if (!m) return res.status(404).json({ message: 'No such card.' });
+        if (!m) {
+            return await failIfCard(res, {
+                status: 404, code: 'bad_slug', wantsImage,
+                title: 'That isn’t a card address',
+                detail: 'Check the link in your profile — it should end in .png.',
+            });
+        }
         const [, slug, ext] = m;
 
         const card = await IfProfileCard.findOne({ slug });
-        if (!card) return res.status(404).json({ message: 'No such card.' });
+        if (!card) {
+            return await failIfCard(res, {
+                status: 404, code: 'no_such_card', wantsImage,
+                title: 'This card no longer exists',
+                detail: 'It may have been deleted. Make a new one at inflight.info/card.',
+            });
+        }
 
         // Re-read the numbers when the month has turned over. Failure is
         // deliberately quiet and non-destructive: we keep serving the stats we
@@ -10167,8 +10946,21 @@ app.get('/api/if-card/:file', async (req, res) => {
             vas: await ifCardVasFor(card),
         });
     } catch (error) {
-        console.error('IF card render error:', error.message);
-        res.status(500).json({ message: 'Could not render the card.' });
+        // Everything the render itself touches — the VA roster lookup, the photo
+        // lookup, each remote image, the monthly stats re-read — catches its own
+        // failure and degrades, so reaching here means something structural: the
+        // database is unreachable, or sharp died. Both of those break EVERY card
+        // at once and stay broken until the process or the connection recovers,
+        // which is exactly the "it worked for hours and then vanished" shape.
+        //
+        // So it is logged with the slug, and answered with a picture that says a
+        // human should wait rather than that the pilot did something wrong.
+        console.error(`IF card render error (${raw}):`, error?.message || error);
+        await failIfCard(res, {
+            status: 500, code: 'card_unavailable', wantsImage,
+            title: 'Stats are unavailable right now',
+            detail: 'This is on our side, not yours — your card and its settings are safe. It’ll be back shortly.',
+        });
     }
 });
 
@@ -11407,12 +12199,77 @@ app.get(/(.*)/, requireAuthPage, (req, res) => {
 // container's memory cap to enable the threshold warning (logging runs regardless).
 const MEMORY_LIMIT_MB = parseInt(process.env.MEMORY_LIMIT_MB, 10) || 0;
 const MEMORY_WARN_RATIO = 0.85;
+// Past this share of the cap the image caches are dropped. Above the warn ratio
+// on purpose: a warning is "watch this", and this is "we are about to be killed".
+const MEMORY_SHED_RATIO = 0.92;
 const mb = (bytes) => Math.round(bytes / 1024 / 1024);
+
+/**
+ * What the image caches are holding, for the memory line.
+ *
+ * `external` already tells us Buffers are growing, but not WHICH buffers, and
+ * these two caches are the largest deliberate retention in the process — a card
+ * bearing a photograph of an aircraft is a lossless encoding of a photograph,
+ * about 1.1 MB against a route map's 6 KB. Naming them turns "external is
+ * climbing" into "the card cache is at 47 of 48 MB", which is the difference
+ * between knowing there is a leak and knowing where it is.
+ */
+const imageCacheLine = () => {
+    const parts = [];
+    for (const [name, cache] of [['maps', routeMapCache], ['cards', ifCardRenderCache]]) {
+        try {
+            const s = cache.stats();
+            parts.push(`${name}=${s.entries}/${mb(s.bytes)}MB`);
+        } catch { /* a cache that cannot report is not worth failing the log for */ }
+    }
+    return parts.length ? ' ' + parts.join(' ') : '';
+};
+
+/**
+ * Give the memory back rather than be killed for it.
+ *
+ * The container OOM-kills with no application log, so the cost of being wrong
+ * here is a crash loop that looks like the service "just disappearing" — which
+ * is precisely how the IFC profile card presented: fine for hours, then a broken
+ * image on every profile at once, because the process that draws it was gone.
+ *
+ * These caches are pure memos. Dropping them costs one render per hot key and
+ * nothing else — no state is lost, nothing is inconsistent afterwards. Against
+ * being killed, that is not a close call, so at 92% of the cap they go.
+ *
+ * Reported loudly and with the figures, because a process quietly dumping its
+ * caches every few minutes is itself a finding: it means the budgets above are
+ * too big for this container, or something else in here is growing.
+ */
+let memoryShedCount = 0;
+const shedImageCaches = (rssMb) => {
+    const before = imageCacheLine();
+    let freed = 0;
+    for (const cache of [routeMapCache, ifCardRenderCache]) {
+        try { freed += cache.bytes; cache.clear(); } catch { /* nothing to do */ }
+    }
+    memoryShedCount += 1;
+    console.warn(
+        `⚠️  [mem] rss=${rssMb}MB is ${Math.round((rssMb / MEMORY_LIMIT_MB) * 100)}% of the `
+        + `${MEMORY_LIMIT_MB}MB cap — dropped the image caches (${mb(freed)}MB,${before}). `
+        + `Shed ${memoryShedCount} time(s) since boot. Cards and maps will re-render on demand; `
+        + 'if this repeats, lower IMAGE_CACHE_MB or give the container more memory.',
+    );
+    // If the process was started with --expose-gc (it is; see package.json's
+    // start script) the freed buffers can be returned to the OS now rather than
+    // whenever V8 next feels like it — which is the whole point of doing this
+    // before the cap rather than after.
+    if (typeof global.gc === 'function') { try { global.gc(); } catch { /* best effort */ } }
+};
+
 setInterval(() => {
     const m = process.memoryUsage();
     const rssMb = mb(m.rss);
-    const line = `[mem] rss=${rssMb}MB heapUsed=${mb(m.heapUsed)}MB heapTotal=${mb(m.heapTotal)}MB external=${mb(m.external)}MB`;
-    if (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_WARN_RATIO) {
+    const line = `[mem] rss=${rssMb}MB heapUsed=${mb(m.heapUsed)}MB heapTotal=${mb(m.heapTotal)}MB`
+        + ` external=${mb(m.external)}MB${imageCacheLine()}`;
+    if (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_SHED_RATIO) {
+        shedImageCaches(rssMb);
+    } else if (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_WARN_RATIO) {
         console.warn(`⚠️  ${line} — near ${MEMORY_LIMIT_MB}MB cap (${Math.round((rssMb / MEMORY_LIMIT_MB) * 100)}%)`);
     } else {
         console.log(line);

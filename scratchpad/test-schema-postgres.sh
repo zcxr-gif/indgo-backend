@@ -148,6 +148,28 @@ insert into crew_bookings (va_slug,schedule_id,pilot_name,seat)
     select 'amv',id,'On the published one',1 from crew_schedules where destination='KJFK';
 insert into crew_bookings (va_slug,schedule_id,pilot_name,seat)
     select 'amv',id,'Pencilled into the draft',1 from crew_schedules where destination='LFPG';
+-- v11. The library's three cases, because a document's gate is enforced by RLS
+-- and not by the backend: one open to everybody, one rank-gated, one still a
+-- draft. Only the first may be visible to a browser key — the gated one's BODY
+-- is the thing being protected, so "visible but locked" would be no gate.
+insert into crew_documents (va_slug,title,body,status,min_rank)
+    values ('amv','Ops Manual','Everyone reads this.','published','');
+insert into crew_documents (va_slug,title,body,status,min_rank)
+    values ('amv','Captain SOP','Captains only.','published','Captain');
+insert into crew_documents (va_slug,title,body,status,min_rank)
+    values ('amv','Half-written policy','Not ready.','draft','');
+-- v11. One pilot's message. There is no policy that could scope a shared browser
+-- credential to "mine", so the table must be refused outright.
+insert into crew_notifications (va_slug,title,body)
+    values ('amv','Your application was accepted','Welcome aboard.');
+-- v12. The links board's three cases, same shape as the library's: the gate is
+-- enforced by RLS because a gated link's ADDRESS is the gated thing.
+insert into crew_links (va_slug,title,url,category,status,min_rank)
+    values ('amv','Discord','https://discord.gg/abc','community','published','');
+insert into crew_links (va_slug,title,url,category,status,min_rank)
+    values ('amv','Staff toolkit','https://example.com/staff','tools','published','Captain');
+insert into crew_links (va_slug,title,url,category,status,min_rank)
+    values ('amv','Unfinished','https://example.com/wip','other','draft','');
 SQL
 
 asanon() { $PSQL -d fresh -tAc "set role anon; $1" 2>/dev/null; }
@@ -171,6 +193,21 @@ is "a draft event is invisible"           "$(asanon 'select count(*) from crew_e
 is "…and so is who was penciled into it"  "$(asanon 'select count(*) from crew_event_signups')" "1"
 is "a draft departure is invisible"          "$(asanon 'select count(*) from crew_schedules')" "1"
 is "…and so is who was pencilled onto it"   "$(asanon 'select count(*) from crew_bookings')" "1"
+is "a published, ungated document is public" \
+   "$(asanon "select count(*) from crew_documents where title='Ops Manual'")" "1"
+is "a rank-gated document's body is NOT" \
+   "$(asanon 'select count(*) from crew_documents')" "1"
+is "…and neither is a draft one" \
+   "$(asanon "select count(*) from crew_documents where status='draft'")" "0"
+is "a published, ungated link is public" \
+   "$(asanon "select count(*) from crew_links where title='Discord'")" "1"
+is "a rank-gated link's address is NOT" \
+   "$(asanon 'select count(*) from crew_links')" "1"
+is "…and neither is a draft one" \
+   "$(asanon "select count(*) from crew_links where status='draft'")" "0"
+is "a browser key cannot inflate the open counter" \
+   "$(saidno "select crew_link_open('amv', (select id from crew_links limit 1))")" "yes"
+is "a pilot's inbox is refused at the door" "$(saidno 'select 1 from crew_notifications')" "yes"
 is "pilot logins are refused at the door" "$(saidno 'select 1 from crew_accounts')" "yes"
 is "so are applications (emails, invites)" "$(saidno 'select 1 from crew_applications')" "yes"
 is "anon cannot write, even to a public table" \

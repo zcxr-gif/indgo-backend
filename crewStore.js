@@ -45,6 +45,15 @@
  */
 
 const axios = require('axios');
+// v11. Pulled in for their vocabularies only — the closed lists of kinds,
+// sources and statuses a column's check constraint will accept. Keeping the
+// lists in the decision modules and reading them here means a value the schema
+// refuses cannot be introduced by editing one file: a write that would fail the
+// constraint is coerced to the default before it leaves. Neither module requires
+// this one, so there is no cycle.
+const crewDocs = require('./crewDocs');
+const crewInbox = require('./crewInbox');
+const crewLinks = require('./crewLinks');
 
 const TIMEOUT_MS = parseInt(process.env.CREW_STORE_TIMEOUT_MS, 10) || 8000;
 const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').toLowerCase() !== 'false';
@@ -54,7 +63,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 10;
+const EXPECTED_SCHEMA_VERSION = 12;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -76,6 +85,24 @@ const SCHEDULES_SCHEMA_VERSION = 8;
 // project cannot answer, and "your database is behind" is a better sentence
 // there than a broken panel.
 const STORAGE_SCHEMA_VERSION = 9;
+
+// The version that introduced crew_documents. Same story as events and
+// schedules: a pre-v11 project has no library table at all, so the crew center
+// names the missing feature rather than reporting a broken store over a VA whose
+// everything else is answering.
+const DOCUMENTS_SCHEMA_VERSION = 11;
+
+// The version that introduced crew_notifications. Reported separately from
+// documents even though the two shipped together, because they fail
+// independently in the one case that matters: a VA who ran a partial script. A
+// library that works while the inbox does not should say exactly that.
+const NOTIFICATIONS_SCHEMA_VERSION = 11;
+
+// The version that introduced crew_links and crew_link_open(). Its own constant
+// for the same reason the others have one: the links board is a whole feature a
+// pre-v12 project has not got, and the panel offers the update button itself
+// rather than reporting a broken store over a VA whose everything else answers.
+const LINKS_SCHEMA_VERSION = 12;
 
 // ---------------------------------------------------------------------------
 // Columns that arrived after the first release
@@ -658,6 +685,129 @@ const announcementToRow = (a) => {
     // A uuid column: '' is not a valid uuid, so an empty id has to go as null.
     pick(a, out, 'refId', 'ref_id', (v) => (str(v, 64) || null));
     pick(a, out, 'authorName', 'author_name', (v) => str(v, 80));
+    return out;
+};
+
+// v11. A document in the VA's library. The shape decisions — which source field
+// survives, what counts as a revision, who may read it — all live in crewDocs.js;
+// this is only the column mapping, and it deliberately does not re-implement any
+// of them. A caller that wants a cleaned document runs it through
+// crewDocs.normalizeDocument first.
+const documentFromRow = (r) => r && {
+    _id: r.id,
+    title: r.title || '',
+    summary: r.summary || '',
+    kind: r.kind || 'document',
+    source: r.source || 'text',
+    body: r.body || '',
+    linkUrl: r.link_url || '',
+    fileUrl: r.file_url || '',
+    fileName: r.file_name || '',
+    fileSize: Number(r.file_size) || 0,
+    minRank: r.min_rank || '',
+    pinned: !!r.pinned,
+    status: r.status || 'draft',
+    revision: r.revision || '',
+    revisedAt: date(r.revised_at),
+    authorName: r.author_name || '',
+    createdAt: date(r.created_at),
+    updatedAt: date(r.updated_at),
+};
+const documentToRow = (d) => {
+    const out = {};
+    pick(d, out, 'title', 'title', (v) => str(v, 160));
+    pick(d, out, 'summary', 'summary', (v) => str(v, 400));
+    pick(d, out, 'kind', 'kind', (v) => (crewDocs.KINDS.includes(v) ? v : 'document'));
+    pick(d, out, 'source', 'source', (v) => (crewDocs.SOURCES.includes(v) ? v : 'text'));
+    // The column is unbounded text; the cap here is the same one crewDocs
+    // applies, so a body that arrived past a normalize step is still refused
+    // rather than committing a megabyte of paste to the VA's project.
+    pick(d, out, 'body', 'body', (v) => str(v, 200000));
+    pick(d, out, 'linkUrl', 'link_url', (v) => str(v, 600));
+    pick(d, out, 'fileUrl', 'file_url', (v) => str(v, 600));
+    pick(d, out, 'fileName', 'file_name', (v) => str(v, 200));
+    pick(d, out, 'fileSize', 'file_size', (v) => int(v, 0, 1e11));
+    pick(d, out, 'minRank', 'min_rank', (v) => str(v, 40));
+    pick(d, out, 'pinned', 'pinned', (v) => !!v);
+    pick(d, out, 'status', 'status', (v) => (crewDocs.STATUSES.includes(v) ? v : 'draft'));
+    pick(d, out, 'revision', 'revision', (v) => str(v, 40));
+    // A timestamptz: '' is not a valid one, so "no revision recorded" has to go
+    // as null. Passed through rather than stamped here because WHEN a revision
+    // happened is the caller's decision (see crewDocs.isSubstantiveChange) — the
+    // store does not get to decide that a save was substantive.
+    pick(d, out, 'revisedAt', 'revised_at', (v) => (v ? new Date(v).toISOString() : null));
+    pick(d, out, 'authorName', 'author_name', (v) => str(v, 80));
+    return out;
+};
+
+// v11. One message addressed to one pilot. See crewInbox.js for who gets what.
+const notificationFromRow = (r) => r && {
+    _id: r.id,
+    accountId: r.account_id || null,
+    memberId: r.member_id || null,
+    title: r.title || '',
+    body: r.body || '',
+    kind: r.kind || 'message',
+    refId: r.ref_id || null,
+    linkUrl: r.link_url || '',
+    senderName: r.sender_name || '',
+    readAt: date(r.read_at),
+    createdAt: date(r.created_at),
+    updatedAt: date(r.updated_at),
+};
+const notificationToRow = (n) => {
+    const out = {};
+    // Both uuid columns: '' is not a valid uuid, so an absent id goes as null.
+    pick(n, out, 'accountId', 'account_id', (v) => (str(v, 64) || null));
+    pick(n, out, 'memberId', 'member_id', (v) => (str(v, 64) || null));
+    pick(n, out, 'title', 'title', (v) => str(v, 160));
+    pick(n, out, 'body', 'body', (v) => str(v, 4000));
+    pick(n, out, 'kind', 'kind', (v) => (crewInbox.KINDS.includes(v) ? v : 'message'));
+    pick(n, out, 'refId', 'ref_id', (v) => (str(v, 64) || null));
+    pick(n, out, 'linkUrl', 'link_url', (v) => str(v, 600));
+    pick(n, out, 'senderName', 'sender_name', (v) => str(v, 80));
+    pick(n, out, 'readAt', 'read_at', (v) => (v ? new Date(v).toISOString() : null));
+    return out;
+};
+
+// v12. A tile on the VA's quick-links board. Every decision about it — whether
+// the URL is one we will send a pilot to, what category it belongs in, who may
+// see it — lives in crewLinks.js; this is the column mapping only.
+//
+// `opens` and `lastOpenedAt` are read here and never written: they belong to
+// crew_link_open(), which increments atomically because a read-then-write would
+// lose counts the moment two pilots tap the Discord tile together.
+const linkFromRow = (r) => r && {
+    _id: r.id,
+    title: r.title || '',
+    url: r.url || '',
+    description: r.description || '',
+    category: r.category || 'other',
+    icon: r.icon || 'link',
+    minRank: r.min_rank || '',
+    pinned: !!r.pinned,
+    status: r.status || 'published',
+    sortOrder: Number(r.sort_order) || 0,
+    opens: Number(r.opens) || 0,
+    lastOpenedAt: date(r.last_opened_at),
+    authorName: r.author_name || '',
+    createdAt: date(r.created_at),
+    updatedAt: date(r.updated_at),
+};
+const linkToRow = (l) => {
+    const out = {};
+    pick(l, out, 'title', 'title', (v) => str(v, 80));
+    // Already normalised by crewLinks.safeUrl at the route — capped here too, so
+    // a caller that skipped that step cannot commit an unbounded string.
+    pick(l, out, 'url', 'url', (v) => str(v, 2000));
+    pick(l, out, 'description', 'description', (v) => str(v, 240));
+    pick(l, out, 'category', 'category', (v) => (crewLinks.CATEGORIES.includes(v) ? v : 'other'));
+    pick(l, out, 'icon', 'icon', (v) => str(v, 40));
+    pick(l, out, 'minRank', 'min_rank', (v) => str(v, 40));
+    pick(l, out, 'pinned', 'pinned', (v) => !!v);
+    pick(l, out, 'status', 'status', (v) => (crewLinks.STATUSES.includes(v) ? v : 'published'));
+    pick(l, out, 'sortOrder', 'sort_order', (v) => int(v, 0, 9999));
+    pick(l, out, 'authorName', 'author_name', (v) => str(v, 80));
     return out;
 };
 
@@ -1367,6 +1517,213 @@ class SupabaseStore {
         return this.announcements(async () => { await this.db.remove('crew_announcements', this.ident(id)); return true; });
     }
 
+    // --- The document library (v11) ---
+    //
+    // Wrapped like events, schedules and the noticeboard: a pre-v11 project has
+    // no crew_documents table, and the panel offers the update button itself
+    // rather than reporting a broken store.
+    async documents(fn) {
+        try { return await fn(); } catch (err) {
+            if (err instanceof CrewStoreError && err.code === 'store_schema_missing') {
+                throw new CrewStoreError(
+                    'This crew center’s project does not have the document library yet. Re-run the setup SQL (Settings → Data store) to add it.',
+                    { status: 409, code: 'store_documents_missing', detail: err.detail });
+            }
+            throw err;
+        }
+    }
+
+    /**
+     * The library.
+     *
+     * Ordered here only enough to be deterministic — the order a READER wants
+     * (pinned, then by kind, then by title) is crewDocs.libraryFor's job,
+     * because it depends on the viewer and on a kind ranking that would need a
+     * CASE expression kept in step with crewDocs.KINDS by hand.
+     *
+     * `status` filters server-side when given, so the pilot-facing call fetches
+     * published rows only instead of pulling drafts across the wire and throwing
+     * them away — a VA with a big archived manual should not pay for it on every
+     * pilot's page load.
+     */
+    listDocuments({ status = '', limit = 200 } = {}) {
+        return this.documents(async () => {
+            const q = { ...this.scope, order: 'pinned.desc,title.asc', limit };
+            if (status) q.status = `eq.${status}`;
+            const rows = await this.db.select('crew_documents', q);
+            return (rows || []).map(documentFromRow);
+        });
+    }
+    getDocument(id) {
+        return this.documents(() => this.one('crew_documents', this.ident(id), documentFromRow));
+    }
+    createDocument(data) {
+        return this.documents(async () => {
+            const [row] = await this.db.insert('crew_documents', { va_slug: this.slug, ...documentToRow(data) });
+            return documentFromRow(row);
+        });
+    }
+    updateDocument(id, patch) {
+        return this.documents(async () => {
+            const [row] = await this.db.update('crew_documents', this.ident(id), documentToRow(patch));
+            return row ? documentFromRow(row) : null;
+        });
+    }
+    deleteDocument(id) {
+        return this.documents(async () => { await this.db.remove('crew_documents', this.ident(id)); return true; });
+    }
+
+    // --- The pilot's inbox (v11) ---
+    async notifications(fn) {
+        try { return await fn(); } catch (err) {
+            if (err instanceof CrewStoreError && err.code === 'store_schema_missing') {
+                throw new CrewStoreError(
+                    'This crew center’s project cannot hold pilot messages yet. Re-run the setup SQL (Settings → Data store) to add it.',
+                    { status: 409, code: 'store_notifications_missing', detail: err.detail });
+            }
+            throw err;
+        }
+    }
+
+    /**
+     * One pilot's inbox.
+     *
+     * Addressed by account OR member, both, because the two are populated at
+     * different moments: an automatic message written the instant an application
+     * is accepted has a member id and may not have an account id yet, and the
+     * pilot who then signs in must still find it. Querying on either with an
+     * `or` keeps that one row from being invisible to the only person it was for.
+     */
+    listNotifications({ accountId = '', memberId = '', unreadOnly = false, limit = 100 } = {}) {
+        return this.notifications(async () => {
+            const ids = [];
+            if (accountId) ids.push(`account_id.eq.${accountId}`);
+            if (memberId) ids.push(`member_id.eq.${memberId}`);
+            // No identity means no inbox. Returned empty rather than
+            // unfiltered — a missing id must never fall through to "everybody's
+            // messages", which is the one mistake here that would be a breach.
+            if (!ids.length) return [];
+            const q = { ...this.scope, or: `(${ids.join(',')})`, order: 'created_at.desc', limit };
+            if (unreadOnly) q.read_at = 'is.null';
+            const rows = await this.db.select('crew_notifications', q);
+            return (rows || []).map(notificationFromRow);
+        });
+    }
+    getNotification(id) {
+        return this.notifications(() => this.one('crew_notifications', this.ident(id), notificationFromRow));
+    }
+
+    /**
+     * Write a batch of messages — one send, many recipients.
+     *
+     * A single insert with an array body rather than a loop: a rank send to a
+     * 200-pilot roster is 200 rows, and 200 round trips against the VA's project
+     * would take long enough for the request to time out halfway and leave the
+     * send half-delivered with no way to tell which half.
+     */
+    createNotifications(rows) {
+        const list = (Array.isArray(rows) ? rows : [rows]).filter(Boolean);
+        if (!list.length) return Promise.resolve([]);
+        return this.notifications(async () => {
+            const payload = list.map((n) => ({ va_slug: this.slug, ...notificationToRow(n) }));
+            const out = await this.db.insert('crew_notifications', payload);
+            return (out || []).map(notificationFromRow);
+        });
+    }
+
+    /**
+     * Mark read. Scoped by the reader's own ids as well as the row id, so a
+     * pilot holding somebody else's notification id cannot mark it read (or
+     * learn that it exists) — the filter simply matches nothing.
+     */
+    markNotificationsRead({ ids = [], accountId = '', memberId = '', all = false } = {}) {
+        return this.notifications(async () => {
+            const owner = [];
+            if (accountId) owner.push(`account_id.eq.${accountId}`);
+            if (memberId) owner.push(`member_id.eq.${memberId}`);
+            if (!owner.length) return 0;
+            const q = { ...this.scope, or: `(${owner.join(',')})`, read_at: 'is.null' };
+            if (!all) {
+                const list = (Array.isArray(ids) ? ids : [ids]).filter(Boolean);
+                if (!list.length) return 0;
+                q.id = `in.(${list.join(',')})`;
+            }
+            const rows = await this.db.update('crew_notifications', q, { read_at: new Date().toISOString() });
+            return (rows || []).length;
+        });
+    }
+
+    deleteNotification(id) {
+        return this.notifications(async () => { await this.db.remove('crew_notifications', this.ident(id)); return true; });
+    }
+
+    // --- The quick-links board (v12) ---
+    async links(fn) {
+        try { return await fn(); } catch (err) {
+            if (err instanceof CrewStoreError && err.code === 'store_schema_missing') {
+                throw new CrewStoreError(
+                    'This crew center’s project does not have the quick-links board yet. Re-run the setup SQL (Settings → Data store) to add it.',
+                    { status: 409, code: 'store_links_missing', detail: err.detail });
+            }
+            throw err;
+        }
+    }
+
+    /**
+     * The board.
+     *
+     * Ordered only enough to be deterministic; the order a READER wants (pinned,
+     * then staff's arrangement, then alphabetical, with sort_order 0 meaning
+     * "never arranged" and sorting LAST) is crewLinks.boardFor's job — see the
+     * note there for why an ORDER BY gets it backwards.
+     */
+    listLinks({ status = '', limit = 300 } = {}) {
+        return this.links(async () => {
+            const q = { ...this.scope, order: 'pinned.desc,sort_order.asc,title.asc', limit };
+            if (status) q.status = `eq.${status}`;
+            const rows = await this.db.select('crew_links', q);
+            return (rows || []).map(linkFromRow);
+        });
+    }
+    getLink(id) {
+        return this.links(() => this.one('crew_links', this.ident(id), linkFromRow));
+    }
+    createLink(data) {
+        return this.links(async () => {
+            const [row] = await this.db.insert('crew_links', { va_slug: this.slug, ...linkToRow(data) });
+            return linkFromRow(row);
+        });
+    }
+    updateLink(id, patch) {
+        return this.links(async () => {
+            const [row] = await this.db.update('crew_links', this.ident(id), linkToRow(patch));
+            return row ? linkFromRow(row) : null;
+        });
+    }
+    deleteLink(id) {
+        return this.links(async () => { await this.db.remove('crew_links', this.ident(id)); return true; });
+    }
+
+    /**
+     * Count an open.
+     *
+     * Through the RPC rather than a PATCH, because `opens = opens + 1` is not
+     * something PostgREST can express and a read-then-write would lose counts
+     * under exactly the traffic this counter exists to measure.
+     *
+     * Best-effort by design: a pilot's tap must open the link whether or not the
+     * counter moved, so the caller is free to ignore a failure here. A project on
+     * a pre-v12 schema has no function to call, and that is a reason to skip the
+     * tally, never to refuse the click.
+     */
+    async noteLinkOpen(id) {
+        if (!id) return 0;
+        try {
+            const out = await this.db.rpc('crew_link_open', { p_va_slug: this.slug, p_link_id: id });
+            return Number(Array.isArray(out) ? out[0] : out) || 0;
+        } catch { return 0; }
+    }
+
     // --- Aggregates ---
     // One round trip via the schema's crew_stats() function. If the project is
     // on an older schema that predates it, fall back to counting client-side so
@@ -1440,6 +1797,12 @@ class SupabaseStore {
                 // using?" — the storage screen offers the update button itself
                 // when it cannot.
                 storage: version >= STORAGE_SCHEMA_VERSION,
+                // v11. The library and the inbox, each reported on its own so the
+                // panel that needs one can offer the update button without
+                // implying the other is broken too.
+                documents: version >= DOCUMENTS_SCHEMA_VERSION,
+                notifications: version >= NOTIFICATIONS_SCHEMA_VERSION,
+                links: version >= LINKS_SCHEMA_VERSION,
                 installedAt: (rows && rows[0] && rows[0].installed_at) || null,
             };
         } catch (err) {
@@ -1452,6 +1815,9 @@ class SupabaseStore {
                 events: false,
                 schedules: false,
                 storage: false,
+                documents: false,
+                notifications: false,
+                links: false,
                 code: err.code || 'store_error',
                 error: err.message,
                 detail: err.detail || '',
@@ -1548,6 +1914,17 @@ const PURGE_DATASETS = {
     schedules:     { table: 'crew_schedules',     dateColumn: 'departs_at', label: 'Scheduled flights' },
     applications:  { table: 'crew_applications',  dateColumn: 'created_at', label: 'Applications' },
     announcements: { table: 'crew_announcements', dateColumn: 'created_at', label: 'Noticeboard posts' },
+    // v11. An inbox is the one new table that genuinely accumulates: every pilot
+    // gets a row for every thing, so a VA three years in has tens of thousands of
+    // "you're on Thursday's LHR–JFK" nobody will read again. Clearing those is
+    // housekeeping in exactly the way this dropdown is for.
+    //
+    // crew_documents is deliberately NOT here. A library is not a log — the
+    // superseded manual IS the thing you want when a pilot asks why they were
+    // told something different last month, which is why 'archived' exists rather
+    // than deleting. Bulk-clearing it belongs with the roster and the network,
+    // behind its own conversation.
+    notifications: { table: 'crew_notifications', dateColumn: 'created_at', label: 'Pilot messages' },
 };
 
 // How many rows one count will look at, one delete will take at a time, and how
@@ -1816,6 +2193,44 @@ class LegacyStore {
     updateAnnouncement() { return this.announcements(); }
     deleteAnnouncement() { return this.announcements(); }
 
+    // v11. The library and the inbox are the VA's operational record and are not
+    // built on the retiring managed path either. Same reasoning, same refusal.
+    documents() {
+        return Promise.reject(new CrewStoreError(
+            'The document library needs your VA’s own database. Connect one in Crew Center → Settings → Data store.',
+            { status: 409, code: 'store_documents_unsupported' }));
+    }
+    listDocuments() { return this.documents(); }
+    getDocument() { return this.documents(); }
+    createDocument() { return this.documents(); }
+    updateDocument() { return this.documents(); }
+    deleteDocument() { return this.documents(); }
+
+    notifications() {
+        return Promise.reject(new CrewStoreError(
+            'Messaging your crew needs your VA’s own database. Connect one in Crew Center → Settings → Data store.',
+            { status: 409, code: 'store_notifications_unsupported' }));
+    }
+    listNotifications() { return this.notifications(); }
+    getNotification() { return this.notifications(); }
+    createNotifications() { return this.notifications(); }
+    markNotificationsRead() { return this.notifications(); }
+    deleteNotification() { return this.notifications(); }
+
+    links() {
+        return Promise.reject(new CrewStoreError(
+            'The quick-links board needs your VA’s own database. Connect one in Crew Center → Settings → Data store.',
+            { status: 409, code: 'store_links_unsupported' }));
+    }
+    listLinks() { return this.links(); }
+    getLink() { return this.links(); }
+    createLink() { return this.links(); }
+    updateLink() { return this.links(); }
+    deleteLink() { return this.links(); }
+    // Not a refusal: the counter is best-effort everywhere, and a legacy VA
+    // clicking a link they do not have should not see an error for a tally.
+    noteLinkOpen() { return Promise.resolve(0); }
+
     async stats() {
         const [members, pireps, routes, applications] = await Promise.all([
             this.listMembers({ limit: 5000 }),
@@ -2012,5 +2427,8 @@ module.exports = {
     EVENTS_SCHEMA_VERSION,
     SCHEDULES_SCHEMA_VERSION,
     STORAGE_SCHEMA_VERSION,
+    DOCUMENTS_SCHEMA_VERSION,
+    NOTIFICATIONS_SCHEMA_VERSION,
+    LINKS_SCHEMA_VERSION,
     REQUIRE_OWN_STORE,
 };
