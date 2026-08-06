@@ -32,6 +32,7 @@
 
 const sharp = require('sharp');
 const axios = require('axios');
+const { resolveGrade } = require('./ifGrade');
 
 const ACARS_BACKEND_URL = (process.env.ACARS_BACKEND_URL || 'https://site--acars-backend--6dmjph8ltlhv.code.run').replace(/\/+$/, '');
 
@@ -243,7 +244,7 @@ async function fetchIfStats(username) {
     return {
         userId: String(user.userId),
         username: String(user.discourseUsername || name),
-        grade: numOrNull(pick(detail?.gradeDetails?.gradeIndex, detail?.grade, user?.grade)),
+        grade: numOrNull(pick(resolveGrade(detail), user?.grade)),
         xp: numOrNull(pick(detail?.totalXP, detail?.xp, user?.totalXP, user?.xp)),
         minutes: numOrNull(pick(detail?.flightTime, user?.flightTime)),
         landings: numOrNull(pick(detail?.landingCount, user?.landingCount)),
