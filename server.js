@@ -84,6 +84,13 @@ const crewInsights = require('./crewInsights');
 const crewSchedules = require('./crewSchedules');
 const crewRetention = require('./crewRetention');
 
+// The document library, and messages addressed to one pilot. Both are pure
+// decision modules in the crewRetention mould: crewDocs decides who may read a
+// document (and strips the content when they may not), crewInbox decides who a
+// send reaches. The routes below hold the I/O and nothing else.
+const crewDocs = require('./crewDocs');
+const crewInbox = require('./crewInbox');
+
 // One-paste setup for a VA's Supabase project: given a Supabase access token we
 // install the schema, read the project's keys back and store the connection
 // ourselves, so nobody has to hand-copy three values between two dashboards.
@@ -1111,6 +1118,18 @@ function postCheckRideDueNotice(va, member, rung, actor) {
         refId: member._id,
         authorName: (actor && actor.name) || '',
     });
+    // And the pilot, in the second person. This is the notice that most needed an
+    // inbox: "they have the hours and are waiting on a sign-off" is addressed to
+    // staff, and the pilot's version — what to do next — had nowhere to go.
+    notifyPilot(va, member, {
+        kind: 'checkride',
+        title: `You’re ready for your ${rung.name} check-ride`,
+        body: rung.checkNote
+            ? String(rung.checkNote).slice(0, 600)
+            : 'You have the hours — the rank is waiting on a sign-off from staff.',
+        refId: member._id,
+        senderName: (actor && actor.name) || '',
+    });
 }
 
 /**
@@ -1133,6 +1152,59 @@ function postAnnouncement(va, { kind = 'notice', title, body = '', refId = null,
             });
         })
         .catch((err) => console.warn('announcement skipped —', err?.message || err));
+}
+
+/**
+ * Put a message in one pilot's inbox. v11.
+ *
+ * The addressed counterpart to postAnnouncement, and fire-and-forget for exactly
+ * the same reason: a promotion that happened must not be reported as a failure
+ * because the message about it could not be written. A VA on a pre-v11 schema has
+ * no crew_notifications table at all, and that is a reason to skip the message,
+ * never to fail the thing that caused it.
+ *
+ * Called with the roster row, so the message follows the pilot by `memberId` even
+ * before they have signed in for the first time and got an `accountId`. See the
+ * store's listNotifications for why both are matched on the way out.
+ *
+ * Deduped against what the pilot already has, because several of the callers run
+ * more than once — a sweep that re-checks, staff pressing approve twice on a slow
+ * connection. crewInbox.withoutDuplicates holds that rule; being told three times
+ * that you made Captain is how a pilot learns to ignore the inbox.
+ */
+function notifyPilot(va, member, { kind = 'system', title, body = '', refId = null, linkUrl = '', senderName = '' }) {
+    if (!va || !member || !title) return;
+    Promise.resolve()
+        .then(async () => {
+            const store = await crewStore.forVaOrNull(va);
+            if (!store || typeof store.createNotifications !== 'function') return;
+            // Callers hand us a roster row, which does not know its own login (the
+            // link runs the other way). Resolve it so the message lands on the
+            // indexed path, and carry on without it if accounts are unavailable —
+            // member id alone still delivers.
+            let accountId = member.accountId || null;
+            if (!accountId && member._id) {
+                try {
+                    const accounts = await store.listAccounts({ limit: 5000 });
+                    const hit = (accounts || []).find((a) => String(a.memberId || '') === String(member._id));
+                    accountId = hit ? hit._id : null;
+                } catch { accountId = null; }
+            }
+            const row = {
+                accountId,
+                memberId: member._id || null,
+                kind, title, body, refId, linkUrl, senderName,
+            };
+            // Only this pilot's recent messages are read back — enough to catch a
+            // repeat without pulling an inbox across the wire to write one row.
+            const recent = await store.listNotifications({
+                accountId: row.accountId || '', memberId: row.memberId || '', limit: 50,
+            });
+            const fresh = crewInbox.withoutDuplicates([row], recent);
+            if (!fresh.length) return;
+            await store.createNotifications(fresh);
+        })
+        .catch((err) => console.warn('pilot message skipped —', err?.message || err));
 }
 
 // ---- Route network notices ----
@@ -2508,6 +2580,16 @@ app.post('/api/crew/:slug/roster/:id/checkride', async (req, res) => {
                 body: `Signed off after their ${rung.name} check-ride.`,
                 refId: saved._id,
             });
+            // And tell the pilot. The board announces it to the crew; this is the
+            // one addressed to the person it happened to, which is the half that
+            // used to go unsaid unless a staff member remembered to DM them.
+            notifyPilot(va, saved, {
+                kind: 'promotion',
+                title: `You’re now ${promotion.to.name}`,
+                body: `Signed off after your ${rung.name} check-ride.`,
+                refId: saved._id,
+                senderName: (gate.p && gate.p.name) || '',
+            });
         }
         res.json(withDrift(store, { member: publicMember(saved, va.ranks), promoted: !!promotion }));
     } catch (err) { crewFail(res, err, { log: 'checkride error', message: 'Could not record the check-ride.' }); }
@@ -3062,6 +3144,383 @@ app.delete('/api/crew/:slug/announcements/:id', async (req, res) => {
         await store.deleteAnnouncement(req.params.id);
         res.json({ ok: true });
     } catch (err) { crewFail(res, err, { log: 'announcement delete error', message: 'Could not remove the notice.' }); }
+});
+
+/* ===========================================================================
+ * The document library (v11)
+ *
+ * Where a VA keeps the operations manual, the SOPs and the handbook, instead of
+ * a Google Doc in a Discord pin nobody can search.
+ *
+ * THE GATE IS ENFORCED IN THREE PLACES AND THIS IS THE MIDDLE ONE.
+ * RLS refuses a rank-gated row to a browser key outright (see the schema's note
+ * on why a document is unlike a route here). crewDocs.visibleTo decides what a
+ * signed-in pilot may have and STRIPS the body, the link and the file URL when
+ * the answer is no. The panel draws the lock.
+ *
+ * Every read below goes through crewDocs.visibleTo rather than returning rows —
+ * these handlers hold the service key, so RLS is not in the way and this is the
+ * only thing standing between a Captains-only SOP and whoever asked for it.
+ * ======================================================================== */
+
+const canManageDocs = async (req, slug) => !(await requireCap(req, slug, 'documents.manage')).error;
+
+/** A document as it goes over the wire. `locked` and `hoursUntilUnlock` are set
+ *  by crewDocs.visibleTo, which has already removed the content if it had to. */
+const publicDocument = (d) => ({
+    id: d._id,
+    title: d.title, summary: d.summary, kind: d.kind, source: d.source,
+    body: d.body, linkUrl: d.linkUrl,
+    fileUrl: d.fileUrl, fileName: d.fileName, fileSize: d.fileSize,
+    minRank: d.minRank || '',
+    locked: !!d.locked,
+    hoursUntilUnlock: d.hoursUntilUnlock || 0,
+    pinned: !!d.pinned,
+    status: d.status,
+    revision: d.revision || '',
+    revisedAt: d.revisedAt || null,
+    authorName: d.authorName || '',
+    createdAt: d.createdAt,
+    updatedAt: d.updatedAt,
+});
+
+app.get('/api/crew/:slug/documents', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const canManage = await canManageDocs(req, req.params.slug);
+        // Staff need the drafts and the archive; nobody else does, and fetching
+        // published-only keeps a VA's archived manual off every pilot's page load.
+        const list = await store.listDocuments(canManage ? {} : { status: 'published' });
+        const viewer = await crewViewer(req, store);
+        const visible = crewDocs.libraryFor(list, { viewer, staff: canManage, ranks: va.ranks });
+        res.json({
+            documents: visible.map(publicDocument),
+            summary: crewDocs.summarize(visible),
+            canManage,
+        });
+    } catch (err) { crewFail(res, err, { log: 'documents list error', message: 'Could not load the library.' }); }
+});
+
+// One document, read long. Separate from the list because a text document's body
+// can be an entire operations manual, and sending every one of those in the list
+// would make opening the library slow for the sake of the one being read.
+app.get('/api/crew/:slug/documents/:id', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const canManage = await canManageDocs(req, req.params.slug);
+        const doc = await store.getDocument(req.params.id);
+        if (!doc) return res.status(404).json({ error: 'Document not found.' });
+        const viewer = await crewViewer(req, store);
+        const visible = crewDocs.visibleTo(doc, { viewer, staff: canManage, ranks: va.ranks });
+        // null means this viewer may not know it exists — a draft, or a gated
+        // document with nobody signed in. 404 rather than 403: telling a stranger
+        // "that exists but you may not read it" is itself the leak.
+        if (!visible) return res.status(404).json({ error: 'Document not found.' });
+        res.json({ document: publicDocument(visible), canManage });
+    } catch (err) { crewFail(res, err, { log: 'document read error', message: 'Could not open the document.' }); }
+});
+
+app.post('/api/crew/:slug/documents', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'documents.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const doc = crewDocs.normalizeDocument(req.body);
+        if (!doc.title) return res.status(400).json({ error: 'Give the document a title.' });
+        // Publishing straight away has to clear the same bar as publishing later.
+        if (doc.status === 'published') {
+            const problem = crewDocs.publishProblem(doc);
+            if (problem) return res.status(400).json({ error: problem });
+        }
+        const saved = await store.createDocument({
+            ...doc,
+            // A new document's first revision is stamped now: there is no earlier
+            // version for a reader to have already seen.
+            revisedAt: new Date().toISOString(),
+            authorName: (gate.p && gate.p.name) || '',
+        });
+        res.status(201).json(withDrift(store, { document: publicDocument(saved) }));
+    } catch (err) { crewFail(res, err, { log: 'document add error', message: 'Could not save the document.' }); }
+});
+
+app.patch('/api/crew/:slug/documents/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'documents.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const existing = await store.getDocument(req.params.id);
+        if (!existing) return res.status(404).json({ error: 'Document not found.' });
+
+        // Merged through normalize so the one-source-only rule holds on an edit
+        // too: switching a written document to a link has to clear the body here
+        // exactly as it does on create, or the old text stays as a second version.
+        const merged = crewDocs.normalizeDocument({ ...existing, ...(req.body || {}) });
+        if (!merged.title) return res.status(400).json({ error: 'Give the document a title.' });
+        if (merged.status === 'published') {
+            const problem = crewDocs.publishProblem(merged);
+            if (problem) return res.status(400).json({ error: problem });
+        }
+
+        const patch = { ...merged };
+        // Whether this counts as a new revision is crewDocs' decision, not the
+        // store's — a retitle must not mark the manual unread for the whole
+        // roster. See isSubstantiveChange.
+        const substantive = crewDocs.isSubstantiveChange(existing, req.body || {});
+        if (substantive) patch.revisedAt = new Date().toISOString();
+
+        const saved = await store.updateDocument(existing._id, patch);
+
+        // Publishing a document, or revising a published one, is worth telling the
+        // crew about — and the noticeboard is the right place for that, not the
+        // library trying to be a feed. Gated documents are announced only to the
+        // extent of their title, which is already what a short-of-the-rung pilot
+        // is allowed to see.
+        const nowPublished = saved.status === 'published';
+        const wasPublished = existing.status === 'published';
+        if (nowPublished && (!wasPublished || substantive)) {
+            postAnnouncement(va, {
+                kind: 'notice',
+                title: wasPublished
+                    ? `${saved.title} has been updated`
+                    : `New in the library: ${saved.title}`,
+                body: saved.revision ? `Revision ${saved.revision}.` : (saved.summary || ''),
+                refId: saved._id,
+                authorName: (gate.p && gate.p.name) || '',
+            });
+        }
+        res.json(withDrift(store, { document: publicDocument(saved) }));
+    } catch (err) { crewFail(res, err, { log: 'document edit error', message: 'Could not update the document.' }); }
+});
+
+app.delete('/api/crew/:slug/documents/:id', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'documents.manage');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const existing = await store.getDocument(req.params.id);
+        // The hosted copy goes with the row. Non-fatal: an orphaned object in the
+        // bucket is untidy, a delete that fails because of one is worse.
+        if (existing && existing.fileUrl) await deleteVaImage(s3Client, existing.fileUrl);
+        await store.deleteDocument(req.params.id);
+        res.json({ ok: true });
+    } catch (err) { crewFail(res, err, { log: 'document delete error', message: 'Could not remove the document.' }); }
+});
+
+/**
+ * Upload the file a document IS.
+ *
+ * Not the image path (uploadVaImage): that runs everything through sharp to a
+ * webp, which is right for a badge and would destroy a PDF. A document is stored
+ * byte-for-byte, so the type has to be checked at the door instead of being
+ * normalised away — see DOCUMENT_TYPES.
+ */
+const DOCUMENT_TYPES = {
+    'application/pdf': 'pdf',
+    'text/plain': 'txt',
+    'text/markdown': 'md',
+    'application/msword': 'doc',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+};
+const DOCUMENT_MAX_BYTES = 25 * 1024 * 1024;
+
+app.post('/api/crew/:slug/documents/:id/file', upload.single('file'), async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'documents.manage');
+    if (gate.error) {
+        if (req.file && req.file.path) fs.unlink(req.file.path, () => {});
+        return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    }
+    const cleanup = () => { if (req.file && req.file.path) fs.unlink(req.file.path, () => {}); };
+    try {
+        if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
+        const ext = DOCUMENT_TYPES[req.file.mimetype];
+        if (!ext) {
+            cleanup();
+            return res.status(415).json({
+                error: 'That file type can’t be hosted here. PDF, Word or plain text — or link to it instead.',
+            });
+        }
+        if (req.file.size > DOCUMENT_MAX_BYTES) {
+            cleanup();
+            return res.status(413).json({ error: 'That file is larger than 25 MB. Link to it instead.' });
+        }
+
+        const { store } = await resolveCrewStore(req.params.slug);
+        const existing = await store.getDocument(req.params.id);
+        if (!existing) { cleanup(); return res.status(404).json({ error: 'Document not found.' }); }
+
+        const body = req.file.path ? fs.readFileSync(req.file.path) : req.file.buffer;
+        const key = `va-documents/${encodeURIComponent(String(req.params.slug).toLowerCase())}/`
+            + `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+        await s3Client.send(new PutObjectCommand({
+            Bucket: process.env.AWS_S3_BUCKET_NAME,
+            Key: key,
+            Body: body,
+            ContentType: req.file.mimetype,
+            // Inline so a pilot tapping the ops manual reads it rather than
+            // downloading it, with the VA's own filename on it either way.
+            ContentDisposition: `inline; filename="${String(req.file.originalname || `document.${ext}`).replace(/[^\w.\- ]/g, '_')}"`,
+        }));
+        const url = `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+
+        // The previous file, if this replaces one. Same non-fatal treatment as
+        // the delete route.
+        if (existing.fileUrl && existing.fileUrl !== url) await deleteVaImage(s3Client, existing.fileUrl);
+
+        const saved = await store.updateDocument(existing._id, {
+            source: 'file',
+            fileUrl: url,
+            fileName: String(req.file.originalname || '').slice(0, 200),
+            fileSize: req.file.size,
+            // Switching to a file is a different document to read even if it says
+            // the same thing, so the other two sources are cleared and the
+            // revision stamp moves. crewDocs.isSubstantiveChange agrees.
+            body: '',
+            linkUrl: '',
+            revisedAt: new Date().toISOString(),
+        });
+        cleanup();
+        res.json(withDrift(store, { document: publicDocument(saved) }));
+    } catch (err) {
+        cleanup();
+        crewFail(res, err, { log: 'document upload error', message: 'Could not upload the file.' });
+    }
+});
+
+/* ===========================================================================
+ * The pilot's inbox (v11)
+ *
+ * The noticeboard is the airline talking to everybody at once. This is the other
+ * half — the things addressed to ONE pilot, which a board either broadcasts to
+ * the whole roster or never says at all. See crewInbox.js.
+ * ======================================================================== */
+
+const publicNotification = (n) => ({
+    id: n._id,
+    title: n.title, body: n.body, kind: n.kind,
+    refId: n.refId || null,
+    linkUrl: n.linkUrl || '',
+    senderName: n.senderName || '',
+    readAt: n.readAt || null,
+    createdAt: n.createdAt,
+});
+
+/**
+ * The pilot asking, and the ids their inbox is addressed by.
+ *
+ * Unlike crewViewer this is about IDENTITY rather than rank, and it deliberately
+ * refuses anybody who is not a signed-in pilot of this crew center. Staff have no
+ * inbox — they read the dashboard — and there is no "whose inbox?" parameter
+ * anywhere in this section, which is what makes it impossible for one pilot to
+ * ask for another's.
+ */
+async function inboxOwner(req, store) {
+    const p = verifyCrewRequest(req);
+    if (!p || p.kind !== 'crew') return null;
+    if (p.slug && p.slug !== String(req.params.slug).toLowerCase()) return null;
+    try {
+        const account = await store.getAccount(p.sub);
+        if (!account) return null;
+        return { accountId: account._id, memberId: account.memberId || '' };
+    } catch { return null; }
+}
+
+// A pilot's own inbox. There is no staff view of somebody else's — see above.
+app.get('/api/crew/:slug/inbox', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const who = await inboxOwner(req, store);
+        if (!who) return res.status(401).json({ error: 'Sign in to read your messages.' });
+        const list = await store.listNotifications({ ...who, limit: 100 });
+        // `latest` is dropped: it is a whole row the list already carries, and
+        // sending it twice would have the badge and the list disagree the moment
+        // one of them is filtered.
+        const { total, unread, badge } = crewInbox.unreadSummary(list);
+        res.json({ messages: list.map(publicNotification), total, unread, badge });
+    } catch (err) { crewFail(res, err, { log: 'inbox list error', message: 'Could not load your messages.' }); }
+});
+
+// Mark read — either the ids given, or everything. Scoped to the reader's own
+// rows in the store, so an id belonging to somebody else matches nothing.
+app.post('/api/crew/:slug/inbox/read', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const who = await inboxOwner(req, store);
+        if (!who) return res.status(401).json({ error: 'Sign in to read your messages.' });
+        const b = req.body || {};
+        const ids = Array.isArray(b.ids) ? b.ids.slice(0, 200).map((i) => String(i)) : [];
+        const marked = await store.markNotificationsRead({ ...who, ids, all: !!b.all });
+        res.json({ ok: true, marked });
+    } catch (err) { crewFail(res, err, { log: 'inbox read error', message: 'Could not update your messages.' }); }
+});
+
+/**
+ * Staff send a message.
+ *
+ * `kind` is forced to 'message' by STAFF_KINDS. A hand-written 'promotion' would
+ * be indistinguishable in the inbox from one that actually happened, which is the
+ * same rule the noticeboard applies to its generated rows and for the same
+ * reason: a record that can be forged is not a record.
+ */
+app.post('/api/crew/:slug/inbox/send', async (req, res) => {
+    const gate = await requireCap(req, req.params.slug, 'members.message');
+    if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const b = req.body || {};
+        const audience = String(b.audience || 'active');
+        const minRank = String(b.minRank || '').trim().slice(0, 40);
+        const memberIds = Array.isArray(b.memberIds) ? b.memberIds.slice(0, 500).map((i) => String(i)) : [];
+        const title = String(b.title || '').trim().slice(0, 160);
+
+        const problem = crewInbox.sendProblem({ audience, minRank, memberIds, title });
+        if (problem) return res.status(400).json({ error: problem });
+
+        // A roster row does not know which login belongs to it — the link runs the
+        // other way — so the account ids are resolved here and attached. Without
+        // this every message would be addressed by member id alone: still
+        // delivered, but off the partial index the unread badge reads. Best-effort
+        // because a VA on a pre-v3 schema has no accounts table, and a send that
+        // reaches pilots by roster row is much better than one that fails.
+        const [members, accounts] = await Promise.all([
+            store.listMembers({ limit: 5000 }),
+            store.listAccounts({ limit: 5000 }).catch(() => []),
+        ]);
+        const accountFor = new Map(
+            (accounts || []).filter((a) => a.memberId).map((a) => [String(a.memberId), a._id]),
+        );
+        const addressable = members.map((m) => ({ ...m, accountId: accountFor.get(String(m._id)) || null }));
+
+        const rows = crewInbox.rowsFor(
+            addressable,
+            { title, body: b.body, linkUrl: b.linkUrl, senderName: (gate.p && gate.p.name) || '' },
+            { audience, minRank, memberIds, allowKinds: crewInbox.STAFF_KINDS },
+            va.ranks,
+        );
+        if (!rows.length) {
+            return res.status(400).json({ error: 'Nobody on the roster matches that — the message wasn’t sent.' });
+        }
+        const saved = await store.createNotifications(rows);
+        res.status(201).json(withDrift(store, { sent: (saved || rows).length }));
+    } catch (err) { crewFail(res, err, { log: 'inbox send error', message: 'Could not send the message.' }); }
+});
+
+// A pilot clearing something out of their own inbox. Scoped by reading the row
+// back first: a delete filtered only by id would let a pilot who guessed one
+// remove somebody else's message.
+app.delete('/api/crew/:slug/inbox/:id', async (req, res) => {
+    try {
+        const { store } = await resolveCrewStore(req.params.slug);
+        const who = await inboxOwner(req, store);
+        if (!who) return res.status(401).json({ error: 'Sign in to read your messages.' });
+        const row = await store.getNotification(req.params.id);
+        const mine = row && (
+            (row.accountId && row.accountId === who.accountId)
+            || (row.memberId && who.memberId && row.memberId === who.memberId)
+        );
+        if (!mine) return res.status(404).json({ error: 'Message not found.' });
+        await store.deleteNotification(row._id);
+        res.json({ ok: true });
+    } catch (err) { crewFail(res, err, { log: 'inbox delete error', message: 'Could not remove the message.' }); }
 });
 
 // ---- The Inflight partnership, as the VA's own crew center sees it ----
@@ -4358,7 +4817,7 @@ app.post('/api/crew/:slug/schedules/:id/bookings', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'schedules.manage');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
-        const { store } = await resolveCrewStore(req.params.slug);
+        const { va, store } = await resolveCrewStore(req.params.slug);
         const schedule = await store.getSchedule(req.params.id);
         if (!schedule) return res.status(404).json({ error: 'Departure not found.' });
 
@@ -4377,6 +4836,24 @@ app.post('/api/crew/:slug/schedules/:id/bookings', async (req, res) => {
             status: 'booked',
         });
         if (full) return res.status(409).json({ error: 'Every seat on this departure has gone.', code: 'full' });
+        // Staff put them on this leg — the pilot did not, so this is the only way
+        // they find out short of noticing it on the schedule. Only for a pilot on
+        // the roster: a guest crew assigned by name has no inbox to write to.
+        if (member) {
+            const leg = [schedule.origin, schedule.destination].filter(Boolean).join('–');
+            notifyPilot(va, member, {
+                kind: 'booking',
+                title: `You’re flying ${schedule.flightNumber || leg || 'a scheduled departure'}`,
+                body: [
+                    leg && `${leg}.`,
+                    schedule.departsAt && `Departs ${new Date(schedule.departsAt).toUTCString()}.`,
+                    booking.seat > 1 ? `Seat ${booking.seat}.` : '',
+                    String(b.note || '').trim().slice(0, 200),
+                ].filter(Boolean).join(' '),
+                refId: schedule._id,
+                senderName: (gate.p && gate.p.name) || '',
+            });
+        }
         res.status(201).json(withDrift(store, { booking: crewSchedules.publicBooking(booking) }));
     } catch (err) {
         if (bookingConflict(err, res, { byStaff: true })) return;
@@ -4461,6 +4938,16 @@ async function applyPirepHours(store, pirep, va) {
                     postAnnouncement(va, {
                         kind: 'promotion',
                         title: `${after.name || 'A pilot'} is now ${promotion.to.name}`,
+                        body: promotion.from ? `Up from ${promotion.from.name}.` : '',
+                        refId: after._id,
+                    });
+                    // The pilot's own copy. This path is the one a pilot is least
+                    // likely to notice unaided — the promotion happens when their
+                    // flight report is approved, which may be days after they flew
+                    // it and nowhere near the crew center.
+                    notifyPilot(va, after, {
+                        kind: 'promotion',
+                        title: `You’re now ${promotion.to.name}`,
                         body: promotion.from ? `Up from ${promotion.from.name}.` : '',
                         refId: after._id,
                     });
@@ -5153,6 +5640,21 @@ app.patch('/api/crew/:slug/applications/:id', async (req, res) => {
                     body: member.callsign ? `Flying as ${member.callsign}.` : '',
                     refId: member._id,
                 });
+                // Waiting for them when they first sign in. The acceptance email
+                // is the thing they are told at the time; this is the copy that is
+                // still there a week later when they have lost the email, and it
+                // is addressed by member id because the login below does not exist
+                // yet (see the store's listNotifications for why that still finds
+                // it).
+                notifyPilot(va, member, {
+                    kind: 'application',
+                    title: `Welcome to ${va.name || 'the airline'}`,
+                    body: member.callsign
+                        ? `Your application was accepted. You’re flying as ${member.callsign}.`
+                        : 'Your application was accepted.',
+                    refId: member._id,
+                    senderName: (gate.p && gate.p.name) || '',
+                });
             }
 
             // A crew center login, when the reviewer asked for one. It is
@@ -5597,6 +6099,8 @@ app.get('/api/crew/:slug/store', async (req, res) => {
             accountsSchemaVersion: crewStore.ACCOUNTS_SCHEMA_VERSION,
             eventsSchemaVersion: crewStore.EVENTS_SCHEMA_VERSION,
             storageSchemaVersion: crewStore.STORAGE_SCHEMA_VERSION,
+            documentsSchemaVersion: crewStore.DOCUMENTS_SCHEMA_VERSION,
+            notificationsSchemaVersion: crewStore.NOTIFICATIONS_SCHEMA_VERSION,
             // The saved access token, described but never disclosed.
             token: tokenState(tokenMeta),
             // Set when this very request brought the project up to date, so the

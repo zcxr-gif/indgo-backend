@@ -215,8 +215,18 @@ const CREW_CAPABILITIES = [
     // the partnership and is not the owner, and the alternative was that owner
     // forwarding screenshots.
     { id: 'partnership.view',       group: 'Partnership',   label: 'See the Inflight partnership & warnings' },
-    // Room to grow, e.g.:
-    // { id: 'members.message',   group: 'Roster',     label: 'Message crew members' },
+    // v11. The library. Its own capability rather than folded into
+    // settings.branding, because publishing the operations manual is a different
+    // job from choosing the airline's colours and is usually a different person —
+    // and because a rank-gated document is an access control decision, which is
+    // not something to hand out with the logo picker.
+    { id: 'documents.manage',       group: 'Communications', label: 'Publish & manage the document library' },
+    // v11. Messaging the crew. Separate from announcements.manage for the reason
+    // that split was made in the first place: a notice is posted to a board
+    // anyone can read, and a message lands in one pilot's inbox addressed to
+    // them. A VA may well want somebody who writes notices but does not message
+    // pilots individually, and the reverse.
+    { id: 'members.message',        group: 'Communications', label: 'Message pilots individually or by rank' },
 ];
 const CREW_CAP_IDS = CREW_CAPABILITIES.map(c => c.id);
 
@@ -287,8 +297,9 @@ const CREW_ROLE_PRESETS = [
         id: 'comms',
         name: 'Communications',
         color: '#0891B2',
-        description: 'Writes to the crew and looks after Discord & email.',
-        permissions: ['announcements.manage', 'settings.notifications', 'events.manage'],
+        description: 'Writes to the crew, keeps the manuals, looks after Discord & email.',
+        permissions: ['announcements.manage', 'members.message', 'documents.manage',
+            'settings.notifications', 'events.manage'],
     },
     {
         id: 'brand-manager',
