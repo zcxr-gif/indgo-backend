@@ -5086,6 +5086,91 @@ function resolveFlightNames(flight, meta) {
     }
     return { aircraftName, liveryName };
 }
+
+/* ---------------------------------------------------------------------------
+ * ONE PILOT'S INFINITE FLIGHT LOGBOOK
+ *
+ * The ACARS auto-sync (below) is staff-driven and all-or-nothing: a manager
+ * presses Sync and every linked pilot's recent history becomes reports. It also
+ * only works for pilots whose account is linked AND whose VA remembered to run
+ * it, which left the pilot themselves with nothing but a form to retype a
+ * flight the API already knows about in full.
+ *
+ * These three helpers are what a pilot picking their own flight needs: read a
+ * page of their logbook, reduce a raw IF flight to the fields a report is made
+ * of, and find one flight by id. The sync uses the same reducer, so a picked
+ * flight and a synced flight carry identical numbers — they are the same flight
+ * read the same way, and staff reviewing them should never see the two paths
+ * disagree.
+ * ------------------------------------------------------------------------- */
+async function fetchIfLogbook(ifUserId, page = 1) {
+    const p = Math.max(1, Math.min(50, Math.round(Number(page) || 1)));
+    const r = await axios.get(
+        `${ACARS_BACKEND_URL}/api/users/${encodeURIComponent(ifUserId)}/flights?page=${p}`,
+        { timeout: 8000 });
+    const d = (r && r.data) || {};
+    return {
+        flights: Array.isArray(d.flights) ? d.flights : [],
+        // The requested page rather than the upstream's `pageIndex`: the IF API
+        // is 0-based in places and 1-based in others, and the only number the
+        // caller can safely ask for next is the one it asked for plus one.
+        page: p,
+        totalPages: Math.max(1, Math.round(Number(d.totalPages) || 1)),
+        totalCount: Math.max(0, Math.round(Number(d.totalCount) || 0)),
+        hasNextPage: !!d.hasNextPage,
+    };
+}
+
+// A raw IF logbook entry reduced to exactly what a flight report stores.
+// `violations` and `landings` arrive as either a count or an array depending on
+// which part of the API answered, hence the two-way read on both.
+function normalizeIfFlight(f, meta) {
+    const { aircraftName, liveryName } = resolveFlightNames(f, meta);
+    return {
+        flightId: String((f && f.id) || ''),
+        origin: String((f && f.originAirport) || '').toUpperCase(),
+        destination: String((f && f.destinationAirport) || '').toUpperCase(),
+        aircraftName, liveryName,
+        durationMin: Math.max(0, Math.round(Number(f && f.totalTime) || 0)),
+        landings: Array.isArray(f && f.landingStats)
+            ? f.landingStats.length
+            : Math.max(0, Math.round(Number(f && f.landingCount) || 0)),
+        xp: Math.round(Number(f && f.xp) || 0),
+        violations: Array.isArray(f && f.violations)
+            ? f.violations.length
+            : Math.max(0, Math.round(Number(f && f.violations) || 0)),
+        server: String((f && f.server) || '').slice(0, 40),
+        callsign: String((f && f.callsign) || '').slice(0, 20),
+        flownAt: (f && f.created) ? new Date(f.created) : null,
+    };
+}
+
+/**
+ * Find one flight in a pilot's logbook by its IF flight id.
+ *
+ * This is what makes filing-by-picking trustworthy: the browser sends an id and
+ * nothing else that matters, and every number that lands in the report is read
+ * back out of Infinite Flight here. A pilot cannot file a two-minute hop as
+ * nine hours by editing the request, because the request never carried the
+ * hours.
+ *
+ * `hintPage` is the page the picker showed it on, tried first; the fallback
+ * scan exists because a flight can shift a page when a newer one lands between
+ * the pilot opening the list and pressing file.
+ */
+async function findIfFlight(ifUserId, flightId, meta, hintPage = 1) {
+    const want = String(flightId || '');
+    if (!want) return null;
+    const pages = [...new Set([Math.max(1, Math.round(Number(hintPage) || 1)), 1, 2, 3])].slice(0, 4);
+    for (const p of pages) {
+        let book;
+        try { book = await fetchIfLogbook(ifUserId, p); } catch { continue; }
+        const hit = book.flights.find((f) => String((f && f.id) || '') === want);
+        if (hit) return normalizeIfFlight(hit, meta);
+    }
+    return null;
+}
+
 // Credit a PIREP's hours to its pilot exactly once. `hoursApplied` is the guard:
 // it is flipped in the same store the hours landed in, so approving an
 // already-approved report is a no-op rather than a double credit. Returns the
@@ -5231,6 +5316,79 @@ app.get('/api/crew/:slug/me/flying', async (req, res) => {
     } catch (err) { crewFail(res, err, { log: 'me/flying error', message: 'Could not load your flying.' }); }
 });
 
+/* ===========================================================================
+ * THE PILOT'S OWN INFINITE FLIGHT LOGBOOK — the flights they can file
+ *
+ * Filing used to mean typing a flight the API already had: two ICAOs, an
+ * aircraft name spelled the way the fleet spells it, and a duration the pilot
+ * had to remember. Every one of those is a chance to file something that does
+ * not match a route it actually flew, and none of it was verified — a typed
+ * report is a claim.
+ *
+ * This hands the pilot their real history and lets them point at it. Each entry
+ * comes back already judged against THIS airline: has it been filed before, is
+ * the aircraft in the fleet, does the leg match a published route and which
+ * flight number that is. That is the whole reason to answer it here rather than
+ * let the page call the ACARS backend itself — the browser has the pilot's
+ * flights but none of the airline's.
+ * ========================================================================= */
+app.get('/api/crew/:slug/me/if-flights', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const me = await crewPilot(req, store);
+        if (!me || !me.memberId) {
+            return res.status(401).json({ error: 'Sign in to see your flights.' });
+        }
+
+        const member = await store.getMember(me.memberId);
+        // No linked IF account is not an error — it is a state the page has a
+        // sentence for, and it is staff who fix it, not the pilot.
+        if (!member || !member.ifUserId) {
+            return res.json({ linked: false, flights: [], page: 1, hasNextPage: false });
+        }
+
+        const page = Math.max(1, Math.min(20, parseInt(req.query.page, 10) || 1));
+        let book;
+        try {
+            book = await fetchIfLogbook(member.ifUserId, page);
+        } catch (err) {
+            console.warn('if-flights upstream —', err?.message || err);
+            return res.status(502).json({ error: 'Infinite Flight didn’t answer. Try again in a moment.' });
+        }
+
+        let meta;
+        try { meta = await loadAircraftMetadata(); } catch { meta = { acById: new Map(), livById: new Map() }; }
+        const vaFull = await VirtualAirlineAd.findById(va._id).select('crewFleet').lean();
+        const fleet = (vaFull && vaFull.crewFleet) || [];
+        const routes = await store.listRoutes({ activeOnly: true });
+
+        const rows = book.flights.map((f) => normalizeIfFlight(f, meta)).filter((f) => f.flightId);
+        // Which of these are already reports. Shown rather than hidden: a pilot
+        // looking for a flight they filed last week needs to see it sitting
+        // there marked, not wonder where it went.
+        const seen = await store.seenFlightIds(rows.map((f) => f.flightId));
+
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            linked: true,
+            page: book.page,
+            totalPages: book.totalPages,
+            totalCount: book.totalCount,
+            hasNextPage: book.hasNextPage,
+            flights: rows.map((f) => {
+                const route = matchRoute(routes, f.origin, f.destination, f.aircraftName);
+                return {
+                    ...f,
+                    filed: seen.has(f.flightId),
+                    inFleet: pirepInFleet(fleet, f.aircraftName),
+                    routeMatched: !!route,
+                    flightNumber: (route && route.flightNumber) || '',
+                };
+            }),
+        });
+    } catch (err) { crewFail(res, err, { log: 'me/if-flights error', message: 'Could not read your Infinite Flight logbook.' }); }
+});
+
 // List PIREPs. Managers (flights.review) see everything and can filter by status;
 // everyone else sees the approved flights only — a public flight log.
 app.get('/api/crew/:slug/pireps', async (req, res) => {
@@ -5246,6 +5404,103 @@ app.get('/api/crew/:slug/pireps', async (req, res) => {
         const pireps = await store.listPireps({ status });
         res.json({ pireps: pireps.map(publicPirep), canReview: isManager });
     } catch (err) { crewFail(res, err, { log: 'pireps list error', message: 'Could not load flights.' }); }
+});
+
+/* ===========================================================================
+ * STANDINGS — where a pilot sits among the people they fly with
+ *
+ * crewInsights.topPilots has existed for as long as the insights panel has,
+ * and only ever answered to a manager. So the airline's own pilots — the
+ * people generating every number in it — were the one group who could not see
+ * it. A pilot filed a flight, watched their hours go up, and had no way of
+ * knowing whether that was a lot.
+ *
+ * Ranked by flights rather than career hours, and over a window rather than
+ * for all time, for the reason crewInsights states: the hours column never
+ * goes down, so it ranks who has been here longest. That is a hall of fame,
+ * not a board a pilot who joined in March can ever appear on. Whoever is
+ * carrying the airline THIS month is the question worth answering, and it is
+ * the one a new pilot can actually act on.
+ *
+ * Nothing here is newly public: the roster endpoint already hands out every
+ * name, callsign and rank without a gate, and the flight log already shows
+ * every approved flight. This is those two facts joined, and the join is done
+ * server-side because a browser doing it would have to download both.
+ * ========================================================================= */
+app.get('/api/crew/:slug/standings', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+
+        // 30 / 90 / all-time. Anything else is somebody guessing at the query
+        // string, and a board over an arbitrary window is a board nobody can
+        // compare against the one they saw yesterday.
+        const asked = String(req.query.window || '30');
+        const days = ['30', '90', '0'].includes(asked) ? Number(asked) : 30;
+
+        const [pireps, members] = await Promise.all([
+            store.listPireps({ status: 'approved', limit: 20000 }),
+            store.listMembers(),
+        ]);
+
+        // Approved only, and inside the window. `flownOnly` is what decides
+        // that — reusing it rather than re-filtering here is what keeps this
+        // board and the staff panel from ever disagreeing about the same month.
+        const flights = crewInsights.withinDays(crewInsights.flownOnly(pireps), days, Date.now());
+        const ranked = crewInsights.topPilots(flights, members, { limit: 10000 });
+
+        // The rank ladder position is worth carrying: a board that shows hours
+        // without saying what they make you is a board that leaves the pilot to
+        // look it up. `byId` is read once rather than per row.
+        const byId = new Map((members || []).map((m) => [String(m._id), m]));
+        const row = (p, i) => {
+            const m = byId.get(String(p.memberId));
+            return {
+                rank: i + 1,
+                memberId: p.memberId,
+                name: p.name,
+                callsign: p.callsign,
+                onRoster: p.onRoster,
+                flights: p.flights,
+                hours: p.hours,
+                landings: p.landings,
+                lastFlightAt: p.lastFlightAt,
+                badge: m ? crewRanks.memberRank(va.ranks, m.hours, m.checksPassed) : null,
+            };
+        };
+        const board = ranked.map(row);
+
+        // Who is asking, and where they came. Included even when they are
+        // nowhere near the top ten — "you are 34th of 51, four flights off the
+        // top ten" is the only line on this page a mid-table pilot can use, and
+        // a board that just doesn't mention them is the version that makes them
+        // close it. Not signed in is not an error: the public crew center shows
+        // the same board with nobody highlighted.
+        let me = null;
+        const who = await crewPilot(req, store).catch(() => null);
+        if (who && who.memberId) {
+            const at = board.findIndex((b) => String(b.memberId) === String(who.memberId));
+            me = at >= 0
+                ? { ...board[at], of: board.length }
+                // On the roster, nothing flown in the window. Said plainly
+                // rather than left out, because "you have not filed a flight
+                // this month" is a true and useful answer to "where am I?".
+                : { rank: null, memberId: who.memberId, name: who.name, callsign: who.callsign || '',
+                    onRoster: true, flights: 0, hours: 0, landings: 0, lastFlightAt: null,
+                    badge: null, of: board.length };
+        }
+
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            window: days,
+            board: board.slice(0, 25),
+            me,
+            totals: {
+                pilots: board.length,
+                flights: flights.length,
+                hours: Math.round(flights.reduce((s, f) => s + (Number(f.durationMin) || 0), 0) / 6) / 10,
+            },
+        });
+    } catch (err) { crewFail(res, err, { log: 'standings error', message: 'Could not load the standings.' }); }
 });
 
 // File a PIREP by hand. Any signed-in crew member of this VA can submit one.
@@ -5291,23 +5546,75 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
             }
         }
 
-        const origin = icao(b.origin) || (event ? event.origin : '') || (schedule ? schedule.origin : '');
-        const destination = icao(b.destination) || (event ? event.destination : '') || (schedule ? schedule.destination : '');
-        if (!origin || !destination) return res.status(400).json({ error: 'Enter both a departure and an arrival airport.' });
-        const aircraftName = String(b.aircraftName || b.aircraft || (event && event.aircraft) || (schedule && schedule.aircraft) || '').trim().slice(0, 60);
-        const liveryName = String(b.liveryName || b.livery || '').trim().slice(0, 80);
-        // Duration accepts either a minutes number or hours+minutes fields.
-        let durationMin = Math.round(Number(b.durationMin) || 0);
-        if (!durationMin && (b.hours || b.minutes)) durationMin = Math.round((Number(b.hours) || 0) * 60 + (Number(b.minutes) || 0));
-        durationMin = Math.max(0, Math.min(100000, durationMin));
-        const landings = Math.max(0, Math.min(100, Math.round(Number(b.landings) || 0)));
-
         // Optional: attribute to a roster pilot (so approving can credit hours).
         let member = null;
         if (b.memberId) member = await store.getMember(b.memberId);
 
+        /* Filing a flight the pilot PICKED out of their own Infinite Flight
+         * logbook (see GET /me/if-flights). The body carries an id and nothing
+         * else that counts: the route, the aircraft, the livery, the duration,
+         * the landings, the XP, the violations and when it happened are all
+         * read back from Infinite Flight here.
+         *
+         * That is the point of the whole flow. A typed report is a claim staff
+         * have to take on trust; a picked one is the API's own record of a
+         * flight that pilot actually flew, and it cannot be edited on the way
+         * in because none of those numbers travelled with the request.
+         *
+         * The pilot is resolved from the SESSION, never from `memberId` — the
+         * logbook searched is the caller's own, so nobody can file another
+         * pilot's flights, or their own flights onto somebody else's hours. */
+        let picked = null;
+        if (b.flightId) {
+            const me = await crewPilot(req, store);
+            if (!me || !me.memberId) {
+                return res.status(403).json({ error: 'Link your pilot record before filing from your logbook.' });
+            }
+            member = await store.getMember(me.memberId);
+            if (!member || !member.ifUserId) {
+                return res.status(400).json({ error: 'Your pilot record isn’t linked to an Infinite Flight account yet.' });
+            }
+            const flightId = String(b.flightId).slice(0, 80);
+            // Filed once. The store's index enforces this too, but a pilot who
+            // double-taps deserves the real reason rather than a failed insert.
+            const already = await store.seenFlightIds([flightId]);
+            if (already.has(flightId)) {
+                return res.status(409).json({ error: 'That flight has already been filed.' });
+            }
+            let meta;
+            try { meta = await loadAircraftMetadata(); } catch { meta = { acById: new Map(), livById: new Map() }; }
+            try {
+                picked = await findIfFlight(member.ifUserId, flightId, meta, b.flightPage);
+            } catch (err) {
+                console.warn('pirep pick upstream —', err?.message || err);
+                return res.status(502).json({ error: 'Infinite Flight didn’t answer. Try again in a moment.' });
+            }
+            if (!picked) {
+                return res.status(404).json({ error: 'That flight isn’t in your Infinite Flight logbook any more.' });
+            }
+            if (!picked.origin || !picked.destination) {
+                return res.status(422).json({ error: 'Infinite Flight has no departure and arrival for that flight, so it can’t be filed.' });
+            }
+        }
+
+        // A picked flight's own values win over anything typed, for the reason
+        // above: they are the record, not a description of it.
+        const origin = (picked && picked.origin) || icao(b.origin) || (event ? event.origin : '') || (schedule ? schedule.origin : '');
+        const destination = (picked && picked.destination) || icao(b.destination) || (event ? event.destination : '') || (schedule ? schedule.destination : '');
+        if (!origin || !destination) return res.status(400).json({ error: 'Enter both a departure and an arrival airport.' });
+        const aircraftName = (picked && picked.aircraftName)
+            || String(b.aircraftName || b.aircraft || (event && event.aircraft) || (schedule && schedule.aircraft) || '').trim().slice(0, 60);
+        const liveryName = (picked && picked.liveryName) || String(b.liveryName || b.livery || '').trim().slice(0, 80);
+        // Duration accepts either a minutes number or hours+minutes fields.
+        let durationMin = picked ? picked.durationMin : Math.round(Number(b.durationMin) || 0);
+        if (!picked && !durationMin && (b.hours || b.minutes)) durationMin = Math.round((Number(b.hours) || 0) * 60 + (Number(b.minutes) || 0));
+        durationMin = Math.max(0, Math.min(100000, durationMin));
+        const landings = picked
+            ? Math.max(0, Math.min(100, picked.landings))
+            : Math.max(0, Math.min(100, Math.round(Number(b.landings) || 0)));
+
         // Compare against the current network to judge whether the route is real.
-        const vaFull = await VirtualAirlineAd.findById(va._id).select('crewFleet').lean();
+        const vaFull = await VirtualAirlineAd.findById(va._id).select('crewFleet crewPirepAutoApprove').lean();
         const routes = await store.listRoutes({ activeOnly: true });
         const route = matchRoute(routes, origin, destination, aircraftName);
         const inFleet = pirepInFleet((vaFull && vaFull.crewFleet) || [], aircraftName);
@@ -5315,7 +5622,15 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
         const claimedFlight = String(b.flightNumber || (event && event.flightNumber) || (schedule && schedule.flightNumber) || '').trim().slice(0, 12);
         const flightNumberMismatch = !!(route && route.flightNumber && claimedFlight && _norm(route.flightNumber) !== _norm(claimedFlight));
 
-        const doc = await store.createPirep({
+        // Auto-approval applies to PICKED flights only, and on the same rule the
+        // sync uses: the VA asked for it and the aircraft is in the fleet. A
+        // typed report can never take this path however the setting is left —
+        // the setting means "trust Infinite Flight's record", not "trust the
+        // form", and crediting hours off an unverified number is the one thing
+        // it must not do.
+        const willApprove = !!(picked && vaFull && vaFull.crewPirepAutoApprove && inFleet);
+
+        let doc = await store.createPirep({
             memberId: (member && member._id) || null,
             // The route the LEG matched, falling back to the one the event was
             // built on. An event flown on a published route credits against it
@@ -5323,12 +5638,24 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
             routeId: (route && route._id) || (event && event.routeId) || (schedule && schedule.routeId) || null,
             eventId: event ? event._id : null,
             scheduleId: schedule ? schedule._id : null,
-            pilotName: (member && member.name) || p.name || '', callsign: String(b.callsign || (member && member.callsign) || '').slice(0, 20),
+            pilotName: (member && member.name) || p.name || '',
+            callsign: String((picked && picked.callsign) || b.callsign || (member && member.callsign) || '').slice(0, 20),
             flightNumber: (route && route.flightNumber) || claimedFlight, ifUserId: (member && member.ifUserId) || '',
+            // The IF flight id is the dedupe key AND the proof: a report
+            // carrying one was read out of a real logbook, whatever `source`
+            // says. It stays 'manual' on this path on purpose — a pilot chose
+            // to file this, which is the distinction `source` records; 'auto'
+            // means the sync swept it up with nobody asking.
+            flightId: (picked && picked.flightId) || '',
             origin, destination, aircraftName, liveryName,
             durationMin, landings, distanceNm: (route && route.distanceNm) || 0,
-            inFleet, source: 'manual', status: 'pending',
-            flownAt: b.flownAt ? new Date(b.flownAt) : new Date(),
+            xp: picked ? picked.xp : 0,
+            violations: picked ? picked.violations : 0,
+            server: picked ? picked.server : '',
+            inFleet, source: 'manual',
+            status: willApprove ? 'approved' : 'pending',
+            flownAt: (picked && picked.flownAt) || (b.flownAt ? new Date(b.flownAt) : new Date()),
+            reviewedAt: willApprove ? new Date() : null,
         });
         vaStats.recordEngagement(va._id, 'pirep', 1, va.name);
         // The booking has been flown. Best-effort and deliberately after the
@@ -5348,10 +5675,19 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
                 .catch((err) => console.warn('booking not marked flown —', err?.message || err));
         }
         postPirepNotice(va, 'filed', doc, p);
+        // Auto-approved legs post twice — filed, then approved — for the same
+        // reason the sync does: that is what happened, and the feed should read
+        // the same whether a human pressed the button or the rule did.
+        if (willApprove) {
+            doc = await applyPirepHours(store, doc, va);
+            postPirepNotice(va, 'approved', doc, { name: 'Auto-approval' });
+        }
         res.status(201).json({
             pirep: publicPirep(doc),
             routeMatched: !!route,
             flightNumberMismatch,
+            fromLogbook: !!picked,
+            autoApproved: willApprove,
             route: route ? { id: route._id, flightNumber: route.flightNumber, origin: route.origin, destination: route.destination, aircraft: route.aircraft } : null,
         });
     } catch (err) { crewFail(res, err, { log: 'pirep file error', message: 'Could not file the flight.' }); }
@@ -5379,24 +5715,20 @@ app.post('/api/crew/:slug/pireps/sync', async (req, res) => {
         for (const m of members) {
             let flights = [];
             try {
-                const r = await axios.get(`${ACARS_BACKEND_URL}/api/users/${encodeURIComponent(m.ifUserId)}/flights?page=1`, { timeout: 8000 });
-                flights = Array.isArray(r.data && r.data.flights) ? r.data.flights : [];
+                flights = (await fetchIfLogbook(m.ifUserId, 1)).flights;
             } catch { continue; }
             if (!flights.length) continue;
             const ids = flights.map(f => String(f.id || '')).filter(Boolean);
             const seen = await store.seenFlightIds(ids);
             for (const f of flights) {
                 scanned++;
-                const flightId = String(f.id || '');
+                // Read by the same reducer the pilot's own picker uses, so a
+                // swept-up flight and a picked one carry identical numbers.
+                const { flightId, origin, destination, aircraftName, liveryName,
+                    durationMin, landings, xp, violations, server } = normalizeIfFlight(f, meta);
                 if (!flightId || seen.has(flightId)) continue;
-                const { aircraftName, liveryName } = resolveFlightNames(f, meta);
-                const origin = String(f.originAirport || '').toUpperCase();
-                const destination = String(f.destinationAirport || '').toUpperCase();
                 const inFleet = pirepInFleet(fleet, aircraftName);
                 const route = matchRoute(routes, origin, destination, aircraftName);
-                const durationMin = Math.max(0, Math.round(Number(f.totalTime) || 0));
-                const landings = Array.isArray(f.landingStats) ? f.landingStats.length : Math.max(0, Math.round(Number(f.landingCount) || 0));
-                const violations = Array.isArray(f.violations) ? f.violations.length : Math.max(0, Math.round(Number(f.violations) || 0));
                 const willApprove = autoApprove && inFleet;
                 let doc;
                 try {
@@ -5405,8 +5737,8 @@ app.post('/api/crew/:slug/pireps/sync', async (req, res) => {
                         pilotName: m.name || m.ifcName || '', callsign: String(f.callsign || m.callsign || '').slice(0, 20),
                         flightNumber: (route && route.flightNumber) || '', ifUserId: m.ifUserId, flightId,
                         origin, destination, aircraftName, liveryName,
-                        durationMin, landings, xp: Math.round(Number(f.xp) || 0), violations,
-                        distanceNm: (route && route.distanceNm) || 0, server: String(f.server || '').slice(0, 40),
+                        durationMin, landings, xp, violations,
+                        distanceNm: (route && route.distanceNm) || 0, server,
                         inFleet, source: 'auto',
                         status: willApprove ? 'approved' : 'pending',
                         flownAt: f.created ? new Date(f.created) : null,
