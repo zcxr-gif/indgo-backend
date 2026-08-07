@@ -5406,6 +5406,103 @@ app.get('/api/crew/:slug/pireps', async (req, res) => {
     } catch (err) { crewFail(res, err, { log: 'pireps list error', message: 'Could not load flights.' }); }
 });
 
+/* ===========================================================================
+ * STANDINGS — where a pilot sits among the people they fly with
+ *
+ * crewInsights.topPilots has existed for as long as the insights panel has,
+ * and only ever answered to a manager. So the airline's own pilots — the
+ * people generating every number in it — were the one group who could not see
+ * it. A pilot filed a flight, watched their hours go up, and had no way of
+ * knowing whether that was a lot.
+ *
+ * Ranked by flights rather than career hours, and over a window rather than
+ * for all time, for the reason crewInsights states: the hours column never
+ * goes down, so it ranks who has been here longest. That is a hall of fame,
+ * not a board a pilot who joined in March can ever appear on. Whoever is
+ * carrying the airline THIS month is the question worth answering, and it is
+ * the one a new pilot can actually act on.
+ *
+ * Nothing here is newly public: the roster endpoint already hands out every
+ * name, callsign and rank without a gate, and the flight log already shows
+ * every approved flight. This is those two facts joined, and the join is done
+ * server-side because a browser doing it would have to download both.
+ * ========================================================================= */
+app.get('/api/crew/:slug/standings', async (req, res) => {
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+
+        // 30 / 90 / all-time. Anything else is somebody guessing at the query
+        // string, and a board over an arbitrary window is a board nobody can
+        // compare against the one they saw yesterday.
+        const asked = String(req.query.window || '30');
+        const days = ['30', '90', '0'].includes(asked) ? Number(asked) : 30;
+
+        const [pireps, members] = await Promise.all([
+            store.listPireps({ status: 'approved', limit: 20000 }),
+            store.listMembers(),
+        ]);
+
+        // Approved only, and inside the window. `flownOnly` is what decides
+        // that — reusing it rather than re-filtering here is what keeps this
+        // board and the staff panel from ever disagreeing about the same month.
+        const flights = crewInsights.withinDays(crewInsights.flownOnly(pireps), days, Date.now());
+        const ranked = crewInsights.topPilots(flights, members, { limit: 10000 });
+
+        // The rank ladder position is worth carrying: a board that shows hours
+        // without saying what they make you is a board that leaves the pilot to
+        // look it up. `byId` is read once rather than per row.
+        const byId = new Map((members || []).map((m) => [String(m._id), m]));
+        const row = (p, i) => {
+            const m = byId.get(String(p.memberId));
+            return {
+                rank: i + 1,
+                memberId: p.memberId,
+                name: p.name,
+                callsign: p.callsign,
+                onRoster: p.onRoster,
+                flights: p.flights,
+                hours: p.hours,
+                landings: p.landings,
+                lastFlightAt: p.lastFlightAt,
+                badge: m ? crewRanks.memberRank(va.ranks, m.hours, m.checksPassed) : null,
+            };
+        };
+        const board = ranked.map(row);
+
+        // Who is asking, and where they came. Included even when they are
+        // nowhere near the top ten — "you are 34th of 51, four flights off the
+        // top ten" is the only line on this page a mid-table pilot can use, and
+        // a board that just doesn't mention them is the version that makes them
+        // close it. Not signed in is not an error: the public crew center shows
+        // the same board with nobody highlighted.
+        let me = null;
+        const who = await crewPilot(req, store).catch(() => null);
+        if (who && who.memberId) {
+            const at = board.findIndex((b) => String(b.memberId) === String(who.memberId));
+            me = at >= 0
+                ? { ...board[at], of: board.length }
+                // On the roster, nothing flown in the window. Said plainly
+                // rather than left out, because "you have not filed a flight
+                // this month" is a true and useful answer to "where am I?".
+                : { rank: null, memberId: who.memberId, name: who.name, callsign: who.callsign || '',
+                    onRoster: true, flights: 0, hours: 0, landings: 0, lastFlightAt: null,
+                    badge: null, of: board.length };
+        }
+
+        res.set('Cache-Control', 'no-store');
+        res.json({
+            window: days,
+            board: board.slice(0, 25),
+            me,
+            totals: {
+                pilots: board.length,
+                flights: flights.length,
+                hours: Math.round(flights.reduce((s, f) => s + (Number(f.durationMin) || 0), 0) / 6) / 10,
+            },
+        });
+    } catch (err) { crewFail(res, err, { log: 'standings error', message: 'Could not load the standings.' }); }
+});
+
 // File a PIREP by hand. Any signed-in crew member of this VA can submit one.
 // Crucially we compare the filed leg against the CURRENT route network to decide
 // whether it's a real route: an active route with the same origin+destination
