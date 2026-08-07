@@ -36,7 +36,7 @@ const head = (s) => console.log(`\n${s}`);
 // keeps every test looking at the same client.
 process.env.IF_OAUTH_CLIENT_ID = 'ifc_test_client';
 process.env.IF_OAUTH_CLIENT_SECRET = 'test_secret';
-process.env.PUBLIC_BASE_URL = 'https://example.com/';
+process.env.IF_OAUTH_REDIRECT_URI = 'https://backend.example.com/api/crew/if-org/callback';
 
 const ifOauth = require(path.resolve(__dirname, '..', 'ifOauth.js'));
 const ifFleet = require(path.resolve(__dirname, '..', 'ifFleet.js'));
@@ -68,8 +68,25 @@ head('Configuration');
 
 {
     ok('a fully configured client reports ready', ifOauth.configured());
-    ok('the redirect URI hangs off PUBLIC_BASE_URL with no double slash',
-        ifOauth.redirectUri() === 'https://example.com/api/crew/if-org/callback', ifOauth.redirectUri());
+    ok('the redirect URI is taken verbatim from its own variable',
+        ifOauth.redirectUri() === 'https://backend.example.com/api/crew/if-org/callback', ifOauth.redirectUri());
+
+    // PUBLIC_BASE_URL is the public SITE (inflight.info), which does not proxy
+    // /api to this backend. Deriving the callback from it would send Infinite
+    // Flight to a 404 on a URL that looks right, so it must not be consulted.
+    const savedBase = process.env.PUBLIC_BASE_URL;
+    process.env.PUBLIC_BASE_URL = 'https://wrong-host.example';
+    ok('PUBLIC_BASE_URL cannot influence the redirect URI',
+        !ifOauth.redirectUri().includes('wrong-host'), ifOauth.redirectUri());
+    if (savedBase === undefined) delete process.env.PUBLIC_BASE_URL; else process.env.PUBLIC_BASE_URL = savedBase;
+
+    const savedRedirect = process.env.IF_OAUTH_REDIRECT_URI;
+    delete process.env.IF_OAUTH_REDIRECT_URI;
+    ok('a missing redirect URI makes the feature unavailable', !ifOauth.configured());
+    ok('...and the reason names the variable and the path',
+        /IF_OAUTH_REDIRECT_URI/.test(ifOauth.unavailableReason())
+        && ifOauth.unavailableReason().includes(ifOauth.CALLBACK_PATH), ifOauth.unavailableReason());
+    process.env.IF_OAUTH_REDIRECT_URI = savedRedirect;
 
     const saved = process.env.IF_OAUTH_CLIENT_SECRET;
     delete process.env.IF_OAUTH_CLIENT_SECRET;

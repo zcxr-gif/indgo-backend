@@ -53,8 +53,10 @@
  * CONFIGURATION
  *   IF_OAUTH_CLIENT_ID       required. From infiniteflight.com/account/api-keys.
  *   IF_OAUTH_CLIENT_SECRET   required for a confidential client (this one).
- *   PUBLIC_BASE_URL          required. The redirect URI is derived from it and
- *                            must match what is registered with IF exactly.
+ *   IF_OAUTH_REDIRECT_URI    required. THIS backend's own origin + the callback
+ *                            path below — not PUBLIC_BASE_URL, which is the
+ *                            public site and does not proxy /api. Must match
+ *                            what is registered with IF character for character.
  * With any of those missing, configured() is false and the feature stays dark.
  */
 
@@ -67,7 +69,8 @@ const API_BASE  = process.env.IF_OAUTH_API_BASE  || 'https://api.infiniteflight.
 const AUTHORIZE_URL = `${AUTH_BASE}/connect/authorize`;
 const TOKEN_URL     = `${AUTH_BASE}/connect/token`;
 
-// The callback path. Registered with IF as PUBLIC_BASE_URL + this, exactly.
+// The callback path this server listens on. IF_OAUTH_REDIRECT_URI must end
+// with it, and must be registered with Infinite Flight exactly as written.
 const CALLBACK_PATH = '/api/crew/if-org/callback';
 
 // Only what the fleet feature needs. `offline_access` is what earns a refresh
@@ -94,24 +97,34 @@ const HTTP_TIMEOUT_MS = 12000;
 
 function clientId()     { return String(process.env.IF_OAUTH_CLIENT_ID || '').trim(); }
 function clientSecret() { return String(process.env.IF_OAUTH_CLIENT_SECRET || '').trim(); }
-function publicBase()   { return String(process.env.PUBLIC_BASE_URL || '').trim().replace(/\/+$/, ''); }
 
-/** The redirect URI. Must byte-match the one registered with Infinite Flight. */
+/**
+ * The redirect URI. Must byte-match the one registered with Infinite Flight.
+ *
+ * Set explicitly rather than derived from PUBLIC_BASE_URL, which points at the
+ * public *site* (inflight.info — the Netlify front end) while this callback is
+ * a route on THIS backend, on its own origin. The site does not proxy /api, so
+ * deriving it would send Infinite Flight to a 404 on a URL that looks correct.
+ * Since the value has to match IF's registration character for character
+ * anyway, naming it outright beats inferring it.
+ */
 function redirectUri() {
-    const base = publicBase();
-    return base ? base + CALLBACK_PATH : '';
+    return String(process.env.IF_OAUTH_REDIRECT_URI || '').trim();
 }
 
 /** True when this deployment can actually run the flow. */
 function configured() {
-    return !!(clientId() && clientSecret() && publicBase());
+    return !!(clientId() && clientSecret() && redirectUri());
 }
 
 /** Why not, in words a VA-facing settings page can print. */
 function unavailableReason() {
     if (!clientId())     return 'IF_OAUTH_CLIENT_ID is not set on the server.';
     if (!clientSecret()) return 'IF_OAUTH_CLIENT_SECRET is not set on the server.';
-    if (!publicBase())   return 'PUBLIC_BASE_URL is not set, so the OAuth redirect URI cannot be built.';
+    if (!redirectUri()) {
+        return 'IF_OAUTH_REDIRECT_URI is not set. It must be this backend\'s own origin '
+             + `plus ${CALLBACK_PATH}, and must match what is registered with Infinite Flight exactly.`;
+    }
     return '';
 }
 
