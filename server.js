@@ -109,6 +109,10 @@ const crewSetup = require('./crewSetup');
 // access token above. The key lives in the environment, not the database. See
 // crewSecrets.js.
 const crewSecrets = require('./crewSecrets');
+// Infinite Flight PublicApi v3 — OAuth2 client and the fleet mapper that turns
+// a Live organization's aircraft into the shape the crew center already uses.
+const ifOauth = require('./ifOauth');
+const ifFleet = require('./ifFleet');
 
 // Group flights — a VA owner selects the aircraft flying their event and mints
 // one short link to share. Ownership is claimed with the contact email already
@@ -289,6 +293,53 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // NOTE: named crewFleet (not fleet) to avoid colliding with the older
     // directory-level `fleet: [String]` field further down this schema.
     crewFleet: { type: [{ _id: false, type: String, name: String, image: String }], default: [] },
+
+    // --- The Infinite Flight Live organization, when a VA connects one (v3) ---
+    //
+    // PublicApi v3 can hand us a VA's real fleet instead of the one they typed
+    // in: actual aircraft, registrations, fleet order, active slots. It is
+    // authorized per user over OAuth2, so what we hold is that staff member's
+    // grant — see ifOauth.js for the flow and why the tokens are sealed.
+    //
+    // This is a MIRROR, never a replacement. v3 is a preview Infinite Flight
+    // say may change without a deprecation period, so `crewFleet` above stays
+    // exactly as the VA built it and PIREP matching reads the union of the two
+    // (ifFleet.combinedTypes). Disconnecting drops only what is below.
+    ifOrg: {
+        organizationId: { type: String, trim: true, default: '' },
+        organizationName: { type: String, trim: true, default: '' },
+        // Who authorized, so a VA can see whose grant is keeping this alive —
+        // it stops working if they leave the organization.
+        connectedBy: { type: String, trim: true, default: '' },
+        connectedAt: { type: Date, default: null },
+        scopes: { type: [String], default: [] },
+        // SEALED (crewSecrets). Never selected by default, never sent to a
+        // browser. A refresh token here is standing read access to the VA's
+        // organization for as long as they leave us connected.
+        accessToken: { type: String, default: '', select: false },
+        refreshToken: { type: String, default: '', select: false },
+        // Absolute expiry of the access token, so staleness can be judged
+        // without knowing when the document was written.
+        expiresAt: { type: Number, default: 0 },
+        lastSyncAt: { type: Date, default: null },
+        lastSyncError: { type: String, trim: true, default: '' },
+    },
+    // The synced fleet. `type`/`livery` are canonical Infinite Flight names
+    // resolved from the content id (ifFleet.js), which is what makes these
+    // entries usable by the same PIREP matcher as the hand-built list.
+    ifFleet: {
+        type: [{
+            _id: false,
+            id: String, contentId: String, registration: String,
+            type: String, livery: String,
+            status: Number, visibility: Number,
+            fleetPriority: Number, fleetRank: Number,
+            isFleetActiveSlot: Boolean,
+            createdAt: String,
+        }],
+        default: [],
+    },
+
     // Auto-PIREP handling. false (default) = auto-captured flights land as pending
     // for staff review; true = a flight that matches the fleet is approved on
     // capture and its hours roll straight onto the roster.
@@ -2332,6 +2383,353 @@ app.get('/api/crew/aircraft-metadata', async (req, res) => {
             return res.json({ ok: true, stale: true, aircraft, liveries });
         }
         res.status(502).json({ ok: false, error: 'Aircraft metadata unavailable.', aircraft: [], liveries: {} });
+    }
+});
+
+/* =========================================================================
+ * Infinite Flight Live organization (PublicApi v3, OAuth2)
+ *
+ * Lets a VA connect the Live organization they actually operate and mirror its
+ * real fleet into the crew center, instead of maintaining a hand-typed list.
+ * See ifOauth.js for the OAuth flow and ifFleet.js for the mapping.
+ *
+ * Everything here is gated on ifOauth.configured() AND crewSecrets.available().
+ * Without an OAuth client the flow cannot run; without a sealing key we would
+ * be storing bearer tokens as plain text in Mongo, and we would rather not
+ * offer the feature than do that.
+ * ========================================================================= */
+
+// Authorization requests in flight, keyed by the one-time `state`.
+//
+// The PKCE verifier must never travel through the browser — that is the whole
+// point of it — so it is held here between the redirect out and the callback
+// back. Entries are single-use and short-lived.
+//
+// NOTE: in memory, so a deployment running several instances behind a load
+// balancer can have the callback land on a process that never saw the state.
+// The failure is clean (the VA is told to try again) and the window is two
+// minutes wide, but if this is ever scaled out, this belongs in Mongo or Redis.
+const ifPendingAuth = new Map();
+const IF_AUTH_TTL_MS = 10 * 60 * 1000;
+
+function ifSweepPendingAuth() {
+    const now = Date.now();
+    for (const [state, entry] of ifPendingAuth) {
+        if (now > entry.expiresAt) ifPendingAuth.delete(state);
+    }
+}
+
+/** Is the feature usable at all on this deployment, and if not, why? */
+function ifOrgAvailability() {
+    if (!ifOauth.configured()) return { ok: false, reason: ifOauth.unavailableReason() };
+    if (!crewSecrets.available()) {
+        return {
+            ok: false,
+            reason: 'No encryption key is configured, so Infinite Flight tokens cannot be stored safely. '
+                  + `Set CREW_SECRET_KEY. (${crewSecrets.unavailableReason()})`,
+        };
+    }
+    return { ok: true, reason: '' };
+}
+
+/**
+ * Reads a VA's connection with the sealed tokens opened.
+ *
+ * Returns null when there is nothing stored, and also when the seal will not
+ * open — which is what a rotated CREW_SECRET_KEY looks like. Treating that as
+ * "not connected" asks the VA to reconnect, rather than throwing 500s at them
+ * on a page they cannot fix.
+ */
+async function loadIfConnection(vaId) {
+    // No inclusion projection here on purpose: `+field` re-adds a select:false
+    // path to the default set, and pairing that with an inclusion of the parent
+    // `ifOrg` is ambiguous. Everything not marked select:false comes back
+    // anyway, so re-adding the two sealed paths is all that is needed.
+    const ad = await VirtualAirlineAd.findById(vaId)
+        .select('+ifOrg.accessToken +ifOrg.refreshToken')
+        .lean();
+    const org = ad && ad.ifOrg;
+    if (!org || !org.refreshToken) return null;
+
+    const accessToken = crewSecrets.open(org.accessToken || '');
+    const refreshToken = crewSecrets.open(org.refreshToken || '');
+    if (!refreshToken) return null;
+
+    return {
+        accessToken, refreshToken,
+        expiresAt: Number(org.expiresAt) || 0,
+        organizationId: org.organizationId || '',
+        organizationName: org.organizationName || '',
+        connectedBy: org.connectedBy || '',
+        scopes: Array.isArray(org.scopes) ? org.scopes : [],
+    };
+}
+
+/**
+ * Persists a rotated token set. Passed to ifOauth.callWithConnection as its
+ * `onTokens`, which is why it must not throw on a benign write failure — losing
+ * the rotated refresh token is worse than the call itself failing, so a problem
+ * here is logged loudly.
+ */
+async function saveIfTokens(vaId, tokens) {
+    try {
+        await VirtualAirlineAd.updateOne({ _id: vaId }, {
+            $set: {
+                'ifOrg.accessToken': crewSecrets.seal(tokens.accessToken),
+                'ifOrg.refreshToken': crewSecrets.seal(tokens.refreshToken),
+                'ifOrg.expiresAt': tokens.expiresAt,
+            },
+        });
+    } catch (err) {
+        console.error('ifOrg: failed to persist rotated tokens —', err?.message || err);
+    }
+}
+
+/** One call against v3 for this VA, refreshing and re-sealing as needed. */
+function ifCall(vaId, conn, path) {
+    return ifOauth.callWithConnection(conn, path, (tokens) => saveIfTokens(vaId, tokens));
+}
+
+/**
+ * Pulls the organization's aircraft and writes the mirror.
+ * Returns the mapped fleet so a caller can respond with it directly.
+ */
+async function syncIfFleet(vaId, conn) {
+    if (!conn.organizationId) throw new Error('No Infinite Flight organization has been chosen yet.');
+
+    const raw = await ifCall(vaId, conn, `/live/organizations/${encodeURIComponent(conn.organizationId)}/aircraft`);
+    // Metadata is what turns v3's content UUIDs into names. If it is down we
+    // still store the fleet — registrations and fleet order are useful on their
+    // own — and the unresolved count in the summary says what is missing.
+    let meta = null;
+    try { meta = await loadAircraftMetadata(); } catch (_) { meta = null; }
+
+    const fleet = ifFleet.mapFleet(raw, meta);
+    await VirtualAirlineAd.updateOne({ _id: vaId }, {
+        $set: { ifFleet: fleet, 'ifOrg.lastSyncAt': new Date(), 'ifOrg.lastSyncError': '' },
+    });
+    return fleet;
+}
+
+// ---- Status. Drives the whole panel; safe for any staff member to read. ----
+app.get('/api/crew/:slug/if-org', async (req, res) => {
+    try {
+        const gate = await requireCap(req, req.params.slug, 'settings.branding');
+        if (gate.error) return res.status(gate.error).json({ ok: false, error: 'Not allowed.' });
+
+        const availability = ifOrgAvailability();
+        const ad = await VirtualAirlineAd.findById(gate.p.vaId).select('ifOrg ifFleet crewFleet').lean();
+        if (!ad) return res.status(404).json({ ok: false, error: 'VA not found.' });
+
+        const org = ad.ifOrg || {};
+        const fleet = Array.isArray(ad.ifFleet) ? ad.ifFleet : [];
+
+        res.json({
+            ok: true,
+            available: availability.ok,
+            unavailableReason: availability.reason,
+            // Registered with Infinite Flight; shown so a VA can check it matches.
+            redirectUri: ifOauth.redirectUri(),
+            scopes: ifOauth.SCOPES,
+            connected: !!org.refreshToken,
+            organizationId: org.organizationId || '',
+            organizationName: org.organizationName || '',
+            connectedBy: org.connectedBy || '',
+            connectedAt: org.connectedAt || null,
+            lastSyncAt: org.lastSyncAt || null,
+            lastSyncError: org.lastSyncError || '',
+            fleet,
+            summary: ifFleet.summarize(fleet),
+            // What PIREP matching will actually use once this is connected.
+            matching: ifFleet.combinedTypes(ad.crewFleet || [], fleet),
+        });
+    } catch (err) {
+        crewFail(res, err, { log: 'if-org status error', message: 'Could not read the Infinite Flight connection.' });
+    }
+});
+
+// ---- Start the flow. Returns the URL to send the staff member to. ----
+app.post('/api/crew/:slug/if-org/connect', async (req, res) => {
+    try {
+        const gate = await requireCap(req, req.params.slug, 'settings.branding');
+        if (gate.error) return res.status(gate.error).json({ ok: false, error: 'Not allowed.' });
+
+        const availability = ifOrgAvailability();
+        if (!availability.ok) return res.status(503).json({ ok: false, error: availability.reason });
+
+        ifSweepPendingAuth();
+        const { verifier, challenge, state } = ifOauth.createPkce();
+        ifPendingAuth.set(state, {
+            verifier,
+            vaId: String(gate.p.vaId),
+            slug: String(req.params.slug).toLowerCase(),
+            who: gate.p.username || gate.p.sub || '',
+            expiresAt: Date.now() + IF_AUTH_TTL_MS,
+        });
+
+        res.json({
+            ok: true,
+            url: ifOauth.authorizeUrl({ challenge, state, prompt: req.body && req.body.prompt }),
+            expiresInSec: Math.round(IF_AUTH_TTL_MS / 1000),
+        });
+    } catch (err) {
+        crewFail(res, err, { log: 'if-org connect error', message: 'Could not start the Infinite Flight connection.' });
+    }
+});
+
+// ---- The redirect URI Infinite Flight sends the browser back to. ----
+//
+// Unauthenticated by design: this is a cross-site redirect, so a crew session
+// cookie may not ride along with it. The `state` is the credential — minted by
+// the capability-checked request above, single-use, and good for ten minutes.
+app.get(ifOauth.CALLBACK_PATH, async (req, res) => {
+    const done = (title, message, slug) => {
+        const backTo = slug ? `/crew/${encodeURIComponent(slug)}/dashboard` : '/';
+        res.type('html').send(`<!doctype html><meta charset="utf-8">
+<title>${escHtml(title)}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<div style="font:15px/1.55 system-ui,sans-serif;max-width:32rem;margin:14vh auto;padding:0 1.25rem;color:#18181b">
+  <h1 style="font-size:1.15rem;margin:0 0 .6rem">${escHtml(title)}</h1>
+  <p style="margin:0 0 1.25rem;color:#52525b">${escHtml(message)}</p>
+  <a href="${escHtml(backTo)}" style="display:inline-block;background:#18181b;color:#fff;padding:.6rem 1rem;border-radius:.5rem;text-decoration:none">Back to the crew center</a>
+</div>`);
+    };
+
+    const state = String(req.query.state || '');
+    const pending = state ? ifPendingAuth.get(state) : null;
+    // Single-use: consumed whether or not the rest succeeds, so a replayed
+    // callback cannot mint a second token off the same authorization.
+    if (pending) ifPendingAuth.delete(state);
+
+    if (!pending || Date.now() > pending.expiresAt) {
+        return done('That link has expired',
+            'Start the connection again from the crew center. Authorization links are good for ten minutes.', null);
+    }
+    if (req.query.error) {
+        return done('Infinite Flight declined',
+            String(req.query.error_description || req.query.error), pending.slug);
+    }
+    const code = String(req.query.code || '');
+    if (!code) return done('Something went wrong', 'Infinite Flight did not send an authorization code back.', pending.slug);
+
+    try {
+        const tokens = await ifOauth.exchangeCode({ code, verifier: pending.verifier });
+        await VirtualAirlineAd.updateOne({ _id: pending.vaId }, {
+            $set: {
+                'ifOrg.accessToken': crewSecrets.seal(tokens.accessToken),
+                'ifOrg.refreshToken': crewSecrets.seal(tokens.refreshToken),
+                'ifOrg.expiresAt': tokens.expiresAt,
+                'ifOrg.scopes': tokens.scopes,
+                'ifOrg.connectedBy': pending.who,
+                'ifOrg.connectedAt': new Date(),
+                'ifOrg.lastSyncError': '',
+            },
+        });
+        done('Connected to Infinite Flight',
+            'Choose which of your Live organizations to mirror, back in the crew center.', pending.slug);
+    } catch (err) {
+        console.error('if-org callback error:', err?.message || err);
+        done('Could not complete the connection', err?.message || 'The token exchange failed.', pending.slug);
+    }
+});
+
+// ---- The organizations this connection can see. ----
+app.get('/api/crew/:slug/if-org/organizations', async (req, res) => {
+    try {
+        const gate = await requireCap(req, req.params.slug, 'settings.branding');
+        if (gate.error) return res.status(gate.error).json({ ok: false, error: 'Not allowed.' });
+
+        const conn = await loadIfConnection(gate.p.vaId);
+        if (!conn) return res.status(409).json({ ok: false, error: 'Not connected to Infinite Flight.' });
+
+        const raw = await ifCall(gate.p.vaId, conn, '/live/organizations');
+        const orgs = (Array.isArray(raw) ? raw : []).map(o => ({
+            id: String(o.id || ''),
+            name: String(o.name || ''),
+            description: o.description || '',
+            type: ifOauth.enumName(ifOauth.ORGANIZATION_TYPE, o.type),
+            operationType: ifOauth.enumName(ifOauth.OPERATION_TYPE, o.operationType),
+            worldType: ifOauth.enumName(ifOauth.WORLD_TYPE, o.worldType),
+            status: ifOauth.enumName(ifOauth.ORGANIZATION_STATUS, o.status),
+        })).filter(o => o.id);
+
+        res.json({ ok: true, organizations: orgs });
+    } catch (err) {
+        crewFail(res, err, { log: 'if-org organizations error', message: err?.message || 'Could not list your Infinite Flight organizations.' });
+    }
+});
+
+// ---- Choose the organization to mirror, and pull its fleet straight away. ----
+app.post('/api/crew/:slug/if-org/organization', async (req, res) => {
+    try {
+        const gate = await requireCap(req, req.params.slug, 'settings.branding');
+        if (gate.error) return res.status(gate.error).json({ ok: false, error: 'Not allowed.' });
+
+        const organizationId = String((req.body && req.body.organizationId) || '').trim();
+        if (!organizationId) return res.status(400).json({ ok: false, error: 'Pick an organization.' });
+
+        const conn = await loadIfConnection(gate.p.vaId);
+        if (!conn) return res.status(409).json({ ok: false, error: 'Not connected to Infinite Flight.' });
+
+        // Read it back rather than trusting the id in the body: this both
+        // confirms the signed-in user is really a member and gets us the name
+        // to display without a second round trip.
+        const org = await ifCall(gate.p.vaId, conn, `/live/organizations/${encodeURIComponent(organizationId)}`);
+        if (!org || !org.id) return res.status(404).json({ ok: false, error: 'Infinite Flight has no such organization for this account.' });
+
+        await VirtualAirlineAd.updateOne({ _id: gate.p.vaId }, {
+            $set: { 'ifOrg.organizationId': String(org.id), 'ifOrg.organizationName': String(org.name || '') },
+        });
+
+        const fleet = await syncIfFleet(gate.p.vaId, { ...conn, organizationId: String(org.id) });
+        res.json({ ok: true, organizationId: String(org.id), organizationName: String(org.name || ''), fleet, summary: ifFleet.summarize(fleet) });
+    } catch (err) {
+        crewFail(res, err, { log: 'if-org select error', message: err?.message || 'Could not select that organization.' });
+    }
+});
+
+// ---- Re-pull the fleet. ----
+app.post('/api/crew/:slug/if-org/sync', async (req, res) => {
+    try {
+        const gate = await requireCap(req, req.params.slug, 'settings.branding');
+        if (gate.error) return res.status(gate.error).json({ ok: false, error: 'Not allowed.' });
+
+        const conn = await loadIfConnection(gate.p.vaId);
+        if (!conn) return res.status(409).json({ ok: false, error: 'Not connected to Infinite Flight.' });
+
+        try {
+            const fleet = await syncIfFleet(gate.p.vaId, conn);
+            res.json({ ok: true, fleet, summary: ifFleet.summarize(fleet), syncedAt: new Date() });
+        } catch (err) {
+            // Record why, so the panel can explain a stale mirror instead of
+            // just showing old aircraft with no indication anything is wrong.
+            await VirtualAirlineAd.updateOne({ _id: gate.p.vaId },
+                { $set: { 'ifOrg.lastSyncError': String(err?.message || 'Sync failed.').slice(0, 300) } });
+            throw err;
+        }
+    } catch (err) {
+        crewFail(res, err, { log: 'if-org sync error', message: err?.message || 'Could not sync the fleet.' });
+    }
+});
+
+// ---- Disconnect. Drops the tokens and the mirror; crewFleet is untouched. ----
+app.delete('/api/crew/:slug/if-org', async (req, res) => {
+    try {
+        const gate = await requireCap(req, req.params.slug, 'settings.branding');
+        if (gate.error) return res.status(gate.error).json({ ok: false, error: 'Not allowed.' });
+
+        await VirtualAirlineAd.updateOne({ _id: gate.p.vaId }, {
+            $set: {
+                'ifOrg.accessToken': '', 'ifOrg.refreshToken': '', 'ifOrg.expiresAt': 0,
+                'ifOrg.organizationId': '', 'ifOrg.organizationName': '',
+                'ifOrg.connectedBy': '', 'ifOrg.connectedAt': null, 'ifOrg.scopes': [],
+                'ifOrg.lastSyncAt': null, 'ifOrg.lastSyncError': '',
+                ifFleet: [],
+            },
+        });
+        res.json({ ok: true });
+    } catch (err) {
+        crewFail(res, err, { log: 'if-org disconnect error', message: 'Could not disconnect.' });
     }
 });
 
@@ -5064,6 +5462,16 @@ function pirepInFleet(fleet, aircraftName) {
     if (!Array.isArray(fleet) || !fleet.length || !aircraftName) return false;
     return fleet.some(f => aircraftMatches(f.type || f.name, aircraftName));
 }
+// The fleet a flown leg is judged against: what the VA typed into the fleet
+// builder, plus anything mirrored from their Infinite Flight Live organization.
+// A VA who has connected one should not have to re-type their own aircraft to
+// get their pilots' legs credited. Callers must select BOTH fields.
+function fleetForMatching(vaFull) {
+    return ifFleet.combinedTypes(
+        (vaFull && vaFull.crewFleet) || [],
+        (vaFull && vaFull.ifFleet) || [],
+    );
+}
 // Best route in the network for a flown leg: same origin+destination, preferring
 // one whose aircraft also matches.
 function matchRoute(routes, origin, dest, aircraftName) {
@@ -5358,8 +5766,8 @@ app.get('/api/crew/:slug/me/if-flights', async (req, res) => {
 
         let meta;
         try { meta = await loadAircraftMetadata(); } catch { meta = { acById: new Map(), livById: new Map() }; }
-        const vaFull = await VirtualAirlineAd.findById(va._id).select('crewFleet').lean();
-        const fleet = (vaFull && vaFull.crewFleet) || [];
+        const vaFull = await VirtualAirlineAd.findById(va._id).select('crewFleet ifFleet').lean();
+        const fleet = fleetForMatching(vaFull);
         const routes = await store.listRoutes({ activeOnly: true });
 
         const rows = book.flights.map((f) => normalizeIfFlight(f, meta)).filter((f) => f.flightId);
@@ -5614,10 +6022,10 @@ app.post('/api/crew/:slug/pireps', async (req, res) => {
             : Math.max(0, Math.min(100, Math.round(Number(b.landings) || 0)));
 
         // Compare against the current network to judge whether the route is real.
-        const vaFull = await VirtualAirlineAd.findById(va._id).select('crewFleet crewPirepAutoApprove').lean();
+        const vaFull = await VirtualAirlineAd.findById(va._id).select('crewFleet ifFleet crewPirepAutoApprove').lean();
         const routes = await store.listRoutes({ activeOnly: true });
         const route = matchRoute(routes, origin, destination, aircraftName);
-        const inFleet = pirepInFleet((vaFull && vaFull.crewFleet) || [], aircraftName);
+        const inFleet = pirepInFleet(fleetForMatching(vaFull), aircraftName);
         // If the pilot typed a flight number, note when it disagrees with the route's.
         const claimedFlight = String(b.flightNumber || (event && event.flightNumber) || (schedule && schedule.flightNumber) || '').trim().slice(0, 12);
         const flightNumberMismatch = !!(route && route.flightNumber && claimedFlight && _norm(route.flightNumber) !== _norm(claimedFlight));
@@ -5701,9 +6109,9 @@ app.post('/api/crew/:slug/pireps/sync', async (req, res) => {
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
     try {
         const { va, store } = await resolveCrewStore(req.params.slug);
-        const vaFull = await VirtualAirlineAd.findById(va._id).select('crewFleet crewPirepAutoApprove').lean();
+        const vaFull = await VirtualAirlineAd.findById(va._id).select('crewFleet ifFleet crewPirepAutoApprove').lean();
         const autoApprove = !!(vaFull && vaFull.crewPirepAutoApprove);
-        const fleet = (vaFull && vaFull.crewFleet) || [];
+        const fleet = fleetForMatching(vaFull);
         const routes = await store.listRoutes({ activeOnly: true });
         // Only active pilots linked to an IF account can be auto-tracked. Cap the
         // batch so one sync can't run unbounded.
@@ -9403,7 +9811,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewTopicMode crewAccent ranks roles crewFleet crewPirepAutoApprove crewSchedule joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewTopicMode crewAccent ranks roles crewFleet ifFleet crewPirepAutoApprove crewSchedule joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -9446,6 +9854,17 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             ranks: Array.isArray(ad.ranks) ? ad.ranks : [],
             roles: Array.isArray(ad.roles) ? ad.roles : [],
             fleet: Array.isArray(ad.crewFleet) ? ad.crewFleet : [],
+            // The fleet mirrored from the VA's Infinite Flight Live
+            // organization, and the union of the two that a flown leg is
+            // actually judged against. Registrations and fleet order are the
+            // VA's own published operating detail, the same class of thing as
+            // the rank ladder above — no tokens or organization ids here.
+            ifFleet: (Array.isArray(ad.ifFleet) ? ad.ifFleet : []).map(a => ({
+                registration: a.registration || '', type: a.type || '', livery: a.livery || '',
+                fleetRank: a.fleetRank == null ? null : a.fleetRank,
+                isFleetActiveSlot: !!a.isFleetActiveSlot,
+            })),
+            fleetMatching: ifFleet.combinedTypes(ad.crewFleet || [], ad.ifFleet || []),
             pirepAutoApprove: !!ad.crewPirepAutoApprove,
             // How this VA runs its schedule. Public because the crew center
             // reads it before it has a session — a VA that does not use the
