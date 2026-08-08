@@ -8197,7 +8197,43 @@ app.get('/api/image-proxy', async (req, res) => {
 
 /* =========================
  * FLIGHT TRAILS STORAGE
- * ========================= */
+ * =========================
+ *
+ * A pilot's permanent replay archive: trails/{userId}/{flightId}.json, one
+ * bare array of points per flight, written by the recorder's archivist once a
+ * flight is over.
+ *
+ * How long a flight is kept is set here:
+ *   TRAIL_ARCHIVE_MAX_PER_USER  newest N flights per pilot (default 200)
+ *   TRAIL_ARCHIVE_MAX_AGE_DAYS  age ceiling, 0 = keep forever (the default)
+ *
+ * Both used to be far tighter — 48 hours and three flights per pilot — which
+ * suited a scratch buffer for the most recent thing you flew and made a
+ * permanent logbook impossible. The browse and profile screens were already
+ * written against this as if it were an archive, so it is one now.
+ */
+
+const TRAIL_MAX_PER_USER = (() => {
+    const n = parseInt(process.env.TRAIL_ARCHIVE_MAX_PER_USER ?? '', 10);
+    return Number.isFinite(n) && n > 0 ? n : 200;
+})();
+
+const TRAIL_MAX_AGE_MS = (() => {
+    const n = parseInt(process.env.TRAIL_ARCHIVE_MAX_AGE_DAYS ?? '', 10);
+    return Number.isFinite(n) && n > 0 ? n * 24 * 60 * 60 * 1000 : 0;
+})();
+
+/**
+ * Timestamp of a trail point, whichever field it happens to carry.
+ * The recorder writes `time`; older stored files use `t`.
+ */
+function trailPointTime(p) {
+    if (!p) return 0;
+    const raw = p.t ?? p.time ?? p.lastReportMs ?? p.timeMs ??
+                (p.position && (p.position.time ?? p.position.lastReportMs));
+    const n = typeof raw === 'string' ? Date.parse(raw) : Number(raw);
+    return Number.isFinite(n) ? n : 0;
+}
 
 // GET: Fetch ALL available replays, across every user.
 // Lets the front end browse the full library of stored flight trails and pick
@@ -8208,6 +8244,21 @@ app.get('/api/trails', async (req, res) => {
         const prefix = 'trails/';
         const trails = [];
         let ContinuationToken;
+        let truncated = false;
+
+        // Bound the scan.
+        //
+        // This walks the whole bucket because S3 lists lexicographically and
+        // the response is sorted by date, so "newest first" cannot be answered
+        // without seeing everything. That was harmless when a pilot kept three
+        // trails for 48 hours; with a real archive behind it, an unbounded walk
+        // is a timeout and a large LIST bill waiting to happen.
+        //
+        // The cap makes it degrade instead of melting. The actual fix is to
+        // stop deriving this list from S3 at all and keep trail metadata in a
+        // table that can be indexed by date — worth doing before this list is
+        // put in front of users at scale.
+        const MAX_KEYS_SCANNED = parseInt(process.env.TRAIL_LIST_MAX_KEYS ?? '', 10) || 20000;
 
         // S3 lists at most 1000 keys per call, so page through until exhausted.
         do {
@@ -8237,11 +8288,20 @@ app.get('/api/trails', async (req, res) => {
             }
 
             ContinuationToken = data.IsTruncated ? data.NextContinuationToken : undefined;
+
+            if (trails.length >= MAX_KEYS_SCANNED && ContinuationToken) {
+                truncated = true;
+                console.warn(`[trails] Listing capped at ${MAX_KEYS_SCANNED} keys — the archive has outgrown this endpoint.`);
+                break;
+            }
         } while (ContinuationToken);
 
         // Sort Newest First
         trails.sort((a, b) => b.date - a.date);
 
+        // The client reads this as a bare array, so the flag rides on a header
+        // rather than changing the response shape out from under it.
+        if (truncated) res.set('X-Trails-Truncated', 'true');
         res.json(trails);
     } catch (e) {
         console.error("All Trails Fetch Error:", e);
@@ -8311,18 +8371,23 @@ app.post('/api/trails', async (req, res) => {
 
             if (Array.isArray(existingJson)) {
                 console.log(`🧩 Found existing trail (${existingJson.length} points). Merging...`);
-                
+
                 // Combine old + new
                 finalTrail = existingJson.concat(trail);
 
-                // OPTIONAL: Sort by timestamp to ensure correct order
-                finalTrail.sort((a, b) => a.t - b.t);
+                // Sort by timestamp to ensure correct order. Trails are written
+                // by more than one producer and the point shape is not uniform:
+                // the recorder stamps `time`, older files use `t`. Reading only
+                // `t` made every comparison NaN, which leaves the merged trail
+                // in whatever order concat happened to produce and defeats the
+                // dedupe below — so read whichever the point actually carries.
+                finalTrail.sort((a, b) => trailPointTime(a) - trailPointTime(b));
 
-                // OPTIONAL: Deduplicate (remove points with identical timestamps)
-                finalTrail = finalTrail.filter((item, index, self) => 
-                    index === 0 || item.t !== self[index - 1].t
+                // Deduplicate (remove points with identical timestamps)
+                finalTrail = finalTrail.filter((item, index, self) =>
+                    index === 0 || trailPointTime(item) !== trailPointTime(self[index - 1])
                 );
-                
+
                 isUpdate = true;
             }
         } catch (err) {
@@ -8332,46 +8397,44 @@ app.post('/api/trails', async (req, res) => {
             }
         }
 
-        // 2. PRUNE: Remove files older than 48 hours (Only runs if this is a NEW file)
-        // We skip this heavy listing operation on mere updates to save performance
+        // 2. PRUNE: keep the pilot's archive within its limits.
+        // Only on a NEW file — an update cannot grow the folder, so it would be
+        // paying for a listing that can never find anything to do.
         if (!isUpdate) {
             const listCmd = new ListObjectsV2Command({
                 Bucket: process.env.AWS_S3_BUCKET_NAME,
                 Prefix: folderPrefix
             });
-            
+
             const existing = await s3Client.send(listCmd);
             const files = existing.Contents || [];
 
-            const limitTime = new Date(Date.now() - 48 * 60 * 60 * 1000);
-            const keepFiles = [];
-            const deletePromises = [];
+            const deleteKeys = [];
+            let keepFiles = files;
 
-            for (const file of files) {
-                if (file.LastModified < limitTime) {
-                    console.log(`🗑️ Expiring old trail: ${file.Key}`);
-                    deletePromises.push(s3Client.send(new DeleteObjectCommand({
-                        Bucket: process.env.AWS_S3_BUCKET_NAME, Key: file.Key
-                    })));
-                } else {
-                    keepFiles.push(file);
+            if (TRAIL_MAX_AGE_MS) {
+                const limitTime = new Date(Date.now() - TRAIL_MAX_AGE_MS);
+                keepFiles = [];
+                for (const file of files) {
+                    if (file.LastModified < limitTime) deleteKeys.push(file.Key);
+                    else keepFiles.push(file);
                 }
             }
 
-            // LIMIT: Max 3 recent flights
-            keepFiles.sort((a, b) => a.LastModified - b.LastModified);
-            
-            // Check if we are accidentally creating a 4th file
-            // (Note: We already know this is not an update to an existing file key)
-            if (keepFiles.length >= 3) {
-                const oldest = keepFiles[0];
-                console.log(`🗑️ Max 3 reached. Deleting oldest: ${oldest.Key}`);
-                deletePromises.push(s3Client.send(new DeleteObjectCommand({
-                    Bucket: process.env.AWS_S3_BUCKET_NAME, Key: oldest.Key
-                })));
+            // Newest first, then drop everything past the cap. The file about to
+            // be written is not in this listing yet, so the cap counts it by
+            // leaving room for one more.
+            keepFiles = keepFiles.slice().sort((a, b) => b.LastModified - a.LastModified);
+            for (const file of keepFiles.slice(Math.max(0, TRAIL_MAX_PER_USER - 1))) {
+                deleteKeys.push(file.Key);
             }
 
-            if (deletePromises.length > 0) await Promise.all(deletePromises);
+            if (deleteKeys.length > 0) {
+                console.log(`🗑️ Pruning ${deleteKeys.length} trail(s) from ${folderPrefix}`);
+                await Promise.all(deleteKeys.map(Key => s3Client.send(
+                    new DeleteObjectCommand({ Bucket: process.env.AWS_S3_BUCKET_NAME, Key })
+                )));
+            }
         }
 
         // 3. SAVE FINAL TRAIL (Compressed JSON)
