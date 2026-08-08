@@ -2213,14 +2213,26 @@ const uploadAircraftImages = upload.fields([
     { name: 'image', maxCount: 1 }
 ]);
 
-// Helper: Convert S3 Stream to String
-const streamToString = (stream) =>
+// Helper: Convert S3 Stream to Buffer, transparently un-gzipping if needed.
+//
+// Trail objects are stored gzipped with Content-Encoding: gzip so browsers
+// decompress them for free on the way out. Objects written before that are
+// still plain JSON, so the magic number decides rather than an assumption —
+// which also means a rollback cannot strand anything already written.
+const zlib = require("zlib");
+const streamToBuffer = (stream) =>
     new Promise((resolve, reject) => {
         const chunks = [];
         stream.on("data", (chunk) => chunks.push(chunk));
         stream.on("error", reject);
-        stream.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+        stream.on("end", () => resolve(Buffer.concat(chunks)));
     });
+
+async function readMaybeGzippedJson(body) {
+    const buf = await streamToBuffer(body);
+    const isGzip = buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b;
+    return JSON.parse((isGzip ? zlib.gunzipSync(buf) : buf).toString("utf8"));
+}
 
 // Helper: Send Discord Webhook Notification
 const sendDiscordWebhook = async (entry) => {
@@ -8366,8 +8378,7 @@ app.post('/api/trails', async (req, res) => {
             });
             
             const { Body } = await s3Client.send(getCmd);
-            const existingData = await streamToString(Body);
-            const existingJson = JSON.parse(existingData);
+            const existingJson = await readMaybeGzippedJson(Body);
 
             if (Array.isArray(existingJson)) {
                 console.log(`🧩 Found existing trail (${existingJson.length} points). Merging...`);
@@ -8437,18 +8448,35 @@ app.post('/api/trails', async (req, res) => {
             }
         }
 
-        // 3. SAVE FINAL TRAIL (Compressed JSON)
-        const bodyBuffer = Buffer.from(JSON.stringify(finalTrail));
+        // 3. SAVE FINAL TRAIL
+        //
+        // Stored gzipped with Content-Encoding: gzip. The archive is the one
+        // thing here that grows without bound — a trail is kept long after the
+        // recorder has forgotten it — and trail JSON is extremely repetitive,
+        // so this is roughly a 4x cut in both stored bytes and egress. Browsers
+        // decompress it on the way out without the client knowing, so the file
+        // is still a plain JSON array as far as replayBrowser.js is concerned.
+        //
+        // Cache-Control stays as it was. A key can be rewritten by the merge
+        // path above, so marking these immutable would let a stale replay
+        // survive an update — and no-cache still revalidates against S3's ETag,
+        // which already avoids re-downloading an unchanged trail.
+        const rawBody = Buffer.from(JSON.stringify(finalTrail));
+        const bodyBuffer = zlib.gzipSync(rawBody);
 
         await s3Client.send(new PutObjectCommand({
             Bucket: process.env.AWS_S3_BUCKET_NAME,
             Key: newFileKey,
             Body: bodyBuffer,
             ContentType: 'application/json',
-            CacheControl: 'no-cache' 
+            ContentEncoding: 'gzip',
+            CacheControl: 'no-cache'
         }));
 
-        console.log(`💾 Saved trail: ${newFileKey} (Total: ${finalTrail.length} points)`);
+        console.log(
+            `💾 Saved trail: ${newFileKey} (${finalTrail.length} points, ` +
+            `${(rawBody.length / 1024).toFixed(1)}KB -> ${(bodyBuffer.length / 1024).toFixed(1)}KB gzipped)`
+        );
         res.json({ ok: true, merged: isUpdate });
 
     } catch (e) {
