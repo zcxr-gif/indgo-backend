@@ -165,9 +165,27 @@ const PORT = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors()); // Allow all origins
-// Increase limit for JSON body (trails can be large)
-app.use(express.json({ limit: '100mb' })); 
-app.use(express.urlencoded({ extended: true, limit: '100mb' }));
+// Body size ceiling. Trails and CSV rosters are genuinely large, so this cannot
+// be express's 100kb default — but it was 100mb, and that is not a limit, it is
+// the absence of one.
+//
+// What 100mb actually permits: body-parser buffers the whole request before
+// parsing, and JSON.parse then expands it into JS objects at roughly 5-10x the
+// text size, because every small object carries a header, a hash map and
+// pointer-aligned slots. A single 100mb POST is therefore a half-gigabyte heap
+// spike from one request, reachable by anyone who can reach the endpoint, with
+// no file and no special content needed. Concurrent copies multiply it. That is
+// a far cheaper way to kill this process than any image.
+//
+// 8mb is set against the largest legitimate body, which is a merged flight
+// trail: a 16-hour flight sampled every second is ~57,000 points at ~90 bytes
+// of JSON each, a little over 5mb, and the recorder samples slower than that.
+// A CSV roster is far smaller — 8mb of CSV is ~40,000 pilots. So this is
+// comfortably above anything real while cutting the worst case by 12x, and an
+// oversized body now gets a clean 413 from body-parser instead of being parsed.
+const BODY_LIMIT = process.env.BODY_LIMIT || '8mb';
+app.use(express.json({ limit: BODY_LIMIT }));
+app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
 
 // Trust Proxy (Required if behind Nginx/Heroku/Cloudflare to get real IPs)
 app.set('trust proxy', 1);
@@ -2220,6 +2238,70 @@ const uploadAircraftImages = upload.fields([
     { name: 'images', maxCount: MAX_AIRCRAFT_IMAGES },
     { name: 'image', maxCount: 1 }
 ]);
+
+/* ---------------------------------------------------------------------------
+ * Streaming a collection out as JSON
+ *
+ * `res.json(await Model.find().lean())` holds the whole answer three times over
+ * at its peak: the array of documents, the single JSON string JSON.stringify
+ * builds from it, and the Buffer express writes to the socket. For an endpoint
+ * that returns an entire collection — one that grows every time a contributor
+ * uploads something, and that the homepage hits on every load — that is the
+ * largest allocation in the process, it scales with concurrent readers, and it
+ * has no ceiling at all. It is also invisible until the collection is big
+ * enough to matter, which is exactly the "ran fine for months" shape.
+ *
+ * A cursor turns that into one document at a time. Two details make it real
+ * rather than cosmetic:
+ *
+ *   • BACKPRESSURE. If `res.write()` returns false and we keep writing anyway,
+ *     Node queues the unwritten chunks in memory and we have rebuilt the whole
+ *     response on the heap with extra steps. Awaiting 'drain' is the part that
+ *     makes this bounded — without it this optimisation is a no-op.
+ *   • The cursor is closed in `finally`, including when the client disconnects
+ *     mid-response. An abandoned cursor holds a server-side batch and a
+ *     connection from the pool.
+ *
+ * Output is byte-identical to `res.json(array)`: JSON.stringify per document
+ * joined by commas is the same text as JSON.stringify of the array, and lean()
+ * documents serialize identically (ObjectId and Date both have toJSON).
+ *
+ * Errors are only recoverable BEFORE the first byte. Afterwards the status line
+ * is already sent and the only honest signal left is to destroy the response so
+ * the client sees a truncated body rather than a valid-looking short array.
+ * ------------------------------------------------------------------------- */
+const streamJsonArray = async (res, query, { prefix = '', suffix = '' } = {}) => {
+    const cursor = query.cursor();
+    let started = false;
+    try {
+        for (let doc = await cursor.next(); doc !== null; doc = await cursor.next()) {
+            if (!started) {
+                res.set('Content-Type', 'application/json; charset=utf-8');
+                res.write(`${prefix}[`);
+                started = true;
+            } else {
+                res.write(',');
+            }
+            if (!res.write(JSON.stringify(doc))) {
+                // The socket is full. Wait for it to drain before reading the
+                // next document, so the cursor advances no faster than the
+                // client consumes and memory stays flat on a slow connection.
+                await new Promise((resolve) => res.once('drain', resolve));
+            }
+        }
+        if (!started) {
+            res.set('Content-Type', 'application/json; charset=utf-8');
+            res.write(`${prefix}[`);
+        }
+        res.end(`]${suffix}`);
+    } catch (err) {
+        if (!started && !res.headersSent) throw err;
+        console.error('Stream Error (response already started):', err?.message || err);
+        res.destroy(err);
+    } finally {
+        try { await cursor.close(); } catch { /* already closed, or the socket went first */ }
+    }
+};
 
 // Helper: Convert S3 Stream to Buffer, transparently un-gzipping if needed.
 //
@@ -6392,6 +6474,10 @@ app.delete('/api/crew/:slug/applications/:id/invite', async (req, res) => {
 // status token. Everything is computed inside the VA's own database.
 const CREW_STATS_TTL_MS = 60 * 1000;
 const _crewStatsCache = new Map();   // slug -> { at, payload }
+// Well above any plausible number of partner VAs, so in practice this never
+// evicts anything — it is here so that "one entry per slug, kept forever" has
+// a ceiling at all rather than being trusted to stay small.
+const CREW_STATS_CACHE_MAX = 500;
 
 // How many people are queued up to join is the VA's business, not the public's:
 // it says something about a private queue that no public page needs. The cache
@@ -6566,6 +6652,16 @@ app.get('/api/crew/:slug/stats', async (req, res) => {
             stats,
         };
         _crewStatsCache.set(slug, { at: Date.now(), payload });
+        // Entries are deliberately never expired — a stale snapshot is what
+        // keeps a VA's homepage up when their database blips (see the catch
+        // below) — so the TTL above bounds freshness but nothing bounds SIZE.
+        // Each value is a full stats payload, and one is kept per slug ever
+        // requested, forever. A count cap costs the least-recently-written VA
+        // its fallback and keeps the map from being a slow leak; Map iterates
+        // in insertion order, so the first key is the oldest.
+        if (_crewStatsCache.size > CREW_STATS_CACHE_MAX) {
+            _crewStatsCache.delete(_crewStatsCache.keys().next().value);
+        }
         res.set('Cache-Control', isManager ? 'no-store' : 'public, max-age=60');
         res.json(scopeStats(payload, isManager));
     } catch (err) {
@@ -7190,6 +7286,15 @@ async function autoUpdateStore(va, health) {
     if (Date.now() - last < AUTO_UPDATE_COOLDOWN_MS) return null;
     _autoUpdateSeen.set(id, Date.now());     // set BEFORE the work, so a second
                                              // request during it does not stack
+    // An entry older than the cooldown can never change an outcome — the check
+    // above would pass regardless — so it is pure retention. Tiny (an id and a
+    // timestamp), but it is the only map here that nothing ever removes from,
+    // and "small and unbounded" is how every leak starts. Swept only once the
+    // map is big enough for the pass to be worth making.
+    if (_autoUpdateSeen.size > 200) {
+        const stale = Date.now() - AUTO_UPDATE_COOLDOWN_MS;
+        for (const [k, t] of _autoUpdateSeen) if (t < stale) _autoUpdateSeen.delete(k);
+    }
 
     const ad = await VirtualAirlineAd.findById(va._id).select(CREW_TOKEN_META + ' +supabaseAccessToken').lean();
     if (!ad || !ad.supabaseAccessToken || ad.supabaseAutoUpdate === false || ad.supabaseTokenFailedAt) return null;
@@ -8064,11 +8169,13 @@ app.get('/api/gates/:icao', async (req, res) => {
     }
 });
 
-// GET: Fetch all gates (Use with caution if dataset is massive)
+// GET: Fetch all gates. Streamed — every airport's full gate list in one
+// response is precisely the "massive dataset" the old comment here warned about,
+// and buffering it held the documents, the JSON string and the write buffer at
+// the same time.
 app.get('/api/gates', async (req, res) => {
     try {
-        const allGates = await AirportGate.find({}).lean();
-        res.json(allGates);
+        await streamJsonArray(res, AirportGate.find({}).lean());
     } catch (error) {
         console.error('Global Gates Fetch Error:', error);
         res.status(500).json({ message: 'Failed to fetch global gates dataset.' });
@@ -8244,6 +8351,30 @@ const TRAIL_MAX_AGE_MS = (() => {
 })();
 
 /**
+ * The most points one stored trail may keep.
+ *
+ * The archive bounds how many trails a pilot keeps and how old they get. It
+ * does not bound how big ONE of them becomes, and the save path appends: each
+ * POST reads the stored trail, concatenates the new points and writes the union
+ * back. Nothing ever removes a point, so a recorder that keeps reporting — a
+ * flight left running overnight, a client that retries, a session that never
+ * ends — grows a single object forever, and every later append pays for the
+ * whole accumulated history at once. Merging holds several copies at the same
+ * time (the parsed original, the concatenation, the deduplicated filter result,
+ * the serialized string, the gzip buffer), so the cost of one save is a
+ * multiple of a file with no ceiling on it.
+ *
+ * 60,000 points is about 17 hours at one point per second, comfortably longer
+ * than the longest flight anyone can fly, so no real trail reaches it. When one
+ * does, the OLDEST points are dropped: a trail that has overrun is a recorder
+ * that never stopped, and the recent end is the part a replay is about.
+ */
+const TRAIL_MAX_POINTS = (() => {
+    const n = parseInt(process.env.TRAIL_MAX_POINTS ?? '', 10);
+    return Number.isFinite(n) && n > 0 ? n : 60000;
+})();
+
+/**
  * Timestamp of a trail point, whichever field it happens to carry.
  * The recorder writes `time`; older stored files use `t`.
  */
@@ -8416,6 +8547,19 @@ app.post('/api/trails', async (req, res) => {
             }
         }
 
+        // Enforce the per-trail ceiling. Applied after the merge and outside it,
+        // so it also catches a first write that arrives oversized rather than
+        // only trails that grew into it. Sliced from the END: the points kept
+        // are the most recent ones (see TRAIL_MAX_POINTS).
+        if (finalTrail.length > TRAIL_MAX_POINTS) {
+            const dropped = finalTrail.length - TRAIL_MAX_POINTS;
+            finalTrail = finalTrail.slice(-TRAIL_MAX_POINTS);
+            console.warn(
+                `✂️  Trail ${newFileKey} exceeded ${TRAIL_MAX_POINTS} points — dropped the oldest ${dropped}. `
+                + 'A trail this long means a recorder that never stopped; raise TRAIL_MAX_POINTS if this is legitimate.'
+            );
+        }
+
         // 2. PRUNE: keep the pilot's archive within its limits.
         // Only on a NEW file — an update cannot grow the folder, so it would be
         // paying for a listing that can never find anything to do.
@@ -8469,8 +8613,16 @@ app.post('/api/trails', async (req, res) => {
         // path above, so marking these immutable would let a stale replay
         // survive an update — and no-cache still revalidates against S3's ETag,
         // which already avoids re-downloading an unchanged trail.
+        // gzip, off the event loop. This was gzipSync, which compresses several
+        // megabytes on the main thread with every other request stopped behind
+        // it — the p99 event-loop spikes the diagnostics terminal flags as an
+        // "irregular rhythm" are partly this. zlib's async form does the same
+        // work on the threadpool for the same bytes out; the only thing that
+        // changes is that the process keeps answering while it happens.
         const rawBody = Buffer.from(JSON.stringify(finalTrail));
-        const bodyBuffer = zlib.gzipSync(rawBody);
+        const bodyBuffer = await new Promise((resolve, reject) => {
+            zlib.gzip(rawBody, (err, buf) => (err ? reject(err) : resolve(buf)));
+        });
 
         await s3Client.send(new PutObjectCommand({
             Bucket: process.env.AWS_S3_BUCKET_NAME,
@@ -8501,8 +8653,11 @@ app.get('/api/aircraft', async (req, res) => {
         // skip Mongoose document hydration (change-tracking, getters/setters) and
         // hand back plain objects. Cuts both the CPU per request and the peak RSS
         // of the response by several times — the result is only serialized to JSON.
-        const aircraft = await CommunityAircraft.find().sort({ uploadedAt: -1 }).lean();
-        res.json(aircraft);
+        //
+        // Streamed rather than buffered: this is the single largest allocation
+        // in the process and it grows with the collection forever. Same bytes to
+        // the client, one document at a time on this side. See streamJsonArray.
+        await streamJsonArray(res, CommunityAircraft.find().sort({ uploadedAt: -1 }).lean());
     } catch (error) {
         console.error(error);
         res.status(500).json({ message: 'Error fetching aircraft.' });
@@ -8525,14 +8680,39 @@ app.get('/api/aircraft/lookup', async (req, res) => {
         }
 
         // 3. Build the MongoDB Query
+        //
+        // The search terms are escaped before becoming a regex. They arrive
+        // straight off the query string, so unescaped they are not a search but
+        // a pattern: a livery containing `(` is a syntax error, and one like
+        // `(a+)+$` is a catastrophic-backtracking pattern that pins a CPU inside
+        // the matcher for every document scanned. Escaping makes them mean
+        // themselves, which is also what a user typing "A350-900(F)" intends.
+        const rx = (v) => ({ $regex: String(v).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' });
         let query = {};
-        if (finalType) query.aircraftType = { $regex: finalType, $options: 'i' };
-        if (finalLivery) query.liveryName = { $regex: finalLivery, $options: 'i' };
+        if (finalType) query.aircraftType = rx(finalType);
+        if (finalLivery) query.liveryName = rx(finalLivery);
         if (finalTail) query.tailNumber = finalTail;
 
-        // .lean(): results are only inspected and serialized (no doc methods),
-        // so return plain objects and skip Mongoose hydration.
-        const results = await CommunityAircraft.find(query).lean();
+        // This endpoint returns exactly ONE aircraft, and it used to load every
+        // match to do it — a broad type like "737" pulls the whole fleet into
+        // memory so that one document can be picked and the rest thrown away.
+        //
+        // The exact-livery preference is asked of the database instead of
+        // scanned for in a materialised array: an anchored, case-insensitive
+        // match on liveryName, limited to one. Same answer as the old
+        // `results.find(exact)` — and, unlike a naive `.limit(n)` on the loose
+        // query, it cannot miss an exact match that happened to sort past the
+        // limit. Only when there is no exact match do we fall back to "any
+        // match", also limited to one.
+        // .lean(): the result is only serialized, so skip Mongoose hydration.
+        if (finalLivery) {
+            const exact = await CommunityAircraft.findOne({
+                ...query,
+                liveryName: { $regex: `^${String(finalLivery).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' },
+            }).lean();
+            if (exact) return res.json(exact);
+        }
+        const results = await CommunityAircraft.find(query).limit(1).lean();
 
         // 4. FIX: If no results found, return placeholder using the normalized 'finalTail'
         if (results.length === 0) {
@@ -8548,16 +8728,10 @@ app.get('/api/aircraft/lookup', async (req, res) => {
             });
         }
 
-        // --- EXISTING INTELLIGENT SORTING LOGIC ---
-        if (finalLivery) {
-            const searchLower = finalLivery.toLowerCase();
-            const exactMatch = results.find(
-                item => item.liveryName.toLowerCase() === searchLower
-            );
-            if (exactMatch) return res.json(exactMatch);
-        }
-
-        res.json(results[0]); 
+        // The exact-livery preference that used to live here now runs as its own
+        // query above, so by this point the answer is simply the one match we
+        // asked the database for.
+        res.json(results[0]);
 
     } catch (error) {
         console.error('Error looking up aircraft:', error);
@@ -12480,8 +12654,9 @@ const applyEmbedAppearance = (cfg, body = {}) => {
 // GET /api/embed/configs — STAFF. List every token config (newest first).
 app.get('/api/embed/configs', requireAuth, async (req, res) => {
     try {
-        const configs = await EmbedConfig.find().sort({ createdAt: -1 }).lean();
-        res.json({ data: configs });
+        await streamJsonArray(res, EmbedConfig.find().sort({ createdAt: -1 }).lean(), {
+            prefix: '{"data":', suffix: '}',
+        });
     } catch (error) {
         console.error('Embed Config List Error:', error);
         res.status(500).json({ message: 'Error fetching embed configs.' });
