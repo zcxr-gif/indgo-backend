@@ -51,6 +51,17 @@ const EMBED_BASE_URL = process.env.EMBED_BASE_URL || 'https://inflight.info/embe
 const EMBED_EVENTS_BASE_URL = process.env.EMBED_EVENTS_BASE_URL
     || 'https://site--indgo-backend--6dmjph8ltlhv.code.run/embed-events.html';
 
+// How closely a live callsign must follow the VA's registered callsigns before a
+// flight is delivered as theirs, tightest first. Mirrors VA_CALLSIGN_MATCH_MODES
+// in server.js, which owns the field on the listing.
+const PORTAL_CALLSIGN_MATCH_MODES = ['exact', 'strict', 'broad'];
+// How far the VA's pilot roster may vouch for a flight that rule rejects.
+// Mirrors VA_ROSTER_TRUST_MODES in server.js.
+//   off     — never; only callsigns that fit the rule count.
+//   airline — (default) waives the VA's tag but not its airline.
+//   any     — a rostered pilot counts whatever they are flying (codeshare opt-in).
+const PORTAL_ROSTER_TRUST_MODES = ['off', 'airline', 'any'];
+
 const COOKIE_NAME = 'va_portal_token';
 const TOKEN_TYPE = 'va_portal';            // distinguishes these tokens from staff tokens
 const TOKEN_TTL = '30d';
@@ -972,6 +983,16 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             flightEventsApproved: !!ad.flightEventsApproved,
             flightEventsRequested: !!ad.flightEventsRequestedAt,
             flightEventsWebhookHint: ad.flightEventsWebhookUrl ? maskWebhookUrl(ad.flightEventsWebhookUrl) : '',
+            // How closely a live callsign must follow this VA's registered
+            // callsigns before a flight is delivered as theirs — 'exact' |
+            // 'strict' | 'broad'. Owner-editable (POST /flight-events/matching).
+            callsignMatch: PORTAL_CALLSIGN_MATCH_MODES.includes(ad.callsignMatch) ? ad.callsignMatch : 'strict',
+            // How far their roster may vouch for a callsign that rule rejects —
+            // the opt-in for members flying codeshare / partner callsigns.
+            rosterTrust: PORTAL_ROSTER_TRUST_MODES.includes(ad.rosterTrust) ? ad.rosterTrust : 'airline',
+            // The callsigns that setting is applied against, so the portal can
+            // show the owner what "exactly this" actually means for them.
+            callsigns: (ad.callsigns && ad.callsigns.length) ? ad.callsigns : (ad.callsign ? [ad.callsign] : []),
             // The (normalized) card customization — colours/layout/fields — so the
             // portal can render the current selection. Always a full, valid object.
             flightEventsCard: normalizeCardOptions(ad.flightEventsCard || {}),
@@ -981,9 +1002,31 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
     // The VA's callsign code(s), uppercased — the key an embed is matched on.
     // An embed "belongs to" this VA when its va.code is one of these, which is
     // also the ownership check for editing (a VA can only restyle its own embeds).
-    const vaCallsignCodes = (ad) =>
-        ((Array.isArray(ad.callsigns) && ad.callsigns.length ? ad.callsigns : [ad && ad.callsign])
-            .filter(Boolean)).map((c) => String(c).toUpperCase());
+    // The airline part of a stored callsign, whatever mask it was saved in:
+    // "OCEAN ##VA" and "SHAMROCK ###EX" both reduce to their airline. Mirrors
+    // normalizeCallsignBase in server.js (which owns the rule) — kept local so
+    // this module still touches nothing of the app's wiring.
+    const callsignBaseOf = (raw) => {
+        const s = String(raw || '').trim().toUpperCase().replace(/\s+/g, ' ');
+        if (!s) return '';
+        const first = s.indexOf('#');
+        if (first !== -1) return s.slice(0, first).trim();
+        const m = s.match(/^(.*?)\s+VA$/);
+        return (m && m[1].trim()) || s;
+    };
+
+    // Every code an embed of this VA might have been created under: each stored
+    // callsign as saved, plus its reduced airline. A VA may fly under several
+    // callsigns, and staff may have typed the embed's va.code as either the full
+    // mask ("OCEAN ##VA") or the short code ("OCEAN") — matching both means a
+    // multi-callsign VA still finds all of its embeds.
+    const vaCallsignCodes = (ad) => {
+        const stored = (Array.isArray(ad.callsigns) && ad.callsigns.length ? ad.callsigns : [ad && ad.callsign])
+            .filter(Boolean).map((c) => String(c).toUpperCase());
+        const out = new Set(stored);
+        for (const c of stored) { const b = callsignBaseOf(c); if (b) out.add(b); }
+        return [...out];
+    };
 
     // Shape one embed config for the portal: the copyable link/iframe plus the
     // editable appearance (mirrors the cosmetic fields applyEmbedAppearance
@@ -1280,6 +1323,89 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
         } catch (err) {
             console.error('VA portal flight-events toggle error:', err);
             res.status(500).json({ error: 'Could not update delivery.' });
+        }
+    });
+
+    /**
+     * Owner decides which live flights count as theirs. Two independent
+     * questions, both settable here and either one alone:
+     *
+     *   callsignMatch — how closely a callsign must follow the ones they
+     *     registered. 'exact' takes only "<callsign> <number><tag>" and nothing
+     *     else, 'strict' (default) also allows a second trailing tag, 'broad'
+     *     accepts the airline name on its own. The knob for "stop posting
+     *     flights that aren't ours".
+     *   rosterTrust — how far their pilot roster may vouch for a callsign that
+     *     rule rejects. 'off' never, 'airline' (default) waives their tag but
+     *     not their airline, 'any' counts a rostered pilot whatever they are
+     *     flying. The knob for "our members fly codeshare callsigns too" — and
+     *     the reason it is opt-in is that 'any' also brings in everything else
+     *     those pilots fly.
+     *
+     * The choice is written to the LISTING (which governs the Discord feed: the
+     * ACARS matcher reads it off /api/va-ads and resolveVaEventPartner
+     * re-applies it) and to every embed config belonging to this VA (which
+     * governs the live map). One answer, both surfaces — a VA that tightened its
+     * feed and then found its map still showing strangers would rightly read
+     * that as the setting not working.
+     */
+    app.post('/api/va-portal/flight-events/matching', requirePortalOwner, async (req, res) => {
+        try {
+            if (!req.portal.vaAdId) return res.status(404).json({ error: 'No VA is linked to this account.' });
+            const body = req.body || {};
+            const wantMatch = body.callsignMatch ?? body.match;
+            const wantRoster = body.rosterTrust ?? body.roster;
+            if (wantMatch === undefined && wantRoster === undefined) {
+                return res.status(400).json({ error: 'Nothing to change.' });
+            }
+            const mode = wantMatch === undefined ? null : String(wantMatch).trim().toLowerCase();
+            const trust = wantRoster === undefined ? null : String(wantRoster).trim().toLowerCase();
+            if (mode !== null && !PORTAL_CALLSIGN_MATCH_MODES.includes(mode)) {
+                return res.status(400).json({ error: `Callsign matching must be one of: ${PORTAL_CALLSIGN_MATCH_MODES.join(', ')}.` });
+            }
+            if (trust !== null && !PORTAL_ROSTER_TRUST_MODES.includes(trust)) {
+                return res.status(400).json({ error: `Roster trust must be one of: ${PORTAL_ROSTER_TRUST_MODES.join(', ')}.` });
+            }
+
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId).select('+flightEventsWebhookUrl');
+            if (!ad) return res.status(404).json({ error: 'Your VA listing could not be found.' });
+            if (mode !== null) ad.callsignMatch = mode;
+            if (trust !== null) ad.rosterTrust = trust;
+            await ad.save();
+
+            // Mirror onto this VA's embeds. Best effort: the listing is the
+            // source of truth for delivery, so a failure here must not fail the
+            // owner's save — it just leaves the map a refresh behind.
+            let embedsUpdated = 0;
+            if (EmbedConfig) {
+                try {
+                    const codes = vaCallsignCodes(ad);
+                    const or = [{ vaAdId: ad._id }];
+                    if (codes.length) or.push({ 'va.code': { $in: codes } });
+                    const set = {};
+                    if (mode !== null) set.callsignMatch = mode;
+                    if (trust !== null) set.rosterTrust = trust;
+                    const r = await EmbedConfig.updateMany({ $or: or }, { $set: set });
+                    embedsUpdated = r.modifiedCount || 0;
+                } catch (err) {
+                    console.error('VA portal embed matching sync error:', err.message);
+                }
+            }
+
+            const changed = [
+                mode !== null ? `callsign matching "${mode}"` : null,
+                trust !== null ? `roster trust "${trust}"` : null,
+            ].filter(Boolean).join(', ');
+            logActivity({
+                vaAdId: ad._id, vaName: ad.name,
+                actorName: req.portal.displayName || req.portal.username, actorRole: 'owner',
+                action: 'flight-events.matching',
+                detail: `Set ${changed}${embedsUpdated ? ` (also applied to ${embedsUpdated} embed${embedsUpdated === 1 ? '' : 's'})` : ''}`,
+            });
+            res.json({ va: portalVa(ad), embedsUpdated });
+        } catch (err) {
+            console.error('VA portal flight-events matching error:', err);
+            res.status(500).json({ error: 'Could not update callsign matching.' });
         }
     });
 

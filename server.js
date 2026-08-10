@@ -239,6 +239,14 @@ const AirportGate = mongoose.model('AirportGate', AirportGateSchema);
  * ========================= */
 const VA_AD_STATUSES = ['pending', 'approved', 'rejected'];
 const VA_AD_TYPES = ['VA', 'VO']; // Virtual Airline vs Virtual Organization (IF terminology)
+// How closely a live callsign must follow the VA's registered callsigns before a
+// flight counts as theirs, tightest first. See the `callsignMatch` field below.
+const VA_CALLSIGN_MATCH_MODES = ['exact', 'strict', 'broad'];
+// How far a VA's pilot roster is allowed to vouch for a flight the callsign rule
+// alone would reject, tightest first. See the `rosterTrust` field below. Kept
+// separate from callsignMatch because they answer different questions: one is
+// "how do we read a callsign", the other is "may the roster override it".
+const VA_ROSTER_TRUST_MODES = ['off', 'airline', 'any'];
 
 const VirtualAirlineAdSchema = new mongoose.Schema({
     // --- Identity ---
@@ -250,6 +258,49 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // A VA may fly under several callsigns (e.g. a parent brand + sub-fleets).
     // The first entry is treated as the primary and synced into `callsign`.
     callsigns: { type: [String], default: [] },
+    /* How closely a live in-game callsign has to follow the callsigns above
+     * before we call the flight this VA's. Owner/staff choose it; it governs
+     * the flight-event feed end to end — the ACARS matcher reads it off this
+     * listing (GET /api/va-ads → va_filter.cjs) and delivery re-applies it here
+     * (resolveVaEventPartner). The embed widget has its own copy of the same
+     * three rules on EmbedConfig.callsignMatch.
+     *
+     *   'exact'  — the callsign must BE a registered shape and stop there:
+     *     "<base> <number><tag>", e.g. "Ocean 12VA". A trailing extra tag, a
+     *     missing tag, or a rostered pilot on somebody else's callsign are all
+     *     rejected. Pick this to keep unwanted flights out of the feed.
+     *   'strict' — (default) the VA's registered callsigns, with the tag allowed
+     *     on either of the last two tokens.
+     *   'broad'  — the airline name alone is enough, tag or no tag.
+     *
+     * This governs CALLSIGNS only. Whether the pilot roster may vouch for a
+     * flight this rejects is the separate `rosterTrust` question below.
+     */
+    callsignMatch: { type: String, enum: VA_CALLSIGN_MATCH_MODES, default: 'strict' },
+    /* How far this VA's pilot roster may vouch for a flight the callsign rule
+     * above would reject.
+     *
+     * The roster says who a pilot IS; it never says what they are flying right
+     * now, and plenty of pilots hold membership in several VAs at once. So how
+     * much weight it carries has to be the VA's own call:
+     *
+     *   'off'     — the roster never widens the callsign rule. Only callsigns
+     *     that fit `callsignMatch` count.
+     *   'airline' — (default) the roster waives the VA's suffix TAG and nothing
+     *     more. An untagged "Ocean 12" by a rostered pilot counts for Ocean;
+     *     that same pilot's "Etihad 456FR" does not. This is what keeps a pilot
+     *     who is on several VAs' rosters out of the feeds of the VAs they are
+     *     not currently flying for.
+     *   'any'     — the roster waives the callsign entirely: if the pilot is on
+     *     this VA's roster, the flight is this VA's, whatever they typed. The
+     *     opt-in for VAs whose members fly codeshare or partner callsigns. The
+     *     cost is that anything else those pilots fly also lands in the feed,
+     *     so it is off unless the VA turns it on.
+     *
+     * Flights matching another VA's registered callsign are still attributed to
+     * that VA first — 'any' only claims what nothing else does.
+     */
+    rosterTrust: { type: String, enum: VA_ROSTER_TRUST_MODES, default: 'airline' },
     type: { type: String, enum: VA_AD_TYPES, default: 'VA' },
 
     // URL handle for the VA's Crew Center — inflight.info/crew/<slug>. Unique
@@ -1660,6 +1711,15 @@ const VaTermsAcceptance = mongoose.models.VaTermsAcceptance
 const EMBED_MODES = ['roster', 'map'];
 const EMBED_PROVIDERS = ['mapbox', 'free'];
 const EMBED_THEMES = ['dark', 'light'];
+// How closely a live callsign must follow what the VA registered, tightest
+// first. Shared with the VA listing's own `callsignMatch` (see
+// VA_CALLSIGN_MATCH_MODES) and with the widget + ACARS matcher, which implement
+// the same three rules. Documented on the EmbedConfig field below.
+const EMBED_CALLSIGN_MATCH_MODES = ['exact', 'strict', 'broad'];
+// How far the VA's pilot roster may vouch for a flight the callsign rule would
+// reject. Mirrors VA_ROSTER_TRUST_MODES; the portal writes the VA's one choice
+// to both so the map and the Discord feed always show the same pilots.
+const EMBED_ROSTER_TRUST_MODES = ['off', 'airline', 'any'];
 const EMBED_HEADER_POSITIONS = ['top', 'bottom', 'left', 'right'];
 // The Events + Calendar companion widget (embed-events.html) ships 10 layout
 // presets; the VA picks one. Kept here so schema, resolve and validation agree.
@@ -1713,14 +1773,29 @@ const EmbedConfigSchema = new mongoose.Schema({
      *
      * A VA cannot have both, so it chooses which error it prefers:
      *
+     *   'exact'  — the callsign must BE the registered shape and stop there:
+     *     <prefix><number><tag>, e.g. "Air Canada 001VA". No second trailing
+     *     tag, no untagged prefix. The tightest filter we offer, for a VA that
+     *     would rather lose a member who typed their callsign loosely than
+     *     carry a flight that isn't theirs.
      *   'strict' — only callsigns that fit this VA's configured patterns. The
      *     map shows nobody who isn't yours. Members on codeshare callsigns, or
      *     any shape not registered here, will be missing.
      *   'broad'  — also accept the prefix without the VA's own tag, catching
      *     members whose callsign doesn't fit. The cost is that somebody flying
      *     for a different VA on a similar callsign can appear as one of yours.
+     *
+     * The codeshare half of that limit has its own answer: `rosterTrust` below,
+     * which is how a VA says its roster may vouch for a callsign this rejects.
      */
-    callsignMatch: { type: String, enum: ['strict', 'broad'], default: 'strict' },
+    callsignMatch: { type: String, enum: EMBED_CALLSIGN_MATCH_MODES, default: 'strict' },
+    /* How far the VA's pilot roster may vouch for a flight the callsign rule
+     * above rejects — 'off' | 'airline' (default) | 'any'. See the matching
+     * field on VirtualAirlineAdSchema for what each one means; the portal writes
+     * the VA's single choice to both, so the map and the Discord feed never
+     * disagree about who counts as a member.
+     */
+    rosterTrust: { type: String, enum: EMBED_ROSTER_TRUST_MODES, default: 'airline' },
 
     // Hub ICAOs. Each becomes a map marker whose window lists the VA's inbound
     // pilots. Stored uppercase, e.g. ["CYYZ", "CYUL", "CYVR"].
@@ -1816,10 +1891,47 @@ const Giveaway = mongoose.model('Giveaway', GiveawaySchema);
 // Store only the base radio callsign (e.g. "OCEAN"); the Infinite Flight VA
 // suffix "##VA" is appended at display time. Strip it here so a value entered as
 // "Ocean ##VA" or "Ocean VA" is normalized back to "OCEAN".
+/**
+ * Split a STORED VA callsign into the airline part and the tag its pilots
+ * append, e.g. "OCEAN ##VA" -> { base: "OCEAN", tag: "VA" }.
+ *
+ * A VA may register several callsigns and they do not all have to work the same
+ * way, so the tag has to be read off each mask rather than assumed:
+ *
+ *   "OCEAN ##VA"      -> { base: "OCEAN",     tag: "VA" }
+ *   "SHAMROCK ###EX"  -> { base: "SHAMROCK",  tag: "EX" }   ← a non-"VA" tag
+ *   "BAW ###"         -> { base: "BAW",       tag: "" }     ← no tag at all
+ *   "OCEAN VA"        -> { base: "OCEAN",     tag: "VA" }
+ *   "OCEAN"           -> { base: "OCEAN",     tag: "VA" }   ← legacy bare base
+ *
+ * The last line is why a bare base can't mean "no tag": every display path
+ * (formatCallsignDisplay, fmtCallsign in the UIs) renders a stored "OCEAN" as
+ * "OCEAN ##VA", so that is what the VA was told its pilots would fly.
+ */
+const vaCallsignParts = (raw) => {
+    const s = String(raw || '').trim().toUpperCase().replace(/\s+/g, ' ');
+    if (!s) return null;
+    const first = s.indexOf('#');
+    if (first !== -1) {
+        // A mask: everything before the first "#" is the airline, everything
+        // after the last one is the tag (empty for "BAW ###").
+        const base = s.slice(0, first).trim();
+        return base ? { base, tag: s.slice(s.lastIndexOf('#') + 1).trim() } : null;
+    }
+    // No placeholder — a bare base, or one with the tag already glued on.
+    const m = s.match(/^(.*?)\s+VA$/);
+    if (m && m[1].trim()) return { base: m[1].trim(), tag: 'VA' };
+    return { base: s, tag: 'VA' };
+};
+
+// Store only the airline part of a stored callsign ("OCEAN" out of
+// "OCEAN ##VA"). Now mask-aware rather than "VA"-only, so a VA whose second
+// callsign carries a different tag ("SHAMROCK ###EX") reduces to "SHAMROCK"
+// instead of staying whole and matching nothing.
 const normalizeCallsignBase = (raw) => {
     if (!raw) return null;
-    const clean = String(raw).trim().toUpperCase().replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim();
-    return clean || null;
+    const parts = vaCallsignParts(raw);
+    return (parts && parts.base) || null;
 };
 
 // Callsign as the operator typed it (trim + uppercase only — no suffix
@@ -1843,20 +1955,30 @@ const formatCallsignDisplay = (raw) => {
     return base ? `${base} ##VA` : null;
 };
 
-// Expand reduced callsign bases with their "##VA" / " VA" suffixed forms for the
-// flight-event lookups. Stored callsigns are now kept verbatim (see
+// Expand reduced callsign bases into everything a VA might actually have stored,
+// for the flight-event lookups. Stored callsigns are kept verbatim (see
 // cleanCallsignInput), so a VA that saved its callsign WITH the suffix (e.g.
 // "AIR CANADA ##VA") must still match a live callsign we reduced to the bare base
-// ("AIR CANADA"). Querying both forms keeps delivery working either way.
+// ("AIR CANADA").
+//
+// The three literal forms cover the common "VA"-tagged cases and can use the
+// index directly. The anchored regex catches the rest of what a VA is allowed to
+// register — a different tag ("SHAMROCK ###EX"), no tag ("BAW ###"), or any
+// other mask on the same airline — which the literals would miss entirely.
+// `$in` accepts regexes, so this stays one query and every caller is unchanged.
 const callsignQueryVariants = (bases) => {
     const out = new Set();
+    const rx = [];
     for (const b of bases) {
         if (!b) continue;
         out.add(b);
         out.add(`${b} ##VA`);
         out.add(`${b} VA`);
+        // Anchored at the airline, so it stays index-eligible and can't match
+        // "OCEANIC" off the back of "OCEAN".
+        rx.push(new RegExp('^' + b.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?:[\\s#]|$)', 'i'));
     }
-    return [...out];
+    return [...out, ...rx];
 };
 
 // --- Our own VA callsign filter ---------------------------------------------
@@ -1869,13 +1991,15 @@ const callsignQueryVariants = (bases) => {
 // "##VA"/" VA" suffix is reduced first; the number may use digits and/or "#"
 // placeholders; the space before "VA" is optional.
 const callsignMatchesVaBase = (callsign, base) => {
-    const cs = String(callsign || '').trim().toUpperCase();
-    const b = String(base || '').trim().toUpperCase()
-        .replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim();
-    if (!cs || !b) return false;
-    const escaped = b.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    // <base><space><pilot number (digits / # placeholders)><optional space>VA
-    return new RegExp('^' + escaped + '\\s+[0-9#]+\\s*VA$').test(cs);
+    const cs = String(callsign || '').trim().toUpperCase().replace(/\s+/g, ' ');
+    const parts = vaCallsignParts(base);
+    if (!cs || !parts) return false;
+    const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // <base><space><pilot number (digits / # placeholders)><optional space><tag>
+    // The tag comes off the stored mask, so "SHAMROCK ###EX" wants "EX" and
+    // "BAW ###" wants nothing after the number.
+    const tail = parts.tag ? `\\s*${esc(parts.tag)}` : '';
+    return new RegExp('^' + esc(parts.base) + '\\s+[0-9#]+' + tail + '$').test(cs);
 };
 
 // List-aware form of callsignMatchesVaBase: returns the first stored base the
@@ -1896,6 +2020,58 @@ const callsignAirlineBase = (raw) => {
     if (!raw) return null;
     const clean = String(raw).trim().toUpperCase().replace(/\s+\d+\s*[A-Z]*$/, '').trim();
     return clean || null;
+};
+
+// Uppercased with every separator (and "#" placeholder) removed, so a stored
+// callsign and a live one line up regardless of how either was spaced:
+// "Air Canada 001VA" -> "AIRCANADA001VA", "AIR CANADA ##VA" -> "AIRCANADAVA".
+const compactCallsign = (raw) => String(raw || '').toUpperCase().replace(/[\s\-_/#]+/g, '');
+
+// Does this live callsign at least fly one of the VA's AIRLINES? The tag is
+// ignored — "Ocean 12", "Ocean 12VA" and "Ocean 12XY" all share the base
+// "OCEAN" — so this is the loose half of the pair with matchVaCallsign, which
+// additionally demands the "<base> <number>VA" shape. Used where the tag is
+// deliberately waived (the pilot-roster fallback) but the airline is not.
+const callsignSharesVaBase = (callsign, bases = []) => {
+    const cs = compactCallsign(callsign);
+    if (!cs) return false;
+    for (const b of (Array.isArray(bases) ? bases : [bases])) {
+        // Reduce a stored mask ("OCEAN ##VA") to its airline part before
+        // comparing, or the trailing "VA" would never line up with "OCEAN 12".
+        const base = compactCallsign(String(b || '').replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, ''));
+        if (base && cs.startsWith(base)) return true;
+    }
+    return false;
+};
+
+// The callsign strictness a VA listing runs under. Anything unrecognised (or a
+// doc saved before the field existed) is 'strict'.
+const vaCallsignMode = (ad) => {
+    const m = String(ad?.callsignMatch || '').trim().toLowerCase();
+    return VA_CALLSIGN_MATCH_MODES.includes(m) ? m : 'strict';
+};
+
+// How far this listing lets its pilot roster vouch for a flight the callsign
+// rule rejects. Anything unrecognised (or a doc saved before the field existed)
+// is 'airline' — the roster waives the tag and nothing more.
+const vaRosterTrust = (ad) => {
+    const r = String(ad?.rosterTrust || '').trim().toLowerCase();
+    return VA_ROSTER_TRUST_MODES.includes(r) ? r : 'airline';
+};
+
+// Does this live callsign fit the listing's registered callsigns closely enough
+// for the mode the VA chose? 'exact' demands the full "<base> <number>VA" shape;
+// 'strict' and 'broad' only ask that the airline is one of theirs. A listing
+// with no stored callsigns has declared nothing to check against, so nothing
+// fits — callers decide whether that means "skip" or "trust the sender".
+const callsignFitsVa = (callsign, ad) => {
+    const bases = Array.isArray(ad?.callsigns) && ad.callsigns.length
+        ? ad.callsigns
+        : (ad?.callsign ? [ad.callsign] : []);
+    if (!bases.length) return false;
+    return vaCallsignMode(ad) === 'exact'
+        ? !!matchVaCallsign(callsign, bases)
+        : callsignSharesVaBase(callsign, bases);
 };
 
 // True only for a well-formed Discord webhook URL. Partner VAs paste these into
@@ -9702,6 +9878,8 @@ app.post('/api/va-ads', requireAuth, uploadVaImages, async (req, res) => {
             name: name.trim(),
             callsign,
             callsigns,
+            callsignMatch: VA_CALLSIGN_MATCH_MODES.includes(req.body.callsignMatch) ? req.body.callsignMatch : 'strict',
+            rosterTrust: VA_ROSTER_TRUST_MODES.includes(req.body.rosterTrust) ? req.body.rosterTrust : 'airline',
             type: VA_AD_TYPES.includes(req.body.type) ? req.body.type : 'VA',
             tagline: req.body.tagline,
             description: req.body.description,
@@ -9781,6 +9959,17 @@ app.put('/api/va-ads/:id', requireAuth, uploadVaImages, async (req, res) => {
             ad.callsigns = cs ? [cs] : [];
         }
         if (b.callsign !== undefined) ad.callsign = cleanCallsignInput(b.callsign);
+        // How closely a live callsign must follow the callsigns above before a
+        // flight counts as this VA's. Anything unrecognised means 'strict'.
+        if (b.callsignMatch !== undefined) {
+            const m = String(b.callsignMatch || '').trim().toLowerCase();
+            ad.callsignMatch = VA_CALLSIGN_MATCH_MODES.includes(m) ? m : 'strict';
+        }
+        // How far the pilot roster may vouch for a callsign that rule rejects.
+        if (b.rosterTrust !== undefined) {
+            const r = String(b.rosterTrust || '').trim().toLowerCase();
+            ad.rosterTrust = VA_ROSTER_TRUST_MODES.includes(r) ? r : 'airline';
+        }
         if (b.type !== undefined && VA_AD_TYPES.includes(b.type)) ad.type = b.type;
         if (b.tagline !== undefined) ad.tagline = b.tagline;
         if (b.description !== undefined) ad.description = b.description;
@@ -10133,6 +10322,46 @@ app.delete('/api/va-ads/:id/pilots', requireAuth, async (req, res) => {
 // one the public GET /api/va-ads listing returns. Only display-safe fields go
 // out: the roster drops the addedBy audit trail and row ids, and both routes
 // 404 (not 500) on a malformed id.
+
+/**
+ * GET /api/va/roster-watch — every username the ACARS matcher must watch even
+ * when the callsign says nothing.
+ *
+ * The event pipeline only forwards a flight once its CALLSIGN matches some VA,
+ * which is exactly the flight a `rosterTrust: 'any'` VA has asked to receive and
+ * would never see: a member on a codeshare or partner callsign matches nobody,
+ * so nothing is ever pushed and the roster never gets a chance to vouch. This is
+ * the small extra signal that closes that hole — the ACARS side folds it into
+ * its poll and forwards those pilots' flights unattributed, leaving the
+ * attribution itself to resolveVaEventPartner here.
+ *
+ * Only VAs that BOTH opted into flight events (staff-approved, enabled, live
+ * webhook) and set `rosterTrust: 'any'` contribute. Usernames go out expanded
+ * through rosterMatchKeys, so the matcher can test a live IF username with a
+ * plain lowercase lookup instead of reimplementing the separator rules.
+ *
+ * Public, like the per-VA roster route below it — it exposes strictly less than
+ * that one does (no VA linkage, no display casing, no timestamps).
+ */
+app.get('/api/va/roster-watch', async (req, res) => {
+    try {
+        const ads = await VirtualAirlineAd.find({ ...OPTED_IN_PARTNER_FILTER, rosterTrust: 'any' })
+            .select('_id').lean();
+        if (!ads.length) {
+            res.set('Cache-Control', 'public, max-age=120');
+            return res.json({ ok: true, count: 0, usernames: [] });
+        }
+        const rows = await VaPilot.find({ vaAdId: { $in: ads.map((a) => a._id) } })
+            .select('username').lean();
+        const out = new Set();
+        for (const r of rows) for (const k of vaPilots.rosterMatchKeys(r.username)) out.add(k);
+        res.set('Cache-Control', 'public, max-age=120');
+        res.json({ ok: true, count: out.size, usernames: [...out] });
+    } catch (error) {
+        console.error('VA roster-watch error:', error);
+        res.status(500).json({ message: 'Server error while building the roster watch list.' });
+    }
+});
 
 // GET /api/public/va/:id/pilots?q=&limit=&skip= — the VA's pilot roster.
 // Same search/paging as the staff route: q is a case-insensitive username
@@ -11644,7 +11873,7 @@ const OPTED_IN_PARTNER_FILTER = {
     flightEventsEnabled: true,
     flightEventsWebhookUrl: { $ne: null },
 };
-const PARTNER_SELECT = 'name callsigns logoUrl flightEventsCard +flightEventsWebhookUrl';
+const PARTNER_SELECT = 'name callsign callsigns callsignMatch rosterTrust logoUrl flightEventsCard +flightEventsWebhookUrl';
 
 // Attribute an event to an opted-in VA by PILOT ROSTER: the flight's pilot
 // (e.username) is on that VA's roster of Infinite Flight usernames. This is what
@@ -11652,12 +11881,33 @@ const PARTNER_SELECT = 'name callsigns logoUrl flightEventsCard +flightEventsWeb
 // when the live callsign doesn't fit the VA's registered pattern. Used only as a
 // fallback (see resolveVaEventPartner) so it never redirects a flight away from
 // the VA the sender explicitly attributed it to. Returns an opted-in ad or null.
+//
+// A roster says who a pilot IS, never what they are flying right now, and plenty
+// of pilots hold membership in several VAs at once. Taken alone it posted a
+// member's every flight into the feed of every VA they had ever joined,
+// including the legs they flew for somebody else — the "pilots popping up in a
+// VA they aren't flying for" report. So how much weight the roster carries is
+// the VA's own call, via `rosterTrust` on the listing:
+//
+//   'off'     — the roster never delivers.
+//   'airline' — (default) it waives the VA's suffix TAG and nothing more, so an
+//     untagged "Ocean 12" by a rostered pilot counts for Ocean while that same
+//     pilot's "Etihad 456FR" does not.
+//   'any'     — it waives the callsign entirely. The opt-in for VAs whose
+//     members fly codeshare or partner callsigns; they have accepted that
+//     everything else those pilots fly arrives too.
+//
+// Airline-matched candidates always outrank 'any' ones, so a pilot on two
+// rosters lands with the VA whose callsign they are actually flying.
 const resolveVaEventPartnerByRoster = async (e) => {
-    const u = String(e.username || '').trim().toLowerCase();
-    if (!u) return null;
+    // Roster entries are typed by VA staff and the live name comes off the IF
+    // API, so the two disagree about separators far more often than they
+    // disagree about the pilot — match every form the name could be written in.
+    const keys = vaPilots.rosterMatchKeys(e.username);
+    if (!keys.length) return null;
     let vaIds;
     try {
-        const rows = await VaPilot.find({ usernameLower: u }).select('vaAdId').lean();
+        const rows = await VaPilot.find({ usernameLower: { $in: keys } }).select('vaAdId').lean();
         vaIds = [...new Set(rows.map((r) => String(r.vaAdId)))];
     } catch (err) {
         console.error('[va-events] roster lookup failed:', err.message);
@@ -11673,14 +11923,26 @@ const resolveVaEventPartnerByRoster = async (e) => {
         console.error('[va-events] roster partner lookup failed:', err.message);
         return null;
     }
-    const valid = ads.filter((a) => a.flightEventsWebhookUrl && isDiscordWebhookUrl(a.flightEventsWebhookUrl));
-    if (!valid.length) return null;
+    const opted = ads.filter((a) => a.flightEventsWebhookUrl && isDiscordWebhookUrl(a.flightEventsWebhookUrl));
+    if (!opted.length) return null;
+
+    // Preferred: the roster VA whose airline this pilot is actually flying.
+    const onAirline = opted.filter((a) => vaRosterTrust(a) !== 'off' && callsignFitsVa(e.callsign, a));
+    // Fallback: VAs that opted into vouching for any callsign at all.
+    const anyCallsign = opted.filter((a) => vaRosterTrust(a) === 'any');
+    const valid = onAirline.length ? onAirline : anyCallsign;
+
+    if (!valid.length) {
+        console.log(`[va-events] pilot "${e.username}" is on ${opted.length} opted-in roster(s) but "${e.callsign}" is not one of their callsigns, and none accept other callsigns — not delivering`);
+        return null;
+    }
     // A pilot on several opted-in rosters is ambiguous; pick deterministically
     // (name-sorted) and log it so the overlap is visible rather than silent.
+    const how = onAirline.length ? 'roster + airline' : 'roster (any callsign)';
     if (valid.length > 1) {
-        console.warn(`[va-events] pilot "${e.username}" is on ${valid.length} opted-in rosters — attributing to "${valid[0].name}"`);
+        console.warn(`[va-events] pilot "${e.username}" matches ${valid.length} opted-in rosters for "${e.callsign}" via ${how} — attributing to "${valid[0].name}"`);
     } else {
-        console.log(`[va-events] attributed by roster: pilot "${e.username}" → "${valid[0].name}"`);
+        console.log(`[va-events] attributed by ${how}: pilot "${e.username}" → "${valid[0].name}"`);
     }
     return valid[0];
 };
@@ -11737,12 +11999,37 @@ const resolveVaEventPartner = async (e) => {
     for (const n of names) attrOr.push({ name: new RegExp('^' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
     let ad = await findPartner(attrOr);
 
+    // 1b. …unless the VA asked us not to take the sender's word for it. A
+    //     listing running in 'exact' mode has said it wants its registered
+    //     callsigns and nothing that merely resembles them, so the live callsign
+    //     is re-checked against "<base> <number>VA" even on the attributed path.
+    //     That is the whole point of the setting.
+    //
+    //     Dropping the attribution rather than returning: the VA may still have
+    //     its roster set to vouch for other callsigns (rosterTrust: 'any'), and
+    //     that question is asked further down. Exact governs callsigns; it does
+    //     not overrule a roster the VA deliberately opened up.
+    if (ad && vaCallsignMode(ad) === 'exact' && !callsignFitsVa(e.callsign, ad)) {
+        const hasCallsigns = (ad.callsigns && ad.callsigns.length) || ad.callsign;
+        console.log(hasCallsigns
+            ? `[va-events] "${ad.name}" runs exact callsign matching and "${e.callsign}" is not one of its registered callsigns — falling through to the roster`
+            // Exact mode with nothing to be exact about matches no callsign at
+            // all. Say so plainly; the fix is a callsign on the listing.
+            : `[va-events] "${ad.name}" runs exact callsign matching but has no registered callsigns — no callsign can match it`);
+        ad = null;
+    }
+
     // 2. Nothing attributed. Now the callsign may speak — but only if it really
     //    is one of this listing's callsigns, tag included. A pilot flying
     //    "OCEAN 12" or "OCEAN 12XY" is not flying for the VA that owns "OCEAN".
+    //    A listing in 'broad' mode has explicitly accepted the untagged form, so
+    //    for those the shared airline base is enough.
     if (!ad && callsignBases.length) {
         const guess = await findPartner([{ callsigns: { $in: callsignQueryVariants(callsignBases) } }]);
-        if (guess && matchVaCallsign(e.callsign, guess.callsigns || [])) {
+        const fits = guess && (vaCallsignMode(guess) === 'broad'
+            ? callsignSharesVaBase(e.callsign, guess.callsigns || [])
+            : !!matchVaCallsign(e.callsign, guess.callsigns || []));
+        if (fits) {
             ad = guess;
         } else if (guess) {
             console.log(`[va-events] callsign "${e.callsign}" shares a base with "${guess.name}" but carries no matching VA tag — not delivering`);
@@ -12030,10 +12317,15 @@ const toResolvePayload = (cfg) => ({
     callsignPrefixes: (cfg.callsignPrefixes && cfg.callsignPrefixes.length) ? cfg.callsignPrefixes : [cfg.va.code],
     callsignSuffixes: cfg.callsignSuffixes || [],
     regularCallsigns: cfg.regularCallsigns || [],
+    // 'exact' = the registered shape "<prefix><number><tag>" and nothing else;
     // 'strict' = only this VA's registered callsign shapes; 'broad' = also the
     // bare prefix, which finds more members and can also find somebody else's.
     // See the field's note on the schema for why this is a choice and not a fix.
-    callsignMatch: cfg.callsignMatch === 'broad' ? 'broad' : 'strict',
+    callsignMatch: EMBED_CALLSIGN_MATCH_MODES.includes(cfg.callsignMatch) ? cfg.callsignMatch : 'strict',
+    // How far the VA's pilot roster may vouch for a callsign the rule above
+    // rejects: 'off' = never, 'airline' = waives the tag only, 'any' = a
+    // rostered pilot counts whatever they're flying (the codeshare opt-in).
+    rosterTrust: EMBED_ROSTER_TRUST_MODES.includes(cfg.rosterTrust) ? cfg.rosterTrust : 'airline',
     hubs: cfg.hubs || [],
     mode: cfg.mode || 'roster',
     provider: cfg.provider || (cfg.mapboxToken ? 'mapbox' : 'free'),
@@ -12139,7 +12431,14 @@ const applyEmbedFields = (cfg, body) => {
     // means 'strict', because showing somebody else's pilot as yours is the
     // error a VA has not agreed to.
     if (body.callsignMatch !== undefined) {
-        cfg.callsignMatch = String(body.callsignMatch) === 'broad' ? 'broad' : 'strict';
+        const m = String(body.callsignMatch || '').trim().toLowerCase();
+        cfg.callsignMatch = EMBED_CALLSIGN_MATCH_MODES.includes(m) ? m : 'strict';
+    }
+    // Whether the VA's roster may vouch for a callsign that rule rejects.
+    // Unrecognised means 'airline' — the roster waives the tag, not the airline.
+    if (body.rosterTrust !== undefined) {
+        const r = String(body.rosterTrust || '').trim().toLowerCase();
+        cfg.rosterTrust = EMBED_ROSTER_TRUST_MODES.includes(r) ? r : 'airline';
     }
     // hubs accepts the body keys "hubs", "icao" or "hub"; stored uppercase ICAO.
     if (body.hubs !== undefined || body.icao !== undefined || body.hub !== undefined) {

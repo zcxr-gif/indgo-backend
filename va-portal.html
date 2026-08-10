@@ -302,6 +302,44 @@
                 </div>
             </div>
 
+            <!-- Which flights count as this VA's. The lever for "flights that
+                 aren't ours keep showing up" — it decides how closely a live
+                 callsign has to follow the callsigns the VA registered. -->
+            <div id="pfMatchCard" class="hidden surface rounded-2xl p-5 sm:p-6 space-y-4 mt-4">
+                <div class="flex items-start gap-3">
+                    <div class="w-9 h-9 rounded-xl bg-zinc-100 dark:bg-zinc-800 grid place-items-center shrink-0"><i data-lucide="filter" class="w-4 h-4 text-zinc-500 dark:text-zinc-400"></i></div>
+                    <div class="min-w-0">
+                        <p class="text-sm font-semibold" data-i18n="fe.match.title">Which flights count as yours</p>
+                        <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5" data-i18n="fe.match.sub">Choose how closely a live callsign has to follow the callsigns you registered with us before we post the flight. Tighten this if flights that aren't yours keep showing up.</p>
+                    </div>
+                </div>
+                <div>
+                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.match.label">Callsign matching</label>
+                    <select id="pfMatchMode" class="field pf-edit">
+                        <option value="exact" data-i18n="fe.match.exact">Exactly my callsigns — the number and tag, nothing after</option>
+                        <option value="strict" selected data-i18n="fe.match.strict">My callsigns, with a little room (recommended)</option>
+                        <option value="broad" data-i18n="fe.match.broad">Anything on my airline name — catches more, and others</option>
+                    </select>
+                    <p id="pfMatchCallsigns" class="text-xs text-zinc-500 dark:text-zinc-400 mt-1.5 break-words"></p>
+                    <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-1.5 leading-relaxed" data-i18n="fe.match.help">"Exactly my callsigns" takes only your callsign followed by the flight number and your tag — a second trailing tag or a missing tag are left out. The middle option also allows an extra trailing tag after yours.</p>
+                </div>
+
+                <!-- The codeshare opt-in. Separate question from the one above:
+                     that decides how a callsign is read, this decides whether the
+                     roster may overrule it. -->
+                <div>
+                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.roster.trustLabel">Pilots on your roster</label>
+                    <select id="pfRosterTrust" class="field pf-edit">
+                        <option value="off" data-i18n="fe.roster.trustOff">Only count them on a callsign above</option>
+                        <option value="airline" selected data-i18n="fe.roster.trustAirline">Count them on my airline even without my tag (recommended)</option>
+                        <option value="any" data-i18n="fe.roster.trustAny">Count them on any callsign — including codeshares</option>
+                    </select>
+                    <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-1.5 leading-relaxed" data-i18n="fe.roster.trustHelp">A live flight only tells us the callsign the pilot typed, so a member on a codeshare leg looks like anyone else. "Any callsign" fixes that using your roster — and means everything else those pilots fly arrives too, including flights for another VA. Only your roster is used, so add your pilots below first.</p>
+                    <p id="pfMatchMsg" class="hidden text-sm font-medium mt-2 break-words"></p>
+                    <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-2 leading-relaxed" data-i18n="fe.match.applies">Both settings apply to your Discord notifications and your live map embed.</p>
+                </div>
+            </div>
+
             <!-- Card appearance customization (shown once a webhook is on file) -->
             <div id="pfCardCustomize" class="hidden surface rounded-2xl p-5 sm:p-6 space-y-4 mt-4">
                 <div class="flex items-start gap-3">
@@ -1321,6 +1359,23 @@
                 flash('pfFlightMsg', e.target.checked ? t('fe.resumed') : t('fe.paused'), true);
             } catch (err) { e.target.checked = !e.target.checked; flash('pfFlightMsg', err.message, false); }
         });
+        // Which flights count as this VA's: how a callsign is read, and how far
+        // the roster may overrule it. Both save immediately — each is one choice,
+        // and an owner reaching for either wants the next flight filtered.
+        const saveMatching = async (el, field, prevValue) => {
+            try {
+                const { va } = await api('/flight-events/matching', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ [field]: el.value }),
+                });
+                vaProfile = va;
+                flash('pfMatchMsg', t('fe.match.saved'), true);
+            } catch (err) { el.value = prevValue; flash('pfMatchMsg', err.message, false); }
+        };
+        $('pfMatchMode').addEventListener('change', (e) =>
+            saveMatching(e.target, 'callsignMatch', (vaProfile && vaProfile.callsignMatch) || 'strict'));
+        $('pfRosterTrust').addEventListener('change', (e) =>
+            saveMatching(e.target, 'rosterTrust', (vaProfile && vaProfile.rosterTrust) || 'airline'));
         // Fire a sample takeoff card at the saved webhook so the owner can confirm
         // delivery (and what the card looks like) without waiting for a real flight.
         $('pfFlightTestBtn').addEventListener('click', async () => {
@@ -1342,6 +1397,16 @@
             if (editable) loadPfPilots();
             const wrap = $('pfCardCustomize');
             const show = editable && (va.flightEventsConfigured || va.flightEventsRequested || va.flightEventsApproved);
+            // Callsign matching and roster trust govern the live map embed as
+            // well as the Discord feed, so — like the roster itself — they show
+            // whenever the owner can edit, not only once a webhook exists.
+            $('pfMatchCard').classList.toggle('hidden', !editable);
+            if (editable) {
+                $('pfMatchMode').value = ['exact', 'broad'].includes(va.callsignMatch) ? va.callsignMatch : 'strict';
+                $('pfRosterTrust').value = ['off', 'any'].includes(va.rosterTrust) ? va.rosterTrust : 'airline';
+                const cs = Array.isArray(va.callsigns) ? va.callsigns.filter(Boolean) : [];
+                $('pfMatchCallsigns').textContent = cs.length ? t('fe.match.yours') + ' ' + cs.join(', ') : '';
+            }
             wrap.classList.toggle('hidden', !show);
             if (!show) return;
             const c = va.flightEventsCard || {};
