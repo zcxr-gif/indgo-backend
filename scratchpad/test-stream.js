@@ -25,7 +25,21 @@ const streamJsonArray = async (res, query, { prefix = '', suffix = '' } = {}) =>
             // The socket is full. Wait for it to drain before reading more
             // documents, so the cursor advances no faster than the client
             // consumes and memory stays flat on a slow connection.
-            await new Promise((resolve) => res.once('drain', resolve));
+            //
+            // 'close' is raced against 'drain' because a client that hangs up
+            // while the socket is full never drains — and waiting on 'drain'
+            // alone would then suspend this function forever, so the `finally`
+            // below never runs and the cursor is never released. An abandoned
+            // download is not exotic on these endpoints (closing the tab on a
+            // large response does it), so that would leak a cursor per abort
+            // and quietly become the very thing this helper exists to prevent.
+            // Both listeners are removed on whichever fires, so a long response
+            // cannot accumulate them either.
+            await new Promise((resolve) => {
+                const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+                res.once('drain', done);
+                res.once('close', done);
+            });
         }
     };
     try {
@@ -39,6 +53,9 @@ const streamJsonArray = async (res, query, { prefix = '', suffix = '' } = {}) =>
             }
             buf += JSON.stringify(doc);
             await flush(false);
+            // Nobody is listening any more. Stop pulling documents for a socket
+            // that is gone rather than reading the collection to its end.
+            if (res.destroyed) return;
         }
         if (!started) {
             res.set('Content-Type', 'application/json; charset=utf-8');
