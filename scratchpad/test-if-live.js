@@ -274,6 +274,86 @@ T('a real change is reported',
     ['callsign']);
 
 // ---------------------------------------------------------------------------
+console.log('\nFleet utilisation — the aeroplane nobody is using');
+//
+// The expensive mistake this exists to catch is an airframe sitting unflown for
+// weeks that everybody assumes somebody else is on. Two ways to get it wrong,
+// and both are worse than not reporting at all: calling an aircraft idle when
+// its rota merely failed to load, and calling it busy on the strength of a
+// schedule nobody actually flew.
+// ---------------------------------------------------------------------------
+
+const uNow = Date.parse('2026-08-10T12:00:00Z');
+const uFleet = [
+    { id: 'a', registration: 'N1', storage: 'active', fleetRank: 1 },
+    { id: 'b', registration: 'N2', storage: 'active', fleetRank: 2 },
+    { id: 'c', registration: 'N3', storage: 'storage', fleetRank: 3 },
+    { id: 'd', registration: 'N4', storage: 'active', fleetRank: 4 },
+    { id: 'e', registration: 'N5', storage: 'active', fleetRank: 5 },
+];
+const uRotas = {
+    a: [
+        { status: { name: 'Scheduled' }, scheduledDepartureUtc: '2026-08-11T09:00:00Z', blockMinutes: 120 },
+        { status: { name: 'Arrived' }, scheduledDepartureUtc: '2026-08-01T09:00:00Z', actualArrivalUtc: '2026-08-01T11:00:00Z' },
+    ],
+    b: [{ status: { name: 'Arrived' }, scheduledDepartureUtc: '2026-07-20T09:00:00Z', actualArrivalUtc: '2026-07-20T11:00:00Z' }],
+    c: [],
+    d: null,               // the read failed
+    e: [],                 // genuinely nothing, never flown
+};
+const util = L.fleetUtilisation(uFleet, uRotas, uNow);
+const byReg = Object.fromEntries(util.aircraft.map((r) => [r.registration, r]));
+
+T('an active aircraft with nothing coming up is idle', byReg.N2.idle, true);
+T('an aircraft with an upcoming leg is not idle', byReg.N1.idle, false);
+// Put away is a decision somebody made; it is not the same finding.
+T('an aircraft in storage is not "idle"', byReg.N3.idle, false);
+// The one that matters most: a failed read must never read as an empty rota.
+T('an unread rota is not idle', byReg.N4.idle, false);
+T('an unread rota reports null legs, not zero', byReg.N4.upcoming, null);
+T('an unread rota is flagged as unknown', byReg.N4.rotaUnknown, true);
+T('a genuinely empty rota reports zero, not null', byReg.N5.upcoming, 0);
+
+T('days since flown come from the ACTUAL arrival', byReg.N2.daysSinceFlown, 21);
+T('never flown is null, not a very large number', byReg.N5.daysSinceFlown, null);
+T('block time is summed over upcoming legs only', byReg.N1.scheduledMinutes, 120);
+
+// A cancelled leg is not workload, and counting it would report a fleet as busy
+// on the strength of flights that are explicitly not happening.
+T('a cancelled leg is not upcoming work',
+    L.aircraftUtilisation({ id: 'x', storage: 'active' },
+        [{ status: { name: 'Cancelled' }, scheduledDepartureUtc: '2026-08-11T09:00:00Z', blockMinutes: 300 }], uNow),
+    {
+        id: 'x', registration: '', storage: 'active', fleetRank: null,
+        upcoming: 0, scheduledMinutes: 0, flownLegs: 0, cancelledLegs: 1,
+        nextDepartureUtc: null, lastArrivalUtc: null, daysSinceFlown: null,
+        idle: true, rotaUnknown: false,
+    });
+
+// A rota in the past that was never actually flown is a plan, not evidence.
+T('a scheduled arrival in the past is not proof it flew',
+    L.aircraftUtilisation({ id: 'y', storage: 'active' },
+        [{ status: { name: 'Scheduled' }, scheduledDepartureUtc: '2026-07-01T09:00:00Z', scheduledArrivalUtc: '2026-07-01T11:00:00Z' }], uNow).lastArrivalUtc,
+    null);
+
+// The twelve-hour grace: a departure that pushed back an hour ago is still
+// today's flying, and the aeroplane is not idle.
+T('a leg that departed an hour ago still counts as upcoming',
+    L.aircraftUtilisation({ id: 'z', storage: 'active' },
+        [{ status: { name: 'InFlight' }, scheduledDepartureUtc: '2026-08-10T11:00:00Z' }], uNow).upcoming, 1);
+
+T('the summary counts only what it could read', [util.summary.read, util.summary.unknown], [4, 1]);
+T('the longest idle stretch is reported', util.summary.longestIdleDays, 21);
+T('an aircraft never flown at all is counted separately', util.summary.neverFlown, 1);
+// Sorted for a reader: the thing to act on first. Idle before busy, and among
+// the idle, "we have never used this one" outranks "this one has sat for three
+// weeks" — the never-flown airframe is the more interesting finding.
+T('the idle aircraft sort above the busy ones',
+    util.aircraft.slice(0, 2).map((r) => r.registration).sort(), ['N2', 'N5']);
+T('a never-flown aircraft outranks a long-idle one', util.aircraft[0].registration, 'N5');
+T('the longest-idle flown aircraft comes next', util.aircraft[1].registration, 'N2');
+
+// ---------------------------------------------------------------------------
 console.log('\nScopes — the panel offers what was granted, not what we asked');
 // ---------------------------------------------------------------------------
 

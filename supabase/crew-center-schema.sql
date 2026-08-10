@@ -794,6 +794,20 @@ alter table crew_schedules add column if not exists if_schedule_id text;
 alter table crew_schedules add column if not exists if_aircraft_id text;
 alter table crew_schedules add column if not exists if_synced_at   timestamptz;
 
+-- The airframe's registration, kept next to its id.
+--
+-- Denormalised deliberately. `aircraft` above is the TYPE and livery — what a
+-- VA has always been able to say about a departure. This is the specific
+-- aeroplane, and the registration is the only part of it a pilot reads ("you're
+-- on N682XL"). Resolving it from `if_aircraft_id` would mean calling Infinite
+-- Flight to draw a schedule, on a page the whole roster loads, for a VA who may
+-- not have connected an organization at all.
+--
+-- The id is the truth and the registration is the label. A stale label on a
+-- re-registered airframe is a much smaller problem than a schedule that cannot
+-- render unless a third party answers.
+alter table crew_schedules add column if not exists if_registration text;
+
 -- One crew departure per Infinite Flight schedule. Scoped by slug like every
 -- other unique index here (one project can back several brands), and partial so
 -- the many unpushed departures do not collide on null.

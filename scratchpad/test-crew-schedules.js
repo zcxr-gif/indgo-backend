@@ -65,6 +65,22 @@ T('the rank gate is carried', clean.minRank, 'Captain');
 T('a real status survives', S.sanitizeSchedule({ status: 'published' }).status, 'published');
 T('seats are capped', S.sanitizeSchedule({ seats: 999 }).seats, S.MAX_SEATS);
 
+// The airframe — WHICH aeroplane, as opposed to which type. `aircraft` is the
+// type and livery and has always been there; these two name a specific
+// aeroplane out of the VA's Infinite Flight organization.
+const assigned = S.sanitizeSchedule({
+    origin: 'EGLL', destination: 'KJFK',
+    aircraft: 'Boeing 787-9',
+    ifAircraftId: '28fb4508-9eca-4120-abe4-3c4f06f6e71c', ifRegistration: 'N682XL',
+});
+T('the airframe id is carried', assigned.ifAircraftId, '28fb4508-9eca-4120-abe4-3c4f06f6e71c');
+T('the registration is carried beside it', assigned.ifRegistration, 'N682XL');
+// The type and the airframe are different fields and must not overwrite each
+// other — a VA that has always filled in "Boeing 787-9" keeps it.
+T('assigning an airframe leaves the type alone', assigned.aircraft, 'Boeing 787-9');
+T('no airframe is empty, not undefined',
+    [S.sanitizeSchedule({}).ifAircraftId, S.sanitizeSchedule({}).ifRegistration], ['', '']);
+
 console.log('\ncrewSchedules — block time');
 
 const dep = '2026-03-01T18:40:00.000Z';
@@ -134,6 +150,21 @@ const uncounted = S.publicSchedule({ _id: 's1', seats: 2, status: 'published' },
 T('a figure nobody counted is null, not zero',
     [uncounted.booked, uncounted.seatsLeft], [null, null]);
 T('…and an uncounted departure is not "full"', uncounted.full, false);
+
+// The airframe reaches the world as a PAIR, so a front-end can link the id
+// through to the fleet board while showing the registration.
+T('an assigned airframe is published as id + registration',
+    S.publicSchedule({ _id: 's3', seats: 1, status: 'published', ifAircraftId: 'ac-1', ifRegistration: 'N682XL' }, {}).airframe,
+    { id: 'ac-1', registration: 'N682XL' });
+// null, not {} — "no airframe assigned" must not be mistakable for one whose
+// registration happens to be blank.
+T('no airframe is null, not an empty object',
+    S.publicSchedule({ _id: 's4', seats: 1, status: 'published' }, {}).airframe, null);
+// An id with no label still counts as assigned: the id is the truth and the
+// registration is only how it reads.
+T('an airframe with no registration is still an airframe',
+    S.publicSchedule({ _id: 's5', seats: 1, status: 'published', ifAircraftId: 'ac-2' }, {}).airframe,
+    { id: 'ac-2', registration: '' });
 
 const gated = S.publicSchedule(
     { _id: 's2', seats: 1, status: 'published', minRank: 'Captain' },

@@ -143,7 +143,7 @@ const LATE_COLUMNS = {
     crew_members: new Set(['checks_passed', 'retention_warned_at']),
     crew_events: new Set(['route_id']),
     crew_pireps: new Set(['event_id', 'schedule_id']),
-    crew_schedules: new Set(['if_schedule_id', 'if_aircraft_id', 'if_synced_at']),
+    crew_schedules: new Set(['if_schedule_id', 'if_aircraft_id', 'if_synced_at', 'if_registration']),
     crew_applications: new Set([
         'discord_invite', 'invite_username', 'invite_password',
         'invite_issued_at', 'invite_claimed_at', 'invite_revoked_at', 'invite_account_id',
@@ -160,6 +160,7 @@ const DRIFT_LABELS = {
     'crew_schedules.if_schedule_id': 'departures pushed to Infinite Flight',
     'crew_schedules.if_aircraft_id': 'departures pushed to Infinite Flight',
     'crew_schedules.if_synced_at': 'departures pushed to Infinite Flight',
+    'crew_schedules.if_registration': 'the aircraft a departure is flown by',
     'crew_routes.kind': 'codeshare routes',
     'crew_routes.partner_name': 'codeshare partner names',
     'crew_routes.partner_logo': 'codeshare partner logos',
@@ -628,6 +629,7 @@ const scheduleFromRow = (r) => r && {
     // LATE_COLUMNS, so a write mentioning them degrades rather than failing.
     ifScheduleId: r.if_schedule_id || '',
     ifAircraftId: r.if_aircraft_id || '',
+    ifRegistration: r.if_registration || '',
     ifSyncedAt: date(r.if_synced_at),
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
@@ -660,6 +662,9 @@ const scheduleToRow = (s) => {
     pick(s, out, 'ifScheduleId', 'if_schedule_id', (v) => (str(v, 64) || null));
     pick(s, out, 'ifAircraftId', 'if_aircraft_id', (v) => (str(v, 64) || null));
     pick(s, out, 'ifSyncedAt', 'if_synced_at', (v) => (date(v) ? date(v).toISOString() : null));
+    // Text, not a uuid column, so '' is a legal value — but null keeps "no
+    // airframe" a single answer across all four of these rather than two.
+    pick(s, out, 'ifRegistration', 'if_registration', (v) => (str(v, 40) || null));
     return out;
 };
 

@@ -742,6 +742,141 @@ function scheduleDiff(request, remote) {
 }
 
 // ---------------------------------------------------------------------------
+// What the fleet is actually doing
+//
+// A VA's most expensive mistake is not a badly-built schedule — it is an
+// aeroplane nobody has flown for three weeks that everybody assumes somebody
+// else is using. That question was previously unanswerable from the crew
+// center, and it is answerable now, because the rota and the actual times are
+// both on the schedules we can read.
+//
+// Everything here is derived from data Infinite Flight has already given us. It
+// invents nothing and, where a figure is genuinely unknown, it says null rather
+// than 0 — the same rule the rest of this codebase holds. An aircraft with no
+// schedules at all has flown `null` legs, not zero, unless the API actually
+// told us its rota is empty.
+// ---------------------------------------------------------------------------
+
+// A departure that pushed back an hour ago is still today's flying. Same grace
+// the crew center's own schedule list uses, so the two agree about what
+// "upcoming" means.
+const UPCOMING_GRACE_MS = 12 * 3600 * 1000;
+
+/**
+ * One aircraft's workload, from its rota.
+ *
+ * `schedules` is what listSchedules returned for this aircraft — already
+ * shaped. Pass null for "we did not manage to read it", which is different from
+ * an empty array meaning "it has nothing scheduled", and is reported as such.
+ */
+function aircraftUtilisation(aircraft, schedules, now = Date.now()) {
+    const a = aircraft || {};
+    const known = Array.isArray(schedules);
+    const list = known ? schedules : [];
+
+    let upcoming = 0;
+    let scheduledMinutes = 0;
+    let nextDepartureUtc = null;
+    let lastArrivalUtc = null;
+    let flown = 0;
+    let cancelled = 0;
+
+    for (const s of list) {
+        const status = s.status && s.status.name;
+        if (status === 'Cancelled') { cancelled += 1; continue; }
+
+        const dep = Date.parse(s.scheduledDepartureUtc || '');
+        if (Number.isFinite(dep) && dep > now - UPCOMING_GRACE_MS) {
+            upcoming += 1;
+            if (s.blockMinutes) scheduledMinutes += s.blockMinutes;
+            if (nextDepartureUtc === null || dep < Date.parse(nextDepartureUtc)) {
+                nextDepartureUtc = s.scheduledDepartureUtc;
+            }
+        }
+
+        // An ACTUAL arrival is the only evidence this aeroplane really flew.
+        // A scheduled arrival in the past is a plan that may or may not have
+        // happened, and counting it would report a fleet as busy on the
+        // strength of a rota nobody flew.
+        const arrived = Date.parse(s.actualArrivalUtc || '');
+        if (Number.isFinite(arrived)) {
+            flown += 1;
+            if (lastArrivalUtc === null || arrived > Date.parse(lastArrivalUtc)) {
+                lastArrivalUtc = s.actualArrivalUtc;
+            }
+        }
+    }
+
+    const lastFlownMs = lastArrivalUtc ? Date.parse(lastArrivalUtc) : null;
+    return {
+        id: a.id || null,
+        registration: a.registration || '',
+        storage: a.storage || '',
+        fleetRank: a.fleetRank ?? null,
+        // null, not 0, when the rota could not be read — see the header.
+        upcoming: known ? upcoming : null,
+        scheduledMinutes: known ? scheduledMinutes : null,
+        flownLegs: known ? flown : null,
+        cancelledLegs: known ? cancelled : null,
+        nextDepartureUtc,
+        lastArrivalUtc,
+        daysSinceFlown: lastFlownMs === null ? null : Math.floor((now - lastFlownMs) / 86400000),
+        // IDLE is a judgement and is stated as one: in the active fleet, and
+        // nothing coming up. An aeroplane in storage is not idle — it is put
+        // away, which is a decision somebody made — and one we could not read
+        // is not idle either, it is unknown.
+        idle: known && upcoming === 0 && (a.storage === 'active'),
+        rotaUnknown: !known,
+    };
+}
+
+/**
+ * The fleet's workload, and the aircraft worth looking at.
+ *
+ * `rotas` maps aircraft id → the schedules for it (or null/absent where the
+ * read failed). Sorted so the answer to "what should I do about my fleet?" is
+ * at the top: the idle aeroplanes first, longest-unflown first within that.
+ */
+function fleetUtilisation(aircraft, rotas, now = Date.now()) {
+    const list = (Array.isArray(aircraft) ? aircraft : [])
+        .map((a) => aircraftUtilisation(a, (rotas || {})[a.id] || null, now));
+
+    const known = list.filter((r) => !r.rotaUnknown);
+    const idle = list.filter((r) => r.idle);
+
+    // Sorted for the reader, not for the machine: idle first, and among the
+    // idle, the one that has sat longest. An aircraft never flown at all sorts
+    // above one flown last week, because "we have never used this" is the more
+    // interesting fact.
+    const rank = (r) => (r.idle ? 0 : 1);
+    const idleAge = (r) => (r.daysSinceFlown === null ? Infinity : r.daysSinceFlown);
+    list.sort((x, y) => rank(x) - rank(y)
+        || (rank(x) === 0 ? idleAge(y) - idleAge(x) : 0)
+        || (x.fleetRank ?? 1e9) - (y.fleetRank ?? 1e9)
+        || String(x.registration).localeCompare(String(y.registration)));
+
+    return {
+        aircraft: list,
+        summary: {
+            total: list.length,
+            // Every count below is over the aircraft we could actually read, and
+            // `unknown` says how many that leaves out — so a fleet whose rotas
+            // half failed to load reports "3 idle of 8 read" rather than
+            // quietly implying it read all twelve.
+            read: known.length,
+            unknown: list.length - known.length,
+            idle: idle.length,
+            upcomingLegs: known.reduce((n, r) => n + (r.upcoming || 0), 0),
+            scheduledMinutes: known.reduce((n, r) => n + (r.scheduledMinutes || 0), 0),
+            // The longest any active aeroplane has gone unflown. The single
+            // number a VA actually reacts to.
+            longestIdleDays: idle.reduce((n, r) => Math.max(n, r.daysSinceFlown === null ? 0 : r.daysSinceFlown), 0),
+            neverFlown: idle.filter((r) => r.lastArrivalUtc === null).length,
+        },
+    };
+}
+
+// ---------------------------------------------------------------------------
 // What went wrong, in words
 // ---------------------------------------------------------------------------
 
@@ -796,6 +931,8 @@ module.exports = {
     scheduleRequest, flightPlanRequest, reorderRequest, reorderPlan, utc,
     // the bridge
     fromCrewSchedule, toCrewSchedule, scheduleDiff,
+    // utilisation
+    aircraftUtilisation, fleetUtilisation, UPCOMING_GRACE_MS,
     // errors
     statusMessage, isRetryable,
     // limits, exported so the front-end counts down to the same numbers

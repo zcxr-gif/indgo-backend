@@ -4976,6 +4976,56 @@ function ifFleetSummary(aircraft, positions) {
     };
 }
 
+/**
+ * The fleet, reduced to what a picker needs.
+ *
+ * Exists because the crew center's own schedule editor wants to offer "which
+ * aeroplane?" and should not have to understand the Live connection to do it.
+ * So this answers **200 with an empty list** for a crew center that has not
+ * connected an organization, has no grant, or whose grant has expired — rather
+ * than the 409 the fleet endpoints correctly return. The editor's question is
+ * "what may I offer?", and "nothing" is a perfectly good answer to it; making a
+ * schedule form handle three failure codes to draw one dropdown would put the
+ * whole Live integration in the path of an unrelated feature.
+ *
+ * Deliberately narrow: id, registration and whether the aeroplane is in the
+ * active fleet. No positions, no fleet priorities, nothing that costs a second
+ * round trip per aircraft.
+ */
+app.get('/api/crew/:slug/if/airframes', async (req, res) => {
+    const gate = ifStaffGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const ad = await ifConnection(va._id);
+        if (!ad || !ad.ifConnectedAt || !ad.ifOrganizationId) return res.json({ airframes: [], connected: false });
+        const { token } = await ifTokenFor(va._id);
+        const aircraft = await ifCached(`${va._id}:fleet:${ad.ifOrganizationId}`,
+            () => ifOAuth.listAircraft(token, ad.ifOrganizationId));
+        res.json({
+            connected: true,
+            airframes: aircraft.map((a) => ({
+                id: a.id,
+                registration: a.registration,
+                // Offered but marked, not hidden: a VA may well schedule an
+                // aeroplane they are about to bring out of storage, and a
+                // picker that silently omits it looks broken to the one person
+                // who knows it exists.
+                inFleet: a.storage === 'active',
+                storage: a.storage,
+            })),
+        });
+    } catch (err) {
+        // Same reasoning as the empty list above: a Live connection having a
+        // bad minute must not stop a VA scheduling flights.
+        if (err instanceof ifOAuth.IfAuthError || err instanceof ifOAuth.IfApiError) {
+            return res.json({ airframes: [], connected: false, unavailable: true });
+        }
+        ifFail(res, err, { log: 'if airframes error', message: 'Could not read the fleet.' });
+    }
+});
+
 /** One aircraft, its last position and its rota, in a single answer. */
 app.get('/api/crew/:slug/if/aircraft/:aircraftId', async (req, res) => {
     const gate = ifStaffGate(req, req.params.slug);
@@ -4990,6 +5040,69 @@ app.get('/api/crew/:slug/if/aircraft/:aircraftId', async (req, res) => {
         });
         res.json(detail);
     } catch (err) { ifFail(res, err, { log: 'if aircraft error', message: 'Could not read that aircraft.' }); }
+});
+
+/**
+ * What every aeroplane in the fleet is actually doing.
+ *
+ * The question this answers is the expensive one a VA cannot otherwise ask:
+ * which of my aircraft is nobody using? An airframe sitting unflown for three
+ * weeks that everybody assumes somebody else is on is invisible in a rota
+ * viewed one aeroplane at a time, and it is exactly what a fleet board should
+ * surface.
+ *
+ * COSTS ONE CALL PER AIRCRAFT, so it is not on the fleet board's refresh path —
+ * it is its own tab, loaded when somebody asks for it, and shares the cache
+ * with the schedule tab (same keys) so opening one after the other is free.
+ *
+ * A rota that fails to load is reported as UNKNOWN rather than as an empty one.
+ * The difference matters more here than anywhere else in this integration:
+ * "this aircraft has nothing scheduled" is the headline finding, and producing
+ * it from a failed read would have a VA go looking for a problem that is not
+ * there.
+ */
+app.get('/api/crew/:slug/if/utilisation', async (req, res) => {
+    const gate = ifStaffGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const ad = await ifConnection(va._id);
+        const organizationId = ifOrgFor(req, ad);
+        if (!organizationId) return res.status(409).json({ error: 'Pick an Infinite Flight organization first.', code: 'no_organization' });
+        const { token, scopes } = await ifTokenFor(va._id);
+        if (!scopes.includes('live:schedules.read')) {
+            return res.status(403).json({
+                error: 'This connection wasn’t granted permission to read schedules, so the fleet’s workload can’t be worked out.',
+                code: 'no_schedule_scope',
+            });
+        }
+
+        const aircraft = await ifCached(`${va._id}:fleet:${organizationId}`,
+            () => ifOAuth.listAircraft(token, organizationId));
+
+        // Same bounded concurrency and same per-aircraft isolation as the
+        // position sweep: one aeroplane's rota failing must leave the other
+        // thirty-nine reported, marked unknown rather than empty.
+        const rotas = {};
+        const queue = aircraft.slice();
+        await Promise.all(Array.from({ length: Math.min(6, queue.length) }, async () => {
+            for (;;) {
+                const next = queue.shift();
+                if (!next) return;
+                try {
+                    rotas[next.id] = await ifCached(`${va._id}:sched:${next.id}`,
+                        () => ifOAuth.listSchedules(token, next.id));
+                } catch { rotas[next.id] = null; }
+            }
+        }));
+
+        res.json({
+            organizationId,
+            ...ifLive.fleetUtilisation(aircraft, rotas),
+            readAt: new Date().toISOString(),
+        });
+    } catch (err) { ifFail(res, err, { log: 'if utilisation error', message: 'Could not work out the fleet’s workload.' }); }
 });
 
 /** Just the position, for a board that is refreshing pins and nothing else. */
@@ -5199,13 +5312,26 @@ app.post('/api/crew/:slug/if/sync', async (req, res) => {
         const $set = {};
         if (req.body?.enabled !== undefined) $set.ifSyncSchedules = !!req.body.enabled;
         if (req.body?.aircraftId !== undefined) $set.ifSyncAircraftId = String(req.body.aircraftId || '').trim().slice(0, 64);
-        // Turning it on without saying which aeroplane would leave a switch that
-        // does nothing and no way to tell that from a switch that is broken.
-        if ($set.ifSyncSchedules && !($set.ifSyncAircraftId || va.ifSyncAircraftId)) {
-            return res.status(400).json({ error: 'Choose which aircraft the schedule is pushed to.' });
-        }
         await VirtualAirlineAd.updateOne({ _id: va._id }, { $set });
-        res.json({ ok: true, ...ifState(await ifConnection(va._id), { owner: true }) });
+
+        // Turning the switch on with no default aircraft is now a legitimate
+        // setup, not an error: a VA that assigns an airframe to each departure
+        // wants exactly that and nothing else. It used to be refused, back when
+        // the default was the only way to say where a leg went.
+        //
+        // It is still worth a word, because it is ALSO what an incomplete setup
+        // looks like — a switch that is on and, for most of the week, does
+        // nothing. So the reply says which of the two it is rather than leaving
+        // the VA to find out by publishing something.
+        const ad = await ifConnection(va._id);
+        const bare = ad && ad.ifSyncSchedules && !ad.ifSyncAircraftId;
+        res.json({
+            ok: true,
+            ...(bare ? {
+                notice: 'Only departures with an aircraft assigned to them will be sent. Set a default aircraft to send the rest as well.',
+            } : {}),
+            ...ifState(ad, { owner: true }),
+        });
     } catch (err) { ifFail(res, err, { log: 'if sync settings error', message: 'Could not save the sync settings.' }); }
 });
 
@@ -5376,6 +5502,121 @@ app.post('/api/crew/:slug/if/pull', async (req, res) => {
         });
     } catch (err) { ifFail(res, err, { log: 'if pull error', message: 'Could not import the schedule.' }); }
 });
+
+/* ---------------------------------------------------------------------------
+ * Keeping one aeroplane's rota in step, without anybody pressing anything
+ *
+ * The manual push above is the bulk operation: "send my week". This is the
+ * per-departure half — a leg published in the crew center appears on the
+ * aircraft's Infinite Flight rota, an edit follows it, and cancelling or
+ * deleting it takes it back off.
+ *
+ * TWO SEPARATE CONSENTS, AND THEY ANSWER DIFFERENT QUESTIONS.
+ *
+ *   assigning an airframe   says WHICH aeroplane this departure is flown by.
+ *                           On its own it is a label: pilots see "you're on
+ *                           N682XL" and nothing is written to Infinite Flight.
+ *   the sync switch         says WHETHER we may write to that aeroplane's real
+ *                           rota. Off by default.
+ *
+ * Keeping them apart matters because the first is a thing a VA does constantly
+ * while building a week, and treating it as permission to start editing their
+ * live fleet would be a surprise nobody asked for. A VA that never turns the
+ * switch on gets the registration on every departure and an untouched rota.
+ *
+ * WHY CANCELLING DELETES WHEN A PUSH NEVER DOES. The bulk push deliberately
+ * leaves alone anything that has merely gone from its list: "it stopped
+ * matching my query" is not evidence, and a bug in that loop would quietly
+ * strip somebody's aircraft. Cancelling or deleting a departure is not that.
+ * It is a person deciding, about one flight, that it is not happening — so the
+ * leg comes off the aeroplane, which is the only reading of that action that
+ * makes sense.
+ *
+ * NOTHING HERE MAY FAIL A REQUEST. Every call is fire-and-forget with its own
+ * catch, in the mould of postScheduleNotice above. A VA's schedule is theirs
+ * and lives in their database; Infinite Flight being slow, rate-limiting us or
+ * refusing a scope must never turn "publish this departure" into an error. What
+ * it produces instead is a log line and an unsynced row, which the panel shows.
+ * ------------------------------------------------------------------------ */
+async function syncScheduleToIf(va, action, schedule, store) {
+    if (!va || !schedule) return;
+    try {
+        const ad = await ifConnection(va._id);
+        if (!ad || !ad.ifConnectedAt || !ad.ifSyncSchedules) return;
+        if (!ifLive.canWriteSchedules(ad.ifScopes || [])) return;
+
+        // The departure's own airframe first, the VA's default second. A
+        // departure with neither is not going anywhere and is not an error —
+        // most of a VA's week may be unassigned, and that is a normal state.
+        const aircraftId = String(schedule.ifAircraftId || ad.ifSyncAircraftId || '').trim();
+        if (!aircraftId) return;
+
+        const linkedId = String(schedule.ifScheduleId || '').trim();
+
+        if (action === 'cancelled' || action === 'removed') {
+            if (!linkedId) return;
+            const { token } = await ifTokenFor(va._id);
+            await ifOAuth.deleteSchedule(token, linkedId);
+            // Only when the row still exists. A deleted departure has nothing
+            // left to unlink, and updating it would recreate it on some stores.
+            if (action === 'cancelled' && store) {
+                await store.updateSchedule(schedule._id, { ifScheduleId: '', ifSyncedAt: null }).catch(() => {});
+            }
+            ifInvalidate(va._id);
+            return;
+        }
+
+        // Anything else is a push. Only published departures: a draft is staff
+        // still working, and putting one on a real aeroplane would be acting on
+        // a decision they have not made.
+        if (schedule.status !== 'published') return;
+
+        const built = ifLive.fromCrewSchedule(schedule);
+        if (!built.ok) {
+            // Most often a departure with no arrival and no block time — ours
+            // are optional, theirs are not. Logged rather than surfaced: the
+            // panel already reports these by name on a manual push, which is
+            // where somebody is actually looking for an answer.
+            console.warn('if sync skipped —', built.reason);
+            return;
+        }
+
+        const { token } = await ifTokenFor(va._id);
+        const saved = linkedId
+            ? await ifOAuth.updateSchedule(token, linkedId, built.value)
+            : await ifOAuth.createSchedule(token, aircraftId, built.value);
+
+        if (store && saved && saved.id) {
+            await store.updateSchedule(schedule._id, {
+                ifScheduleId: saved.id,
+                ifAircraftId: aircraftId,
+                ifSyncedAt: new Date(),
+            }).catch((err) => {
+                // Pushed but not recorded. This is the one failure worth a loud
+                // log: the next publish will not find a link and will add the
+                // same leg to the aeroplane a second time.
+                console.warn('if sync wrote to Infinite Flight but could not record the link —', err?.message || err);
+            });
+        }
+        ifInvalidate(va._id);
+    } catch (err) {
+        // A schedule the VA can see and Infinite Flight has not been told
+        // about. Recoverable by hand from the panel, so this is a log and not
+        // an escalation.
+        console.warn(`if sync (${action}) skipped —`, err?.message || err);
+    }
+}
+
+/**
+ * The same, detached from the request that caused it.
+ *
+ * The caller is a route that has already done the thing the VA asked for. The
+ * reply should not wait on a third party to hear about it, and must not change
+ * because that third party said no.
+ */
+const syncScheduleToIfLater = (va, action, schedule, store) => {
+    syncScheduleToIf(va, action, schedule, store).catch(() => {});
+};
 
 /**
  * The pilot's view: what the airline is flying, without the controls.
@@ -6553,6 +6794,14 @@ app.post('/api/crew/:slug/schedules', async (req, res) => {
         // of flying wants their crew told once that the schedule is up — a
         // Discord channel with sixty identical embeds in it is the same thing
         // as no notice at all.
+        // Each one individually, because each is a leg on an aeroplane — a
+        // fortnight published in one go is a fortnight of flights that aircraft
+        // is really going to operate, and there is no batch endpoint for that.
+        // Detached, so sixty round trips do not sit in front of the reply.
+        if (template.status === 'published') {
+            for (const s of created) syncScheduleToIfLater(va, 'published', s, store);
+        }
+
         if (template.status === 'published' && created.length) {
             postScheduleNotice(va, 'published', created[0], gate.p, created.length);
             postAnnouncement(va, {
@@ -6611,6 +6860,14 @@ app.patch('/api/crew/:slug/schedules/:id', async (req, res) => {
         // people have booked has to reach them.
         if (before.status !== 'published' && s.status === 'published') postScheduleNotice(va, 'published', s, gate.p, 1);
         else if (before.status !== 'cancelled' && s.status === 'cancelled') postScheduleNotice(va, 'cancelled', s, gate.p, 1);
+
+        // The Live rota follows the edit — unlike the notice above, on EVERY
+        // save rather than only on a crossing. A notice is an announcement and
+        // must not repeat; a rota is a statement of fact about an aeroplane, and
+        // a departure whose time moved by an hour has to move by an hour on the
+        // aircraft too. syncScheduleToIf decides whether there is anything to
+        // do; a published leg with no airframe and no sync switch is a no-op.
+        syncScheduleToIfLater(va, s.status === 'cancelled' ? 'cancelled' : 'published', s, store);
         res.json(withDrift(store, { schedule: publicSchedule(s, { canManage: true }) }));
     } catch (err) { crewFail(res, err, { log: 'schedule edit error', message: 'Could not update the departure.' }); }
 });
@@ -6623,6 +6880,12 @@ app.delete('/api/crew/:slug/schedules/:id', async (req, res) => {
         const existing = await store.getSchedule(req.params.id);
         if (!existing) return res.json({ ok: true });
         await store.deleteSchedule(existing._id);
+        // Take the leg off the aeroplane too, before the announcement — and
+        // regardless of whether it was published, because what decides this is
+        // whether Infinite Flight was ever told about it, not whether the
+        // crew's noticeboard was. `store` is not passed: the row is gone, so
+        // there is nothing left to unlink.
+        syncScheduleToIfLater(va, 'removed', existing, null);
         // Only worth announcing if anybody could see it. Deleting a draft is
         // staff tidying up their own working copy.
         if (existing.status === 'published') postScheduleNotice(va, 'removed', existing, gate.p, 1);

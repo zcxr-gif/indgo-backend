@@ -84,6 +84,23 @@ function sanitizeSchedule(b) {
         origin: icao(b.origin),
         destination: icao(b.destination),
         aircraft: str(b.aircraft, 60),
+        // WHICH AEROPLANE, as opposed to which TYPE.
+        //
+        // `aircraft` above is the type and livery — "Boeing 787-10, British
+        // Airways" — which is what a VA has always been able to say about a
+        // departure. This is a specific airframe out of the VA's Infinite
+        // Flight organization: the persistent organization aircraft id, and its
+        // registration kept alongside.
+        //
+        // The registration is DENORMALISED on purpose. It is the only part a
+        // pilot reads ("you're on N682XL"), and looking it up would mean a call
+        // to Infinite Flight to draw a schedule — on a page a whole roster
+        // loads, for a VA that may not have connected an organization at all.
+        // The id is the truth; this is the label, and a stale label on a
+        // re-registered airframe is a far smaller problem than a schedule that
+        // cannot render without a third party answering.
+        ifAircraftId: str(b.ifAircraftId, 64),
+        ifRegistration: str(b.ifRegistration, 40),
         departsAt: when(b.departsAt),
         arrivesAt: when(b.arrivesAt),
         seats: Math.max(1, Math.min(MAX_SEATS, Math.round(Number(b.seats) || 1))),
@@ -149,6 +166,15 @@ function publicSchedule(s, { bookings = null, ranks = null, viewer = null, canMa
         origin: s.origin,
         destination: s.destination,
         aircraft: s.aircraft,
+        // The specific aeroplane, when the VA has assigned one. Sent as a pair
+        // rather than a bare string so a front-end can link the id through to
+        // the fleet board while showing the registration — and `null` rather
+        // than an empty object when there is none, so "no airframe assigned"
+        // cannot be mistaken for one with a blank registration.
+        airframe: s.ifAircraftId ? {
+            id: s.ifAircraftId,
+            registration: s.ifRegistration || '',
+        } : null,
         departsAt: s.departsAt,
         arrivesAt: s.arrivesAt,
         // Minutes rather than a formatted string: the crew center, the embed

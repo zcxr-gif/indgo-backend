@@ -153,6 +153,8 @@ than at the row.
 | `GET /api/crew/:slug/if/fleet` | staff | the fleet with every aircraft's last position attached, in one call |
 | `GET /api/crew/:slug/if/aircraft/:id` | staff | one aircraft, its position and its rota |
 | `GET /api/crew/:slug/if/aircraft/:id/position` | staff | just the last stored position |
+| `GET /api/crew/:slug/if/airframes` | staff | the fleet reduced to a picker. **Answers `[]` rather than 409** when nothing is connected |
+| `GET /api/crew/:slug/if/utilisation` | staff | what every aircraft is doing: legs booked, block scheduled, days since it last flew, which are idle |
 | `GET /api/crew/:slug/if/aircraft/:id/schedules` | staff | the aircraft's rota, in sequence, marked with which legs the crew center already has |
 | `POST /api/crew/:slug/if/aircraft/:id/schedules` | `schedules.manage` | add a leg to the end of the rota |
 | `PUT /api/crew/:slug/if/schedules/:id` | `schedules.manage` | change a leg |
@@ -659,10 +661,11 @@ Version history:
 - **v9** — `crew_storage_usage()`: the project reports its own size, so VA staff
   can see how close they are to their Supabase plan's ceiling from inside the
   crew center
-- **v13** — `crew_schedules.if_schedule_id` / `if_aircraft_id` / `if_synced_at`:
-  a departure can record the Infinite Flight Live schedule it was pushed to, so
-  the second push is an update rather than the same leg twice on somebody's real
-  aircraft
+- **v13** — `crew_schedules.if_schedule_id` / `if_aircraft_id` /
+  `if_registration` / `if_synced_at`: a departure can name the specific airframe
+  that flies it, and record the Infinite Flight Live schedule it was pushed to —
+  so the second push is an update rather than the same leg twice on somebody's
+  real aircraft
 
 Note what v13 is not: it is not what makes the Live panel work. The fleet, the
 positions and the Live schedules all come from Infinite Flight, so a project on
@@ -818,6 +821,85 @@ link). Three rules the sync follows:
 - **Deleting a Live schedule unlinks the crew departure, it does not delete it.**
   That row has bookings hanging off it and pilots who took those seats.
 
+### Which aeroplane, as opposed to which type
+
+`crew_schedules.aircraft` is the **type** and livery — "Boeing 787-9" — and has
+always been there. `if_aircraft_id` + `if_registration` name a **specific
+airframe** out of the VA's Live organization, and reach the world as
+`airframe: { id, registration }` (or `null`, never `{}` — "no airframe" must not
+be mistakable for one whose registration is blank).
+
+The registration is denormalised on purpose. It is the only part a pilot reads
+("you're on N682XL"), and resolving it from the id would mean calling Infinite
+Flight to draw a schedule — on a page the whole roster loads, for a VA who may
+not have connected an organization at all. The id is the truth; this is the
+label. A stale label on a re-registered airframe is a much smaller problem than
+a schedule that cannot render unless a third party answers.
+
+`GET /if/airframes` exists so the schedule editor can offer the picker without
+understanding the Live connection: it answers **200 with an empty list** for a
+crew center with no organization, no grant or an expired one, rather than the
+409 the fleet endpoints correctly return. A schedule form should not have to
+handle three failure codes to draw one dropdown, and "nothing to offer" is a
+perfectly good answer to "what may I offer?".
+
+### The automatic sync — two consents, two questions
+
+`syncScheduleToIf` in `server.js` runs off the crew center's own schedule
+routes: publish a departure and it appears on the aircraft's Live rota, edit it
+and the rota follows, cancel or delete it and the leg comes off.
+
+Two settings, deliberately answering different questions:
+
+| | says |
+|---|---|
+| assigning an airframe to a departure | **which** aeroplane it is flown by |
+| `ifSyncSchedules` | **whether** we may write to that aeroplane's real rota |
+
+Keeping them apart matters: assigning an airframe is something a VA does
+constantly while building a week, and treating it as permission to start editing
+their live fleet would be a surprise nobody asked for. With the switch off the
+airframe is purely a label — pilots see the registration, the rota is untouched,
+and the manual Push button still works. `ifSyncAircraftId` is the fallback for
+departures with no airframe of their own; leaving it unset while the switch is
+on is a legitimate setup (only assigned departures sync) and the reply says so,
+because it is *also* what a half-finished setup looks like.
+
+**Why cancelling deletes when a push never does.** The bulk push leaves alone
+anything that has merely gone from its list — "it stopped matching my query" is
+not evidence, and a bug in that loop would quietly strip somebody's aircraft.
+Cancelling or deleting a departure is not that: it is a person deciding, about
+one flight, that it is not happening.
+
+**Nothing in the sync may fail a request.** Every call is fire-and-forget with
+its own catch, in the mould of `postScheduleNotice`. A VA's schedule is theirs
+and lives in their database; Infinite Flight being slow, rate-limiting us or
+refusing a scope must never turn "publish this departure" into an error. The one
+failure logged loudly is a push that succeeded but could not be recorded — that
+is the one that duplicates a leg next time.
+
+### Fleet utilisation
+
+`GET /if/utilisation` answers the expensive question a rota read one aeroplane
+at a time cannot: **which aircraft is nobody using?** Per airframe — legs
+booked, block hours scheduled, next departure, days since it last flew — plus a
+roll-up, sorted so the aircraft to act on is first (never-flown above
+long-idle).
+
+Three rules it holds, all of them the "don't invent" rule wearing different
+clothes:
+
+- **A rota that failed to load is `unknown`, not empty.** "This aircraft has
+  nothing scheduled" is the headline finding here, and producing it from a
+  failed read would send a VA hunting a problem that is not there.
+- **Only an *actual* arrival counts as flown.** A schedule in the past that
+  nobody flew is a plan, not evidence.
+- **In storage is not idle.** That is a decision somebody made, not neglect.
+
+One call per aircraft, so it is its own tab rather than part of the fleet
+board's refresh — and it shares cache keys with the schedule tab, so opening one
+after the other is free.
+
 ### Reordering
 
 The API moves one schedule at a time relative to another; a drag-and-drop list
@@ -933,7 +1015,10 @@ client), the reorder plan (a rota is what an aeroplane actually flies), and the
 crew-schedule bridge, where a mapping error would duplicate legs on somebody's
 real aircraft — so it pins that an import carries *no* seats, rank gate or
 publication status, and that a departure with no arrival time is skipped with a
-reason rather than given an invented one.
+reason rather than given an invented one. The utilisation block is written
+against the two ways to get "which aircraft is nobody using?" wrong, both worse
+than not answering: calling an aircraft idle when its rota merely failed to
+load, and calling it busy on the strength of a schedule nobody flew.
 
 `bash scratchpad/test-schema-postgres.sh` runs the schema against a **real**
 Postgres, which is the only thing that catches what the impersonators cannot: it
