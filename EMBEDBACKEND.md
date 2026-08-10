@@ -48,6 +48,7 @@ To embed it on their site, they paste this iframe:
 | `suffixes`   | `VA,EX`                                    | Your trailing tag(s) (see Callsign matching). |
 | `regulars`   | `OCEAN%20STAFF,Shamrock`                  | Untagged callsigns, prefix-only, always included (alias `callsigns`). See §2. |
 | `match`      | `exact` \| `strict` \| `broad`            | How closely a callsign must follow the pattern. Default `strict`. See §2. |
+| `roster`     | `off` \| `airline` \| `any`               | How far the VA's pilot roster may vouch for a callsign the rule rejects. Default `airline`. See §2a. |
 | `hubs`       | `CYYZ,CYUL,CYVR`                          | Hub ICAOs. Each becomes a map marker listing your inbound pilots. |
 | `provider`   | `mapbox` or `free`                        | Auto: `free` when no Mapbox token. |
 | `mapboxToken`| `pk.eyJ…`                                 | The VA's own Mapbox token (mapbox provider only). |
@@ -218,6 +219,35 @@ mode, so `Air Canada 001VA Heavy` matches wherever `Air Canada 001VA` does.
 The trade is the mirror of `"broad"`: nothing that isn't yours gets through, and
 a member who types their callsign loosely does not get on.
 
+## 2a. Roster trust — the codeshare answer (`rosterTrust`)
+
+`callsignMatch` decides how a callsign is *read*. `rosterTrust` decides whether
+the VA's pilot roster may **overrule** it. They are independent — a VA can run
+`exact` callsigns and still let its roster vouch for a partner leg.
+
+| Value | A rostered pilot counts when… | Cost |
+|---|---|---|
+| `off` | never — only callsigns passing `callsignMatch` | Members off-pattern are missing |
+| `airline` (default) | they're flying one of the VA's **airlines**, tag or no tag | Codeshare legs still missing |
+| `any` | always, **whatever** they're flying | Everything else those pilots fly arrives too |
+
+`"any"` is the one setting that solves the codeshare limitation below, because it
+stops reading the callsign and reads the roster instead. It is opt-in for a
+reason: a member's flight for *another* VA also lands in this VA's feed and on
+its map. Flights matching another VA's registered callsign are attributed to that
+VA first, so `"any"` only claims what nothing else does.
+
+It needs a roster — build one in the VA portal (Flight events → Pilot roster), or
+via `GET/POST /api/public/va/:id/pilots`. A VA with an empty roster sees no
+change from any of these values.
+
+> **Event feed note.** For the Discord takeoff/landing feed, `"any"` also
+> requires the ACARS matcher to forward flights whose callsign matches no VA at
+> all. It picks those pilots up from `GET /api/va/roster-watch` (the usernames of
+> every opted-in VA running `"any"`), refreshed on the same interval as the VA
+> list, and forwards them unattributed for this backend to resolve. Nothing to
+> configure per VA.
+
 ### A limit worth stating plainly
 
 The only thing a live flight gives us is the callsign the pilot typed. Nothing
@@ -227,7 +257,8 @@ follow, and neither can be engineered away:
 - **A member on a codeshare leg is invisible.** They type the partner airline's
   callsign, with no VA tag on it, so there is nothing to match. Mixing codeshare
   callsigns with your own prefix means some of your pilots will not appear on the
-  map, however the rules are set.
+  map, however the *callsign* rules are set. The only way out is to stop reading
+  the callsign and read the roster instead — `rosterTrust: "any"`, §2a.
 - **A stranger can look like a member.** `VA` is a near-universal tag, so a pilot
   flying for a *different* airline's VA on a similar callsign is, by pattern
   alone, indistinguishable from one of yours.
@@ -305,6 +336,7 @@ so you can lock a token to one or more domains.
   "callsignSuffixes": ["VA"],
   "regularCallsigns": ["OCEAN STAFF", "Shamrock"],
   "callsignMatch": "strict",   // exact | strict | broad — see §2
+  "rosterTrust": "airline",    // off | airline | any — see §2a
   "hubs": ["CYYZ", "CYUL", "CYVR"],
   "mode": "map",
   "provider": "mapbox",

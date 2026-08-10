@@ -292,9 +292,10 @@
                         <p class="text-xs text-amber-800/90 dark:text-amber-300/80 mt-2 leading-relaxed">
                             <strong>Exactly my callsigns</strong> is the tightest filter: the callsign must be
                             the airline, the flight number and the tag glued to it — "Air Canada 001VA" — and
-                            stop there. A second trailing tag ("001VA CX"), a missing tag ("001"), or a
-                            rostered pilot on somebody else's callsign are all left off. Nothing that isn't
-                            yours gets through; a member who types their callsign loosely does not get on.
+                            stop there. A second trailing tag ("001VA CX") or a missing tag ("001") are left
+                            off. Nothing that isn't yours gets through; a member who types their callsign
+                            loosely does not get on. The <strong>codeshare</strong> case above has its own
+                            answer — see "Pilots on the roster" below.
                         </p>
                         <p class="text-xs text-amber-800/90 dark:text-amber-300/80 mt-2 leading-relaxed">
                             <strong>Only my VA callsigns</strong> shows nobody who isn't yours, but members
@@ -304,6 +305,20 @@
                             This is a choice between the two, not a setting that fixes either.
                         </p>
                     </div>
+                </div>
+
+                <!-- The one thing that DOES fix the codeshare half of the limit
+                     above, because it stops reading the callsign and reads the
+                     roster instead. Opt-in: it also brings in whatever else
+                     those pilots fly. -->
+                <div>
+                    <label class="block text-sm font-semibold mb-1.5">Pilots on the roster</label>
+                    <select id="f_rosterTrust" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                        <option value="off">Off — only callsigns that fit the rule above</option>
+                        <option value="airline" selected>On my airline — the roster waives my tag, not my airline</option>
+                        <option value="any">Any callsign — a rostered pilot counts whatever they fly</option>
+                    </select>
+                    <p class="text-xs text-zinc-400 mt-1">"Any callsign" is the codeshare opt-in: it uses the VA's pilot roster instead of the callsign, so members on partner callsigns appear — along with everything else those pilots fly, including their flights for another VA. Needs a roster; a VA with none sees no change.</p>
                 </div>
 
                 <div>
@@ -1125,6 +1140,7 @@
             document.getElementById('f_suffixes').value = (c.callsignSuffixes || []).join(', ');
             document.getElementById('f_regulars').value = (c.regularCallsigns || []).join(', ');
             document.getElementById('f_callsignMatch').value = ['exact', 'broad'].includes(c.callsignMatch) ? c.callsignMatch : 'strict';
+            document.getElementById('f_rosterTrust').value = ['off', 'any'].includes(c.rosterTrust) ? c.rosterTrust : 'airline';
             document.getElementById('f_hubs').value = (c.hubs || []).join(', ');
             document.getElementById('f_mode').value = c.mode || 'roster';
             document.getElementById('f_provider').value = c.provider || '';
@@ -1202,6 +1218,7 @@
                 callsignSuffixes: v('f_suffixes'),
                 regularCallsigns: v('f_regulars'),
                 callsignMatch: v('f_callsignMatch'),
+                rosterTrust: v('f_rosterTrust'),
                 hubs: v('f_hubs'),
                 mode: v('f_mode'),
                 provider: v('f_provider'),
