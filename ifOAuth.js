@@ -72,10 +72,17 @@ const ISSUER = (process.env.IF_OAUTH_ISSUER || 'https://auth.infiniteflight.com/
 // exactly, and a per-VA URI would mean every VA editing their client every time
 // they added a crew center. The VA is carried in the `state` instead, which is
 // what state is for.
-const REDIRECT_URI = (
-    process.env.IF_OAUTH_REDIRECT_URI
-    || (process.env.PUBLIC_BASE_URL ? `${String(process.env.PUBLIC_BASE_URL).replace(/\/+$/, '')}/api/crew/if/callback` : '')
-).trim();
+//
+// DELIBERATELY NOT DERIVED FROM PUBLIC_BASE_URL. In this codebase that variable
+// is the SITE (https://inflight.info — where the crew center is served from),
+// and the callback route lives on this API server, which is a different host
+// with no /api proxy in front of it. Deriving from it would produce a
+// confident-looking URI that routes nowhere, and the failure would surface as
+// Infinite Flight refusing a redirect_uri mismatch — about the least
+// diagnosable error in OAuth.
+//
+// So: this variable, or the request's own host. Nothing in between.
+const REDIRECT_URI = String(process.env.IF_OAUTH_REDIRECT_URI || '').trim();
 
 // The platform's own OAuth client, when there is one. A VA may bring their own
 // instead (see clientFor in server.js) — which is the path that works today,
