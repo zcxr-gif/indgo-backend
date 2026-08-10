@@ -142,6 +142,27 @@ than at the row.
 | `POST /api/crew/:slug/roster/import` | staff | upsert from CSV. `dryRun` defaults true |
 | `GET /api/crew/:slug/routes.csv` | staff | the route network as a spreadsheet |
 | `POST /api/crew/:slug/routes/import` | staff | upsert from CSV. `dryRun` defaults true |
+| `GET /api/crew/:slug/if` | staff | the Infinite Flight connection's state. Client details are added for the owner only |
+| `POST/DELETE /api/crew/:slug/if/client` | owner | register (or forget) the VA's own OAuth2 client |
+| `POST /api/crew/:slug/if/connect` | owner | begin the OAuth2 sign-in. Returns the URL to send the browser to |
+| `GET /api/crew/if/callback` | public | where Infinite Flight redirects back. Authenticated by the OAuth `state` alone — see below |
+| `DELETE /api/crew/:slug/if/connection` | owner | forget our copy of the grant |
+| `GET /api/crew/:slug/if/organizations[/:id]` | staff | the Live organizations this account belongs to |
+| `POST /api/crew/:slug/if/organization` | owner | point this crew center at one of them |
+| `GET /api/crew/:slug/if/aircraft` | staff | the organization's fleet, in fleet order |
+| `GET /api/crew/:slug/if/fleet` | staff | the fleet with every aircraft's last position attached, in one call |
+| `GET /api/crew/:slug/if/aircraft/:id` | staff | one aircraft, its position and its rota |
+| `GET /api/crew/:slug/if/aircraft/:id/position` | staff | just the last stored position |
+| `GET /api/crew/:slug/if/aircraft/:id/schedules` | staff | the aircraft's rota, in sequence, marked with which legs the crew center already has |
+| `POST /api/crew/:slug/if/aircraft/:id/schedules` | `schedules.manage` | add a leg to the end of the rota |
+| `PUT /api/crew/:slug/if/schedules/:id` | `schedules.manage` | change a leg |
+| `PUT /api/crew/:slug/if/schedules/:id/flightplan` | `schedules.manage` | replace just the flight plan. Empty clears it |
+| `POST /api/crew/:slug/if/aircraft/:id/schedules/order` | `schedules.manage` | send the whole arrangement; the backend turns it into the API's single moves |
+| `DELETE /api/crew/:slug/if/schedules/:id` | `schedules.manage` | remove a leg. The linked crew departure is **unlinked, never deleted** |
+| `POST /api/crew/:slug/if/sync` | `schedules.manage` | which aircraft the crew schedule pushes to, and whether it does |
+| `POST /api/crew/:slug/if/push` | `schedules.manage` | push published upcoming departures onto that aircraft's rota |
+| `POST /api/crew/:slug/if/pull` | `schedules.manage` | import the aircraft's rota into the crew center as drafts |
+| `GET /api/crew/:slug/if/board` | any crew login | the pilot's read-only view: the fleet, where it is, what is going out next |
 
 Everything else under `/api/crew/:slug/*` (roster, routes, pireps,
 applications) reads and writes through `crewStore.js`, which hides which
@@ -638,6 +659,17 @@ Version history:
 - **v9** — `crew_storage_usage()`: the project reports its own size, so VA staff
   can see how close they are to their Supabase plan's ceiling from inside the
   crew center
+- **v13** — `crew_schedules.if_schedule_id` / `if_aircraft_id` / `if_synced_at`:
+  a departure can record the Infinite Flight Live schedule it was pushed to, so
+  the second push is an update rather than the same leg twice on somebody's real
+  aircraft
+
+Note what v13 is not: it is not what makes the Live panel work. The fleet, the
+positions and the Live schedules all come from Infinite Flight, so a project on
+v12 gets the whole feature — what it cannot do is *remember* which of its own
+departures it has pushed. The three columns are in `LATE_COLUMNS`, so the push
+degrades to "sent, but this crew center could not record it" with the update
+button attached, rather than failing.
 
 Note what v9 is not: it adds no columns and no tables, only a function, so
 nothing degrades on a project that has not got it. `GET /store/usage` answers
@@ -680,6 +712,136 @@ send under our own name, and as a link on a page we serve. Anything that is not
 literally a `discord.gg` or `discord.com/invite` URL is rejected outright rather
 than sanitised, and what is stored is rebuilt from the parsed URL so a pilot is
 never shown a path-traversal or a tracking query as their invite link.
+
+## Infinite Flight Live
+
+A VA runs two things that could not see each other. One is this crew center. The
+other is their Live **organization** inside Infinite Flight: the aircraft they
+actually own, in fleet order, each with a rota of flights it is going to fly and
+a last-known position. Infinite Flight's PublicApi v3 opened that up over OAuth2,
+and `ifOAuth.js` / `ifLive.js` are it wired in.
+
+**Note the API is a preview.** Infinite Flight say its paths, fields, enum
+values, validation rules and rate limits may change before general availability.
+Two consequences run through the whole implementation: an enum value we have not
+been told about becomes a *label* rather than an exception (a
+`ScheduledFlightStatus` of 5 renders as "Status 5" and the fleet board keeps
+painting), an unrecognised **field** is carried through untouched under `extra`
+so a rename degrades to "not drawn yet" rather than "data gone", and every base
+URL is environment-overridable so a moved path is a config change.
+
+### Who can do what
+
+| | who |
+|---|---|
+| connect the account, register the OAuth client, pick the organization, disconnect | **owner** |
+| read the fleet, positions and rotas in the staff panel | **staff** |
+| add / edit / re-plan / reorder / remove a Live schedule, push or pull the crew schedule | **`schedules.manage`** |
+| the read-only fleet board on the pilot page | **any crew login** |
+
+Above all of that sits a ceiling we do not impose and cannot route around.
+Everything is done as **one** Infinite Flight user — the staff member who pressed
+Connect — so Infinite Flight's own rules apply: reads need membership of the
+organization, writes need owner or admin of it. A crew center can never do more
+to a VA's Live organization than that person could do by hand. Where their grant
+is narrower than the screen, the screen narrows: `canWrite` is read off the
+scopes Infinite Flight actually **granted**, not off what we asked for, so a VA
+who declined schedule writes gets a read-only panel rather than a save button
+that 403s.
+
+Pilots never hold a token, cannot reach any of the fleet or schedule endpoints,
+and cannot address any organization but the one their VA selected. `/if/board`
+is the only Live endpoint a pilot session can call.
+
+### The credential
+
+Both tokens are sealed with `crewSecrets` (AES-256-GCM, key from the
+environment) exactly as the Supabase access token is, and neither is ever sent
+to a browser. **`CREW_SECRET_KEY` is required**: the connect flow refuses to
+start without one rather than walking a VA through consent and then dropping the
+token on the floor.
+
+Refresh tokens rotate, so `ifTokenFor()` **writes the new pair before it returns
+the new access token**. A crash between those two would otherwise leave the VA
+holding a refresh token Infinite Flight has already retired — indistinguishable
+from a revoked connection, and fixable only by reconnecting.
+
+Disconnecting deletes *our* copy. It does not revoke the authorization at
+Infinite Flight, and the reply says so, because "forgotten" is not "revoked" —
+the same honesty the Supabase token deletion offers.
+
+### The callback is authenticated by `state` alone
+
+`GET /api/crew/if/callback` is public by necessity: it is a navigation from
+Infinite Flight's own site carrying none of our cookies. So `state` does all the
+work. It names a row in `CrewIfAuthState` holding the PKCE verifier, the VA, the
+staff member and the scopes; the row is **deleted by the same call that reads
+it** (single use), expires on a TTL index after ten minutes, and is compared in
+constant time. A callback whose state does not resolve gets a flat refusal — a
+helpful distinction there is a helpful distinction for whoever is probing.
+
+### Whose OAuth client
+
+Either the platform's (`IF_OAUTH_CLIENT_ID`) or one the VA registers themselves,
+and **the VA's is preferred**. Infinite Flight limit a new client to "the owner
+and invited test users until the app is reviewed and approved", so a platform
+client works for nobody but us until that review lands, while a client the VA
+creates at infiniteflight.com/account/api-keys has the VA as its owner and works
+for them today. A stored client secret is sealed like everything else; without
+one the client is public and leans on PKCE, which is supported and is what the
+preview expects of browser and native apps. PKCE is used for **both** types.
+
+### The bridge to the crew schedule — a link, not a merge
+
+The two kinds of schedule are different objects and are deliberately not
+conflated:
+
+- **`crew_schedules`** — a departure with *seats*, which pilots book, gated on a
+  rank, drafted before it is published.
+- **an Infinite Flight schedule** — a leg attached to one real aeroplane, with a
+  sequence in that aeroplane's running order and a status driven by the flight
+  actually happening.
+
+So a crew departure may *refer* to the Live schedule it was pushed to, and that
+is all: `if_schedule_id`, `if_aircraft_id`, `if_synced_at` (v13, and in
+`LATE_COLUMNS`, so a project on v12 keeps working and simply cannot record the
+link). Three rules the sync follows:
+
+- **A push never deletes.** A leg that has gone from the crew center's week is
+  left alone in Infinite Flight — "this disappeared from one list" is not enough
+  to justify removing a flight from somebody's aircraft, and a bug in that loop
+  would be expensive and quiet. Removing is a deliberate act on the panel.
+- **A pull always imports as drafts**, and never touches seats, the rank gate,
+  publication status or bookings. `ifLive.toCrewSchedule` returns only the
+  fields that mean the same thing on both sides, which is what makes that
+  guarantee structural rather than a promise.
+- **Deleting a Live schedule unlinks the crew departure, it does not delete it.**
+  That row has bookings hanging off it and pilots who took those seats.
+
+### Reordering
+
+The API moves one schedule at a time relative to another; a drag-and-drop list
+hands back a whole arrangement. `ifLive.reorderPlan` turns the arrangement into
+the moves — first to the top (`afterId: null`), then each after its predecessor.
+That is *n* calls rather than the theoretical minimum, on purpose: the minimum
+needs to know the current order at the moment each call lands, and it cannot,
+because somebody else may be reordering the same aircraft. Every call states an
+absolute intention, so a lost one leaves the rota closer to right rather than
+shuffled. Schedules the API will not move (cancelled, arrived, diverted) are
+dropped from the plan rather than spent as calls that will be refused — but a
+status we do not recognise is **kept**, because refusing to move something we
+have not heard of is exactly the preview failure mode above.
+
+### "Flying now"
+
+`/live/aircraft/{id}/position` is the *last persisted* state and "can be stale
+when the aircraft is not actively reporting". The v3 docs say what to do about
+that: compare the aircraft id with `FlightEntry.flightId` from the v2 multiplayer
+feed. The tracker service already polls that feed, so
+`POST /api/live/aircraft-active` (in `live_flights.cjs`) answers it from the
+cache the poller has already filled — no extra calls against anyone's rate
+limit. It is strictly a bonus: it adds a green dot, and a board without one is
+still a board.
 
 ## Tests
 
@@ -759,6 +921,19 @@ not-null violation both still fail.
 formats, lookalike hosts, non-invite Discord paths, scheme downgrades, and the
 three-way `'' / url / null` contract that lets a handler tell "clear this" from
 "the caller sent junk".
+
+`node scratchpad/test-if-live.js` covers the Infinite Flight Live integration's
+pure half. Most of it is written against one failure class rather than against
+the happy path: the API is a preview, so the cases that matter are the ones
+where a change at *their* end takes the crew center down — an undocumented enum
+value (`ScheduledFlightStatus` has a real hole at 5), a field we have never
+seen, a validation rule we might accidentally make stricter than theirs. Then
+the parts where being wrong is expensive: PKCE (the whole security of a public
+client), the reorder plan (a rota is what an aeroplane actually flies), and the
+crew-schedule bridge, where a mapping error would duplicate legs on somebody's
+real aircraft — so it pins that an import carries *no* seats, rank gate or
+publication status, and that a departure with no arrival time is skipped with a
+reason rather than given an invented one.
 
 `bash scratchpad/test-schema-postgres.sh` runs the schema against a **real**
 Postgres, which is the only thing that catches what the impersonators cannot: it
