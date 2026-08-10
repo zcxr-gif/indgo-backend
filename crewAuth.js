@@ -233,6 +233,20 @@ const CREW_CAPABILITIES = [
     // the liveries" is rarely the person who writes the operations manual, and a
     // VA should be able to hand out the first without the second.
     { id: 'links.manage',           group: 'Communications', label: 'Curate the quick-links board' },
+    // v13. Infinite Flight Live ops — the VA's real organization, its aircraft
+    // and the schedules sitting on them, reached through the connected Infinite
+    // Flight account (see ifLive.js).
+    //
+    // Its own capability rather than folded into schedules.manage, because the
+    // two schedules are different objects in different systems: schedules.manage
+    // publishes OUR week and hands legs to pilots, while this one writes into
+    // Infinite Flight itself, on airframes the VA owns, visible to everyone in
+    // the organization. A VA may reasonably want somebody building the crew
+    // center's roster of flying who is not also editing the live fleet.
+    //
+    // Reading Live ops needs no capability at all — any signed-in member of the
+    // crew center can look at the fleet board. This gates the writes.
+    { id: 'live.manage',            group: 'Operations',     label: 'Manage Infinite Flight Live schedules & fleet' },
 ];
 const CREW_CAP_IDS = CREW_CAPABILITIES.map(c => c.id);
 
@@ -282,8 +296,8 @@ const CREW_ROLE_PRESETS = [
         id: 'ops-manager',
         name: 'Operations manager',
         color: '#D97706',
-        description: 'Runs the network and the week — routes, schedule, bookings.',
-        permissions: ['routes.manage', 'schedules.manage', 'flights.review'],
+        description: 'Runs the network and the week — routes, schedule, bookings, Live ops.',
+        permissions: ['routes.manage', 'schedules.manage', 'flights.review', 'live.manage'],
     },
     {
         id: 'events-coordinator',
