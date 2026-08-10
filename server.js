@@ -2270,30 +2270,46 @@ const uploadAircraftImages = upload.fields([
  * is already sent and the only honest signal left is to destroy the response so
  * the client sees a truncated body rather than a valid-looking short array.
  * ------------------------------------------------------------------------- */
+const STREAM_CHUNK_CHARS = 64 * 1024;
 const streamJsonArray = async (res, query, { prefix = '', suffix = '' } = {}) => {
     const cursor = query.cursor();
     let started = false;
+    // Documents are accumulated and written in ~64KB chunks rather than one
+    // write per document. Writing each document separately is correct but
+    // wasteful: every write is its own chunked-transfer framing and its own
+    // trip through the socket, so a 60,000-document response became 60,000 of
+    // them. Batching cuts that by two or three orders of magnitude while
+    // keeping memory bounded — this buffer holds one chunk, not one response,
+    // which is the entire distinction being drawn here.
+    let buf = '';
+    const flush = async (force) => {
+        if (!buf || (!force && buf.length < STREAM_CHUNK_CHARS)) return;
+        const chunk = buf;
+        buf = '';
+        if (!res.write(chunk)) {
+            // The socket is full. Wait for it to drain before reading more
+            // documents, so the cursor advances no faster than the client
+            // consumes and memory stays flat on a slow connection.
+            await new Promise((resolve) => res.once('drain', resolve));
+        }
+    };
     try {
         for (let doc = await cursor.next(); doc !== null; doc = await cursor.next()) {
             if (!started) {
                 res.set('Content-Type', 'application/json; charset=utf-8');
-                res.write(`${prefix}[`);
+                buf += `${prefix}[`;
                 started = true;
             } else {
-                res.write(',');
+                buf += ',';
             }
-            if (!res.write(JSON.stringify(doc))) {
-                // The socket is full. Wait for it to drain before reading the
-                // next document, so the cursor advances no faster than the
-                // client consumes and memory stays flat on a slow connection.
-                await new Promise((resolve) => res.once('drain', resolve));
-            }
+            buf += JSON.stringify(doc);
+            await flush(false);
         }
         if (!started) {
             res.set('Content-Type', 'application/json; charset=utf-8');
-            res.write(`${prefix}[`);
+            buf += `${prefix}[`;
         }
-        res.end(`]${suffix}`);
+        res.end(`${buf}]${suffix}`);
     } catch (err) {
         if (!started && !res.headersSent) throw err;
         console.error('Stream Error (response already started):', err?.message || err);
