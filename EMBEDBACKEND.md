@@ -216,6 +216,31 @@ With `prefixes: ["Air Canada"]`, `suffixes: ["VA"]`:
 Weight-class words (`Heavy`, `Super`) are still stripped before the test in every
 mode, so `Air Canada 001VA Heavy` matches wherever `Air Canada 001VA` does.
 
+### Several callsigns, and they need not work alike
+
+A VA may register more than one callsign — a parent brand plus sub-fleets — and
+each one carries its own tag, or none:
+
+```
+callsigns: ["OCEAN ##VA", "SHAMROCK ###EX", "BAW ###"]
+```
+
+Every entry contributes. Each airline is held to **its own** tag, so `exact`
+accepts `Ocean 12VA`, `Shamrock 004EX` and `BAW 123`, and rejects `Ocean 12EX`
+and `BAW 123VA`. A VA that wants one tag across several airlines just registers
+each airline with that tag (`AIR CANADA ##VA`, `JAZZ ##VA`).
+
+Tag-less entries keep working alongside tagged ones: `BAW ###` declares no tag,
+so `BAW 123` matches even though the same listing's `SPEEDBIRD ##VA` requires
+one.
+
+> **Preview links and embed configs are different**, deliberately.
+> `callsignPrefixes` and `callsignSuffixes` are two *independent* lists with no
+> pairing between them, so every combination matches — that is how you run one
+> tag across several airlines from a preview URL. If you need airline-specific
+> tags on an embed, give each airline its own embed, or drive the embed from the
+> listing's callsigns.
+
 The trade is the mirror of `"broad"`: nothing that isn't yours gets through, and
 a member who types their callsign loosely does not get on.
 

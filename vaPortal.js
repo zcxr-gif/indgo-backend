@@ -1002,9 +1002,31 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
     // The VA's callsign code(s), uppercased — the key an embed is matched on.
     // An embed "belongs to" this VA when its va.code is one of these, which is
     // also the ownership check for editing (a VA can only restyle its own embeds).
-    const vaCallsignCodes = (ad) =>
-        ((Array.isArray(ad.callsigns) && ad.callsigns.length ? ad.callsigns : [ad && ad.callsign])
-            .filter(Boolean)).map((c) => String(c).toUpperCase());
+    // The airline part of a stored callsign, whatever mask it was saved in:
+    // "OCEAN ##VA" and "SHAMROCK ###EX" both reduce to their airline. Mirrors
+    // normalizeCallsignBase in server.js (which owns the rule) — kept local so
+    // this module still touches nothing of the app's wiring.
+    const callsignBaseOf = (raw) => {
+        const s = String(raw || '').trim().toUpperCase().replace(/\s+/g, ' ');
+        if (!s) return '';
+        const first = s.indexOf('#');
+        if (first !== -1) return s.slice(0, first).trim();
+        const m = s.match(/^(.*?)\s+VA$/);
+        return (m && m[1].trim()) || s;
+    };
+
+    // Every code an embed of this VA might have been created under: each stored
+    // callsign as saved, plus its reduced airline. A VA may fly under several
+    // callsigns, and staff may have typed the embed's va.code as either the full
+    // mask ("OCEAN ##VA") or the short code ("OCEAN") — matching both means a
+    // multi-callsign VA still finds all of its embeds.
+    const vaCallsignCodes = (ad) => {
+        const stored = (Array.isArray(ad.callsigns) && ad.callsigns.length ? ad.callsigns : [ad && ad.callsign])
+            .filter(Boolean).map((c) => String(c).toUpperCase());
+        const out = new Set(stored);
+        for (const c of stored) { const b = callsignBaseOf(c); if (b) out.add(b); }
+        return [...out];
+    };
 
     // Shape one embed config for the portal: the copyable link/iframe plus the
     // editable appearance (mirrors the cosmetic fields applyEmbedAppearance

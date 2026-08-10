@@ -1891,10 +1891,47 @@ const Giveaway = mongoose.model('Giveaway', GiveawaySchema);
 // Store only the base radio callsign (e.g. "OCEAN"); the Infinite Flight VA
 // suffix "##VA" is appended at display time. Strip it here so a value entered as
 // "Ocean ##VA" or "Ocean VA" is normalized back to "OCEAN".
+/**
+ * Split a STORED VA callsign into the airline part and the tag its pilots
+ * append, e.g. "OCEAN ##VA" -> { base: "OCEAN", tag: "VA" }.
+ *
+ * A VA may register several callsigns and they do not all have to work the same
+ * way, so the tag has to be read off each mask rather than assumed:
+ *
+ *   "OCEAN ##VA"      -> { base: "OCEAN",     tag: "VA" }
+ *   "SHAMROCK ###EX"  -> { base: "SHAMROCK",  tag: "EX" }   ← a non-"VA" tag
+ *   "BAW ###"         -> { base: "BAW",       tag: "" }     ← no tag at all
+ *   "OCEAN VA"        -> { base: "OCEAN",     tag: "VA" }
+ *   "OCEAN"           -> { base: "OCEAN",     tag: "VA" }   ← legacy bare base
+ *
+ * The last line is why a bare base can't mean "no tag": every display path
+ * (formatCallsignDisplay, fmtCallsign in the UIs) renders a stored "OCEAN" as
+ * "OCEAN ##VA", so that is what the VA was told its pilots would fly.
+ */
+const vaCallsignParts = (raw) => {
+    const s = String(raw || '').trim().toUpperCase().replace(/\s+/g, ' ');
+    if (!s) return null;
+    const first = s.indexOf('#');
+    if (first !== -1) {
+        // A mask: everything before the first "#" is the airline, everything
+        // after the last one is the tag (empty for "BAW ###").
+        const base = s.slice(0, first).trim();
+        return base ? { base, tag: s.slice(s.lastIndexOf('#') + 1).trim() } : null;
+    }
+    // No placeholder — a bare base, or one with the tag already glued on.
+    const m = s.match(/^(.*?)\s+VA$/);
+    if (m && m[1].trim()) return { base: m[1].trim(), tag: 'VA' };
+    return { base: s, tag: 'VA' };
+};
+
+// Store only the airline part of a stored callsign ("OCEAN" out of
+// "OCEAN ##VA"). Now mask-aware rather than "VA"-only, so a VA whose second
+// callsign carries a different tag ("SHAMROCK ###EX") reduces to "SHAMROCK"
+// instead of staying whole and matching nothing.
 const normalizeCallsignBase = (raw) => {
     if (!raw) return null;
-    const clean = String(raw).trim().toUpperCase().replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim();
-    return clean || null;
+    const parts = vaCallsignParts(raw);
+    return (parts && parts.base) || null;
 };
 
 // Callsign as the operator typed it (trim + uppercase only — no suffix
@@ -1918,20 +1955,30 @@ const formatCallsignDisplay = (raw) => {
     return base ? `${base} ##VA` : null;
 };
 
-// Expand reduced callsign bases with their "##VA" / " VA" suffixed forms for the
-// flight-event lookups. Stored callsigns are now kept verbatim (see
+// Expand reduced callsign bases into everything a VA might actually have stored,
+// for the flight-event lookups. Stored callsigns are kept verbatim (see
 // cleanCallsignInput), so a VA that saved its callsign WITH the suffix (e.g.
 // "AIR CANADA ##VA") must still match a live callsign we reduced to the bare base
-// ("AIR CANADA"). Querying both forms keeps delivery working either way.
+// ("AIR CANADA").
+//
+// The three literal forms cover the common "VA"-tagged cases and can use the
+// index directly. The anchored regex catches the rest of what a VA is allowed to
+// register — a different tag ("SHAMROCK ###EX"), no tag ("BAW ###"), or any
+// other mask on the same airline — which the literals would miss entirely.
+// `$in` accepts regexes, so this stays one query and every caller is unchanged.
 const callsignQueryVariants = (bases) => {
     const out = new Set();
+    const rx = [];
     for (const b of bases) {
         if (!b) continue;
         out.add(b);
         out.add(`${b} ##VA`);
         out.add(`${b} VA`);
+        // Anchored at the airline, so it stays index-eligible and can't match
+        // "OCEANIC" off the back of "OCEAN".
+        rx.push(new RegExp('^' + b.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?:[\\s#]|$)', 'i'));
     }
-    return [...out];
+    return [...out, ...rx];
 };
 
 // --- Our own VA callsign filter ---------------------------------------------
@@ -1944,13 +1991,15 @@ const callsignQueryVariants = (bases) => {
 // "##VA"/" VA" suffix is reduced first; the number may use digits and/or "#"
 // placeholders; the space before "VA" is optional.
 const callsignMatchesVaBase = (callsign, base) => {
-    const cs = String(callsign || '').trim().toUpperCase();
-    const b = String(base || '').trim().toUpperCase()
-        .replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim();
-    if (!cs || !b) return false;
-    const escaped = b.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    // <base><space><pilot number (digits / # placeholders)><optional space>VA
-    return new RegExp('^' + escaped + '\\s+[0-9#]+\\s*VA$').test(cs);
+    const cs = String(callsign || '').trim().toUpperCase().replace(/\s+/g, ' ');
+    const parts = vaCallsignParts(base);
+    if (!cs || !parts) return false;
+    const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // <base><space><pilot number (digits / # placeholders)><optional space><tag>
+    // The tag comes off the stored mask, so "SHAMROCK ###EX" wants "EX" and
+    // "BAW ###" wants nothing after the number.
+    const tail = parts.tag ? `\\s*${esc(parts.tag)}` : '';
+    return new RegExp('^' + esc(parts.base) + '\\s+[0-9#]+' + tail + '$').test(cs);
 };
 
 // List-aware form of callsignMatchesVaBase: returns the first stored base the
