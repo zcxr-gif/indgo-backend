@@ -138,6 +138,10 @@ const os = require('os');
 // MEMORY FIX: Disable Sharp's internal cache to prevent RAM balloons
 sharp.cache(false);
 sharp.concurrency(1);
+// ...and a ceiling on how large a single decode may be, which is the one bound
+// neither of the above provides. See imageLimits.js for why the byte caps
+// elsewhere do not cover this.
+const { uploadOpts, isPixelLimitError, PIXEL_LIMIT_MESSAGE } = require('./imageLimits');
 
 // STABILITY: Keep the backend alive when the bot (or anything else) misbehaves.
 // Without these, a single rejected promise inside discord.js takes down the API.
@@ -2123,7 +2127,11 @@ const queueAircraftImage = (task) => {
 
 // Helper: Optimize a single image file and upload it to S3, returning the public URL.
 const processAndUploadAircraftImage = (file, tailRef) => queueAircraftImage(async () => {
-    const optimizedBuffer = await sharp(file.path)
+    // The queue above bounds how MANY pipelines run at once; the ceiling here
+    // bounds how big ONE of them can get. Both are needed — a single 20000x12000
+    // photo decodes to about a gigabyte outside the V8 heap, which no amount of
+    // serialization survives. See imageLimits.js.
+    const optimizedBuffer = await sharp(file.path, uploadOpts())
         .resize({ width: 1920, withoutEnlargement: true })
         .webp({ quality: 80 })
         .toBuffer();
@@ -2148,7 +2156,7 @@ const processAndUploadAircraftImage = (file, tailRef) => queueAircraftImage(asyn
 // S3 (mirroring the DM flow). Runs through the same single-slot sharp queue so it
 // can't stack native image buffers with other uploads.
 const optimizeAircraftImageBuffer = (file) => queueAircraftImage(() =>
-    sharp(file.path)
+    sharp(file.path, uploadOpts())
         .resize({ width: 1920, withoutEnlargement: true })
         .webp({ quality: 80 })
         .toBuffer()
@@ -8669,6 +8677,14 @@ app.post('/api/aircraft', requireAuth, uploadAircraftImages, async (req, res) =>
         // Ensure cleanup happens even on error
         cleanupTempFiles(files);
 
+        // An image refused by the decode ceiling is not a server fault and a 500
+        // tells the contributor to try again, which will not work. Answer with
+        // what they can actually do about it.
+        if (isPixelLimitError(error)) {
+            console.warn('Upload refused — image over the decode ceiling:', error.message);
+            return res.status(413).json({ message: PIXEL_LIMIT_MESSAGE });
+        }
+
         console.error('Upload Error:', error);
         res.status(500).json({ message: 'Server error during upload.' });
     }
@@ -10958,6 +10974,67 @@ async function ifCardVasFor(card) {
     return wanted.map((id) => options.find((o) => o.id === id)).filter(Boolean);
 }
 
+/* ---------------------------------------------------------------------------
+ * Which of the matching photos to show
+ *
+ * The lookup below regularly matches many photos — up to 20 rows, each carrying
+ * up to 3 images — and the picker used to take `rows[0].imageUrl` and stop. So
+ * a pilot whose favourite is a 737 saw the same 737, from the same angle, every
+ * time anyone loaded their card, forever, while a few dozen other photographs of
+ * the same aircraft sat in the collection unseen. That is a waste of the whole
+ * community gallery, and it makes every card of a popular type look identical.
+ *
+ * So the photo rotates. The interesting part is what "random" has to mean here,
+ * because the naive version is actively harmful:
+ *
+ * A fresh pick per render CANNOT be used. The rendered PNG is memoized, and
+ * `photoUrl` is part of the cache key (see ifCardCacheKey) — as it must be,
+ * since two cards differing only in their photo are not the same picture. Rolling
+ * the dice per render therefore misses the cache on every single request, and
+ * every miss is a full sharp pipeline: fetch a photograph, decode it, crop it
+ * with `position: 'attention'`, composite, re-encode. That is precisely the work
+ * the memory ceiling in imageLimits.js exists to keep bounded, and turning a
+ * cached read into a guaranteed render on a hotlinked public <img> would push
+ * the process back toward the OOM this same change is fixing. Randomness that
+ * defeats the cache buys variety by paying in crashes.
+ *
+ * Instead the pick is a pure function of (who the card belongs to, which
+ * half-day it is). Two consequences, both wanted:
+ *
+ *   • Inside a window the answer is STABLE, so the render cache, the browser
+ *     cache and the CDN all behave exactly as they did before. No extra renders.
+ *   • Across windows it moves, so the card genuinely does show a different
+ *     aircraft through the day — which is the thing being asked for.
+ *
+ * Seeding on the card as well as the clock matters: without it every card of a
+ * given type would rotate in lockstep and show the SAME photo as each other,
+ * which is the original complaint moved rather than fixed. With it, two pilots
+ * who both favour the 737 get different photographs at the same moment.
+ * ------------------------------------------------------------------------- */
+
+// How long a card keeps the same photograph. Six hours ≈ four different
+// aircraft a day, which reads as variety without the picture changing under a
+// reader mid-scroll. Well above the 10-minute render TTL and the 5-minute
+// browser freshness window, so rotation costs one render per card per window
+// and never invalidates anything early.
+const IF_CARD_PHOTO_ROTATE_MS = Math.max(
+    60 * 1000,
+    parseInt(process.env.IF_CARD_PHOTO_ROTATE_MS, 10) || 6 * 3600 * 1000,
+);
+
+// FNV-1a. Not for security — this only has to spread nearby seeds ("pilot-a" vs
+// "pilot-b" in the same window) across the candidate list, which a plain
+// character sum does not do: it would map adjacent names to adjacent buckets and
+// hand half the fleet the same photo.
+const seedHash = (str) => {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h >>> 0;
+};
+
 /**
  * The community photo URL for a favourite aircraft, or null.
  *
@@ -10968,9 +11045,15 @@ async function ifCardVasFor(card) {
  *
  * Matching mirrors that endpoint — type is required, livery narrows it, and an
  * exact livery match wins over a loose one — so the photo a pilot gets here is
- * the photo they would see anywhere else in the product.
+ * from the same set they would see anywhere else in the product.
+ *
+ * @param {object} fav   the card's favourites ({ aircraft, livery })
+ * @param {string} seed  who this card belongs to (slug, or username for the
+ *                       preview). Only affects WHICH of the equally-valid
+ *                       photos is chosen; an empty seed still works, it just
+ *                       means every unseeded card rotates together.
  */
-async function ifCardPhotoUrl(fav) {
+async function ifCardPhotoUrl(fav, seed = '') {
     const type = String(fav?.aircraft || '').trim();
     if (!type) return null;
     const livery = String(fav?.livery || '').trim();
@@ -10980,12 +11063,43 @@ async function ifCardPhotoUrl(fav) {
         if (livery) query.liveryName = { $regex: esc(livery), $options: 'i' };
         const rows = await CommunityAircraft.find(query).lean().limit(20);
         if (!rows.length) return null;
+
+        // Exact-livery rows still win outright — a pilot who said "British
+        // Airways" gets a British Airways aircraft, and rotation happens WITHIN
+        // that set rather than across it. Variety must not cost accuracy.
         const exact = livery
-            ? rows.find((r) => String(r.liveryName || '').toLowerCase() === livery.toLowerCase())
-            : null;
-        const pick = exact || rows[0];
-        const url = pick.imageUrl || (Array.isArray(pick.imageUrls) ? pick.imageUrls[0] : null);
-        return url || null;
+            ? rows.filter((r) => String(r.liveryName || '').toLowerCase() === livery.toLowerCase())
+            : [];
+        const pool = exact.length ? exact : rows;
+
+        // Every image of every eligible row, not just each row's primary. A row
+        // with three photographs of the same airframe contributes all three;
+        // `imageUrl` mirrors `imageUrls[0]`, so dedupe keeps that from counting
+        // twice and weighting the older single-image rows differently.
+        const candidates = [];
+        for (const r of pool) {
+            const urls = Array.isArray(r.imageUrls) && r.imageUrls.length
+                ? r.imageUrls
+                : (r.imageUrl ? [r.imageUrl] : []);
+            for (const u of urls) {
+                const url = String(u || '').trim();
+                if (url && !candidates.includes(url)) candidates.push(url);
+            }
+        }
+        if (!candidates.length) return null;
+        if (candidates.length === 1) return candidates[0];
+
+        // Sorted before indexing. Mongo makes no promise about the order of an
+        // unsorted find, so without this the index would be applied to a list
+        // that can reshuffle between calls — the same seed and the same window
+        // could then pick a different URL, which is exactly the cache-missing
+        // behaviour this design avoids. The order itself is arbitrary; that it
+        // is REPEATABLE is the point.
+        candidates.sort();
+
+        const window = Math.floor(Date.now() / IF_CARD_PHOTO_ROTATE_MS);
+        const idx = seedHash(`${seed}|${type}|${livery}|${window}`) % candidates.length;
+        return candidates[idx];
     } catch (err) {
         console.error('[if-card] photo lookup failed:', err?.message || err);
         return null;
@@ -11126,7 +11240,10 @@ app.get('/api/if-card/preview', async (req, res) => {
             aircraft: req.query.favAircraft,
             livery: req.query.favLivery,
         });
-        const photoUrl = req.query.photo === '0' ? null : await ifCardPhotoUrl(fav);
+        // Seeded on the username: the preview has no slug yet, and this keeps a
+        // pilot's preview showing the same aircraft as the card they are about
+        // to save rather than a different one.
+        const photoUrl = req.query.photo === '0' ? null : await ifCardPhotoUrl(fav, stats.username || username);
 
         // The preview verifies the roster exactly as a save would. A pilot
         // cannot preview themselves into a VA they are not on — which matters,
@@ -11226,7 +11343,7 @@ app.post('/api/if-card', async (req, res) => {
             // Whether their favourite aircraft actually has a photo behind it.
             // The page can then say "we have no photo of that one" instead of
             // leaving them wondering why the band never appeared.
-            photoFound: card.showPhoto ? !!(await ifCardPhotoUrl(card.favourites)) : false,
+            photoFound: card.showPhoto ? !!(await ifCardPhotoUrl(card.favourites, card.slug)) : false,
             vaAdIds: card.vaAdIds,
             vaOptions,
             // Asked for VAs and did not get all of them: they are not on those
@@ -11363,7 +11480,7 @@ app.get('/api/if-card/:file', async (req, res) => {
             theme: card.theme,
             pro: card.pro && card.autoRefresh,
             statsAt: card.statsAt,
-            photoUrl: card.showPhoto ? await ifCardPhotoUrl(card.favourites) : null,
+            photoUrl: card.showPhoto ? await ifCardPhotoUrl(card.favourites, card.slug) : null,
             // Re-checked against the roster on every render, so leaving a VA
             // takes its colours off the card without the pilot doing anything.
             vas: await ifCardVasFor(card),
@@ -12665,7 +12782,20 @@ const imageCacheLine = () => {
  * too big for this container, or something else in here is growing.
  */
 let memoryShedCount = 0;
+// Shedding is cheap; the global.gc() that follows it is not — it is a
+// stop-the-world pause, and the sampler now runs every 30s. RSS that stays above
+// the shed ratio because something OTHER than these caches is holding it would
+// otherwise mean a forced full GC twice a minute, forever: an event-loop stall
+// on a fixed cadence, which is a worse fault than the one being guarded against
+// and reads in the diagnostics terminal as the "irregular rhythm" it would be
+// causing. Once every two minutes is often enough to matter and rare enough not
+// to be the problem.
+const MEMORY_SHED_COOLDOWN_MS = 2 * 60 * 1000;
+let lastShedAt = 0;
 const shedImageCaches = (rssMb) => {
+    const now = Date.now();
+    if (now - lastShedAt < MEMORY_SHED_COOLDOWN_MS) return false;
+    lastShedAt = now;
     const before = imageCacheLine();
     let freed = 0;
     for (const cache of [routeMapCache, ifCardRenderCache]) {
@@ -12683,21 +12813,53 @@ const shedImageCaches = (rssMb) => {
     // whenever V8 next feels like it — which is the whole point of doing this
     // before the cap rather than after.
     if (typeof global.gc === 'function') { try { global.gc(); } catch { /* best effort */ } }
+    return true;
 };
 
+// Checked every 30s, logged every 5 minutes.
+//
+// These were one number, and it was 5 minutes — which is a fine cadence for a
+// log line and far too slow for a guard. RSS does not drift up to the cap; it
+// steps, in the time one image pipeline takes to allocate, and a sampler that
+// looks twelve times an hour will usually look just after the process was
+// already killed. Sampling is a `process.memoryUsage()` call and two
+// comparisons, so the frequent one is free and there is no reason for the guard
+// to inherit the log's interval.
+//
+// Note what this can and cannot do, because it is easy to over-trust: shedding
+// releases what we are RETAINING, so it helps against a slow climb through the
+// caches. It cannot save a single decode that asks for a gigabyte in one go —
+// nothing observing from out here can. That case is bounded at the source, by
+// the pixel ceiling in imageLimits.js; this is the second line, not the first.
+const MEMORY_SAMPLE_MS = 30 * 1000;
+const MEMORY_LOG_EVERY = 10; // 10 x 30s = the original 5-minute log cadence
+let memoryTicks = 0;
 setInterval(() => {
     const m = process.memoryUsage();
     const rssMb = mb(m.rss);
-    const line = `[mem] rss=${rssMb}MB heapUsed=${mb(m.heapUsed)}MB heapTotal=${mb(m.heapTotal)}MB`
+    const shouldLog = (memoryTicks++ % MEMORY_LOG_EVERY) === 0;
+    // Shedding reports itself loudly, with the figures. When it declines because
+    // of its cooldown we still fall through to the warn below, so an RSS parked
+    // above the shed line leaves a continuous trail rather than going quiet
+    // between sheds — going quiet at the top of the range is the exact failure
+    // this whole block exists to stop.
+    const shed = (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_SHED_RATIO)
+        ? shedImageCaches(rssMb)
+        : false;
+    if (shed) return;
+    // Build the line only when it is going to be used — imageCacheLine() walks
+    // both caches, and at this cadence that is 120 pointless walks an hour.
+    const line = () => `[mem] rss=${rssMb}MB heapUsed=${mb(m.heapUsed)}MB heapTotal=${mb(m.heapTotal)}MB`
         + ` external=${mb(m.external)}MB${imageCacheLine()}`;
-    if (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_SHED_RATIO) {
-        shedImageCaches(rssMb);
-    } else if (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_WARN_RATIO) {
-        console.warn(`⚠️  ${line} — near ${MEMORY_LIMIT_MB}MB cap (${Math.round((rssMb / MEMORY_LIMIT_MB) * 100)}%)`);
-    } else {
-        console.log(line);
+    if (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_WARN_RATIO) {
+        // Always warned, on every sample: crossing the warn line is the trail
+        // that explains a kill afterwards, and thinning it to one-in-ten is
+        // thinning exactly the part worth having.
+        console.warn(`⚠️  ${line()} — near ${MEMORY_LIMIT_MB}MB cap (${Math.round((rssMb / MEMORY_LIMIT_MB) * 100)}%)`);
+    } else if (shouldLog) {
+        console.log(line());
     }
-}, 5 * 60 * 1000).unref();
+}, MEMORY_SAMPLE_MS).unref();
 
 // ---- The roster sweep, on a timer ----
 //

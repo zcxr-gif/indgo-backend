@@ -28,6 +28,10 @@ const fs = require('fs');
 const path = require('path');
 const sharp = require('sharp');
 const axios = require('axios');
+// Aircraft photos and VA brand logos on these cards are third-party URLs. The
+// fetch cap below bounds compressed bytes; this bounds decoded pixels, which is
+// the figure that gets the container OOM-killed. See imageLimits.js.
+const { remoteOpts } = require('./imageLimits');
 const {
     extractRoute, isHttpUrl, resolveAccent, resolveMapLine, normalizeCardOptions,
     routeDistanceNm, eteTextFor,
@@ -165,7 +169,7 @@ const fetchImage = async (url) => {
 // Resize to exactly w*h (cover), with rounded corners, returning a PNG buffer.
 const coverRounded = async (buf, w, h, r = 16) => {
     try {
-        const base = await sharp(buf).resize(w, h, { fit: 'cover', position: 'attention' }).png().toBuffer();
+        const base = await sharp(buf, remoteOpts()).resize(w, h, { fit: 'cover', position: 'attention' }).png().toBuffer();
         const mask = Buffer.from(
             `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}"><rect width="${w}" height="${h}" rx="${r}" ry="${r}" fill="#fff"/></svg>`);
         return await sharp(base).composite([{ input: mask, blend: 'dest-in' }]).png().toBuffer();
@@ -176,7 +180,7 @@ const coverRounded = async (buf, w, h, r = 16) => {
 // that must NOT be cropped.
 const contain = async (buf, w, h) => {
     try {
-        return await sharp(buf)
+        return await sharp(buf, remoteOpts())
             .resize(w, h, { fit: 'inside', withoutEnlargement: false })
             .png().toBuffer();
     } catch { return null; }

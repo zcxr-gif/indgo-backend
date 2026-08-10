@@ -11,6 +11,7 @@
 const { PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const sharp = require('sharp');
 const fs = require('fs');
+const { uploadOpts, isPixelLimitError, PIXEL_LIMIT_MESSAGE } = require('./imageLimits');
 
 // Per-kind sizing. Banners keep their aspect ratio but are capped so we never
 // store a 4K upload; logos are fit inside a square box without enlarging.
@@ -67,7 +68,7 @@ const uploadVaImage = async (s3Client, file, vaRef, kind = 'banner') => {
     // Probe the source. metadata() only reads the header, so this is cheap and
     // tells us the frame count (pages) and per-frame dimensions up front.
     let meta = {};
-    try { meta = await sharp(inputSource).metadata(); } catch { meta = {}; }
+    try { meta = await sharp(inputSource, uploadOpts()).metadata(); } catch { meta = {}; }
     const frames = meta.pages || 1;
     const animated = frames > 1;
 
@@ -95,15 +96,40 @@ const uploadVaImage = async (s3Client, file, vaRef, kind = 'banner') => {
     // squeeze size hard — lower quality, smart chroma subsampling and a tight
     // dimension cap. effort:4 (not 6) keeps the encode fast; frame decode already
     // dominates, so max effort buys little size but a lot of time.
-    const readOpts = animated ? { animated: true, limitInputPixels: 200_000_000 } : {};
+    // A still upload decodes under the ordinary upload ceiling. The animated
+    // path needs its own, because `animated: true` decodes EVERY frame into one
+    // tall image — the pixel count that matters is frames x w x h, which is what
+    // the fast-fail above measures. The two numbers are deliberately the same:
+    // when they differ, the gap between them is reachable by any upload whose
+    // metadata() probe failed (frames falls back to 1, so the fast-fail never
+    // runs) — which is exactly the malformed input least worth trusting.
+    const readOpts = animated
+        ? { animated: true, limitInputPixels: MAX_ANIMATED_SOURCE_PIXELS }
+        : uploadOpts();
     const webpOpts = animated
         ? { quality: 58, effort: 4, smartSubsample: true }
         : { quality: 82 };
 
-    const optimizedBuffer = await sharp(inputSource, readOpts)
-        .resize({ ...profile, withoutEnlargement: true })
-        .webp(webpOpts)
-        .toBuffer();
+    // Tagged the same way the animated fast-fail above tags itself, because the
+    // callers key off `err.status` (see the crew/portal upload routes) and an
+    // untagged sharp error would reach a VA admin as a 400 reading "Input image
+    // exceeds pixel limit" — true, and useless. The two refusals are the same
+    // refusal for the same reason, so they should read alike.
+    let optimizedBuffer;
+    try {
+        optimizedBuffer = await sharp(inputSource, readOpts)
+            .resize({ ...profile, withoutEnlargement: true })
+            .webp(webpOpts)
+            .toBuffer();
+    } catch (err) {
+        if (file.path) fs.unlink(file.path, () => {});
+        if (isPixelLimitError(err)) {
+            const e = new Error(PIXEL_LIMIT_MESSAGE);
+            e.status = 413;
+            throw e;
+        }
+        throw err;
+    }
 
     const key = buildKey(vaRef, kind);
 
