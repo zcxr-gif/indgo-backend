@@ -8322,19 +8322,85 @@ app.get('/api/leaderboard/top', async (req, res) => {
 /* =========================
  * IMAGE PROXY FOR SCREENSHOTS
  * ========================= */
+
+/**
+ * Is this hostname on the private side of the network?
+ *
+ * A literal-address check, deliberately: it covers the addresses that are
+ * reachable from inside the container but not from the internet, which is the
+ * class this proxy must not be pointed at. It is not a complete SSRF defence —
+ * a hostname that RESOLVES to a private address still passes, because the
+ * resolution happens later inside axios — and closing that properly means
+ * resolving first and pinning the connection to the address checked. Worth
+ * doing if this endpoint ever handles anything sensitive; the literal check is
+ * what stops the trivial `?url=http://169.254.169.254/...` today.
+ */
+function isPrivateHost(hostname) {
+    const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+    if (!h || h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.internal') || h.endsWith('.local')) return true;
+    // IPv6 loopback / link-local / unique-local.
+    if (h === '::1' || h === '::' || /^f[cd][0-9a-f]{2}:/.test(h) || /^fe80:/.test(h)) return true;
+    // IPv4-mapped IPv6 (::ffff:127.0.0.1) is checked on its embedded address.
+    const mapped = h.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    const v4 = mapped ? mapped[1] : h;
+    const m = v4.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (!m) return false;                       // a name — resolved later, see above
+    const [a, b] = [Number(m[1]), Number(m[2])];
+    if ([a, Number(m[2]), Number(m[3]), Number(m[4])].some((n) => n > 255)) return true;
+    return a === 0 || a === 10 || a === 127                       // this-host, private, loopback
+        || (a === 169 && b === 254)                               // link-local, incl. cloud metadata
+        || (a === 172 && b >= 16 && b <= 31)                      // private
+        || (a === 192 && b === 168)                               // private
+        || (a === 100 && b >= 64 && b <= 127)                     // carrier-grade NAT
+        || a >= 224;                                              // multicast / reserved
+}
 app.get('/api/image-proxy', async (req, res) => {
     const imageUrl = req.query.url;
     if (!imageUrl) {
         return res.status(400).send('No URL provided');
     }
 
+    // Only http(s), and not at ourselves or anything else on the private side of
+    // the network. This endpoint takes a URL from the query string, is
+    // unauthenticated, and fetches it from inside the container — which without
+    // a check makes it a general-purpose way to ask our host to make requests on
+    // the caller's behalf, including to cloud metadata (169.254.169.254),
+    // localhost and anything else the container can reach but the internet
+    // cannot. It exists to relay public screenshot images, so it is restricted
+    // to that. IMAGE_PROXY_ALLOW_PRIVATE=1 restores the old reach if some
+    // deployment genuinely proxies an internal host.
+    let target;
+    try {
+        target = new URL(String(imageUrl));
+    } catch {
+        return res.status(400).send('Invalid URL');
+    }
+    if (!/^https?:$/.test(target.protocol)) {
+        return res.status(400).send('Only http and https URLs can be proxied');
+    }
+    if (process.env.IMAGE_PROXY_ALLOW_PRIVATE !== '1' && isPrivateHost(target.hostname)) {
+        return res.status(400).send('That host cannot be proxied');
+    }
+
+    let upstream = null;
     try {
         // Fetch the external image as a stream
         const response = await axios({
             method: 'get',
-            url: imageUrl,
-            responseType: 'stream'
+            url: target.href,
+            responseType: 'stream',
+            // Without a timeout an upstream that accepts the connection and then
+            // says nothing holds this request, its socket and its buffers open
+            // indefinitely. Handles that only ever accumulate are the shape the
+            // diagnostics terminal calls a leak, and they precede an OOM.
+            timeout: 15000,
+            maxRedirects: 3,
+            // Bounds what we are willing to relay. Applies to the stream, so an
+            // endless response is cut off rather than piped forever.
+            maxContentLength: 25 * 1024 * 1024,
+            maxBodyLength: 25 * 1024 * 1024,
         });
+        upstream = response.data;
 
         // 1. Force Allow Origin * (The magic permission slip)
         res.header("Access-Control-Allow-Origin", "*");
@@ -8346,12 +8412,27 @@ app.get('/api/image-proxy', async (req, res) => {
             res.header("Content-Type", response.headers['content-type']);
         }
 
-        // 3. Pipe the image data straight to the frontend
-        response.data.pipe(res);
+        // 3. Pipe the image data straight to the frontend.
+        //
+        // pipe() does NOT tear down the source when the destination goes away,
+        // and the destination going away is the normal case here: a browser
+        // that navigates, or an <img> removed from the page, closes the socket
+        // mid-transfer. The upstream request would then stay open — holding a
+        // connection and its buffers — until it finished on its own, which for
+        // a slow origin is a long time and for a hanging one is forever. So the
+        // client's disconnect is forwarded upstream explicitly.
+        res.once('close', () => { if (!upstream.destroyed) upstream.destroy(); });
+        upstream.once('error', (err) => {
+            console.error('Image Proxy Error (upstream):', err.message);
+            if (!res.headersSent) res.status(502).send('Failed to fetch image');
+            else res.destroy(err);
+        });
+        upstream.pipe(res);
 
     } catch (error) {
         console.error("Image Proxy Error:", error.message);
-        res.status(500).send('Failed to fetch image');
+        if (upstream && !upstream.destroyed) upstream.destroy();
+        if (!res.headersSent) res.status(502).send('Failed to fetch image');
     }
 });
 
