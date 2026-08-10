@@ -273,7 +273,10 @@
                 <div>
                     <label class="block text-sm font-semibold mb-1.5">Who appears on the map</label>
                     <select id="f_callsignMatch" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
-                        <option value="strict">Only my VA callsigns — no one else's pilots</option>
+                        <option value="exact">Exactly my callsigns — "Air Canada 001VA" and nothing else</option>
+                        <!-- `selected` keeps form.reset() (a new embed) on the
+                             schema default rather than the first option. -->
+                        <option value="strict" selected>Only my VA callsigns — no one else's pilots</option>
                         <option value="broad">Catch more of my pilots — may include someone else's</option>
                     </select>
                     <div class="mt-2 rounded-xl border-2 border-amber-200 dark:border-amber-900/60 bg-amber-50 dark:bg-amber-950/30 p-3">
@@ -285,6 +288,13 @@
                             <strong>cannot</strong> be shown as one of yours. And because
                             <strong>VA</strong> is a tag almost everyone uses, a pilot flying for a
                             different airline's VA on a similar callsign looks exactly like one of yours.
+                        </p>
+                        <p class="text-xs text-amber-800/90 dark:text-amber-300/80 mt-2 leading-relaxed">
+                            <strong>Exactly my callsigns</strong> is the tightest filter: the callsign must be
+                            the airline, the flight number and the tag glued to it — "Air Canada 001VA" — and
+                            stop there. A second trailing tag ("001VA CX"), a missing tag ("001"), or a
+                            rostered pilot on somebody else's callsign are all left off. Nothing that isn't
+                            yours gets through; a member who types their callsign loosely does not get on.
                         </p>
                         <p class="text-xs text-amber-800/90 dark:text-amber-300/80 mt-2 leading-relaxed">
                             <strong>Only my VA callsigns</strong> shows nobody who isn't yours, but members
@@ -1114,7 +1124,7 @@
             document.getElementById('f_prefixes').value = (c.callsignPrefixes || []).join(', ');
             document.getElementById('f_suffixes').value = (c.callsignSuffixes || []).join(', ');
             document.getElementById('f_regulars').value = (c.regularCallsigns || []).join(', ');
-            document.getElementById('f_callsignMatch').value = c.callsignMatch === 'broad' ? 'broad' : 'strict';
+            document.getElementById('f_callsignMatch').value = ['exact', 'broad'].includes(c.callsignMatch) ? c.callsignMatch : 'strict';
             document.getElementById('f_hubs').value = (c.hubs || []).join(', ');
             document.getElementById('f_mode').value = c.mode || 'roster';
             document.getElementById('f_provider').value = c.provider || '';

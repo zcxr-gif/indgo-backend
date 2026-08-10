@@ -51,6 +51,11 @@ const EMBED_BASE_URL = process.env.EMBED_BASE_URL || 'https://inflight.info/embe
 const EMBED_EVENTS_BASE_URL = process.env.EMBED_EVENTS_BASE_URL
     || 'https://site--indgo-backend--6dmjph8ltlhv.code.run/embed-events.html';
 
+// How closely a live callsign must follow the VA's registered callsigns before a
+// flight is delivered as theirs, tightest first. Mirrors VA_CALLSIGN_MATCH_MODES
+// in server.js, which owns the field on the listing.
+const PORTAL_CALLSIGN_MATCH_MODES = ['exact', 'strict', 'broad'];
+
 const COOKIE_NAME = 'va_portal_token';
 const TOKEN_TYPE = 'va_portal';            // distinguishes these tokens from staff tokens
 const TOKEN_TTL = '30d';
@@ -972,6 +977,13 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             flightEventsApproved: !!ad.flightEventsApproved,
             flightEventsRequested: !!ad.flightEventsRequestedAt,
             flightEventsWebhookHint: ad.flightEventsWebhookUrl ? maskWebhookUrl(ad.flightEventsWebhookUrl) : '',
+            // How closely a live callsign must follow this VA's registered
+            // callsigns before a flight is delivered as theirs — 'exact' |
+            // 'strict' | 'broad'. Owner-editable (POST /flight-events/matching).
+            callsignMatch: PORTAL_CALLSIGN_MATCH_MODES.includes(ad.callsignMatch) ? ad.callsignMatch : 'strict',
+            // The callsigns that setting is applied against, so the portal can
+            // show the owner what "exactly this" actually means for them.
+            callsigns: (ad.callsigns && ad.callsigns.length) ? ad.callsigns : (ad.callsign ? [ad.callsign] : []),
             // The (normalized) card customization — colours/layout/fields — so the
             // portal can render the current selection. Always a full, valid object.
             flightEventsCard: normalizeCardOptions(ad.flightEventsCard || {}),
@@ -1280,6 +1292,39 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
         } catch (err) {
             console.error('VA portal flight-events toggle error:', err);
             res.status(500).json({ error: 'Could not update delivery.' });
+        }
+    });
+
+    // Owner chooses how closely a live callsign has to follow the callsigns they
+    // registered with us before we call the flight theirs. This is the knob for
+    // "stop posting flights that aren't ours": 'exact' takes only
+    // "<callsign> <number><tag>" and nothing else, 'strict' (the default) also
+    // allows a second trailing tag and lets a rostered member fly the VA's
+    // airline untagged, 'broad' accepts the airline name on its own.
+    //
+    // It governs delivery end to end — the ACARS matcher reads it off the
+    // listing and resolveVaEventPartner re-applies it — so the flights a VA sees
+    // in Discord follow the same rule they picked here.
+    app.post('/api/va-portal/flight-events/matching', requirePortalOwner, async (req, res) => {
+        try {
+            if (!req.portal.vaAdId) return res.status(404).json({ error: 'No VA is linked to this account.' });
+            const mode = String((req.body && (req.body.callsignMatch ?? req.body.match)) || '').trim().toLowerCase();
+            if (!PORTAL_CALLSIGN_MATCH_MODES.includes(mode)) {
+                return res.status(400).json({ error: `Choose one of: ${PORTAL_CALLSIGN_MATCH_MODES.join(', ')}.` });
+            }
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId).select('+flightEventsWebhookUrl');
+            if (!ad) return res.status(404).json({ error: 'Your VA listing could not be found.' });
+            ad.callsignMatch = mode;
+            await ad.save();
+            logActivity({
+                vaAdId: ad._id, vaName: ad.name,
+                actorName: req.portal.displayName || req.portal.username, actorRole: 'owner',
+                action: 'flight-events.matching', detail: `Callsign matching set to "${mode}"`,
+            });
+            res.json({ va: portalVa(ad) });
+        } catch (err) {
+            console.error('VA portal flight-events matching error:', err);
+            res.status(500).json({ error: 'Could not update callsign matching.' });
         }
     });
 

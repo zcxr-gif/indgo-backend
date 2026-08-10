@@ -152,6 +152,7 @@ expect and enforce. Backed by the data model in `server.js`
 |-------|-----------|---------------------|
 | **VA Name** | **Yes** | Exact, unique. Duplicates are rejected by the system (HTTP 409). Must match IFVARB approval. |
 | **Callsign** | No (strongly preferred) | Enter the **base only** (e.g. `OCEAN`). The system stores the base and displays it as `OCEAN ##VA`; pilots substitute their pilot number. Don't type the `##VA` suffix — it's stripped/added automatically. |
+| **Callsign matching** | Yes (defaults to Strict) | How closely a live in-game callsign must follow the callsign(s) above before a flight counts as this VA's. **Strict** (default) allows a second trailing tag (`OCEAN 12VA CX`) and lets a pilot on the VA's roster fly the VA's airline untagged. **Exact** takes `OCEAN 12VA` and nothing else — no extra tag, no missing tag, no roster waiver. **Broad** accepts the airline name alone (`OCEAN 12`), which finds more of their pilots and can also find somebody else's. Reach for **Exact** when a VA reports flights in their feed that aren't theirs; reach for **Broad** when they report missing pilots. The VA owner can change this themselves in the portal. |
 | **Type** | Yes | `VA` (virtual airline) or `VO` (virtual organisation). Drives the IFVARB-vs-exception path in Section 3. |
 | **Tagline** | No | One-line hook, **max 140 chars**. No clickbait, no false claims. |
 | **Description** | No | Up to 4000 chars. Accurate, on-brand, no infringing copy. |

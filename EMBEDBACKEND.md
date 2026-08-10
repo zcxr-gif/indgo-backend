@@ -47,6 +47,7 @@ To embed it on their site, they paste this iframe:
 | `prefixes`   | `Air%20Canada,United`                     | **Full airline name(s)** you fly under (see Callsign matching). Defaults to `[va]`. |
 | `suffixes`   | `VA,EX`                                    | Your trailing tag(s) (see Callsign matching). |
 | `regulars`   | `OCEAN%20STAFF,Shamrock`                  | Untagged callsigns, prefix-only, always included (alias `callsigns`). See §2. |
+| `match`      | `exact` \| `strict` \| `broad`            | How closely a callsign must follow the pattern. Default `strict`. See §2. |
 | `hubs`       | `CYYZ,CYUL,CYVR`                          | Hub ICAOs. Each becomes a map marker listing your inbound pilots. |
 | `provider`   | `mapbox` or `free`                        | Auto: `free` when no Mapbox token. |
 | `mapboxToken`| `pk.eyJ…`                                 | The VA's own Mapbox token (mapbox provider only). |
@@ -172,20 +173,50 @@ grabbing every callsign that merely ends in a common tag like `VA`.
   airline callsigns alongside your tagged members. Alias in preview URLs:
   `callsigns`.
 
-- **Match mode** (`callsignMatch`) — `"strict"` (default) or `"broad"`. Chooses
-  which mistake the VA would rather live with; see the limitation below.
+- **Match mode** (`callsignMatch`) — `"exact"`, `"strict"` (default) or
+  `"broad"`. Chooses which mistake the VA would rather live with; see the
+  limitation below. `"exact"` demands the registered shape and nothing else;
   `"broad"` waives the suffix requirement in step 2, so a declared prefix is
-  enough on its own even when tags are configured.
+  enough on its own even when tags are configured. Preview-URL alias: `match`.
 
 **How they combine (per flight):**
 
 1. If it prefix-matches any `regularCallsigns` → **included** (no tag needed).
+   In `"exact"` mode the callsign has to *be* that regular — the bare name, or
+   the name plus a flight number — not merely start with it.
 2. Else if it prefix-matches any `callsignPrefixes`:
-   - no `callsignSuffixes` set → **included** (prefix-only mode)
-   - `callsignSuffixes` set → included **only** if a tag is on one of the last
-     two tokens — **unless** `callsignMatch` is `"broad"`, which includes it on
-     the prefix alone.
+   - `callsignMatch: "exact"` → included **only** if the compacted callsign is
+     exactly `<prefix><number><tag>` (or `<prefix><number>` for a VA with no
+     tags) and stops there.
+   - `callsignMatch: "broad"` → **included** on the prefix alone.
+   - otherwise (`"strict"`): no `callsignSuffixes` set → **included**
+     (prefix-only mode); `callsignSuffixes` set → included **only** if a tag is
+     on one of the last two tokens.
 3. Otherwise → not this VA.
+
+### Exact mode — "only the callsigns we gave you"
+
+`callsignMatch: "exact"` is the tightest filter offered. The compacted callsign
+must be a declared prefix, then the flight number, then one of the declared tags
+— and end there. Everything that merely resembles the pattern is dropped, and so
+are the two widenings `"strict"` applies on top of the plain rule (a rostered
+pilot flying the airline untagged, and a distinctive tag standing on its own).
+
+With `prefixes: ["Air Canada"]`, `suffixes: ["VA"]`:
+
+| Callsign               | `exact` | `strict` | `broad` |
+|------------------------|:-------:|:--------:|:-------:|
+| `Air Canada 001VA`     | ✅ | ✅ | ✅ |
+| `Air Canada 001VA CX`  | ❌ | ✅ | ✅ |
+| `Air Canada 001 VA EX` | ❌ | ✅ | ✅ |
+| `Air Canada 001`       | ❌ | ❌ | ✅ |
+| `Air France 045VA`     | ❌ | ❌ | ❌ |
+
+Weight-class words (`Heavy`, `Super`) are still stripped before the test in every
+mode, so `Air Canada 001VA Heavy` matches wherever `Air Canada 001VA` does.
+
+The trade is the mirror of `"broad"`: nothing that isn't yours gets through, and
+a member who types their callsign loosely does not get on.
 
 ### A limit worth stating plainly
 
@@ -205,6 +236,7 @@ follow, and neither can be engineered away:
 
 | Mode | What the map shows | What it costs |
 |---|---|---|
+| `exact` | Only `<prefix> <number><tag>`, nothing else | Any member whose callsign isn't typed exactly that way is missing |
 | `strict` (default) | Only callsigns fitting your registered patterns | Members on codeshare or unregistered callsigns are missing |
 | `broad` | Also the bare prefix, catching more of your members | Somebody else's pilot can appear as one of yours |
 
@@ -272,6 +304,7 @@ so you can lock a token to one or more domains.
   "callsignPrefixes": ["Air Canada"],
   "callsignSuffixes": ["VA"],
   "regularCallsigns": ["OCEAN STAFF", "Shamrock"],
+  "callsignMatch": "strict",   // exact | strict | broad — see §2
   "hubs": ["CYYZ", "CYUL", "CYVR"],
   "mode": "map",
   "provider": "mapbox",
