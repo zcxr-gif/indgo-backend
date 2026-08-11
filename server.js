@@ -4185,7 +4185,11 @@ function ifRedirectUri(req) {
  * What a crew center is told about its connection. Never a token, never a
  * secret — the same rule the Supabase token state follows, for the same reason.
  */
-function ifState(ad, { owner = false } = {}) {
+// `manage` is "may this caller maintain the connection" — integrations.manage,
+// which the owner holds implicitly. It gates the client's own details, which
+// are the credential's and not the airline's: everything else here is readable
+// by any staff member, because whether the airline is connected is not a power.
+function ifState(ad, { manage = false } = {}) {
     const client = ifClientFor(ad || {});
     const scopes = (ad && ad.ifScopes) || [];
     const hasGrant = !!(ad && ad.ifConnectedAt);
@@ -4226,8 +4230,8 @@ function ifState(ad, { owner = false } = {}) {
             configured: !!client.id,
             source: client.source,
             type: client.type,
-            id: owner ? client.id : '',
-            secretHint: owner ? ((ad && ad.ifClientSecretHint) || '') : '',
+            id: manage ? client.id : '',
+            secretHint: manage ? ((ad && ad.ifClientSecretHint) || '') : '',
             secretUnavailable: client.secretUnavailable,
             // Can this deployment hold a secret at all? When false the screen
             // hides the confidential-client option rather than offering a field
@@ -4259,17 +4263,35 @@ function ifState(ad, { owner = false } = {}) {
  * `owner` is passed rather than re-derived: the owner-gated routes have
  * already established it, and asking twice invites the two answers to differ.
  */
-async function ifPayload(req, slug, ad, { owner }) {
+async function ifPayload(req, slug, ad) {
+    const p = verifyCrewRequest(req);
+    const owner = !!p && (p.kind === 'inflight' || p.role === 'owner');
+    // Everything on the setup half of this panel keys on THIS, not on `owner`.
+    // The person who connects the account is whoever holds
+    // integrations.manage, which an owner always does and a technical manager
+    // may — and a screen that shows them the connection while hiding the
+    // client id they are supposed to be maintaining would be delegation in
+    // name only.
+    const manage = owner || !(await requireCap(req, slug, 'integrations.manage')).error;
     return {
-        ...ifState(ad, { owner }),
+        ...ifState(ad, { manage }),
         // What the CALLER may do, as distinct from what the grant allows.
         // Both have to be true for a save button to appear, and the panel
         // says which one is missing.
-        you: { owner, canManageSchedules: !(await ifWriteGate(req, slug)).error },
-        // Only the owner is shown it, and only the owner is asked to register
-        // it — but they are asked for it on the same screen they just saved a
-        // client on, so it has to survive that save.
-        redirectUri: owner ? ifRedirectUri(req) : '',
+        //
+        // `owner` is still reported, and still means literal ownership — it is
+        // no longer what gates this screen, but "are you the owner" is a
+        // different question from "may you do this" and conflating them is how
+        // the two drifted apart in the first place.
+        you: {
+            owner,
+            canManage: manage,
+            canManageSchedules: !(await ifWriteGate(req, slug)).error,
+        },
+        // Whoever maintains the client is who needs the URI to register on it,
+        // and they are asked for it on the same screen they just saved that
+        // client on — so it has to survive the save.
+        redirectUri: manage ? ifRedirectUri(req) : '',
     };
 }
 
@@ -4313,17 +4335,29 @@ function ifFail(res, err, fallback) {
 //   cap     WRITING a Live schedule, gated on schedules.manage — the capability
 //           that already means "builds the airline's week".
 
-const ifOwnerGate = (req, slug) => {
-    const p = verifyCrewRequest(req);
-    if (!p) return { error: 401, message: 'Not authenticated.' };
-    if (!(p.kind === 'inflight' || p.role === 'owner')) {
-        return { error: 403, message: 'Only the VA owner can connect an Infinite Flight account.' };
-    }
-    if (p.kind !== 'inflight' && p.slug && p.slug !== String(slug || '').toLowerCase()) {
-        return { error: 403, message: 'Wrong crew center.' };
-    }
-    return { p };
-};
+/**
+ * May this caller manage the Infinite Flight connection?
+ *
+ * Was owner-only. Now gated on integrations.manage, which an owner holds
+ * implicitly and can grant to somebody else — because the person who keeps a
+ * VA's integrations working is very often not the person whose name is on the
+ * partnership, and the previous answer to that was the owner handing over their
+ * own password.
+ *
+ * Still a high bar: integrations.manage is excluded from the unassigned-staff
+ * default, so holding it means an owner ticked it on a role deliberately.
+ */
+async function ifManageGate(req, slug) {
+    const gate = await requireCap(req, slug, 'integrations.manage');
+    return gate.error
+        ? {
+            error: gate.error,
+            message: gate.error === 401
+                ? 'Not authenticated.'
+                : 'You don’t have permission to manage the Infinite Flight connection.',
+        }
+        : gate;
+}
 
 const ifStaffGate = (req, slug) => {
     const base = crewCanManage(req, slug);
@@ -4506,8 +4540,9 @@ const ifInvalidate = (vaId) => {
  * What this crew center's Infinite Flight connection looks like.
  *
  * Readable by any staff member — knowing whether the airline is connected is
- * not a power — but the client id and the secret hint are added only for the
- * owner, because those are the credential's own details.
+ * not a power — but the client id and the secret hint are added only for
+ * whoever may maintain it (integrations.manage, which an owner holds
+ * implicitly), because those are the credential's own details.
  */
 app.get('/api/crew/:slug/if', async (req, res) => {
     const gate = ifStaffGate(req, req.params.slug);
@@ -4515,9 +4550,7 @@ app.get('/api/crew/:slug/if', async (req, res) => {
     try {
         const va = await resolveCrewVa(req.params.slug);
         if (!va) return res.status(404).json({ error: 'Crew center not found.' });
-        const ad = await ifConnection(va._id);
-        const owner = gate.p.kind === 'inflight' || gate.p.role === 'owner';
-        res.json(await ifPayload(req, req.params.slug, ad, { owner }));
+        res.json(await ifPayload(req, req.params.slug, await ifConnection(va._id)));
     } catch (err) { ifFail(res, err, { log: 'if status error', message: 'Could not read the Infinite Flight connection.' }); }
 });
 
@@ -4537,7 +4570,7 @@ app.get('/api/crew/:slug/if', async (req, res) => {
  * which still works, because PKCE is mandatory for both types.
  */
 app.post('/api/crew/:slug/if/client', async (req, res) => {
-    const gate = ifOwnerGate(req, req.params.slug);
+    const gate = await ifManageGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -4585,14 +4618,14 @@ app.post('/api/crew/:slug/if/client', async (req, res) => {
             ...(ad && ad.ifConnectedAt ? {
                 notice: 'The account that is already connected will need reconnecting — the tokens it holds belong to the previous client.',
             } : {}),
-            ...(await ifPayload(req, req.params.slug, ad, { owner: true })),
+            ...(await ifPayload(req, req.params.slug, ad)),
         });
     } catch (err) { ifFail(res, err, { log: 'if client save error', message: 'Could not save the OAuth client.' }); }
 });
 
 /** Forget the VA's own client and fall back to the platform's, if there is one. */
 app.delete('/api/crew/:slug/if/client', async (req, res) => {
-    const gate = ifOwnerGate(req, req.params.slug);
+    const gate = await ifManageGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -4602,7 +4635,7 @@ app.delete('/api/crew/:slug/if/client', async (req, res) => {
         });
         res.json({
             ok: true,
-            ...(await ifPayload(req, req.params.slug, await ifConnection(va._id), { owner: true })),
+            ...(await ifPayload(req, req.params.slug, await ifConnection(va._id))),
         });
     } catch (err) { ifFail(res, err, { log: 'if client delete error', message: 'Could not remove the OAuth client.' }); }
 });
@@ -4620,7 +4653,7 @@ app.delete('/api/crew/:slug/if/client', async (req, res) => {
  * user gesture. A crew center reconnecting in a desktop browser wants it off.
  */
 app.post('/api/crew/:slug/if/connect', async (req, res) => {
-    const gate = ifOwnerGate(req, req.params.slug);
+    const gate = await ifManageGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -4853,7 +4886,7 @@ app.get('/api/crew/if/callback', async (req, res) => {
  * offers, for the same reason.
  */
 app.delete('/api/crew/:slug/if/connection', async (req, res) => {
-    const gate = ifOwnerGate(req, req.params.slug);
+    const gate = await ifManageGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -4863,7 +4896,7 @@ app.delete('/api/crew/:slug/if/connection', async (req, res) => {
         res.json({
             ok: true,
             notice: 'Disconnected here. To withdraw the authorization at Infinite Flight as well, remove this app from your Infinite Flight account.',
-            ...(await ifPayload(req, req.params.slug, await ifConnection(va._id), { owner: true })),
+            ...(await ifPayload(req, req.params.slug, await ifConnection(va._id))),
         });
     } catch (err) { ifFail(res, err, { log: 'if disconnect error', message: 'Could not disconnect.' }); }
 });
@@ -4904,7 +4937,7 @@ app.get('/api/crew/:slug/if/organizations/:organizationId', async (req, res) => 
  * against the id, and the label is what every screen shows.
  */
 app.post('/api/crew/:slug/if/organization', async (req, res) => {
-    const gate = ifOwnerGate(req, req.params.slug);
+    const gate = await ifManageGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -4929,7 +4962,7 @@ app.post('/api/crew/:slug/if/organization', async (req, res) => {
         res.json({
             ok: true,
             organization,
-            ...(await ifPayload(req, req.params.slug, await ifConnection(va._id), { owner: true })),
+            ...(await ifPayload(req, req.params.slug, await ifConnection(va._id))),
         });
     } catch (err) { ifFail(res, err, { log: 'if org select error', message: 'Could not select that organization.' }); }
 });
@@ -5445,7 +5478,7 @@ app.post('/api/crew/:slug/if/sync', async (req, res) => {
             ...(bare ? {
                 notice: 'Only departures with an aircraft assigned to them will be sent. Set a default aircraft to send the rest as well.',
             } : {}),
-            ...(await ifPayload(req, req.params.slug, ad, { owner: true })),
+            ...(await ifPayload(req, req.params.slug, ad)),
         });
     } catch (err) { ifFail(res, err, { log: 'if sync settings error', message: 'Could not save the sync settings.' }); }
 });
@@ -8579,13 +8612,19 @@ function scopeStats(payload, isManager) {
  * same code path as the real sweep with dryRun set, so the list it shows is the
  * list that would go — not a second implementation that could disagree.
  *
- * Owner-only, both of them, matching the settings gate in crewAuth.
+ * Gated on retention.manage, both of them, matching the settings gate in
+ * crewAuth. That capability is owner-implicit, is in none of the presets and is
+ * excluded from the unassigned-staff default — so it is held only where an
+ * owner ticked that specific line, which is the bar this deserves. Seeing the
+ * sweep is gated the same as running it on purpose: the preview names the
+ * pilots who would be removed.
  * ========================================================================= */
 app.get('/api/crew/:slug/retention', async (req, res) => {
-    const p = verifyCrewRequest(req);
-    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
-    if (!(p.kind === 'inflight' || p.role === 'owner')) {
-        return res.status(403).json({ error: 'Only the owner can see the roster sweep.' });
+    const gate = await requireCap(req, req.params.slug, 'retention.manage');
+    if (gate.error) {
+        return res.status(gate.error).json({
+            error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to see the roster sweep.',
+        });
     }
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -8608,10 +8647,11 @@ app.get('/api/crew/:slug/retention', async (req, res) => {
 });
 
 app.post('/api/crew/:slug/retention/run', async (req, res) => {
-    const p = verifyCrewRequest(req);
-    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
-    if (!(p.kind === 'inflight' || p.role === 'owner')) {
-        return res.status(403).json({ error: 'Only the owner can run the roster sweep.' });
+    const gate = await requireCap(req, req.params.slug, 'retention.manage');
+    if (gate.error) {
+        return res.status(gate.error).json({
+            error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to run the roster sweep.',
+        });
     }
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -8956,19 +8996,19 @@ app.post('/api/crew/:slug/data/:dataset/purge', async (req, res) => {
     } catch (err) { crewFail(res, err, { log: 'crew data purge error', message: 'Could not delete that data.' }); }
 });
 
-// Move a VA's remaining managed data into their own project. Owner (or
-// Inflight) only — this is the one-way door out of our storage.
+// Move a VA's remaining managed data into their own project. Gated on
+// integrations.manage, like the rest of the data-store setup — this is the
+// one-way door out of our storage, and the person who walks the VA through it
+// is the same one who connected the project on the far side.
 //
 // Idempotent by construction: it copies in dependency order (members and routes
 // first, so a PIREP can point at the ids they were given), and skips anything
 // already present on the far side. Nothing is deleted from managed storage here
 // — the VA verifies the copy first, then calls DELETE to release it.
 app.post('/api/crew/:slug/store/migrate', async (req, res) => {
-    const p = verifyCrewRequest(req);
-    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
-    if (!(p.kind === 'inflight' || p.role === 'owner')) {
-        return res.status(403).json({ error: 'Only the VA owner can migrate the data store.' });
-    }
+    const gate = await crewOwnerGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    const p = gate.p;
     if (p.kind !== 'inflight' && p.slug && p.slug !== String(req.params.slug).toLowerCase()) {
         return res.status(403).json({ error: 'Wrong crew center.' });
     }
@@ -9092,11 +9132,9 @@ app.post('/api/crew/:slug/store/migrate', async (req, res) => {
 // from the migration itself on purpose: copying is safe and repeatable, and
 // deleting is neither, so the VA has to ask for it explicitly.
 app.delete('/api/crew/:slug/store/legacy', async (req, res) => {
-    const p = verifyCrewRequest(req);
-    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
-    if (!(p.kind === 'inflight' || p.role === 'owner')) {
-        return res.status(403).json({ error: 'Only the VA owner can release managed storage.' });
-    }
+    const gate = await crewOwnerGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    const p = gate.p;
     if (p.kind !== 'inflight' && p.slug && p.slug !== String(req.params.slug).toLowerCase()) {
         return res.status(403).json({ error: 'Wrong crew center.' });
     }
@@ -9182,19 +9220,29 @@ app.delete('/api/crew/:slug/store/legacy', async (req, res) => {
 // moment they ask. With no encryption key configured the offer is not made and
 // nothing is kept.
 
-// Owner (or Inflight) gate, shared by the setup routes. Connecting a data store
-// is deliberately not delegable to staff: it is the VA's data and their
-// Supabase account.
-function crewOwnerGate(req, slug) {
-    const p = verifyCrewRequest(req);
-    if (!p) return { error: 401, message: 'Not authenticated.' };
-    if (!(p.kind === 'inflight' || p.role === 'owner')) {
-        return { error: 403, message: 'Only the VA owner can set up the data store.' };
+// Gate shared by the setup routes, on integrations.manage.
+//
+// This was owner-only, on the reasoning that it is the VA's data and their
+// Supabase account. Both still true — but so is the fact that connecting a
+// Postgres project is the most technical thing in the crew center, and the
+// owner is not reliably the person who can do it. The delegation is the point:
+// integrations.manage exists so an airline can have somebody who sets this up
+// WITHOUT being handed the owner's login, which was the previous workaround and
+// gave them everything instead.
+//
+// Not folded into the bulk-purge gate above, which stays owner-only. Connecting
+// storage and emptying it are different decisions.
+async function crewOwnerGate(req, slug) {
+    const gate = await requireCap(req, slug, 'integrations.manage');
+    if (gate.error) {
+        return {
+            error: gate.error,
+            message: gate.error === 401
+                ? 'Not authenticated.'
+                : 'You don’t have permission to set up the data store.',
+        };
     }
-    if (p.kind !== 'inflight' && p.slug && p.slug !== String(slug || '').toLowerCase()) {
-        return { error: 403, message: 'Wrong crew center.' };
-    }
-    return { p };
+    return gate;
 }
 
 // ---------------------------------------------------------------------------
@@ -9385,7 +9433,7 @@ function setupFail(res, err, log) {
 // in a body rather than in a URL that would land in every access log between
 // here and there.
 app.post('/api/crew/:slug/store/projects', async (req, res) => {
-    const gate = crewOwnerGate(req, req.params.slug);
+    const gate = await crewOwnerGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
     try {
         // A VA who kept a token does not have to fetch a new one to move to a
@@ -9437,7 +9485,7 @@ const CREW_SUPABASE_REGIONS = [
 // { ready: false, projectRef } and the dashboard polls with the same token and
 // ref until it is. Every stage is safe to repeat.
 app.post('/api/crew/:slug/store/provision', async (req, res) => {
-    const gate = crewOwnerGate(req, req.params.slug);
+    const gate = await crewOwnerGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
 
     try {
@@ -9536,7 +9584,7 @@ app.post('/api/crew/:slug/store/provision', async (req, res) => {
 // exactly where they were. Either way the token is used only to run our own
 // script against the project this crew center is already connected to.
 app.post('/api/crew/:slug/store/upgrade', async (req, res) => {
-    const gate = crewOwnerGate(req, req.params.slug);
+    const gate = await crewOwnerGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
 
     try {
@@ -9624,7 +9672,7 @@ app.post('/api/crew/:slug/store/upgrade', async (req, res) => {
 // would otherwise cause arrives weeks later, in an automatic update nobody is
 // watching, and would look like the update feature being broken.
 app.post('/api/crew/:slug/store/token', async (req, res) => {
-    const gate = crewOwnerGate(req, req.params.slug);
+    const gate = await crewOwnerGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
     const accessToken = String(req.body?.accessToken || '').trim();
     const hasAuto = req.body?.autoUpdate !== undefined;
@@ -9680,7 +9728,7 @@ app.post('/api/crew/:slug/store/token', async (req, res) => {
 // VA's Supabase account until they revoke it there, and the reply says so
 // rather than letting "forgotten" be mistaken for "revoked".
 app.delete('/api/crew/:slug/store/token', async (req, res) => {
-    const gate = crewOwnerGate(req, req.params.slug);
+    const gate = await crewOwnerGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
     try {
         const va = await resolveCrewVa(req.params.slug);

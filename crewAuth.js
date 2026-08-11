@@ -233,8 +233,48 @@ const CREW_CAPABILITIES = [
     // the liveries" is rarely the person who writes the operations manual, and a
     // VA should be able to hand out the first without the second.
     { id: 'links.manage',           group: 'Communications', label: 'Curate the quick-links board' },
+
+    // ---- Owner-grade. Read the note under CREW_OWNER_GRADE_CAPS. ----
+    //
+    // v13. These three powers were owner-only and hard-coded, and the reason to
+    // open them is the same one that produced partnership.view: a VA of any
+    // size has people who are not the owner and whose job needs one of them.
+    // Somebody runs the airline day to day and needs to build the team;
+    // somebody keeps the integrations working and is not the person whose name
+    // is on the partnership. The alternative to delegating was the owner
+    // handing over their own login, which is worse in every way — it is
+    // unauditable, it cannot be narrowed, and it cannot be taken back without a
+    // password change.
+    { id: 'integrations.manage',    group: 'Owner-level',    label: 'Connect Infinite Flight & the data store' },
+    { id: 'team.manage',            group: 'Owner-level',    label: 'Create staff roles & assign the team' },
+    { id: 'retention.manage',       group: 'Owner-level',    label: 'Configure & run the roster sweep' },
 ];
 const CREW_CAP_IDS = CREW_CAPABILITIES.map(c => c.id);
+
+/**
+ * The capabilities that are NOT part of the unassigned-staff default.
+ *
+ * effectiveCaps gives a staff member with no role assignment everything, so
+ * that switching the permission system on does not lock out a team that never
+ * had roles. That default is load-bearing and stays — but it means the set of
+ * capabilities and the set of things an unassigned staff member can do are the
+ * same list, and adding a row to that list silently hands the new power to
+ * every unassigned staff member at every VA the moment this deploys.
+ *
+ * For the day-to-day capabilities that was always fine: they describe work
+ * those people were already doing. For these three it is not. Nobody should
+ * wake up able to disconnect their airline's Infinite Flight account, rewrite
+ * the team's permissions or start deleting pilots because a row was added to a
+ * catalogue.
+ *
+ * So these are opt-in only. An owner grants them by ticking them on a role,
+ * having read the line — which is exactly the bar the presets note below
+ * describes, and the reason there is still no preset with the lot ticked.
+ */
+const CREW_OWNER_GRADE_CAPS = ['integrations.manage', 'team.manage', 'retention.manage'];
+
+/** What a staff member with no role assigned gets: everything except the above. */
+const CREW_DEFAULT_STAFF_CAPS = CREW_CAP_IDS.filter(id => !CREW_OWNER_GRADE_CAPS.includes(id));
 
 /**
  * Ready-made roles.
@@ -322,6 +362,38 @@ const CREW_ROLE_PRESETS = [
         permissions: ['partnership.view'],
     },
     {
+        id: 'chief-of-staff',
+        name: 'Chief of staff',
+        color: '#B45309',
+        description: 'Runs the airline day to day and builds the team.',
+        // The COO. Everything about people — who is on the roster, who joins,
+        // who holds which role — plus the two ways of talking to them.
+        //
+        // NOT integrations.manage, and NOT retention.manage. This is the
+        // closest preset to "deputy owner" and it is still not that: the job
+        // is running the team, which does not require the power to disconnect
+        // the airline's Infinite Flight account or to start a sweep that
+        // removes pilots. An owner who wants either on this role ticks it,
+        // having read the line — same bar as before, and the reason the note
+        // above about no all-ticked preset still holds.
+        permissions: [
+            'team.manage', 'roster.manage', 'applications.review',
+            'announcements.manage', 'members.message',
+        ],
+    },
+    {
+        id: 'technical-manager',
+        name: 'Technical manager',
+        color: '#0F766E',
+        description: 'Keeps the integrations and the data store working.',
+        // The tech person. Deliberately narrow: the integrations, and the two
+        // operational capabilities whose failures they are the ones to
+        // diagnose — a schedule that will not sync and a PIREP that will not
+        // auto-approve are both reported to this person, and both are
+        // impossible to look at without being able to open the screen.
+        permissions: ['integrations.manage', 'schedules.manage', 'flights.review'],
+    },
+    {
         id: 'observer',
         name: 'Observer',
         color: '#6B7280',
@@ -339,19 +411,119 @@ function slugifyRoleId(s) {
     return base || ('role-' + Math.random().toString(36).slice(2, 8));
 }
 // Owner-defined staff roles: a name + colour + a set of capability ids.
-function sanitizeStaffRoles(arr) {
+//
+// `ceiling` is what the SAVER may hand out, and `prevRoles` what each role
+// already carried. Both undefined for the owner (or Inflight), for whom the
+// ceiling is everything — the historical behaviour and still the common case.
+//
+// A delegate with team.manage passes their own effective capabilities, which is
+// what stops the delegation from being a way around itself. The previous roles
+// come with it because the ceiling applies to what a save ADDS: a capability
+// already on the role is a fact the owner established, and re-sending it — which
+// every save does, the whole config goes at once — must not quietly strip it.
+// teamSaveFailure has already refused an overreaching save by this point; this
+// is the same rule enforced where the write happens, so a future caller that
+// skips the check cannot widen anything.
+function sanitizeStaffRoles(arr, ceiling, prevRoles) {
     if (!Array.isArray(arr)) return null;
+    const allowed = ceiling ? new Set(ceiling) : null;
+    const before = Array.isArray(prevRoles) ? prevRoles : [];
     const seen = new Set();
     return arr.slice(0, 30).map(r => {
         let id = slugifyRoleId(clampStr(r && r.id, 40) || (r && r.name));
         while (seen.has(id)) id = id + '-' + Math.random().toString(36).slice(2, 4);
         seen.add(id);
+        const had = new Set(((before.find(p => p && p.id === id) || {}).permissions) || []);
         return {
             id, name: clampStr(r && r.name, 40),
             color: isHexColor(r && r.color) ? r.color : '',
-            permissions: Array.isArray(r && r.permissions) ? r.permissions.filter(c => CREW_CAP_IDS.includes(c)) : [],
+            permissions: Array.isArray(r && r.permissions)
+                ? r.permissions.filter(c => CREW_CAP_IDS.includes(c) && (!allowed || allowed.has(c) || had.has(c)))
+                : [],
         };
     }).filter(r => r.name);
+}
+
+const capLabel = (id) => {
+    const known = CREW_CAPABILITIES.find(c => c.id === id);
+    return known ? known.label : id;
+};
+
+/**
+ * Would this save hand out something the saver does not have?
+ *
+ * The question that makes team.manage safe to delegate. Without it the
+ * capability is a superset of every other one, and there are two ways through,
+ * not one:
+ *
+ *   1. Edit a role and tick a capability you do not hold.
+ *   2. Leave the roles alone and assign yourself to one somebody else built.
+ *
+ * The second is the one that is easy to miss. A chief of staff who cannot tick
+ * "connect Infinite Flight" can still point their own username at the technical
+ * manager role the owner already made, and arrive at the same place without
+ * editing a permission at all. Both are checked here.
+ *
+ * WHAT IS COMPARED, AND WHY IT IS NOT JUST "held ⊇ wanted". The whole team
+ * config is sent on every save, so a delegate saving an unrelated change
+ * re-sends every role and assignment in the airline — including the ones they
+ * could never have created. Judging the payload on its own would refuse every
+ * save they ever make while a role richer than they are exists, which is most
+ * airlines, immediately.
+ *
+ * So what is judged is the DIFFERENCE. A capability already on that role, and
+ * an assignment that already existed exactly, are pre-existing facts and pass
+ * through untouched. What must be within the saver's own capabilities is what
+ * this save is adding.
+ *
+ * REFUSED, NOT FILTERED. Dropping the offending tick silently would show
+ * somebody a role that does not match what they configured, with no reason
+ * why — and would turn an attempt to escalate into a shrug. A 403 that names
+ * the capability is the honest answer to both.
+ *
+ * Returns a sentence for the 403, or '' when the save is clean.
+ */
+function teamSaveFailure({ roles, assignments }, prev, held) {
+    const allowed = new Set(held || []);
+    const prevRoles = Array.isArray(prev && prev.roles) ? prev.roles : [];
+    const prevAsn = Array.isArray(prev && prev.assignments) ? prev.assignments : [];
+    const roleById = (list, id) => list.find(r => r && r.id === id) || null;
+
+    // 1. No role may GAIN a capability the saver does not hold.
+    if (Array.isArray(roles)) {
+        for (const role of roles) {
+            const before = roleById(prevRoles, role && role.id);
+            const had = new Set((before && before.permissions) || []);
+            for (const cap of (Array.isArray(role && role.permissions) ? role.permissions : [])) {
+                if (!CREW_CAP_IDS.includes(cap) || allowed.has(cap) || had.has(cap)) continue;
+                return `You can’t grant “${capLabel(cap)}” — it isn’t one of your own permissions.`;
+            }
+        }
+    }
+
+    // 2. No NEW assignment may point at a role that is richer than the saver.
+    //
+    // Read against the roles as this save leaves them, not as they were: a save
+    // that both creates a role and assigns somebody to it has to be judged on
+    // what that person will actually end up holding.
+    if (Array.isArray(assignments)) {
+        const after = Array.isArray(roles) ? roles : prevRoles;
+        for (const a of assignments) {
+            const uname = String((a && a.username) || '').toLowerCase();
+            const roleId = String((a && a.roleId) || '');
+            if (!uname || !roleId) continue;
+            const existed = prevAsn.some(x =>
+                String((x && x.username) || '').toLowerCase() === uname && String((x && x.roleId) || '') === roleId);
+            if (existed) continue;
+            const target = roleById(after, roleId);
+            for (const cap of (target && target.permissions) || []) {
+                if (!CREW_CAP_IDS.includes(cap) || allowed.has(cap)) continue;
+                return `You can’t put anyone in “${(target && target.name) || roleId}” — it carries “${capLabel(cap)}”, which isn’t one of your own permissions.`;
+            }
+        }
+    }
+
+    return '';
 }
 // Which staff account (by login username) maps to which staff role.
 function sanitizeAssignments(arr) {
@@ -407,7 +579,10 @@ function effectiveCaps(va, p) {
         }
         return [...held];
     }
-    return CREW_CAP_IDS.slice(); // unassigned staff → full (non-breaking default)
+    // Unassigned staff → full, minus the owner-grade set. Still the
+    // non-breaking default for everything that default was written for; see
+    // CREW_OWNER_GRADE_CAPS for why the new powers are not in it.
+    return CREW_DEFAULT_STAFF_CAPS.slice();
 }
 
 // Which dashboard a role routes to.
@@ -593,19 +768,42 @@ function registerCrewAuthRoutes(app) {
             const touchesRetention = body.retention !== undefined;
             if (touchesBranding && !can('settings.branding')) return res.status(403).json({ error: 'You don’t have permission to change appearance.' });
             if (touchesRecruit && !can('settings.recruitment')) return res.status(403).json({ error: 'You don’t have permission to change recruitment settings.' });
-            if (touchesTeam && !(isInflight || p.role === 'owner')) return res.status(403).json({ error: 'Only the owner can manage staff roles.' });
+            const isOwner = isInflight || p.role === 'owner';
+            if (touchesTeam && !can('team.manage')) {
+                return res.status(403).json({ error: 'You don’t have permission to manage staff roles.' });
+            }
+            // The no-escalation rule, and the reason team.manage is safe to
+            // hand out at all. An owner holds everything, so this can only ever
+            // fire for a delegate — who may grant what they hold and nothing
+            // else, by either route. See teamSaveFailure.
+            if (touchesTeam && !isOwner) {
+                const overreach = teamSaveFailure(
+                    {
+                        roles: body.staffRoles,
+                        // An assignments-only save still has to be judged
+                        // against the roles that exist, or "point myself at the
+                        // technical manager" would pass for want of a role
+                        // array to look at.
+                        assignments: body.staffAssignments,
+                    },
+                    { roles: ad.staffRoles || [], assignments: ad.staffAssignments || [] },
+                    caps,
+                );
+                if (overreach) return res.status(403).json({ error: overreach });
+            }
             if (touchesOps && !can('flights.review')) return res.status(403).json({ error: 'You don’t have permission to change flight tracking.' });
             // Gated on the same capability as building the schedule itself. A
             // staff member trusted to publish the week is the one who decides
             // how it is bid for; one who is not should not be able to switch
             // self-service booking off for the whole airline.
             if (touchesSchedule && !can('schedules.manage')) return res.status(403).json({ error: 'You don’t have permission to change the schedule settings.' });
-            // Owner only, and not delegable. These settings remove pilots from
-            // the roster on a timer; that is the one thing in the crew center a
-            // staff member should not be able to switch on for the whole
-            // airline, however much of the day-to-day they otherwise run.
-            if (touchesRetention && !(isInflight || p.role === 'owner')) {
-                return res.status(403).json({ error: 'Only the owner can change the roster sweep.' });
+            // Owner-grade and now delegable, but only deliberately. These
+            // settings remove pilots from the roster on a timer, which is why
+            // retention.manage is excluded from the unassigned-staff default
+            // and is in none of the presets: the only way to hold it is for an
+            // owner to have ticked that specific line on a role.
+            if (touchesRetention && !can('retention.manage')) {
+                return res.status(403).json({ error: 'You don’t have permission to change the roster sweep.' });
             }
 
             if (typeof req.body?.layout === 'string') {
@@ -721,7 +919,12 @@ function registerCrewAuthRoutes(app) {
                 }
             }
             if (touchesTeam) {
-                if (req.body.staffRoles !== undefined) { const r = sanitizeStaffRoles(req.body.staffRoles); if (r) ad.staffRoles = r; }
+                // A delegate may only write ticks they hold. The 403 above has
+                // already refused an overreaching save outright; passing the
+                // set here too means the ceiling is enforced at the point of
+                // writing as well as at the point of checking, so a future
+                // caller that reaches this without the check cannot widen it.
+                if (req.body.staffRoles !== undefined) { const r = sanitizeStaffRoles(req.body.staffRoles, isOwner ? null : caps, ad.staffRoles || []); if (r) ad.staffRoles = r; }
                 if (req.body.staffAssignments !== undefined) { const a = sanitizeAssignments(req.body.staffAssignments); if (a) ad.staffAssignments = a; }
             }
             if (touchesOps) ad.crewPirepAutoApprove = !!req.body.pirepAutoApprove;
@@ -813,6 +1016,7 @@ function registerCrewAuthRoutes(app) {
         const va = await resolveVa(slug || p.slug);
         const caps = effectiveCaps(va, p);
         const isOwner = p.kind === 'inflight' || p.role === 'owner';
+        const canManageTeam = isOwner || caps.includes('team.manage');
         // Re-read the "you still owe us a password change" flag from the store
         // rather than trusting the token: the flag clears mid-session, and a
         // stale claim in a 7-day token would either nag someone who has already
@@ -831,8 +1035,18 @@ function registerCrewAuthRoutes(app) {
             mustChangePassword,
             canChangePassword: p.kind === 'crew',
             caps, capabilities: CREW_CAPABILITIES, rolePresets: CREW_ROLE_PRESETS,
-            staffRoles: (isOwner && va && va.staffRoles) || [],
-            staffAssignments: (isOwner && va && va.staffAssignments) || [],
+            // Keyed on the capability rather than on being the owner, or a
+            // chief of staff would be told they may manage the team and then
+            // handed an empty team to manage.
+            //
+            // `grantable` is what the role builder may offer THIS person. The
+            // server refuses an overreaching save either way; sending the
+            // ceiling means the screen greys the lines out instead of letting
+            // somebody tick one, press save and collect a 403 explaining that
+            // the box they were shown was never theirs to tick.
+            staffRoles: (canManageTeam && va && va.staffRoles) || [],
+            staffAssignments: (canManageTeam && va && va.staffAssignments) || [],
+            grantable: canManageTeam ? (isOwner ? CREW_CAP_IDS.slice() : caps.slice()) : [],
         });
     });
 }
@@ -841,4 +1055,5 @@ module.exports = {
     registerCrewAuthRoutes, viewForRole, verifyCrewRequest, effectiveCaps,
     isDiscordInviteUrl, cleanDiscordInvite,
     CREW_CAPABILITIES, CREW_CAP_IDS, CREW_ROLE_PRESETS, CAPABILITY_HEIRS,
+    CREW_OWNER_GRADE_CAPS, CREW_DEFAULT_STAFF_CAPS, teamSaveFailure,
 };
