@@ -813,6 +813,11 @@ function aircraftUtilisation(aircraft, schedules, now = Date.now()) {
         registration: a.registration || '',
         storage: a.storage || '',
         fleetRank: a.fleetRank ?? null,
+        // Carried through so this list can show the same aircraft picture the
+        // fleet board does. Null when the type could not be resolved, which the
+        // image chain treats as "draw a generic silhouette" rather than as an
+        // absence of picture.
+        type: a.type || null,
         // null, not 0, when the rota could not be read — see the header.
         upcoming: known ? upcoming : null,
         scheduledMinutes: known ? scheduledMinutes : null,

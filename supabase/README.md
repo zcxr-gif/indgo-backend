@@ -900,6 +900,25 @@ One call per aircraft, so it is its own tab rather than part of the fleet
 board's refresh — and it shares cache keys with the schedule tab, so opening one
 after the other is free.
 
+### Naming the aircraft type
+
+PublicApi v3 returns `aircraftId` — "the Infinite Flight aircraft **or livery**
+content identifier", and deliberately vague about which. On its own that is
+unusable: a fleet board can show a registration and nothing about what the
+aeroplane is.
+
+`ifWithTypes` resolves it against the same aircraft/livery catalogue live
+flights already use (`resolveFlightNames`), trying both maps because the id may
+be either kind, and attaches `type: { name, livery }` — or `null`, so a caller
+can tell "we don't know what this is" from "a 787 with no livery recorded".
+
+Never fatal. The catalogue is a third party's; a fleet board that refused to
+draw because it could not name a type would trade something useful for something
+cosmetic. Every fleet read goes through one `ifFleet()` helper so the cache key
+and the enrichment cannot drift apart — a sixth caller that remembered the cache
+and forgot the types would produce a board where some aircraft have a picture
+and some do not, depending on which screen warmed the cache first.
+
 ### Reordering
 
 The API moves one schedule at a time relative to another; a drag-and-drop list

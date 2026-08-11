@@ -324,7 +324,7 @@ T('a cancelled leg is not upcoming work',
     L.aircraftUtilisation({ id: 'x', storage: 'active' },
         [{ status: { name: 'Cancelled' }, scheduledDepartureUtc: '2026-08-11T09:00:00Z', blockMinutes: 300 }], uNow),
     {
-        id: 'x', registration: '', storage: 'active', fleetRank: null,
+        id: 'x', registration: '', storage: 'active', fleetRank: null, type: null,
         upcoming: 0, scheduledMinutes: 0, flownLegs: 0, cancelledLegs: 1,
         nextDepartureUtc: null, lastArrivalUtc: null, daysSinceFlown: null,
         idle: true, rotaUnknown: false,
@@ -348,6 +348,12 @@ T('an aircraft never flown at all is counted separately', util.summary.neverFlow
 // Sorted for a reader: the thing to act on first. Idle before busy, and among
 // the idle, "we have never used this one" outranks "this one has sat for three
 // weeks" — the never-flown airframe is the more interesting finding.
+// The type travels with the row so the utilisation list can draw the same
+// aircraft picture the fleet board does.
+T('the aircraft type is carried through to utilisation',
+    L.aircraftUtilisation({ id: 'q', storage: 'active', type: { name: 'Boeing 787-10', livery: 'BA' } }, [], uNow).type,
+    { name: 'Boeing 787-10', livery: 'BA' });
+
 T('the idle aircraft sort above the busy ones',
     util.aircraft.slice(0, 2).map((r) => r.registration).sort(), ['N2', 'N5']);
 T('a never-flown aircraft outranks a long-idle one', util.aircraft[0].registration, 'N5');

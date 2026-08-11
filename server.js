@@ -4882,7 +4882,7 @@ app.get('/api/crew/:slug/if/aircraft', async (req, res) => {
         const organizationId = ifOrgFor(req, ad);
         if (!organizationId) return res.status(409).json({ error: 'Pick an Infinite Flight organization first.', code: 'no_organization' });
         const { token } = await ifTokenFor(va._id);
-        const aircraft = await ifCached(`${va._id}:fleet:${organizationId}`, () => ifOAuth.listAircraft(token, organizationId));
+        const aircraft = await ifFleet(va._id, token, organizationId);
         res.json({ aircraft, organizationId, summary: ifFleetSummary(aircraft) });
     } catch (err) { ifFail(res, err, { log: 'if fleet error', message: 'Could not read the fleet.' }); }
 });
@@ -4909,7 +4909,7 @@ app.get('/api/crew/:slug/if/fleet', async (req, res) => {
         if (!organizationId) return res.status(409).json({ error: 'Pick an Infinite Flight organization first.', code: 'no_organization' });
         const { token, scopes } = await ifTokenFor(va._id);
 
-        const aircraft = await ifCached(`${va._id}:fleet:${organizationId}`, () => ifOAuth.listAircraft(token, organizationId));
+        const aircraft = await ifFleet(va._id, token, organizationId);
         const withPositions = req.query.positions !== '0' && scopes.includes('live:aircraft.read');
         const positions = withPositions
             ? await ifCached(`${va._id}:positions:${organizationId}`, () => ifPositions(token, aircraft))
@@ -4925,6 +4925,57 @@ app.get('/api/crew/:slug/if/fleet', async (req, res) => {
         });
     } catch (err) { ifFail(res, err, { log: 'if fleet board error', message: 'Could not read the fleet.' }); }
 });
+
+/**
+ * Put a TYPE NAME on every aircraft in a Live fleet.
+ *
+ * PublicApi v3 hands back `aircraftId`, which the preview describes as "the
+ * Infinite Flight aircraft or livery content identifier" — a UUID, and
+ * deliberately vague about which of the two it is. On its own that is unusable:
+ * a fleet board can show "N682XL" and nothing about what N682XL actually is.
+ *
+ * We already resolve exactly these UUIDs for live flights (resolveFlightNames),
+ * against the aircraft/livery catalogue the ACARS service publishes. Same
+ * lookup, same cache, both maps tried because the id may be either kind.
+ *
+ * NEVER FATAL. The catalogue is a third party's and may be down; a fleet board
+ * that refused to draw because it could not name a type would be trading
+ * something useful for something cosmetic. A type it cannot resolve comes back
+ * empty, and the front-end draws a generic silhouette — which is why the image
+ * chain there has a tier that needs no network at all.
+ */
+async function ifWithTypes(aircraft) {
+    const list = Array.isArray(aircraft) ? aircraft : [];
+    if (!list.length) return list;
+    let meta;
+    try { meta = await loadAircraftMetadata(); } catch { return list; }
+    return list.map((a) => {
+        const { aircraftName, liveryName } = resolveFlightNames(
+            { aircraftId: a.aircraftId, liveryId: a.aircraftId }, meta,
+        );
+        return {
+            ...a,
+            // Absent rather than an empty object when nothing resolved, so a
+            // caller can tell "we don't know what this is" from "it's a 787
+            // with no livery recorded".
+            type: aircraftName ? { name: aircraftName, livery: liveryName || '' } : null,
+        };
+    });
+}
+
+/**
+ * The organization's fleet: cached, and with every aircraft's type resolved.
+ *
+ * One function rather than the same two lines at five call sites — which is not
+ * tidiness but correctness. The cache key and the enrichment have to agree, and
+ * a sixth caller that remembered the cache and forgot the types would produce a
+ * fleet board where some aircraft have a silhouette and some do not, depending
+ * on which screen happened to warm the cache first.
+ */
+const ifFleet = (vaId, token, organizationId) => ifCached(
+    `${vaId}:fleet:${organizationId}`,
+    () => ifOAuth.listAircraft(token, organizationId).then(ifWithTypes),
+);
 
 /**
  * Positions for a list of aircraft, a few at a time.
@@ -5001,13 +5052,13 @@ app.get('/api/crew/:slug/if/airframes', async (req, res) => {
         const ad = await ifConnection(va._id);
         if (!ad || !ad.ifConnectedAt || !ad.ifOrganizationId) return res.json({ airframes: [], connected: false });
         const { token } = await ifTokenFor(va._id);
-        const aircraft = await ifCached(`${va._id}:fleet:${ad.ifOrganizationId}`,
-            () => ifOAuth.listAircraft(token, ad.ifOrganizationId));
+        const aircraft = await ifFleet(va._id, token, ad.ifOrganizationId);
         res.json({
             connected: true,
             airframes: aircraft.map((a) => ({
                 id: a.id,
                 registration: a.registration,
+                type: a.type || null,
                 // Offered but marked, not hidden: a VA may well schedule an
                 // aeroplane they are about to bring out of storage, and a
                 // picker that silently omits it looks broken to the one person
@@ -5078,8 +5129,7 @@ app.get('/api/crew/:slug/if/utilisation', async (req, res) => {
             });
         }
 
-        const aircraft = await ifCached(`${va._id}:fleet:${organizationId}`,
-            () => ifOAuth.listAircraft(token, organizationId));
+        const aircraft = await ifFleet(va._id, token, organizationId);
 
         // Same bounded concurrency and same per-aircraft isolation as the
         // position sweep: one aeroplane's rota failing must leave the other
@@ -5661,8 +5711,7 @@ app.get('/api/crew/:slug/if/board', async (req, res) => {
         }
 
         const { token, scopes } = await ifTokenFor(va._id);
-        const aircraft = await ifCached(`${va._id}:fleet:${ad.ifOrganizationId}`,
-            () => ifOAuth.listAircraft(token, ad.ifOrganizationId));
+        const aircraft = await ifFleet(va._id, token, ad.ifOrganizationId);
         const positions = scopes.includes('live:aircraft.read')
             ? await ifCached(`${va._id}:positions:${ad.ifOrganizationId}`, () => ifPositions(token, aircraft))
             : {};
@@ -5700,6 +5749,10 @@ app.get('/api/crew/:slug/if/board', async (req, res) => {
                 registration: a.registration,
                 storage: a.storage,
                 fleetRank: a.fleetRank,
+                // Carried so the pilot board draws the same picture the staff
+                // one does. It is not staff-only information — what type an
+                // aeroplane is, is the least private thing about it.
+                type: a.type || null,
                 position: positions[a.id] || null,
             })),
             departures,
