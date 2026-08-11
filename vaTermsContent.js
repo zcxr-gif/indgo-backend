@@ -72,6 +72,8 @@ const CLAUSES = [
             { list: [
                 'If you announce or run an event, that event must be tracked using Inflight (our tracker). This applies to every event, regardless of size.',
                 'You may announce events however you wish — for example, in your VA’s Discord or on the Infinite Flight Community (IFC) forum — but any announcement must be accompanied by a picture showcasing your event in our tracker.',
+                'If no picture of the event was taken, or you are unable to provide one, the announcement must instead carry — in bold text — an invitation to follow your VA’s events, or its future events, on Inflight, together with a link to our tracker at https://inflight.info. Both parts are required: bold text without the link, or the link without bold text, does not satisfy this clause.',
+                'That written alternative stands in place of the picture only. It does not replace the requirement above that the event itself is tracked using Inflight.',
             ] },
             { p: 'Running or publicising an event without using Inflight may result in enforcement action under “Compliance, Warnings & Enforcement” below, up to suspension or removal at our discretion.' },
         ],
