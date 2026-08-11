@@ -257,6 +257,93 @@ function authorizeUrl({ clientId, redirectUri, scopes, state, challenge, prompt 
  * confidential-client request with no credential — which servers reject, and
  * rightly.
  */
+/**
+ * The OAuth2 error out of a refusal, whichever shape it arrives in.
+ *
+ * The token endpoint answers RFC 6749 style at the top level:
+ *
+ *     { "error": "invalid_grant", "error_description": "…" }
+ *
+ * …but the same host also wraps things in the PublicApi envelope, and when it
+ * does, the entire OAuth error moves one level down:
+ *
+ *     { "errorCode": 12, "result": { "error": "invalid_request",
+ *       "errorDescription": "The specified 'client_id' is invalid." } }
+ *
+ * Reading only the top level of the second shape produces code "12" — the
+ * envelope's numeric code, which says nothing — and NO description at all, so
+ * the one sentence that explains the failure is dropped on the floor and the VA
+ * is told to reconnect. That is how "your client_id is wrong" became "Infinite
+ * Flight would not renew this connection".
+ *
+ * Both shapes, and both spellings of the description field, are read here.
+ */
+function oauthFailure(json) {
+    const layers = [json, json && json.result].filter((l) => l && typeof l === 'object');
+    let code = '';
+    let description = '';
+    for (const l of layers) {
+        // A string `error` is the OAuth2 code. The envelope's numeric errorCode
+        // is only a fallback, and only when nothing better turned up.
+        if (!code && typeof l.error === 'string' && l.error) code = l.error;
+        if (!description) {
+            description = String(l.error_description || l.errorDescription || '');
+        }
+    }
+    if (!code) {
+        const envelope = json && json.errorCode;
+        if (envelope !== undefined && envelope !== null) code = String(envelope);
+    }
+    return { code, description };
+}
+
+// OAuth2 codes that mean the CLIENT registration is wrong, not the grant.
+// Reconnecting cannot fix any of these — the client id or secret has to change.
+const CLIENT_FAULT_CODES = new Set(['invalid_client', 'unauthorized_client', 'invalid_request']);
+
+/**
+ * A client id trimmed to its ends, for logs.
+ *
+ * Not a secret — it travels in every authorization URL — but long enough to be
+ * noise at full length. The ends are what a person compares against a
+ * dashboard, and keeping them makes a stray quote or a truncated paste visible.
+ */
+function redactClientId(id) {
+    const s = String(id || '');
+    if (!s) return '(none)';
+    return s.length <= 12 ? s : `${s.slice(0, 6)}…${s.slice(-4)} (${s.length} chars)`;
+}
+
+/**
+ * Is this client id obviously not one?
+ *
+ * Infinite Flight does not document the format, so this refuses only what
+ * cannot be right whatever the format turns out to be: inner whitespace,
+ * wrapping quotes, and the placeholder strings people paste when they copy an
+ * example instead of their own value. Deliberately narrow — a format guess that
+ * rejected a real id would be worse than the error it prevents.
+ *
+ * Worth catching at all because the alternative is Infinite Flight's own
+ * answer, which arrives only after the VA has been redirected off-site, reads
+ * "The specified 'client_id' is invalid", and names nothing they can act on.
+ *
+ * Lives here rather than in server.js because it is a fact about an OAuth
+ * client, and because this module can be required by a test while server.js
+ * cannot.
+ *
+ * Returns a sentence explaining the refusal, or '' when the id looks usable.
+ */
+function clientIdProblem(raw) {
+    const id = String(raw || '').trim();
+    if (!id) return 'The client ID is empty.';
+    if (/\s/.test(id)) return 'The client ID contains a space — check for a partial or doubled paste.';
+    if (/^["'`]|["'`]$/.test(id)) return 'The client ID is wrapped in quotes. Paste the value only, without them.';
+    if (/^(your|my|the)[-_ ]?client[-_ ]?id$|^<.*>$|^\.\.\.$|^xxx+$/i.test(id)) {
+        return 'That looks like placeholder text rather than a client ID from infiniteflight.com/account/api-keys.';
+    }
+    return '';
+}
+
 async function tokenRequest(form) {
     const body = new URLSearchParams();
     for (const [k, v] of Object.entries(form)) {
@@ -289,16 +376,25 @@ async function tokenRequest(form) {
     try { json = raw ? JSON.parse(raw) : null; } catch { json = null; }
 
     if (!resp.ok) {
-        const code = String((json && (json.error || json.errorCode)) || '');
-        const description = String((json && (json.error_description || json.errorDescription)) || '');
+        const { code, description } = oauthFailure(json);
         // invalid_grant is the one that means the stored credential is finished:
         // the code was used already, or the refresh token has been revoked or
         // rotated past. Everything else may be transient or our own mistake.
-        const reconnect = code === 'invalid_grant' || resp.status === 400 || resp.status === 401;
+        //
+        // A CLIENT fault is neither. "The specified 'client_id' is invalid" is
+        // the registration being wrong, and telling somebody to reconnect —
+        // which sends them back through consent to arrive at the same refusal —
+        // is advice that cannot work. It gets its own message and does NOT set
+        // reconnect, so the panel stops offering the button that will not help.
+        const clientFault = CLIENT_FAULT_CODES.has(code) || /client_id|client_secret/i.test(description);
+        const reconnect = !clientFault
+            && (code === 'invalid_grant' || resp.status === 400 || resp.status === 401);
         throw new IfAuthError(
-            reconnect
-                ? 'Infinite Flight would not renew this connection. Connect the account again.'
-                : 'Infinite Flight refused the sign-in.',
+            clientFault
+                ? 'Infinite Flight does not recognise this OAuth client. Check the client ID (and secret, if it is a confidential client) against infiniteflight.com/account/api-keys.'
+                : reconnect
+                    ? 'Infinite Flight would not renew this connection. Connect the account again.'
+                    : 'Infinite Flight refused the sign-in.',
             { status: resp.status, code, detail: description || raw.slice(0, 300), reconnect }
         );
     }
@@ -652,6 +748,8 @@ module.exports = {
     IfApiError, IfAuthError,
     // the handshake
     pkce, randomState, safeEqual, authorizeUrl, exchangeCode, refresh,
+    // diagnostics — pure, and exported so they can be tested without booting server.js
+    oauthFailure, clientIdProblem, redactClientId, CLIENT_FAULT_CODES,
     // transport
     call,
     // endpoints

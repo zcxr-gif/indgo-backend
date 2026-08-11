@@ -591,16 +591,29 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // account gets a fleet board and no schedule editing, which is correct
     // rather than broken, and the panel says which it has.
     //
-    // WHICH OAUTH CLIENT. Either ours (IF_OAUTH_CLIENT_ID in the environment) or
-    // the VA's own, registered by them at infiniteflight.com/account/api-keys.
-    // Their own is the path that works today: "testing clients are limited to
-    // the owner and invited test users until the app is reviewed and approved by
-    // Infinite Flight", and a client the VA created has the VA as its owner. A
-    // stored client secret is a credential like any other here — sealed, and
-    // never returned to a browser.
+    // WHICH OAUTH CLIENT. Ours — IF_OAUTH_CLIENT_ID in the environment. One
+    // client for the whole platform, every crew center signing in through it,
+    // the VA carried in the `state`. A VA may still register their own (see
+    // ifClientFor for the two cases where that wins), and a stored client
+    // secret is a credential like any other here — sealed, and never returned
+    // to a browser.
     ifClientId: { type: String, trim: true, default: '' },
     ifClientSecret: { type: String, default: '', select: false },   // sealed (crewSecrets)
     ifClientType: { type: String, enum: ['', 'confidential', 'public'], default: '' },
+    // WHICH CLIENT MINTED THE LIVE GRANT. Recorded, not inferred.
+    //
+    // A refresh token can only be redeemed by the client it was issued to, so
+    // the connection has to keep using that client for as long as it lasts —
+    // and which client that was is not derivable from the current preference.
+    // A VA holding their own client id who signed in on the PLATFORM one looks
+    // identical to one who signed in on their own, and guessing wrong does not
+    // fail at the guess: it fails at the next refresh, an hour later, as
+    // "your connection stopped working".
+    //
+    // Empty on a grant made before this field existed, which is read as "the
+    // VA's own if they have one" — the rule that was in force when those grants
+    // were made.
+    ifGrantClientId: { type: String, trim: true, default: '' },
     // Non-secret companion, so the settings screen can say WHICH secret is
     // saved without being able to show it.
     ifClientSecretHint: { type: String, default: '' },
@@ -4168,7 +4181,7 @@ app.post('/api/crew/:slug/links/:id/open', async (req, res) => {
 // token fields and the sealed client secret: the STATE of a connection is not
 // the connection, and the only place that wants the values asks for them by
 // name (ifConnection below).
-const CREW_IF_META = 'ifClientId ifClientType ifClientSecretHint ifTokenExpiresAt ifScopes '
+const CREW_IF_META = 'ifClientId ifClientType ifClientSecretHint ifGrantClientId ifTokenExpiresAt ifScopes '
     + 'ifConnectedAt ifConnectedBy ifLastUsedAt ifOrganizationId ifOrganizationName ifOrganizationWorld '
     + 'ifTokenFailedAt ifTokenError ifSyncSchedules ifSyncAircraftId ifSyncedAt';
 
@@ -4180,12 +4193,31 @@ const ifConnection = (vaId) => VirtualAirlineAd.findById(vaId)
 /**
  * Which OAuth client this VA signs in with.
  *
- * Theirs if they have registered one, ours otherwise. Theirs FIRST, and that
- * order is the important part: "testing clients are limited to the owner and
- * invited test users until the app is reviewed and approved by Infinite
- * Flight", so until our platform client is approved it works for nobody but us,
- * while a client the VA created at infiniteflight.com/account/api-keys has the
- * VA themselves as its owner and works for them today.
+ * OURS FIRST. This is a sign-in button, and a sign-in button that first asks a
+ * volunteer airline manager to go and register an OAuth application on a
+ * third-party developer page is not a sign-in button. The platform holds one
+ * client, every crew center signs in through it, and the VA is identified by
+ * the `state` — which is what state is for.
+ *
+ * That is a reversal. The order used to be theirs-first, on the reasoning that
+ * "testing clients are limited to the owner and invited test users until the
+ * app is reviewed and approved by Infinite Flight", so an unapproved platform
+ * client worked for nobody but us while a VA's own worked for them today. That
+ * was a workaround for a client pending approval, and it made every VA do
+ * setup that only existed because of it. With an approved client the workaround
+ * costs more than it saves.
+ *
+ * TWO EXCEPTIONS, both about not breaking something that already works:
+ *
+ *   1. No platform client configured — a deployment that has not set
+ *      IF_OAUTH_CLIENT_ID falls back to the VA's own, which is the old
+ *      behaviour and the only thing that can work there.
+ *   2. The VA is CONNECTED on their own client. Their stored refresh token was
+ *      issued to that client and only that client can refresh it; switching
+ *      underneath them would not fail at the switch, it would fail at the next
+ *      refresh, an hour later, as "your connection stopped working". So a live
+ *      grant keeps the client that minted it until the VA disconnects — at
+ *      which point they land on the platform client like everyone else.
  *
  * A stored client secret that will not unseal (a rotated CREW_SECRET_KEY) comes
  * back as a public client rather than as a confidential one with an empty
@@ -4195,7 +4227,7 @@ const ifConnection = (vaId) => VirtualAirlineAd.findById(vaId)
  */
 function ifClientFor(ad) {
     const own = String((ad && ad.ifClientId) || '').trim();
-    if (own) {
+    const ownClient = () => {
         const secret = ad.ifClientSecret ? crewSecrets.open(ad.ifClientSecret) : '';
         return {
             id: own,
@@ -4206,16 +4238,42 @@ function ifClientFor(ad) {
             // can say which of the two happened.
             secretUnavailable: !!(ad.ifClientSecret && !secret),
         };
+    };
+    const platform = ifOAuth.PLATFORM_CLIENT;
+
+    // Exception 2 — see the header. Checked before the platform client so a
+    // working connection is never moved off the credentials holding it up.
+    //
+    // Read off ifGrantClientId, which records what the grant was actually made
+    // with. Falling back to "their own, if they have one" only for a grant that
+    // predates the field — which is correct for those, because theirs is what
+    // took priority when they were made.
+    if (ad && ad.ifConnectedAt) {
+        const grantClient = String(ad.ifGrantClientId || '').trim();
+        if (grantClient) {
+            if (own && grantClient === own) return ownClient();
+            // The grant belongs to the platform client (or to a platform client
+            // this deployment no longer has, which the connect route will refuse
+            // for its own reasons rather than by silently substituting one).
+            if (platform.id && grantClient === platform.id) {
+                return { id: platform.id, secret: platform.secret, type: platform.type, source: 'platform', secretUnavailable: false };
+            }
+        } else if (own) {
+            return ownClient();
+        }
     }
-    if (ifOAuth.PLATFORM_CLIENT.id) {
+
+    if (platform.id) {
         return {
-            id: ifOAuth.PLATFORM_CLIENT.id,
-            secret: ifOAuth.PLATFORM_CLIENT.secret,
-            type: ifOAuth.PLATFORM_CLIENT.type,
+            id: platform.id,
+            secret: platform.secret,
+            type: platform.type,
             source: 'platform',
             secretUnavailable: false,
         };
     }
+    // Exception 1 — no platform client on this deployment.
+    if (own) return ownClient();
     return { id: '', secret: '', type: '', source: '', secretUnavailable: false };
 }
 
@@ -4510,7 +4568,7 @@ async function ifTokenFor(vaId, { refresh = true } = {}) {
  * check is repeated here because "store the credential in the clear" must not
  * be reachable by any path.
  */
-async function ifStoreTokens(vaId, tokens, { scopes, connectedBy } = {}) {
+async function ifStoreTokens(vaId, tokens, { scopes, connectedBy, grantClientId } = {}) {
     const sealedAccess = crewSecrets.seal(tokens.accessToken);
     if (!sealedAccess) throw new ifOAuth.IfAuthError(crewSecrets.unavailableReason(), { reconnect: false });
     const $set = {
@@ -4525,6 +4583,10 @@ async function ifStoreTokens(vaId, tokens, { scopes, connectedBy } = {}) {
         if (sealedRefresh) $set.ifRefreshToken = sealedRefresh;
     }
     if (Array.isArray(scopes) && scopes.length) $set.ifScopes = scopes;
+    // Written on the exchange that creates the grant, not on a refresh — a
+    // refresh cannot change which client the credential belongs to, and writing
+    // it there would only be a chance to write it wrong.
+    if (grantClientId) $set.ifGrantClientId = String(grantClientId);
     if (connectedBy !== undefined) {
         $set.ifConnectedAt = new Date();
         $set.ifConnectedBy = String(connectedBy || '').slice(0, 80);
@@ -4540,6 +4602,11 @@ const ifMarkFailed = (vaId, message) => VirtualAirlineAd.updateOne({ _id: vaId }
 const ifClearConnection = (vaId) => VirtualAirlineAd.updateOne({ _id: vaId }, {
     $set: {
         ifAccessToken: '', ifRefreshToken: '', ifTokenExpiresAt: null, ifScopes: [],
+        // Cleared with the grant it describes. Leaving it behind would pin the
+        // next connection to the client the last one happened to use — which is
+        // the opposite of the point: disconnecting is exactly how a VA who was
+        // grandfathered onto their own client moves to the platform's.
+        ifGrantClientId: '',
         ifConnectedAt: null, ifConnectedBy: '', ifLastUsedAt: null,
         ifOrganizationId: '', ifOrganizationName: '', ifOrganizationWorld: null,
         ifTokenFailedAt: null, ifTokenError: '',
@@ -4614,14 +4681,15 @@ app.get('/api/crew/:slug/if', async (req, res) => {
 });
 
 /**
- * Register the VA's own OAuth client.
+ * Register the VA's own OAuth client — an override, not the normal path.
  *
- * The path that works today, and the reason this route exists at all: our
- * platform client, until Infinite Flight reviews and approves it, is limited to
- * its owner and invited testers — so a VA using it would get a 403 with no
- * obvious cause. A client the VA creates themselves at
- * infiniteflight.com/account/api-keys has the VA as its owner, and works for
- * them immediately.
+ * Signing in uses the platform's client (see ifClientFor); nobody has to
+ * register anything. This route stays for the two cases where a VA's own is
+ * still the right answer: a deployment with no platform client configured, and
+ * a VA that has a reason to run the connection under credentials they own.
+ *
+ * It is also how the VAs who registered one under the previous arrangement keep
+ * working — their live grant stays on their client until they disconnect.
  *
  * The secret is optional and its presence is what makes the client
  * confidential. A VA who pastes one on a deployment with no CREW_SECRET_KEY is
@@ -4636,6 +4704,11 @@ app.post('/api/crew/:slug/if/client', async (req, res) => {
         if (!va) return res.status(404).json({ error: 'Crew center not found.' });
         const clientId = String(req.body?.clientId || '').trim().slice(0, 120);
         if (!clientId) return res.status(400).json({ error: 'Paste the client ID from your Infinite Flight OAuth client.' });
+        // Caught here rather than at Infinite Flight, which only says so after
+        // the VA has been redirected off-site and phrases it as
+        // "The specified 'client_id' is invalid" — true, and useless.
+        const idProblem = ifOAuth.clientIdProblem(clientId);
+        if (idProblem) return res.status(400).json({ error: idProblem, code: 'bad_client_id' });
         const secret = String(req.body?.clientSecret || '').trim();
 
         const $set = { ifClientId: clientId };
@@ -4732,8 +4805,25 @@ app.post('/api/crew/:slug/if/connect', async (req, res) => {
         const client = ifClientFor(ad);
         if (!client.id) {
             return res.status(409).json({
-                error: 'No Infinite Flight OAuth client is set up. Create one at infiniteflight.com/account/api-keys and paste its client ID here.',
+                // Reached only on a deployment with no IF_OAUTH_CLIENT_ID, which
+                // is an operator problem and not a VA one — so it says whose it
+                // is rather than sending a volunteer off to a developer page.
+                error: 'Infinite Flight sign-in is not configured on this server yet. An Inflight administrator needs to set the platform OAuth client.',
                 code: 'no_client',
+            });
+        }
+        // The platform client is read from the environment, so a deployment can
+        // hand every VA the same broken id at once — and the VA reading the
+        // message is not the person who can fix it. Named separately for that
+        // reason: "ask an administrator" is the actionable half.
+        const clientProblem = ifOAuth.clientIdProblem(client.id);
+        if (clientProblem) {
+            console.warn(`[if oauth] refusing to start: ${client.source} client id is unusable — ${clientProblem}`);
+            return res.status(500).json({
+                error: client.source === 'platform'
+                    ? `The platform’s Infinite Flight client is misconfigured (${clientProblem}) — this needs an Inflight administrator, not you.`
+                    : clientProblem,
+                code: 'bad_client_id',
             });
         }
 
@@ -4784,6 +4874,17 @@ app.post('/api/crew/:slug/if/connect', async (req, res) => {
             redirectUri,
             returnTo,
         });
+
+        // Which client this VA is about to be sent with, in the log.
+        //
+        // When Infinite Flight answers "The specified 'client_id' is invalid",
+        // the only question that matters is WHOSE client it was — the VA's own,
+        // or the platform's — and until now nothing recorded that. The id is
+        // not a secret (it travels in the authorization URL the browser is
+        // about to follow) but it is long, so it is trimmed to its ends: enough
+        // to tell two clients apart or spot a pasted quote, without filling the
+        // log with it.
+        console.log(`[if oauth] "${va.name || req.params.slug}" → ${client.source} client ${ifOAuth.redactClientId(client.id)} (${client.type}), redirect ${redirectUri}`);
 
         res.json({
             url: ifOAuth.authorizeUrl({
@@ -4901,6 +5002,9 @@ app.get('/api/crew/if/callback', async (req, res) => {
             // matches the request exactly.
             scopes: tokens.scopes || row.scopes || [],
             connectedBy: row.startedBy,
+            // The client this grant belongs to, so a later refresh uses the
+            // same one however the platform's preference has moved since.
+            grantClientId: client.id,
         });
         ifInvalidate(row.vaId);
 
@@ -4929,7 +5033,11 @@ app.get('/api/crew/if/callback', async (req, res) => {
 
         return back(returnTo, { if: 'connected', org: picked });
     } catch (err) {
-        console.warn('if callback exchange failed —', err?.message || err);
+        // Name the client here too. The exchange presents the same credentials
+        // the authorization request did, so a refusal at this step is as likely
+        // to be the client as the code — and the two are indistinguishable in a
+        // log line that mentions neither.
+        console.warn(`if callback exchange failed [${client.source} client ${ifOAuth.redactClientId(client.id)}] —`, err?.message || err);
         await ifMarkFailed(row.vaId, err && err.message);
         return back(returnTo, { if: 'failed', reason: 'exchange' });
     }
