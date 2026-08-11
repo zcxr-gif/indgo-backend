@@ -336,6 +336,25 @@ function redactClientId(id) {
 function clientIdProblem(raw) {
     const id = String(raw || '').trim();
     if (!id) return 'The client ID is empty.';
+    // CHARACTERS THAT DO NOT SHOW, first — because this is the failure that
+    // wastes the most time. A value pasted out of a web dashboard can carry a
+    // zero-width space, a non-breaking space or a smart quote; it looks
+    // identical in every editor and is a different string to a server, which
+    // reports it as "The specified 'client_id' is invalid". Neither .trim() nor
+    // \s removes U+200B, so nothing else here would catch it.
+    //
+    // Narrow on purpose: only the invisible and the typographic, both of which
+    // are paste artefacts and never deliberate in a client id. Rejecting all
+    // non-ASCII would be a guess about a format nobody has documented.
+    const invisible = id.match(/[\u00A0\u1680\u180E\u2000-\u200D\u2028\u2029\u202F\u205F\u2060\u3000\uFEFF]/);
+    if (invisible) {
+        const cp = invisible[0].codePointAt(0).toString(16).toUpperCase().padStart(4, '0');
+        return `The client ID contains an invisible character (U+${cp}) picked up when it was copied. Retype it by hand, or paste it through a plain-text editor first.`;
+    }
+    const smart = id.match(/[\u2018\u2019\u201C\u201D\u2013\u2014]/);
+    if (smart) {
+        return `The client ID contains a “smart” quote or dash (${smart[0]}) — something reformatted it on the way here. Retype it by hand.`;
+    }
     if (/\s/.test(id)) return 'The client ID contains a space — check for a partial or doubled paste.';
     if (/^["'`]|["'`]$/.test(id)) return 'The client ID is wrapped in quotes. Paste the value only, without them.';
     if (/^(your|my|the)[-_ ]?client[-_ ]?id$|^<.*>$|^\.\.\.$|^xxx+$/i.test(id)) {
