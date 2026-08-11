@@ -97,6 +97,29 @@ T('xxxx is refused', H.clientIdProblem('xxxxxxxx') !== '', true);
 // its own — the save path trims before asking.
 T('leading/trailing space alone is not a refusal', H.clientIdProblem('  7f3a91c2  '), '');
 
+console.log('\nclientIdProblem — the characters that do not show');
+// The failure that wastes the most time: an id copied out of a web dashboard
+// that carries something invisible. It looks right in every editor, it is a
+// different string to a server, and neither .trim() nor \s catches U+200B.
+const withChar = (cp) => 'abc123' + String.fromCodePoint(cp) + 'def';
+T('a zero-width space is refused', H.clientIdProblem(withChar(0x200b)) !== '', true);
+T('…and named in the message', /U\+200B/.test(H.clientIdProblem(withChar(0x200b))), true);
+T('a non-breaking space is refused', H.clientIdProblem(withChar(0x00a0)) !== '', true);
+T('a word joiner is refused', H.clientIdProblem(withChar(0x2060)) !== '', true);
+T('a BOM in the middle is refused', H.clientIdProblem(withChar(0xfeff)) !== '', true);
+T('an ideographic space is refused', H.clientIdProblem(withChar(0x3000)) !== '', true);
+T('a smart apostrophe is refused', H.clientIdProblem('abc’123') !== '', true);
+T('an en dash is refused', H.clientIdProblem('abc–123') !== '', true);
+// A BOM at the very start is whitespace to .trim(), so it is gone before this
+// sees it and the id that remains is genuinely fine. Asserted so the "no
+// refusal" is understood as correct rather than as a hole.
+T('a BOM at the start is trimmed away, leaving a clean id',
+    H.clientIdProblem('﻿7f3a91c2-55de'), '');
+// The punctuation a real id is allowed to contain must survive all of that.
+T('a plain hyphen is fine', H.clientIdProblem('abc-123'), '');
+T('an underscore is fine', H.clientIdProblem('abc_123'), '');
+T('a dot is fine', H.clientIdProblem('abc.123'), '');
+
 console.log('\nredactClientId — enough to compare, not enough to fill a log');
 T('a long id keeps both ends',
     H.redactClientId('7f3a91c2-55de-4b0e-9a11-2c8f6d4e77b0'), '7f3a91…77b0 (36 chars)');
