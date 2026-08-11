@@ -48,7 +48,7 @@ To embed it on their site, they paste this iframe:
 | `suffixes`   | `VA,EX`                                    | Your trailing tag(s) (see Callsign matching). |
 | `regulars`   | `OCEAN%20STAFF,Shamrock`                  | Untagged callsigns, prefix-only, always included (alias `callsigns`). See §2. |
 | `match`      | `exact` \| `strict` \| `broad`            | How closely a callsign must follow the pattern. Default `strict`. See §2. |
-| `roster`     | `off` \| `airline` \| `any`               | How far the VA's pilot roster may vouch for a callsign the rule rejects. Default `airline`. See §2a. |
+| `roster`     | `off` \| `tagged` \| `airline` \| `any`    | How far the VA's pilot roster may vouch for a callsign the rule rejects. Default `airline`. See §2a. |
 | `hubs`       | `CYYZ,CYUL,CYVR`                          | Hub ICAOs. Each becomes a map marker listing your inbound pilots. |
 | `provider`   | `mapbox` or `free`                        | Auto: `free` when no Mapbox token. |
 | `mapboxToken`| `pk.eyJ…`                                 | The VA's own Mapbox token (mapbox provider only). |
@@ -253,8 +253,17 @@ the VA's pilot roster may **overrule** it. They are independent — a VA can run
 | Value | A rostered pilot counts when… | Cost |
 |---|---|---|
 | `off` | never — only callsigns passing `callsignMatch` | Members off-pattern are missing |
+| `tagged` | they're flying one of the VA's **airlines** *and* carrying one of its **tags** | A member who forgets the tag is missing |
 | `airline` (default) | they're flying one of the VA's **airlines**, tag or no tag | Codeshare legs still missing |
 | `any` | always, **whatever** they're flying | Everything else those pilots fly arrives too |
+
+`"tagged"` is the tight end of the dial, for a VA whose suffix is the whole point
+of having one. The roster still forgives the rest of the callsign's *shape* — a
+member's `UPS 123UP Cargo` arrives where `exact` would have refused the trailing
+word — but it never forgives a missing tag: `UPS 123` does not count, and neither
+does `Delta 9UP`, which wears the tag on somebody else's airline. A VA that has
+registered no suffix has no tag to require, so the roster cannot widen anything
+for it under this value.
 
 `"any"` is the one setting that solves the codeshare limitation below, because it
 stops reading the callsign and reads the roster instead. It is opt-in for a
@@ -361,7 +370,7 @@ so you can lock a token to one or more domains.
   "callsignSuffixes": ["VA"],
   "regularCallsigns": ["OCEAN STAFF", "Shamrock"],
   "callsignMatch": "strict",   // exact | strict | broad — see §2
-  "rosterTrust": "airline",    // off | airline | any — see §2a
+  "rosterTrust": "airline",    // off | tagged | airline | any — see §2a
   "hubs": ["CYYZ", "CYUL", "CYVR"],
   "mode": "map",
   "provider": "mapbox",

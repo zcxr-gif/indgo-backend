@@ -66,14 +66,17 @@ function lift(name) {
 }
 
 // Order matters: the later helpers close over the earlier ones.
-const source = [
-    lift('vaCallsignParts'),
-    lift('compactCallsign'),
-    lift('callsignSharesVaBase'),
-    lift('formatCallsignDisplay'),
-].join('\n');
+const NAMES = [
+    'vaCallsignParts',
+    'compactCallsign',
+    'callsignSharesVaBase',
+    'formatCallsignDisplay',
+    'tokenHasSuffixTag',
+    'callsignCarriesVaTag',
+];
+const source = NAMES.map(lift).join('\n');
 // eslint-disable-next-line no-new-func
-const H = new Function(`${source}\nreturn { vaCallsignParts, compactCallsign, callsignSharesVaBase, formatCallsignDisplay };`)();
+const H = new Function(`${source}\nreturn { ${NAMES.join(', ')} };`)();
 
 let failures = 0;
 const T = (label, got, expected) => {
@@ -119,6 +122,63 @@ T('another tag is not doubled either', H.formatCallsignDisplay('UPS ##UP'), 'UPS
 T('…and keeps its own tag rather than being given "VA"', H.formatCallsignDisplay('SHAMROCK ###EX'), 'SHAMROCK ##EX');
 T('a tagless mask is not handed a tag it never had', H.formatCallsignDisplay('BAW ###'), 'BAW ###');
 T('nothing in, nothing out', H.formatCallsignDisplay(''), null);
+
+/* ===========================================================================
+ * callsignCarriesVaTag — the other half, for rosterTrust: 'tagged'
+ *
+ * 'airline' lets the roster waive the suffix, which is right for most VAs and
+ * wrong for one whose suffix is the entire point of having one: a rostered
+ * pilot's untagged "UPS 123" arrived in the UPS feed because the callsign rule
+ * the roster widens ignores the tag. 'tagged' keeps the widening — the rest of
+ * the callsign's shape is still forgiven — but never for a missing tag.
+ * ======================================================================== */
+
+console.log('\ntokenHasSuffixTag — a tag, not a coincidence');
+T('a tag glued to a flight number counts', H.tokenHasSuffixTag('123UP', 'UP'), true);
+T('a tag standing alone counts', H.tokenHasSuffixTag('UP', 'UP'), true);
+// The rule that stops every Russian airline joining somebody's VA.
+T('a word merely ending in the letters does not', H.tokenHasSuffixTag('MOSKVA', 'VA'), false);
+T('…nor another one', H.tokenHasSuffixTag('NOVA', 'VA'), false);
+T('a different tag does not', H.tokenHasSuffixTag('123EX', 'UP'), false);
+T('no tag, no match', H.tokenHasSuffixTag('123UP', ''), false);
+
+console.log('\ncallsignCarriesVaTag — does this flight wear our tag?');
+const UPS = { callsigns: ['UPS ##UP'] };
+T('a tagged flight does', H.callsignCarriesVaTag('UPS 123UP', UPS), true);
+T('an untagged one does not', H.callsignCarriesVaTag('UPS 123', UPS), false);
+// The reason the window is the last TWO tokens: pilots append a second word.
+T('a trailing word does not hide the tag', H.callsignCarriesVaTag('UPS 123UP Cargo', UPS), true);
+T('…nor does a weight class', H.callsignCarriesVaTag('UPS 123UP Heavy', UPS), true);
+// Deliberately true — this helper answers "is our tag present", and the AIRLINE
+// is checked separately by callsignFitsVa. Asserted so that stays a decision.
+T('our tag on another airline is still our tag (the airline is checked elsewhere)',
+    H.callsignCarriesVaTag('DELTA 9UP', UPS), true);
+T('a VA with several callsigns accepts either tag',
+    H.callsignCarriesVaTag('SHAMROCK 1EX', { callsigns: ['UPS ##UP', 'SHAMROCK ###EX'] }), true);
+T('a VA with a tagless mask has no tag to carry',
+    H.callsignCarriesVaTag('BAW 42', { callsigns: ['BAW ###'] }), false);
+T('a VA with no registered callsigns has nothing to check',
+    H.callsignCarriesVaTag('UPS 123UP', {}), false);
+T('the single-callsign field is read too',
+    H.callsignCarriesVaTag('UPS 123UP', { callsign: 'UPS ##UP' }), true);
+
+console.log('\nrosterTrust: the decision the feed actually makes');
+// Mirrors the onAirline filter in resolveVaEventPartnerByRoster: a rostered
+// pilot on a listing in 'strict' mode, where callsignFitsVa is the loose
+// shared-airline test. This is the table the VA is choosing between.
+const decide = (trust, callsign, ad) => {
+    if (trust === 'off') return false;
+    if (!H.callsignSharesVaBase(callsign, ad.callsigns)) return false;
+    return trust !== 'tagged' || H.callsignCarriesVaTag(callsign, ad);
+};
+T('tagged: a tagged flight by a member counts', decide('tagged', 'UPS 123UP', UPS), true);
+T('tagged: an untagged flight by a member does NOT', decide('tagged', 'UPS 123', UPS), false);
+T('tagged: our tag on another airline does not', decide('tagged', 'DELTA 9UP', UPS), false);
+T('tagged: a trailing word is still forgiven', decide('tagged', 'UPS 123UP Cargo', UPS), true);
+// The behaviour every existing VA keeps, unchanged.
+T('airline: an untagged flight by a member still counts', decide('airline', 'UPS 123', UPS), true);
+T('airline: another airline still does not', decide('airline', 'DELTA 9UP', UPS), false);
+T('off: nothing counts', decide('off', 'UPS 123UP', UPS), false);
 
 console.log(failures ? `\n${failures} failure(s)\n` : '\nAll good.\n');
 process.exit(failures ? 1 : 0);

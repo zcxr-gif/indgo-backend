@@ -60,7 +60,7 @@ const PORTAL_CALLSIGN_MATCH_MODES = ['exact', 'strict', 'broad'];
 //   off     — never; only callsigns that fit the rule count.
 //   airline — (default) waives the VA's tag but not its airline.
 //   any     — a rostered pilot counts whatever they are flying (codeshare opt-in).
-const PORTAL_ROSTER_TRUST_MODES = ['off', 'airline', 'any'];
+const PORTAL_ROSTER_TRUST_MODES = ['off', 'tagged', 'airline', 'any'];
 
 const COOKIE_NAME = 'va_portal_token';
 const TOKEN_TYPE = 'va_portal';            // distinguishes these tokens from staff tokens
@@ -1336,11 +1336,14 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
      *     accepts the airline name on its own. The knob for "stop posting
      *     flights that aren't ours".
      *   rosterTrust — how far their pilot roster may vouch for a callsign that
-     *     rule rejects. 'off' never, 'airline' (default) waives their tag but
-     *     not their airline, 'any' counts a rostered pilot whatever they are
-     *     flying. The knob for "our members fly codeshare callsigns too" — and
-     *     the reason it is opt-in is that 'any' also brings in everything else
-     *     those pilots fly.
+     *     rule rejects. 'off' never, 'tagged' vouches for the pilot but never
+     *     for a missing tag, 'airline' (default) waives their tag but not their
+     *     airline, 'any' counts a rostered pilot whatever they are flying. The
+     *     knob for "our members fly codeshare callsigns too" — and the reason
+     *     it is opt-in is that 'any' also brings in everything else those
+     *     pilots fly. 'tagged' is the opposite end: for a VA whose suffix is
+     *     the whole point of having one, and who would rather miss a flight
+     *     than post somebody else's.
      *
      * The choice is written to the LISTING (which governs the Discord feed: the
      * ACARS matcher reads it off /api/va-ads and resolveVaEventPartner

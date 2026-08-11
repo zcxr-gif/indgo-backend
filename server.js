@@ -276,7 +276,7 @@ const VA_CALLSIGN_MATCH_MODES = ['exact', 'strict', 'broad'];
 // alone would reject, tightest first. See the `rosterTrust` field below. Kept
 // separate from callsignMatch because they answer different questions: one is
 // "how do we read a callsign", the other is "may the roster override it".
-const VA_ROSTER_TRUST_MODES = ['off', 'airline', 'any'];
+const VA_ROSTER_TRUST_MODES = ['off', 'tagged', 'airline', 'any'];
 
 const VirtualAirlineAdSchema = new mongoose.Schema({
     // --- Identity ---
@@ -316,6 +316,13 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
      *
      *   'off'     — the roster never widens the callsign rule. Only callsigns
      *     that fit `callsignMatch` count.
+     *   'tagged'  — the roster vouches for a pilot, but NEVER for a missing
+     *     tag. The airline must be one of ours and the callsign must carry one
+     *     of our tags; what it waives is only the rest of the shape, so a
+     *     rostered pilot's "UPS 123UP Cargo" counts where 'exact' would have
+     *     refused the trailing word. An untagged "UPS 123" does not count, and
+     *     neither does "Delta 9UP" — our tag on somebody else's airline.
+     *     For VAs whose tag is the whole point of having one.
      *   'airline' — (default) the roster waives the VA's suffix TAG and nothing
      *     more. An untagged "Ocean 12" by a rostered pilot counts for Ocean;
      *     that same pilot's "Etihad 456FR" does not. This is what keeps a pilot
@@ -1881,7 +1888,7 @@ const EMBED_CALLSIGN_MATCH_MODES = ['exact', 'strict', 'broad'];
 // How far the VA's pilot roster may vouch for a flight the callsign rule would
 // reject. Mirrors VA_ROSTER_TRUST_MODES; the portal writes the VA's one choice
 // to both so the map and the Discord feed always show the same pilots.
-const EMBED_ROSTER_TRUST_MODES = ['off', 'airline', 'any'];
+const EMBED_ROSTER_TRUST_MODES = ['off', 'tagged', 'airline', 'any'];
 const EMBED_HEADER_POSITIONS = ['top', 'bottom', 'left', 'right'];
 // The Events + Calendar companion widget (embed-events.html) ships 10 layout
 // presets; the VA picks one. Kept here so schema, resolve and validation agree.
@@ -2221,6 +2228,41 @@ const callsignSharesVaBase = (callsign, bases = []) => {
         if (base && cs.startsWith(base)) return true;
     }
     return false;
+};
+
+// Does this token end in `tag` as a REAL suffix tag, rather than by accident?
+//
+// The token must end with the tag and either BE the tag ("VA") or have a digit
+// immediately before it, glued to the flight number ("001VA", "123UP"). Without
+// the digit rule, "MOSKVA" and "NOVA" carry the tag "VA" and every Russian
+// airline joins somebody's VA. Mirrors tokenHasSuffixTag in va_filter.cjs and
+// embed.js so all three agree on what wearing a tag means.
+const tokenHasSuffixTag = (token, tag) => {
+    const t = String(token || '').toUpperCase();
+    const g = String(tag || '').toUpperCase();
+    if (!g || !t.endsWith(g)) return false;
+    if (t === g) return true;
+    return /[0-9]/.test(t.charAt(t.length - g.length - 1));
+};
+
+// Does this live callsign carry one of the VA's own suffix tags?
+//
+// The tags come off the stored masks ("UPS ##UP" → "UP"), so a VA that never
+// registered one has no tag to carry and this is false — callers treat that as
+// "there is nothing to check" rather than as a refusal.
+//
+// Looks at the last two tokens, not just the last, because a pilot routinely
+// appends a second one: "UPS 123UP Cargo" and "UPS 123UP Heavy" are both
+// carrying "UP". Same two-token window va_filter.cjs and embed.js use.
+const callsignCarriesVaTag = (callsign, ad) => {
+    const bases = Array.isArray(ad?.callsigns) && ad.callsigns.length
+        ? ad.callsigns
+        : (ad?.callsign ? [ad.callsign] : []);
+    const tags = [...new Set(bases.map((b) => (vaCallsignParts(b) || {}).tag).filter(Boolean))];
+    if (!tags.length) return false;
+    const tokens = String(callsign || '').trim().toUpperCase().split(/[\s\-_/]+/).filter(Boolean);
+    const tail = tokens.slice(-2);
+    return tags.some((tag) => tail.some((t) => tokenHasSuffixTag(t, tag)));
 };
 
 // The callsign strictness a VA listing runs under. Anything unrecognised (or a
@@ -13929,6 +13971,9 @@ const PARTNER_SELECT = 'name callsign callsigns callsignMatch rosterTrust logoUr
 // the VA's own call, via `rosterTrust` on the listing:
 //
 //   'off'     — the roster never delivers.
+//   'tagged'  — it vouches for the pilot but never for a missing tag: the
+//     airline must be theirs and the callsign must carry one of their tags, so
+//     a rostered pilot's "UPS 123UP Cargo" arrives and their "UPS 123" does not.
 //   'airline' — (default) it waives the VA's suffix TAG and nothing more, so an
 //     untagged "Ocean 12" by a rostered pilot counts for Ocean while that same
 //     pilot's "Etihad 456FR" does not.
@@ -13966,7 +14011,19 @@ const resolveVaEventPartnerByRoster = async (e) => {
     if (!opted.length) return null;
 
     // Preferred: the roster VA whose airline this pilot is actually flying.
-    const onAirline = opted.filter((a) => vaRosterTrust(a) !== 'off' && callsignFitsVa(e.callsign, a));
+    //
+    // 'tagged' adds the second half of that question. The callsign rule the
+    // roster is widening here ignores the suffix — in 'strict' and 'broad' mode
+    // callsignFitsVa is a shared-airline test — so without this a rostered
+    // pilot's untagged "UPS 123" arrives in the UPS feed. A VA on 'tagged' has
+    // said the tag is not decoration: the airline must be theirs AND the
+    // callsign must wear their tag.
+    const onAirline = opted.filter((a) => {
+        const trust = vaRosterTrust(a);
+        if (trust === 'off') return false;
+        if (!callsignFitsVa(e.callsign, a)) return false;
+        return trust !== 'tagged' || callsignCarriesVaTag(e.callsign, a);
+    });
     // Fallback: VAs that opted into vouching for any callsign at all.
     const anyCallsign = opted.filter((a) => vaRosterTrust(a) === 'any');
     const valid = onAirline.length ? onAirline : anyCallsign;

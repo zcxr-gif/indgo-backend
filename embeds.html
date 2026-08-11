@@ -315,10 +315,11 @@
                     <label class="block text-sm font-semibold mb-1.5">Pilots on the roster</label>
                     <select id="f_rosterTrust" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                         <option value="off">Off — only callsigns that fit the rule above</option>
+                        <option value="tagged">On my airline, with my tag — the roster never waives the tag</option>
                         <option value="airline" selected>On my airline — the roster waives my tag, not my airline</option>
                         <option value="any">Any callsign — a rostered pilot counts whatever they fly</option>
                     </select>
-                    <p class="text-xs text-zinc-400 mt-1">"Any callsign" is the codeshare opt-in: it uses the VA's pilot roster instead of the callsign, so members on partner callsigns appear — along with everything else those pilots fly, including their flights for another VA. Needs a roster; a VA with none sees no change.</p>
+                    <p class="text-xs text-zinc-400 mt-1">"Any callsign" is the codeshare opt-in: it uses the VA's pilot roster instead of the callsign, so members on partner callsigns appear — along with everything else those pilots fly, including their flights for another VA. Needs a roster; a VA with none sees no change. "With my tag" is the opposite end: a rostered pilot's "UPS 123UP Cargo" counts, their untagged "UPS 123" does not.</p>
                 </div>
 
                 <div>
@@ -1140,7 +1141,7 @@
             document.getElementById('f_suffixes').value = (c.callsignSuffixes || []).join(', ');
             document.getElementById('f_regulars').value = (c.regularCallsigns || []).join(', ');
             document.getElementById('f_callsignMatch').value = ['exact', 'broad'].includes(c.callsignMatch) ? c.callsignMatch : 'strict';
-            document.getElementById('f_rosterTrust').value = ['off', 'any'].includes(c.rosterTrust) ? c.rosterTrust : 'airline';
+            document.getElementById('f_rosterTrust').value = ['off', 'tagged', 'any'].includes(c.rosterTrust) ? c.rosterTrust : 'airline';
             document.getElementById('f_hubs').value = (c.hubs || []).join(', ');
             document.getElementById('f_mode').value = c.mode || 'roster';
             document.getElementById('f_provider').value = c.provider || '';

@@ -178,6 +178,7 @@
                     <label class="block text-sm font-semibold mb-1.5">Pilot roster trust</label>
                     <select id="f_rosterTrust" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                         <option value="off">Off — only callsigns that fit the rule above</option>
+                        <option value="tagged">Airline + tag — the roster never waives the VA's tag</option>
                         <option value="airline" selected>Airline (default) — the roster waives their tag, not their airline</option>
                         <option value="any">Any callsign — a rostered pilot counts whatever they fly</option>
                     </select>
@@ -506,7 +507,7 @@
                 // back to the legacy single callsign for older records.
                 set('f_callsign', (ad.callsigns && ad.callsigns.length ? ad.callsigns : (ad.callsign ? [ad.callsign] : [])).join(', '));
                 set('f_callsignMatch', ['exact', 'broad'].includes(ad.callsignMatch) ? ad.callsignMatch : 'strict');
-                set('f_rosterTrust', ['off', 'any'].includes(ad.rosterTrust) ? ad.rosterTrust : 'airline');
+                set('f_rosterTrust', ['off', 'tagged', 'any'].includes(ad.rosterTrust) ? ad.rosterTrust : 'airline');
                 set('f_tagline', ad.tagline);
                 set('f_description', ad.description); set('f_region', ad.region); set('f_pilotCount', ad.pilotCount ?? 0);
                 set('f_minGrade', ad.minGrade); set('f_requirements', ad.requirements);
