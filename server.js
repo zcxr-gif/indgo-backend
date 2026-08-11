@@ -14930,7 +14930,62 @@ app.get('/', requireAuthPage, (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
+/* ===========================================================================
+ * An /api path that matched nothing is an ERROR, not a page.
+ *
+ * Below this comment is the SPA catch-all, and until now every mistyped API
+ * path fell into it: no route matched, express.static found no file, and the
+ * request was answered with the Aircraft Database's index.html — or, because
+ * that catch-all is behind requireAuthPage, with a redirect to the staff login.
+ * Status 200 either way. A caller asking for JSON got a page of HTML about
+ * aeroplanes and had to work out for themselves that the URL was wrong.
+ *
+ * The way this bit somebody: an Infinite Flight OAuth client registered with a
+ * redirect URI of /api/crew/if-org/callback, one hyphenated word away from the
+ * real /api/crew/if/callback. Nothing matched, so Infinite Flight's redirect
+ * landed on the aircraft app, and the authorization code went to a handler that
+ * has never heard of one. The sign-in simply did not happen, and the only
+ * visible symptom was a page of plane pictures where a crew center should be.
+ *
+ * So: anything under /api that reaches this point gets an honest 404 in JSON.
+ * ======================================================================== */
+app.use('/api', (req, res) => {
+    const attempted = String(req.originalUrl || '').split('?')[0];
+
+    // A near miss on the OAuth callback is worth its own sentence. This is the
+    // one wrong URL in the codebase that somebody types into ANOTHER system's
+    // dashboard, which means the feedback loop is "consent screen fails days
+    // later" rather than "page 404s now" — so the 404 says what the right one
+    // is, in full, ready to paste back into the OAuth client.
+    //
+    // DELIBERATELY NOT A REDIRECT. Forwarding an authorization code to another
+    // URL is a bad habit at the best of times, and here it would not even work:
+    // Infinite Flight compares the redirect_uri we send at /connect/authorize
+    // against the one registered on the client, character for character, and
+    // refuses BEFORE the browser ever reaches us. A redirect would only paper
+    // over a mismatch that has already stopped the flow — and would leave the
+    // real fault, a wrong URI in the dashboard, undiscovered.
+    if (/^\/api\/crew\/[^/]+\/callback$/.test(attempted) && attempted !== '/api/crew/if/callback') {
+        const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+        const host = String(req.headers['x-forwarded-host'] || req.get('host') || '').split(',')[0].trim();
+        const correct = host ? `${proto}://${host}/api/crew/if/callback` : '/api/crew/if/callback';
+        console.warn(`[if oauth] callback hit at ${attempted} — the registered redirect URI is wrong; it should be ${correct}`);
+        res.set('Cache-Control', 'no-store');
+        return res.status(404).json({
+            error: 'That is not the Infinite Flight callback address.',
+            code: 'wrong_callback_path',
+            attempted,
+            expected: correct,
+            detail: 'Open the OAuth client at infiniteflight.com/account/api-keys and set its redirect URI to the address in `expected`, exactly — no trailing slash. It has to match what this server sends character for character.',
+        });
+    }
+
+    res.set('Cache-Control', 'no-store');
+    return res.status(404).json({ error: 'No such API endpoint.', code: 'not_found', attempted });
+});
+
 // Catch-all for the SPA — also staff-only (the whole site sits behind login).
+// Reached only by non-/api paths now; see the block above.
 app.get(/(.*)/, requireAuthPage, (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
@@ -15082,9 +15137,22 @@ app.listen(PORT, () => {
     // id travels in every authorization URL and the redirect URI is printed on
     // the setup panel — so both can be said out loud.
     const ifRedirect = ifOAuth.REDIRECT_URI;
-    console.log(ifRedirect
-        ? `   Infinite Flight redirect URI: ${ifRedirect}`
-        : '   Infinite Flight redirect URI: NOT SET — falling back to each request’s own host. Set IF_OAUTH_REDIRECT_URI to the URI registered on the OAuth client.');
+    const IF_CALLBACK_PATH = '/api/crew/if/callback';
+    if (!ifRedirect) {
+        console.log('   Infinite Flight redirect URI: NOT SET — falling back to each request’s own host. Set IF_OAUTH_REDIRECT_URI to the URI registered on the OAuth client.');
+    } else if (!ifRedirect.endsWith(IF_CALLBACK_PATH)) {
+        // The one misconfiguration that is invisible until a VA tries to sign
+        // in days later, and which cost real time once: the path is checked
+        // here because it is the only place we can check it BEFORE somebody is
+        // sitting on a consent screen. Only this server knows what its callback
+        // route is actually called, so only this server can say the URI is
+        // pointing somewhere it does not serve.
+        console.warn(`   ⚠️  Infinite Flight redirect URI: ${ifRedirect}`);
+        console.warn(`       This does not end in ${IF_CALLBACK_PATH}, which is the only callback route this server has.`);
+        console.warn('       Infinite Flight will send the browser somewhere nothing handles it, and the sign-in will not complete.');
+    } else {
+        console.log(`   Infinite Flight redirect URI: ${ifRedirect}`);
+    }
     console.log(`   Infinite Flight platform client: ${ifOAuth.PLATFORM_CLIENT.id
         ? `${ifOAuth.PLATFORM_CLIENT.id} (${ifOAuth.PLATFORM_CLIENT.type})`
         : 'none — every VA uses their own'}`);
