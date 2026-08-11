@@ -58,14 +58,32 @@ const ifLive = require('./ifLive');
 // Configuration
 // ---------------------------------------------------------------------------
 
-const AUTH_BASE = (process.env.IF_OAUTH_BASE_URL || 'https://api.infiniteflight.com/auth/v2')
-    .trim().replace(/\/+$/, '');
-const API_BASE = (process.env.IF_V3_BASE_URL || 'https://api.infiniteflight.com/public/v3')
-    .trim().replace(/\/+$/, '');
+// READ AT USE, NOT AT REQUIRE.
+//
+// Every value in this section used to be a `const` evaluated while the module
+// was being required. That works only if whatever loads the environment has
+// already run, and in a file the size of server.js "already run" is a property
+// of require order that nobody can see from here. When it was wrong the
+// symptom was the worst kind: IF_OAUTH_REDIRECT_URI present in the
+// environment, blank in this module, and the connect route reporting a
+// redirect URI problem to a VA who had configured one correctly.
+//
+// Functions instead. The cost is a string trim per call on a code path that
+// makes network requests; the benefit is that this file cannot be broken by a
+// line moving in another one.
+const env = (name, fallback = '') => {
+    const value = process.env[name];
+    return (value === undefined || value === null || String(value).trim() === '')
+        ? fallback
+        : String(value).trim();
+};
+
+const authBase = () => env('IF_OAUTH_BASE_URL', 'https://api.infiniteflight.com/auth/v2').replace(/\/+$/, '');
+const apiBase = () => env('IF_V3_BASE_URL', 'https://api.infiniteflight.com/public/v3').replace(/\/+$/, '');
 
 // The user-facing sign-in host. Never called from here — see the header — but
 // exported so the connect screen can say where the VA is about to be sent.
-const ISSUER = (process.env.IF_OAUTH_ISSUER || 'https://auth.infiniteflight.com/').trim();
+const issuer = () => env('IF_OAUTH_ISSUER', 'https://auth.infiniteflight.com/');
 
 // Where Infinite Flight sends the browser back to. One URI for the whole
 // platform rather than one per VA: it has to be registered on the OAuth client
@@ -82,23 +100,28 @@ const ISSUER = (process.env.IF_OAUTH_ISSUER || 'https://auth.infiniteflight.com/
 // diagnosable error in OAuth.
 //
 // So: this variable, or the request's own host. Nothing in between.
-const REDIRECT_URI = String(process.env.IF_OAUTH_REDIRECT_URI || '').trim();
+//
+// A trailing slash is stripped. Infinite Flight matches the registered URI
+// character for character, our own callback path carries no trailing slash,
+// and a stray one pasted into a dashboard field is the kind of difference that
+// costs an afternoon to see.
+const redirectUri = () => env('IF_OAUTH_REDIRECT_URI').replace(/\/+$/, '');
 
 // The platform's own OAuth client, when there is one. A VA may bring their own
 // instead (see clientFor in server.js) — which is the path that works today,
 // because "testing clients are limited to the owner and invited test users
 // until the app is reviewed and approved by Infinite Flight", and a VA's own
 // client has the VA as its owner.
-const PLATFORM_CLIENT = {
-    id: (process.env.IF_OAUTH_CLIENT_ID || '').trim(),
-    secret: (process.env.IF_OAUTH_CLIENT_SECRET || '').trim(),
+const platformClient = () => {
+    const id = env('IF_OAUTH_CLIENT_ID');
+    const secret = env('IF_OAUTH_CLIENT_SECRET');
     // A client with a secret is confidential; without one it is public and
     // leans on PKCE alone. Inferred rather than configured separately so the
     // two cannot contradict each other.
-    get type() { return this.secret ? 'confidential' : 'public'; },
+    return { id, secret, type: secret ? 'confidential' : 'public' };
 };
 
-const TIMEOUT_MS = Math.max(3000, Number(process.env.IF_API_TIMEOUT_MS || 15000));
+const timeoutMs = () => Math.max(3000, Number(env('IF_API_TIMEOUT_MS', '15000')) || 15000);
 
 // An access token lasts 1800s. Refresh this far ahead of the stated expiry so a
 // request never leaves with a token that dies in flight — 1800 is the documented
@@ -217,7 +240,7 @@ function authorizeUrl({ clientId, redirectUri, scopes, state, challenge, prompt 
     // published example costs one replace. Nothing else in these parameters is
     // ever a literal space (base64url, an opaque client id, an encoded URI), so
     // this cannot corrupt another value.
-    return `${AUTH_BASE}/connect/authorize?${params.toString().replace(/\+/g, '%20')}`;
+    return `${authBase()}/connect/authorize?${params.toString().replace(/\+/g, '%20')}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +266,7 @@ async function tokenRequest(form) {
 
     let resp;
     try {
-        resp = await withTimeout((signal) => fetch(`${AUTH_BASE}/connect/token`, {
+        resp = await withTimeout((signal) => fetch(`${authBase()}/connect/token`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/x-www-form-urlencoded',
@@ -343,7 +366,7 @@ function refresh({ clientId, clientSecret, refreshToken }) {
 
 function withTimeout(run) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), timeoutMs());
     return Promise.resolve(run(controller.signal)).finally(() => clearTimeout(timer));
 }
 
@@ -384,7 +407,7 @@ async function call(accessToken, method, path, { body, write = false, retries = 
     if (!accessToken) {
         throw new IfApiError('Not connected to Infinite Flight.', { status: 401 });
     }
-    const url = `${API_BASE}${path.startsWith('/') ? path : `/${path}`}`;
+    const url = `${apiBase()}${path.startsWith('/') ? path : `/${path}`}`;
 
     for (let attempt = 0; ; attempt++) {
         let resp;
@@ -612,8 +635,19 @@ async function aircraftDetail(token, aircraftId, { position = true, schedules = 
 }
 
 module.exports = {
-    // configuration, read by server.js so there is one source for each value
-    AUTH_BASE, API_BASE, ISSUER, REDIRECT_URI, PLATFORM_CLIENT, REFRESH_MARGIN_MS,
+    // Configuration, read by server.js so there is one source for each value.
+    //
+    // Getters rather than values: server.js reads these as `ifOAuth.REDIRECT_URI`
+    // at request time and gets what the environment says NOW, not what it said
+    // during require. The call sites are unchanged and cannot tell the
+    // difference — which is the point, because the previous behaviour also
+    // looked identical at the call site and was wrong.
+    get AUTH_BASE() { return authBase(); },
+    get API_BASE() { return apiBase(); },
+    get ISSUER() { return issuer(); },
+    get REDIRECT_URI() { return redirectUri(); },
+    get PLATFORM_CLIENT() { return platformClient(); },
+    REFRESH_MARGIN_MS,
     // errors
     IfApiError, IfAuthError,
     // the handshake

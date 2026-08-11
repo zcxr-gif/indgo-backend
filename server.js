@@ -1,6 +1,21 @@
 // server.js
 // A lightweight backend for Community Aircraft Contributions and Flight Trail Storage.
 
+// FIRST LINE OF EXECUTABLE CODE, AND IT HAS TO STAY THERE.
+//
+// Several of the modules required below read process.env while they are being
+// evaluated — ifOAuth.js reads IF_OAUTH_REDIRECT_URI and the OAuth client at
+// require time, staffAuth/vaPortal/airports do the same with their own keys. A
+// dotenv.config() that runs after those requires populates process.env too late
+// for all of them: the variable is set in the file, visible to anything that
+// looks later, and yet the module that needed it saw an empty string. That
+// surfaces as configuration that is "definitely set" and definitely ignored —
+// for Infinite Flight, as a redirect URI error on a deployment whose
+// IF_OAUTH_REDIRECT_URI is right there in the environment file.
+//
+// Nothing may be required above this line.
+require('dotenv').config();
+
 const {
     uploadAirportImage,
     getAirportInfo,
@@ -147,7 +162,6 @@ const {
 } = require('@aws-sdk/client-s3');
 const { CloudWatchClient, GetMetricStatisticsCommand } = require('@aws-sdk/client-cloudwatch');
 const sharp = require('sharp'); // Image processing library
-require('dotenv').config();
 const fs = require('fs');
 const os = require('os');
 
@@ -839,6 +853,16 @@ const CrewIfAuthStateSchema = new mongoose.Schema({
     startedBy: { type: String, default: '' },
     scopes: { type: [String], default: [] },
     clientId: { type: String, default: '' },
+    // The redirect_uri that was actually sent to /connect/authorize.
+    //
+    // Stored rather than recomputed at the callback because OAuth2 requires the
+    // token exchange to present the SAME value, byte for byte, and the two
+    // requests do not arrive the same way: the authorize call is a fetch from
+    // the dashboard, the callback is a navigation from Infinite Flight's own
+    // site. On a deployment without IF_OAUTH_REDIRECT_URI, where the value is
+    // derived from the request's host headers, any difference between those two
+    // hops produces an invalid_grant with nothing in it to say why.
+    redirectUri: { type: String, default: '' },
     // Where the browser is sent when this is over. Validated against our own
     // site origin at both ends — a stored redirect that a request could set
     // freely is an open redirect with extra steps.
@@ -4219,6 +4243,36 @@ function ifState(ad, { owner = false } = {}) {
     };
 }
 
+/**
+ * ifState plus what the CALLER may do with it — the complete answer, and the
+ * only shape any of these routes should ever send.
+ *
+ * It exists because the two halves were separated once and every route that
+ * forgot the second half shipped a payload that says "this connection exists"
+ * and, by omission, "you are nobody". The panel replaces its whole status with
+ * whatever a save returns, so a reply missing `you` did not degrade politely:
+ * an owner who saved their OAuth client watched the screen decide they were
+ * not the owner, and the setup instructions — which is where the redirect URI
+ * to register is printed — went with it. Saving something must never be able
+ * to tell you less about yourself than loading it did.
+ *
+ * `owner` is passed rather than re-derived: the owner-gated routes have
+ * already established it, and asking twice invites the two answers to differ.
+ */
+async function ifPayload(req, slug, ad, { owner }) {
+    return {
+        ...ifState(ad, { owner }),
+        // What the CALLER may do, as distinct from what the grant allows.
+        // Both have to be true for a save button to appear, and the panel
+        // says which one is missing.
+        you: { owner, canManageSchedules: !(await ifWriteGate(req, slug)).error },
+        // Only the owner is shown it, and only the owner is asked to register
+        // it — but they are asked for it on the same screen they just saved a
+        // client on, so it has to survive that save.
+        redirectUri: owner ? ifRedirectUri(req) : '',
+    };
+}
+
 /** One error shape for everything this block can fail with. */
 function ifFail(res, err, fallback) {
     if (err instanceof ifOAuth.IfAuthError) {
@@ -4463,15 +4517,7 @@ app.get('/api/crew/:slug/if', async (req, res) => {
         if (!va) return res.status(404).json({ error: 'Crew center not found.' });
         const ad = await ifConnection(va._id);
         const owner = gate.p.kind === 'inflight' || gate.p.role === 'owner';
-        const canWrite = !(await ifWriteGate(req, req.params.slug)).error;
-        res.json({
-            ...ifState(ad, { owner }),
-            // What the CALLER may do, as distinct from what the grant allows.
-            // Both have to be true for a save button to appear, and the panel
-            // says which one is missing.
-            you: { owner, canManageSchedules: canWrite },
-            redirectUri: owner ? ifRedirectUri(req) : '',
-        });
+        res.json(await ifPayload(req, req.params.slug, ad, { owner }));
     } catch (err) { ifFail(res, err, { log: 'if status error', message: 'Could not read the Infinite Flight connection.' }); }
 });
 
@@ -4539,8 +4585,7 @@ app.post('/api/crew/:slug/if/client', async (req, res) => {
             ...(ad && ad.ifConnectedAt ? {
                 notice: 'The account that is already connected will need reconnecting — the tokens it holds belong to the previous client.',
             } : {}),
-            ...ifState(ad, { owner: true }),
-            redirectUri: ifRedirectUri(req),
+            ...(await ifPayload(req, req.params.slug, ad, { owner: true })),
         });
     } catch (err) { ifFail(res, err, { log: 'if client save error', message: 'Could not save the OAuth client.' }); }
 });
@@ -4555,7 +4600,10 @@ app.delete('/api/crew/:slug/if/client', async (req, res) => {
         await VirtualAirlineAd.updateOne({ _id: va._id }, {
             $set: { ifClientId: '', ifClientSecret: '', ifClientSecretHint: '', ifClientType: '' },
         });
-        res.json({ ok: true, ...ifState(await ifConnection(va._id), { owner: true }) });
+        res.json({
+            ok: true,
+            ...(await ifPayload(req, req.params.slug, await ifConnection(va._id), { owner: true })),
+        });
     } catch (err) { ifFail(res, err, { log: 'if client delete error', message: 'Could not remove the OAuth client.' }); }
 });
 
@@ -4606,7 +4654,15 @@ app.post('/api/crew/:slug/if/connect', async (req, res) => {
         // catching it here says so in one sentence instead of as an opaque
         // error on their consent screen.
         if (!/^https:/i.test(redirectUri) && !/^http:\/\/localhost[:/]/i.test(redirectUri)) {
-            return res.status(500).json({ error: 'The Infinite Flight redirect URI has to be https. Set IF_OAUTH_REDIRECT_URI.' });
+            // The URI itself goes in the message. It is not a secret — it is
+            // printed on the setup panel and registered in a dashboard — and
+            // without it this reads as "your configuration is wrong" to
+            // somebody whose configuration says https, when what actually
+            // happened is that we derived a URI from the request instead of
+            // reading theirs.
+            return res.status(500).json({
+                error: `The Infinite Flight redirect URI has to be https, and this one is “${redirectUri}”. Set IF_OAUTH_REDIRECT_URI on the API server to the exact URI registered on the OAuth client.`,
+            });
         }
 
         // What to ask for. Defaults to everything the crew center can use;
@@ -4633,6 +4689,7 @@ app.post('/api/crew/:slug/if/connect', async (req, res) => {
             startedBy: (gate.p && (gate.p.name || gate.p.username)) || '',
             scopes,
             clientId: client.id,
+            redirectUri,
             returnTo,
         });
 
@@ -4738,7 +4795,11 @@ app.get('/api/crew/if/callback', async (req, res) => {
             clientId: client.id,
             clientSecret: client.secret,
             code,
-            redirectUri: ifRedirectUri(req),
+            // The one from the authorization request, not a fresh derivation —
+            // see the note on the field. Falls back only for a row written by a
+            // previous version of this code, which will not exist for long: the
+            // collection expires its rows after ten minutes.
+            redirectUri: row.redirectUri || ifRedirectUri(req),
             verifier: row.verifier,
         });
 
@@ -4802,7 +4863,7 @@ app.delete('/api/crew/:slug/if/connection', async (req, res) => {
         res.json({
             ok: true,
             notice: 'Disconnected here. To withdraw the authorization at Infinite Flight as well, remove this app from your Infinite Flight account.',
-            ...ifState(await ifConnection(va._id), { owner: true }),
+            ...(await ifPayload(req, req.params.slug, await ifConnection(va._id), { owner: true })),
         });
     } catch (err) { ifFail(res, err, { log: 'if disconnect error', message: 'Could not disconnect.' }); }
 });
@@ -4865,7 +4926,11 @@ app.post('/api/crew/:slug/if/organization', async (req, res) => {
             },
         });
         ifInvalidate(va._id);
-        res.json({ ok: true, organization, ...ifState(await ifConnection(va._id), { owner: true }) });
+        res.json({
+            ok: true,
+            organization,
+            ...(await ifPayload(req, req.params.slug, await ifConnection(va._id), { owner: true })),
+        });
     } catch (err) { ifFail(res, err, { log: 'if org select error', message: 'Could not select that organization.' }); }
 });
 
@@ -5380,7 +5445,7 @@ app.post('/api/crew/:slug/if/sync', async (req, res) => {
             ...(bare ? {
                 notice: 'Only departures with an aircraft assigned to them will be sent. Set a default aircraft to send the rest as well.',
             } : {}),
-            ...ifState(ad, { owner: true }),
+            ...(await ifPayload(req, req.params.slug, ad, { owner: true })),
         });
     } catch (err) { ifFail(res, err, { log: 'if sync settings error', message: 'Could not save the sync settings.' }); }
 });
@@ -14962,4 +15027,17 @@ diagnostics.registerSource('mongo', () => {
 
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
+    // One line about the Infinite Flight OAuth configuration, because the
+    // failure it guards against is invisible from the outside: a redirect URI
+    // that is set in the environment and unread by the process reports itself
+    // as a VA's configuration mistake. Neither value is a secret — the client
+    // id travels in every authorization URL and the redirect URI is printed on
+    // the setup panel — so both can be said out loud.
+    const ifRedirect = ifOAuth.REDIRECT_URI;
+    console.log(ifRedirect
+        ? `   Infinite Flight redirect URI: ${ifRedirect}`
+        : '   Infinite Flight redirect URI: NOT SET — falling back to each request’s own host. Set IF_OAUTH_REDIRECT_URI to the URI registered on the OAuth client.');
+    console.log(`   Infinite Flight platform client: ${ifOAuth.PLATFORM_CLIENT.id
+        ? `${ifOAuth.PLATFORM_CLIENT.id} (${ifOAuth.PLATFORM_CLIENT.type})`
+        : 'none — every VA uses their own'}`);
 });
