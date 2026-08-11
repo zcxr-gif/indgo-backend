@@ -1325,6 +1325,50 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
 
     const MAX_AIRCRAFT_IMAGES = 3;
 
+    /**
+     * The submitter token exactly as a pending review card carries it.
+     *
+     * Two shapes, both written into the footer as `User: <token>`:
+     *   • a Discord snowflake — a DM submission, or a site submission from an
+     *     account with a linked Discord identity
+     *   • the literal 'web' — a site submission with no Discord identity, in
+     *     which case the display name to credit rides in the footer's `Collab:`
+     *
+     * PARSED AS A TOKEN, NOT AS DIGITS. It used to be read with /User: (\d+)/,
+     * which cannot see 'web' — and the two callers handled that miss
+     * differently, both badly. The rebuild loop skipped web cards entirely, so
+     * their buttons never refreshed. The admin-edit handler fell back to
+     * `interaction.user.id`, baking the MODERATOR's Discord id into the rebuilt
+     * approve buttons; approval then read that id back, resolved it to a guild
+     * member, and credited the photo to whoever had edited the card instead of
+     * to the person who submitted it. Every site submission an admin touched
+     * before approving came out under a staff name.
+     */
+    const submitterTokenFrom = (footerText) =>
+        (String(footerText || '').match(/User: ([^\s|]+)/)?.[1] || '');
+
+    /**
+     * The same token, recovered from the approve buttons already on a card.
+     *
+     * The footer is the primary source and normally survives an edit; this is
+     * the second place the token exists, for a card whose footer was lost. It
+     * matters because the alternative fallback — the moderator — is the bug
+     * above, and there is no third guess worth making.
+     */
+    const submitterTokenFromComponents = (message) => {
+        for (const row of (message?.components || [])) {
+            for (const c of (row?.components || [])) {
+                const id = String(c?.customId || '');
+                if (!id.startsWith('approve_') || id.startsWith('approve_apt_')) continue;
+                // approve_<action>_<slot>_<token>, or the older approve_<slot>_<token>
+                // / approve_<token>. The token is always last.
+                const token = id.split('_').pop();
+                if (token) return token;
+            }
+        }
+        return '';
+    };
+
     // Build the admin review UI for an aircraft submission: mutates `mainEmbed`
     // (title/colour/description) and returns the slot-choice buttons plus a
     // comparison embed per existing photo. The admin chooses which of the (up to
@@ -1418,7 +1462,11 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 if (!t || !l) continue;
                 if (t.toLowerCase() !== typeField.toLowerCase() || l.toLowerCase() !== liveryField.toLowerCase()) continue;
 
-                const submitterId = (embed.footer?.text || '').match(/User: (\d+)/)?.[1];
+                // Web cards carry `User: web`, which the old digits-only parse
+                // could not see — so they were skipped here and never had their
+                // buttons refreshed when a duplicate appeared.
+                const submitterId = submitterTokenFrom(embed.footer?.text)
+                    || submitterTokenFromComponents(msg);
                 if (!submitterId) continue;
                 const refreshed = EmbedBuilder.from(embed);
                 const review = buildAircraftReview(refreshed, updatedEntry, submitterId);
@@ -2966,8 +3014,21 @@ client.on('interactionCreate', async (interaction) => {
                 fields.find(f => f.name === 'Livery').value = newLivery;
                 newEmbed.setFields(fields);
 
-                // Recover the submitter id from the pending footer so we can rebuild buttons.
-                const submitterId = (oldEmbed.footer?.text || '').match(/User: (\d+)/)?.[1] || interaction.user.id;
+                // Recover the submitter token from the pending footer so we can
+                // rebuild the buttons around the person who actually submitted
+                // this. Falling back to the buttons already on the card, and
+                // then to 'web' — which credits the footer's `Collab:` name, or
+                // 'Anonymous'.
+                //
+                // NEVER to interaction.user.id. That was the previous fallback,
+                // and because `User: web` did not match a digits-only parse it
+                // fired on every site submission an admin edited: the
+                // moderator's id went into the approve buttons, approval read it
+                // back as the contributor, and the photo went live credited to
+                // staff instead of to the person who sent it in.
+                const submitterId = submitterTokenFrom(oldEmbed.footer?.text)
+                    || submitterTokenFromComponents(interaction.message)
+                    || 'web';
 
                 // Re-run the duplicate check so an admin edit that now matches an existing
                 // record gets the replacement banner + per-photo comparison embeds and the

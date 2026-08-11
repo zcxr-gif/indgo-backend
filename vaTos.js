@@ -18,11 +18,11 @@
 
 // Bump this whenever the Terms text or the PDF changes. Previous accepters are
 // re-prompted in their portal (and can be re-notified in Discord) when it moves.
-const TOS_VERSION = 'v3';
+const TOS_VERSION = 'v4';
 
 // Human-readable effective date of the current version (shown on the Terms
 // page, the PDF, and the portal banner).
-const TOS_EFFECTIVE_DATE = '2026-07-13';
+const TOS_EFFECTIVE_DATE = '2026-08-11';
 
 // Where partners find the Terms. The PDF is served statically from the repo
 // root; the page is a public route (see server.js).
@@ -97,7 +97,7 @@ const TOS_SUMMARY = [
     'Free program — a directory advertising your VA across our platform, subject to staff approval.',
     'Partner benefits — every participating VA is entitled to a free live embed (a widget for your own website showing your VA’s live flights and pilot roster) and a Discord flight-events webhook (automatic takeoff/landing cards posted to your own server).',
     'Official tracking provider — by joining, you accept Inflight as your VA’s official flight-tracking provider. This does not require every individual pilot to use Inflight, but whenever you post or run an event, it must be tracked with Inflight and Inflight is credited as the tracker.',
-    'Event tracking — any event you announce or run must be tracked using Inflight, evidenced by a screenshot from our tracker.',
+    'Event tracking — any event you announce or run must be tracked using Inflight, evidenced by a screenshot from our tracker. If no picture was taken, the announcement must instead carry, in bold text, an invitation to follow your events on Inflight together with a link to our tracker.',
     'Accurate content — listing info, logos and banners must be accurate, owned by you, and not offensive or infringing.',
     'Staff authority — Inflight may review, edit, approve, decline, feature or remove any listing at our discretion.',
     'Enforcement — breaches are handled through a warning ladder (verbal → first → second → final warning) and may end in contract termination.',
@@ -107,6 +107,14 @@ const TOS_SUMMARY = [
 // What changed in the current version, shown on the Terms page + portal banner
 // so partners can see why they are being asked to re-acknowledge.
 const TOS_CHANGELOG = [
+    {
+        version: 'v4',
+        date: TOS_EFFECTIVE_DATE,
+        notes: [
+            'Added: if no picture of an event was taken, or you cannot provide one, the announcement may instead carry — in bold text — an invitation to follow your VA’s events on Inflight, together with a link to our tracker. Previously a picture from the tracker was the only accepted way to meet this requirement.',
+            'Unchanged: the event itself must still be tracked using Inflight. The written alternative replaces the picture, not the tracking.',
+        ],
+    },
     {
         version: 'v3',
         date: TOS_EFFECTIVE_DATE,

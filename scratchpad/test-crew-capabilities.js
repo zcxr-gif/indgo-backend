@@ -8,9 +8,13 @@
 //   * an owner and Inflight oversight hold everything, always
 //   * a pilot holds nothing, whatever roles happen to exist
 //   * a staff member with a role holds THAT ROLE and nothing else
-//   * a staff member with NO role keeps full access — the deliberate
-//     non-breaking default, and the reason "see everything, change nothing" has
-//     to be an Observer role with nothing ticked rather than the absence of one
+//   * a staff member with NO role keeps the day-to-day default — the
+//     deliberate non-breaking rule, and the reason "see everything, change
+//     nothing" has to be an Observer role with nothing ticked rather than the
+//     absence of one — while the owner-grade powers stay out of it, so that
+//     adding a row to the catalogue never grants one to everybody at once
+//   * a delegate holding team.manage cannot use it to grant themselves more
+//     than they hold, by editing a role OR by stepping into a richer one
 //   * an assignment pointing at a role that has been deleted grants NOTHING,
 //     rather than falling back to the unassigned default and quietly promoting
 //     somebody the owner had just restricted
@@ -31,6 +35,13 @@ const Module = require('module');
 const realResolve = Module._resolveFilename;
 const STUBS = {
     mongoose: { model: () => ({}), models: {}, Schema: function Schema() {} },
+    // crewAuth pulls these in at require time and crewStore adds axios. None is
+    // touched by anything under test, and stubbing them means this file runs
+    // without node_modules installed — which is the difference between a check
+    // somebody runs and one they mean to.
+    bcryptjs: { hashSync: () => '', compareSync: () => false, genSaltSync: () => '' },
+    jsonwebtoken: { sign: () => '', verify: () => ({}) },
+    axios: { get: async () => ({}), post: async () => ({}), create: () => ({}) },
 };
 Module._resolveFilename = function (request, ...rest) {
     if (Object.prototype.hasOwnProperty.call(STUBS, request)) return request;
@@ -90,8 +101,18 @@ T('…and cannot post to the noticeboard', has(jo, 'announcements.manage'), fals
 
 // The deliberate non-breaking default. Turning the system on must not lock out
 // a team the owner has not got round to assigning yet.
-T('an unassigned staff member keeps full access',
-    A.effectiveCaps(VA, staff('nobody-assigned')).length, A.CREW_CAP_IDS.length);
+//
+// "Full" now means the day-to-day catalogue and not the owner-grade three. The
+// default is a kindness to teams that predate the permission system; it is not
+// a licence to disconnect the airline's Infinite Flight account, rewrite the
+// team's permissions or start deleting pilots, and adding a row to a catalogue
+// must never hand those to everybody at once.
+T('an unassigned staff member keeps the day-to-day default',
+    A.effectiveCaps(VA, staff('nobody-assigned')).length, A.CREW_DEFAULT_STAFF_CAPS.length);
+T('…which is everything except the owner-grade powers',
+    A.CREW_OWNER_GRADE_CAPS.some((c) => has(A.effectiveCaps(VA, staff('nobody-assigned')), c)), false);
+T('…and still includes the ordinary jobs',
+    has(A.effectiveCaps(VA, staff('nobody-assigned')), 'roster.manage'), true);
 // …which is exactly why "watch and change nothing" needs a real empty role.
 T('an Observer role holds nothing at all', A.effectiveCaps(VA, staff('obs')), []);
 // An assignment left pointing at a deleted role must NOT fall through to the
@@ -165,6 +186,93 @@ T('the noticeboard is its own capability',
     A.CREW_CAP_IDS.includes('announcements.manage'), true);
 T('the partnership is its own capability',
     A.CREW_CAP_IDS.includes('partnership.view'), true);
+T('the owner-grade powers are all real capabilities',
+    A.CREW_OWNER_GRADE_CAPS.every((c) => A.CREW_CAP_IDS.includes(c)), true);
+T('no owner-grade power is in the unassigned default',
+    A.CREW_OWNER_GRADE_CAPS.some((c) => A.CREW_DEFAULT_STAFF_CAPS.includes(c)), false);
+T('the default and the owner-grade set account for the whole catalogue',
+    A.CREW_DEFAULT_STAFF_CAPS.length + A.CREW_OWNER_GRADE_CAPS.length, A.CREW_CAP_IDS.length);
+
+/* ===========================================================================
+ * Delegating an owner-grade power
+ *
+ * team.manage lets somebody who is not the owner build the airline's roles and
+ * decide who is in them. That is only safe because of one rule — you may grant
+ * what you hold, and nothing else — and there are two ways through it, not one:
+ *
+ *   1. edit a role and tick a capability you do not hold
+ *   2. leave the roles alone and assign yourself to a richer one
+ *
+ * The second is the one that is easy to miss, and the one that needs no
+ * permission edit at all. Both are checked, along with the case that would make
+ * the whole feature unusable if it were judged wrong: every save re-sends the
+ * WHOLE team config, so a role richer than the saver is in every payload they
+ * will ever send, and refusing on that would refuse everything.
+ * ======================================================================== */
+
+console.log('\ncrewAuth — delegating the team, without handing over the airline');
+
+// The chief of staff: runs the people side, holds no owner-grade power except
+// the one that lets them build the team.
+const COO = ['team.manage', 'roster.manage', 'applications.review', 'announcements.manage', 'members.message'];
+const BEFORE = {
+    roles: [
+        { id: 'r-recruit', name: 'Recruiter', permissions: ['applications.review', 'roster.manage'] },
+        { id: 'r-tech', name: 'Technical manager', permissions: ['integrations.manage', 'schedules.manage'] },
+    ],
+    assignments: [{ username: 'bob', roleId: 'r-tech' }],
+};
+const clean = (next) => A.teamSaveFailure(next, BEFORE, COO) === '';
+const refused = (next) => A.teamSaveFailure(next, BEFORE, COO) !== '';
+
+T('a delegate may edit a role within their own permissions',
+    clean({ roles: [{ id: 'r-recruit', name: 'Recruiter', permissions: ['applications.review'] }] }), true);
+T('a delegate may NOT tick a capability they do not hold',
+    refused({ roles: [{ id: 'r-recruit', name: 'Recruiter', permissions: ['applications.review', 'integrations.manage'] }] }), true);
+T('a delegate may NOT invent an all-powerful role',
+    refused({ roles: [{ id: 'r-new', name: 'Everything', permissions: A.CREW_CAP_IDS }] }), true);
+T('a delegate may NOT grant the roster sweep',
+    refused({ roles: [{ id: 'r-new', name: 'Sweeper', permissions: ['retention.manage'] }] }), true);
+// The regression that would make team.manage useless: the whole config is
+// re-sent on every save, richer roles included.
+T('a delegate may save an unrelated change while a richer role exists',
+    clean({ roles: JSON.parse(JSON.stringify(BEFORE.roles)) }), true);
+T('an owner is not constrained by any of it',
+    A.teamSaveFailure({ roles: [{ id: 'r', name: 'R', permissions: A.CREW_CAP_IDS }] }, BEFORE, A.CREW_CAP_IDS), '');
+
+T('a delegate may NOT assign themselves to a richer role',
+    refused({ assignments: [{ username: 'coo', roleId: 'r-tech' }] }), true);
+T('…nor anybody else',
+    refused({ assignments: [{ username: 'mallory', roleId: 'r-tech' }] }), true);
+T('a delegate may assign somebody to a role within their permissions',
+    clean({ assignments: [{ username: 'carol', roleId: 'r-recruit' }] }), true);
+T('an assignment that already existed passes through',
+    clean({ assignments: JSON.parse(JSON.stringify(BEFORE.assignments)) }), true);
+T('removing an assignment is always allowed',
+    clean({ assignments: [] }), true);
+// Create-and-assign in one payload: the role is not in the previous config, so
+// a check that only consulted the old roles would find nothing to object to.
+T('a delegate may NOT create a rich role and step into it in one save',
+    refused({
+        roles: [...BEFORE.roles, { id: 'r-new', name: 'New', permissions: ['integrations.manage'] }],
+        assignments: [{ username: 'coo', roleId: 'r-new' }],
+    }), true);
+
+console.log('\ncrewAuth — the delegation presets');
+
+const preset = (id) => A.CREW_ROLE_PRESETS.find((p) => p.id === id) || { permissions: [] };
+T('the chief of staff can build the team',
+    preset('chief-of-staff').permissions.includes('team.manage'), true);
+T('…but cannot touch the integrations',
+    preset('chief-of-staff').permissions.includes('integrations.manage'), false);
+T('the technical manager can manage the integrations',
+    preset('technical-manager').permissions.includes('integrations.manage'), true);
+T('…but cannot rewrite the team',
+    preset('technical-manager').permissions.includes('team.manage'), false);
+// The sweep removes pilots. It stays something an owner ticks by hand, having
+// read the line — never something a preset hands over as part of a job.
+T('no preset grants the roster sweep',
+    A.CREW_ROLE_PRESETS.every((p) => !(p.permissions || []).includes('retention.manage')), true);
 
 Module._resolveFilename = realResolve;
 Module._load = realLoad;

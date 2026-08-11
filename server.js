@@ -1,6 +1,21 @@
 // server.js
 // A lightweight backend for Community Aircraft Contributions and Flight Trail Storage.
 
+// FIRST LINE OF EXECUTABLE CODE, AND IT HAS TO STAY THERE.
+//
+// Several of the modules required below read process.env while they are being
+// evaluated — ifOAuth.js reads IF_OAUTH_REDIRECT_URI and the OAuth client at
+// require time, staffAuth/vaPortal/airports do the same with their own keys. A
+// dotenv.config() that runs after those requires populates process.env too late
+// for all of them: the variable is set in the file, visible to anything that
+// looks later, and yet the module that needed it saw an empty string. That
+// surfaces as configuration that is "definitely set" and definitely ignored —
+// for Infinite Flight, as a redirect URI error on a deployment whose
+// IF_OAUTH_REDIRECT_URI is right there in the environment file.
+//
+// Nothing may be required above this line.
+require('dotenv').config();
+
 const {
     uploadAirportImage,
     getAirportInfo,
@@ -147,7 +162,6 @@ const {
 } = require('@aws-sdk/client-s3');
 const { CloudWatchClient, GetMetricStatisticsCommand } = require('@aws-sdk/client-cloudwatch');
 const sharp = require('sharp'); // Image processing library
-require('dotenv').config();
 const fs = require('fs');
 const os = require('os');
 
@@ -262,7 +276,7 @@ const VA_CALLSIGN_MATCH_MODES = ['exact', 'strict', 'broad'];
 // alone would reject, tightest first. See the `rosterTrust` field below. Kept
 // separate from callsignMatch because they answer different questions: one is
 // "how do we read a callsign", the other is "may the roster override it".
-const VA_ROSTER_TRUST_MODES = ['off', 'airline', 'any'];
+const VA_ROSTER_TRUST_MODES = ['off', 'tagged', 'airline', 'any'];
 
 const VirtualAirlineAdSchema = new mongoose.Schema({
     // --- Identity ---
@@ -302,6 +316,13 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
      *
      *   'off'     — the roster never widens the callsign rule. Only callsigns
      *     that fit `callsignMatch` count.
+     *   'tagged'  — the roster vouches for a pilot, but NEVER for a missing
+     *     tag. The airline must be one of ours and the callsign must carry one
+     *     of our tags; what it waives is only the rest of the shape, so a
+     *     rostered pilot's "UPS 123UP Cargo" counts where 'exact' would have
+     *     refused the trailing word. An untagged "UPS 123" does not count, and
+     *     neither does "Delta 9UP" — our tag on somebody else's airline.
+     *     For VAs whose tag is the whole point of having one.
      *   'airline' — (default) the roster waives the VA's suffix TAG and nothing
      *     more. An untagged "Ocean 12" by a rostered pilot counts for Ocean;
      *     that same pilot's "Etihad 456FR" does not. This is what keeps a pilot
@@ -839,6 +860,16 @@ const CrewIfAuthStateSchema = new mongoose.Schema({
     startedBy: { type: String, default: '' },
     scopes: { type: [String], default: [] },
     clientId: { type: String, default: '' },
+    // The redirect_uri that was actually sent to /connect/authorize.
+    //
+    // Stored rather than recomputed at the callback because OAuth2 requires the
+    // token exchange to present the SAME value, byte for byte, and the two
+    // requests do not arrive the same way: the authorize call is a fetch from
+    // the dashboard, the callback is a navigation from Infinite Flight's own
+    // site. On a deployment without IF_OAUTH_REDIRECT_URI, where the value is
+    // derived from the request's host headers, any difference between those two
+    // hops produces an invalid_grant with nothing in it to say why.
+    redirectUri: { type: String, default: '' },
     // Where the browser is sent when this is over. Validated against our own
     // site origin at both ends — a stored redirect that a request could set
     // freely is an open redirect with extra steps.
@@ -1857,7 +1888,7 @@ const EMBED_CALLSIGN_MATCH_MODES = ['exact', 'strict', 'broad'];
 // How far the VA's pilot roster may vouch for a flight the callsign rule would
 // reject. Mirrors VA_ROSTER_TRUST_MODES; the portal writes the VA's one choice
 // to both so the map and the Discord feed always show the same pilots.
-const EMBED_ROSTER_TRUST_MODES = ['off', 'airline', 'any'];
+const EMBED_ROSTER_TRUST_MODES = ['off', 'tagged', 'airline', 'any'];
 const EMBED_HEADER_POSITIONS = ['top', 'bottom', 'left', 'right'];
 // The Events + Calendar companion widget (embed-events.html) ships 10 layout
 // presets; the VA picks one. Kept here so schema, resolve and validation agree.
@@ -2084,13 +2115,20 @@ const cleanCallsignInput = (raw) => {
     return clean || null;
 };
 
-// Render a stored callsign as "<BASE> ##VA" for read-only display, tolerating a
-// stored value that already ends in the suffix so it isn't doubled.
+// Render a stored callsign as "<BASE> ##<TAG>" for read-only display,
+// tolerating a stored value that already ends in the suffix so it isn't doubled.
+//
+// Mask-aware, for the same reason callsignSharesVaBase is: stripping a literal
+// "VA" only un-doubles the suffix for VAs whose tag IS "VA". A stored
+// "UPS ##UP" matched neither strip and came out as "UPS ##UP ##VA" — the exact
+// doubling this function exists to prevent, wearing somebody else's tag.
 const formatCallsignDisplay = (raw) => {
     if (!raw) return null;
-    const base = String(raw).trim().toUpperCase()
-        .replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim();
-    return base ? `${base} ##VA` : null;
+    const parts = vaCallsignParts(raw);
+    if (!parts || !parts.base) return null;
+    // A tagless mask ("BAW ###") keeps its shape rather than being handed a
+    // "VA" it never had.
+    return parts.tag ? `${parts.base} ##${parts.tag}` : `${parts.base} ###`;
 };
 
 // Expand reduced callsign bases into everything a VA might actually have stored,
@@ -2175,11 +2213,56 @@ const callsignSharesVaBase = (callsign, bases = []) => {
     if (!cs) return false;
     for (const b of (Array.isArray(bases) ? bases : [bases])) {
         // Reduce a stored mask ("OCEAN ##VA") to its airline part before
-        // comparing, or the trailing "VA" would never line up with "OCEAN 12".
-        const base = compactCallsign(String(b || '').replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, ''));
+        // comparing, or the trailing tag would never line up with "OCEAN 12".
+        //
+        // THROUGH vaCallsignParts, which reads the tag off the mask. This used
+        // to strip a literal "VA" with two hard-coded regexes, which is right
+        // for exactly the VAs whose tag is "VA" and wrong for every other one:
+        // "UPS ##UP" reduced to "UPSUP" instead of "UPS", and a real "UPS 123UP"
+        // then failed to start with it. The whole airline stopped matching — no
+        // webhook, no embed row, and the roster fallback's "is this pilot on our
+        // airline" preference silently false as well. normalizeCallsignBase was
+        // moved onto vaCallsignParts for this same reason; this one was missed.
+        const parts = vaCallsignParts(b);
+        const base = parts ? compactCallsign(parts.base) : '';
         if (base && cs.startsWith(base)) return true;
     }
     return false;
+};
+
+// Does this token end in `tag` as a REAL suffix tag, rather than by accident?
+//
+// The token must end with the tag and either BE the tag ("VA") or have a digit
+// immediately before it, glued to the flight number ("001VA", "123UP"). Without
+// the digit rule, "MOSKVA" and "NOVA" carry the tag "VA" and every Russian
+// airline joins somebody's VA. Mirrors tokenHasSuffixTag in va_filter.cjs and
+// embed.js so all three agree on what wearing a tag means.
+const tokenHasSuffixTag = (token, tag) => {
+    const t = String(token || '').toUpperCase();
+    const g = String(tag || '').toUpperCase();
+    if (!g || !t.endsWith(g)) return false;
+    if (t === g) return true;
+    return /[0-9]/.test(t.charAt(t.length - g.length - 1));
+};
+
+// Does this live callsign carry one of the VA's own suffix tags?
+//
+// The tags come off the stored masks ("UPS ##UP" → "UP"), so a VA that never
+// registered one has no tag to carry and this is false — callers treat that as
+// "there is nothing to check" rather than as a refusal.
+//
+// Looks at the last two tokens, not just the last, because a pilot routinely
+// appends a second one: "UPS 123UP Cargo" and "UPS 123UP Heavy" are both
+// carrying "UP". Same two-token window va_filter.cjs and embed.js use.
+const callsignCarriesVaTag = (callsign, ad) => {
+    const bases = Array.isArray(ad?.callsigns) && ad.callsigns.length
+        ? ad.callsigns
+        : (ad?.callsign ? [ad.callsign] : []);
+    const tags = [...new Set(bases.map((b) => (vaCallsignParts(b) || {}).tag).filter(Boolean))];
+    if (!tags.length) return false;
+    const tokens = String(callsign || '').trim().toUpperCase().split(/[\s\-_/]+/).filter(Boolean);
+    const tail = tokens.slice(-2);
+    return tags.some((tag) => tail.some((t) => tokenHasSuffixTag(t, tag)));
 };
 
 // The callsign strictness a VA listing runs under. Anything unrecognised (or a
@@ -4161,7 +4244,11 @@ function ifRedirectUri(req) {
  * What a crew center is told about its connection. Never a token, never a
  * secret — the same rule the Supabase token state follows, for the same reason.
  */
-function ifState(ad, { owner = false } = {}) {
+// `manage` is "may this caller maintain the connection" — integrations.manage,
+// which the owner holds implicitly. It gates the client's own details, which
+// are the credential's and not the airline's: everything else here is readable
+// by any staff member, because whether the airline is connected is not a power.
+function ifState(ad, { manage = false } = {}) {
     const client = ifClientFor(ad || {});
     const scopes = (ad && ad.ifScopes) || [];
     const hasGrant = !!(ad && ad.ifConnectedAt);
@@ -4202,8 +4289,8 @@ function ifState(ad, { owner = false } = {}) {
             configured: !!client.id,
             source: client.source,
             type: client.type,
-            id: owner ? client.id : '',
-            secretHint: owner ? ((ad && ad.ifClientSecretHint) || '') : '',
+            id: manage ? client.id : '',
+            secretHint: manage ? ((ad && ad.ifClientSecretHint) || '') : '',
             secretUnavailable: client.secretUnavailable,
             // Can this deployment hold a secret at all? When false the screen
             // hides the confidential-client option rather than offering a field
@@ -4216,6 +4303,54 @@ function ifState(ad, { owner = false } = {}) {
         enums: ifLive.ENUMS,
         limits: ifLive.LIMITS,
         scopeCatalog: ifLive.SCOPES,
+    };
+}
+
+/**
+ * ifState plus what the CALLER may do with it — the complete answer, and the
+ * only shape any of these routes should ever send.
+ *
+ * It exists because the two halves were separated once and every route that
+ * forgot the second half shipped a payload that says "this connection exists"
+ * and, by omission, "you are nobody". The panel replaces its whole status with
+ * whatever a save returns, so a reply missing `you` did not degrade politely:
+ * an owner who saved their OAuth client watched the screen decide they were
+ * not the owner, and the setup instructions — which is where the redirect URI
+ * to register is printed — went with it. Saving something must never be able
+ * to tell you less about yourself than loading it did.
+ *
+ * `owner` is passed rather than re-derived: the owner-gated routes have
+ * already established it, and asking twice invites the two answers to differ.
+ */
+async function ifPayload(req, slug, ad) {
+    const p = verifyCrewRequest(req);
+    const owner = !!p && (p.kind === 'inflight' || p.role === 'owner');
+    // Everything on the setup half of this panel keys on THIS, not on `owner`.
+    // The person who connects the account is whoever holds
+    // integrations.manage, which an owner always does and a technical manager
+    // may — and a screen that shows them the connection while hiding the
+    // client id they are supposed to be maintaining would be delegation in
+    // name only.
+    const manage = owner || !(await requireCap(req, slug, 'integrations.manage')).error;
+    return {
+        ...ifState(ad, { manage }),
+        // What the CALLER may do, as distinct from what the grant allows.
+        // Both have to be true for a save button to appear, and the panel
+        // says which one is missing.
+        //
+        // `owner` is still reported, and still means literal ownership — it is
+        // no longer what gates this screen, but "are you the owner" is a
+        // different question from "may you do this" and conflating them is how
+        // the two drifted apart in the first place.
+        you: {
+            owner,
+            canManage: manage,
+            canManageSchedules: !(await ifWriteGate(req, slug)).error,
+        },
+        // Whoever maintains the client is who needs the URI to register on it,
+        // and they are asked for it on the same screen they just saved that
+        // client on — so it has to survive the save.
+        redirectUri: manage ? ifRedirectUri(req) : '',
     };
 }
 
@@ -4259,17 +4394,29 @@ function ifFail(res, err, fallback) {
 //   cap     WRITING a Live schedule, gated on schedules.manage — the capability
 //           that already means "builds the airline's week".
 
-const ifOwnerGate = (req, slug) => {
-    const p = verifyCrewRequest(req);
-    if (!p) return { error: 401, message: 'Not authenticated.' };
-    if (!(p.kind === 'inflight' || p.role === 'owner')) {
-        return { error: 403, message: 'Only the VA owner can connect an Infinite Flight account.' };
-    }
-    if (p.kind !== 'inflight' && p.slug && p.slug !== String(slug || '').toLowerCase()) {
-        return { error: 403, message: 'Wrong crew center.' };
-    }
-    return { p };
-};
+/**
+ * May this caller manage the Infinite Flight connection?
+ *
+ * Was owner-only. Now gated on integrations.manage, which an owner holds
+ * implicitly and can grant to somebody else — because the person who keeps a
+ * VA's integrations working is very often not the person whose name is on the
+ * partnership, and the previous answer to that was the owner handing over their
+ * own password.
+ *
+ * Still a high bar: integrations.manage is excluded from the unassigned-staff
+ * default, so holding it means an owner ticked it on a role deliberately.
+ */
+async function ifManageGate(req, slug) {
+    const gate = await requireCap(req, slug, 'integrations.manage');
+    return gate.error
+        ? {
+            error: gate.error,
+            message: gate.error === 401
+                ? 'Not authenticated.'
+                : 'You don’t have permission to manage the Infinite Flight connection.',
+        }
+        : gate;
+}
 
 const ifStaffGate = (req, slug) => {
     const base = crewCanManage(req, slug);
@@ -4452,8 +4599,9 @@ const ifInvalidate = (vaId) => {
  * What this crew center's Infinite Flight connection looks like.
  *
  * Readable by any staff member — knowing whether the airline is connected is
- * not a power — but the client id and the secret hint are added only for the
- * owner, because those are the credential's own details.
+ * not a power — but the client id and the secret hint are added only for
+ * whoever may maintain it (integrations.manage, which an owner holds
+ * implicitly), because those are the credential's own details.
  */
 app.get('/api/crew/:slug/if', async (req, res) => {
     const gate = ifStaffGate(req, req.params.slug);
@@ -4461,17 +4609,7 @@ app.get('/api/crew/:slug/if', async (req, res) => {
     try {
         const va = await resolveCrewVa(req.params.slug);
         if (!va) return res.status(404).json({ error: 'Crew center not found.' });
-        const ad = await ifConnection(va._id);
-        const owner = gate.p.kind === 'inflight' || gate.p.role === 'owner';
-        const canWrite = !(await ifWriteGate(req, req.params.slug)).error;
-        res.json({
-            ...ifState(ad, { owner }),
-            // What the CALLER may do, as distinct from what the grant allows.
-            // Both have to be true for a save button to appear, and the panel
-            // says which one is missing.
-            you: { owner, canManageSchedules: canWrite },
-            redirectUri: owner ? ifRedirectUri(req) : '',
-        });
+        res.json(await ifPayload(req, req.params.slug, await ifConnection(va._id)));
     } catch (err) { ifFail(res, err, { log: 'if status error', message: 'Could not read the Infinite Flight connection.' }); }
 });
 
@@ -4491,7 +4629,7 @@ app.get('/api/crew/:slug/if', async (req, res) => {
  * which still works, because PKCE is mandatory for both types.
  */
 app.post('/api/crew/:slug/if/client', async (req, res) => {
-    const gate = ifOwnerGate(req, req.params.slug);
+    const gate = await ifManageGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -4539,15 +4677,14 @@ app.post('/api/crew/:slug/if/client', async (req, res) => {
             ...(ad && ad.ifConnectedAt ? {
                 notice: 'The account that is already connected will need reconnecting — the tokens it holds belong to the previous client.',
             } : {}),
-            ...ifState(ad, { owner: true }),
-            redirectUri: ifRedirectUri(req),
+            ...(await ifPayload(req, req.params.slug, ad)),
         });
     } catch (err) { ifFail(res, err, { log: 'if client save error', message: 'Could not save the OAuth client.' }); }
 });
 
 /** Forget the VA's own client and fall back to the platform's, if there is one. */
 app.delete('/api/crew/:slug/if/client', async (req, res) => {
-    const gate = ifOwnerGate(req, req.params.slug);
+    const gate = await ifManageGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -4555,7 +4692,10 @@ app.delete('/api/crew/:slug/if/client', async (req, res) => {
         await VirtualAirlineAd.updateOne({ _id: va._id }, {
             $set: { ifClientId: '', ifClientSecret: '', ifClientSecretHint: '', ifClientType: '' },
         });
-        res.json({ ok: true, ...ifState(await ifConnection(va._id), { owner: true }) });
+        res.json({
+            ok: true,
+            ...(await ifPayload(req, req.params.slug, await ifConnection(va._id))),
+        });
     } catch (err) { ifFail(res, err, { log: 'if client delete error', message: 'Could not remove the OAuth client.' }); }
 });
 
@@ -4572,7 +4712,7 @@ app.delete('/api/crew/:slug/if/client', async (req, res) => {
  * user gesture. A crew center reconnecting in a desktop browser wants it off.
  */
 app.post('/api/crew/:slug/if/connect', async (req, res) => {
-    const gate = ifOwnerGate(req, req.params.slug);
+    const gate = await ifManageGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -4606,7 +4746,15 @@ app.post('/api/crew/:slug/if/connect', async (req, res) => {
         // catching it here says so in one sentence instead of as an opaque
         // error on their consent screen.
         if (!/^https:/i.test(redirectUri) && !/^http:\/\/localhost[:/]/i.test(redirectUri)) {
-            return res.status(500).json({ error: 'The Infinite Flight redirect URI has to be https. Set IF_OAUTH_REDIRECT_URI.' });
+            // The URI itself goes in the message. It is not a secret — it is
+            // printed on the setup panel and registered in a dashboard — and
+            // without it this reads as "your configuration is wrong" to
+            // somebody whose configuration says https, when what actually
+            // happened is that we derived a URI from the request instead of
+            // reading theirs.
+            return res.status(500).json({
+                error: `The Infinite Flight redirect URI has to be https, and this one is “${redirectUri}”. Set IF_OAUTH_REDIRECT_URI on the API server to the exact URI registered on the OAuth client.`,
+            });
         }
 
         // What to ask for. Defaults to everything the crew center can use;
@@ -4633,6 +4781,7 @@ app.post('/api/crew/:slug/if/connect', async (req, res) => {
             startedBy: (gate.p && (gate.p.name || gate.p.username)) || '',
             scopes,
             clientId: client.id,
+            redirectUri,
             returnTo,
         });
 
@@ -4738,7 +4887,11 @@ app.get('/api/crew/if/callback', async (req, res) => {
             clientId: client.id,
             clientSecret: client.secret,
             code,
-            redirectUri: ifRedirectUri(req),
+            // The one from the authorization request, not a fresh derivation —
+            // see the note on the field. Falls back only for a row written by a
+            // previous version of this code, which will not exist for long: the
+            // collection expires its rows after ten minutes.
+            redirectUri: row.redirectUri || ifRedirectUri(req),
             verifier: row.verifier,
         });
 
@@ -4792,7 +4945,7 @@ app.get('/api/crew/if/callback', async (req, res) => {
  * offers, for the same reason.
  */
 app.delete('/api/crew/:slug/if/connection', async (req, res) => {
-    const gate = ifOwnerGate(req, req.params.slug);
+    const gate = await ifManageGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -4802,7 +4955,7 @@ app.delete('/api/crew/:slug/if/connection', async (req, res) => {
         res.json({
             ok: true,
             notice: 'Disconnected here. To withdraw the authorization at Infinite Flight as well, remove this app from your Infinite Flight account.',
-            ...ifState(await ifConnection(va._id), { owner: true }),
+            ...(await ifPayload(req, req.params.slug, await ifConnection(va._id))),
         });
     } catch (err) { ifFail(res, err, { log: 'if disconnect error', message: 'Could not disconnect.' }); }
 });
@@ -4843,7 +4996,7 @@ app.get('/api/crew/:slug/if/organizations/:organizationId', async (req, res) => 
  * against the id, and the label is what every screen shows.
  */
 app.post('/api/crew/:slug/if/organization', async (req, res) => {
-    const gate = ifOwnerGate(req, req.params.slug);
+    const gate = await ifManageGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -4865,7 +5018,11 @@ app.post('/api/crew/:slug/if/organization', async (req, res) => {
             },
         });
         ifInvalidate(va._id);
-        res.json({ ok: true, organization, ...ifState(await ifConnection(va._id), { owner: true }) });
+        res.json({
+            ok: true,
+            organization,
+            ...(await ifPayload(req, req.params.slug, await ifConnection(va._id))),
+        });
     } catch (err) { ifFail(res, err, { log: 'if org select error', message: 'Could not select that organization.' }); }
 });
 
@@ -5380,7 +5537,7 @@ app.post('/api/crew/:slug/if/sync', async (req, res) => {
             ...(bare ? {
                 notice: 'Only departures with an aircraft assigned to them will be sent. Set a default aircraft to send the rest as well.',
             } : {}),
-            ...ifState(ad, { owner: true }),
+            ...(await ifPayload(req, req.params.slug, ad)),
         });
     } catch (err) { ifFail(res, err, { log: 'if sync settings error', message: 'Could not save the sync settings.' }); }
 });
@@ -8514,13 +8671,19 @@ function scopeStats(payload, isManager) {
  * same code path as the real sweep with dryRun set, so the list it shows is the
  * list that would go — not a second implementation that could disagree.
  *
- * Owner-only, both of them, matching the settings gate in crewAuth.
+ * Gated on retention.manage, both of them, matching the settings gate in
+ * crewAuth. That capability is owner-implicit, is in none of the presets and is
+ * excluded from the unassigned-staff default — so it is held only where an
+ * owner ticked that specific line, which is the bar this deserves. Seeing the
+ * sweep is gated the same as running it on purpose: the preview names the
+ * pilots who would be removed.
  * ========================================================================= */
 app.get('/api/crew/:slug/retention', async (req, res) => {
-    const p = verifyCrewRequest(req);
-    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
-    if (!(p.kind === 'inflight' || p.role === 'owner')) {
-        return res.status(403).json({ error: 'Only the owner can see the roster sweep.' });
+    const gate = await requireCap(req, req.params.slug, 'retention.manage');
+    if (gate.error) {
+        return res.status(gate.error).json({
+            error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to see the roster sweep.',
+        });
     }
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -8543,10 +8706,11 @@ app.get('/api/crew/:slug/retention', async (req, res) => {
 });
 
 app.post('/api/crew/:slug/retention/run', async (req, res) => {
-    const p = verifyCrewRequest(req);
-    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
-    if (!(p.kind === 'inflight' || p.role === 'owner')) {
-        return res.status(403).json({ error: 'Only the owner can run the roster sweep.' });
+    const gate = await requireCap(req, req.params.slug, 'retention.manage');
+    if (gate.error) {
+        return res.status(gate.error).json({
+            error: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to run the roster sweep.',
+        });
     }
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -8891,19 +9055,19 @@ app.post('/api/crew/:slug/data/:dataset/purge', async (req, res) => {
     } catch (err) { crewFail(res, err, { log: 'crew data purge error', message: 'Could not delete that data.' }); }
 });
 
-// Move a VA's remaining managed data into their own project. Owner (or
-// Inflight) only — this is the one-way door out of our storage.
+// Move a VA's remaining managed data into their own project. Gated on
+// integrations.manage, like the rest of the data-store setup — this is the
+// one-way door out of our storage, and the person who walks the VA through it
+// is the same one who connected the project on the far side.
 //
 // Idempotent by construction: it copies in dependency order (members and routes
 // first, so a PIREP can point at the ids they were given), and skips anything
 // already present on the far side. Nothing is deleted from managed storage here
 // — the VA verifies the copy first, then calls DELETE to release it.
 app.post('/api/crew/:slug/store/migrate', async (req, res) => {
-    const p = verifyCrewRequest(req);
-    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
-    if (!(p.kind === 'inflight' || p.role === 'owner')) {
-        return res.status(403).json({ error: 'Only the VA owner can migrate the data store.' });
-    }
+    const gate = await crewOwnerGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    const p = gate.p;
     if (p.kind !== 'inflight' && p.slug && p.slug !== String(req.params.slug).toLowerCase()) {
         return res.status(403).json({ error: 'Wrong crew center.' });
     }
@@ -9027,11 +9191,9 @@ app.post('/api/crew/:slug/store/migrate', async (req, res) => {
 // from the migration itself on purpose: copying is safe and repeatable, and
 // deleting is neither, so the VA has to ask for it explicitly.
 app.delete('/api/crew/:slug/store/legacy', async (req, res) => {
-    const p = verifyCrewRequest(req);
-    if (!p) return res.status(401).json({ error: 'Not authenticated.' });
-    if (!(p.kind === 'inflight' || p.role === 'owner')) {
-        return res.status(403).json({ error: 'Only the VA owner can release managed storage.' });
-    }
+    const gate = await crewOwnerGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    const p = gate.p;
     if (p.kind !== 'inflight' && p.slug && p.slug !== String(req.params.slug).toLowerCase()) {
         return res.status(403).json({ error: 'Wrong crew center.' });
     }
@@ -9117,19 +9279,29 @@ app.delete('/api/crew/:slug/store/legacy', async (req, res) => {
 // moment they ask. With no encryption key configured the offer is not made and
 // nothing is kept.
 
-// Owner (or Inflight) gate, shared by the setup routes. Connecting a data store
-// is deliberately not delegable to staff: it is the VA's data and their
-// Supabase account.
-function crewOwnerGate(req, slug) {
-    const p = verifyCrewRequest(req);
-    if (!p) return { error: 401, message: 'Not authenticated.' };
-    if (!(p.kind === 'inflight' || p.role === 'owner')) {
-        return { error: 403, message: 'Only the VA owner can set up the data store.' };
+// Gate shared by the setup routes, on integrations.manage.
+//
+// This was owner-only, on the reasoning that it is the VA's data and their
+// Supabase account. Both still true — but so is the fact that connecting a
+// Postgres project is the most technical thing in the crew center, and the
+// owner is not reliably the person who can do it. The delegation is the point:
+// integrations.manage exists so an airline can have somebody who sets this up
+// WITHOUT being handed the owner's login, which was the previous workaround and
+// gave them everything instead.
+//
+// Not folded into the bulk-purge gate above, which stays owner-only. Connecting
+// storage and emptying it are different decisions.
+async function crewOwnerGate(req, slug) {
+    const gate = await requireCap(req, slug, 'integrations.manage');
+    if (gate.error) {
+        return {
+            error: gate.error,
+            message: gate.error === 401
+                ? 'Not authenticated.'
+                : 'You don’t have permission to set up the data store.',
+        };
     }
-    if (p.kind !== 'inflight' && p.slug && p.slug !== String(slug || '').toLowerCase()) {
-        return { error: 403, message: 'Wrong crew center.' };
-    }
-    return { p };
+    return gate;
 }
 
 // ---------------------------------------------------------------------------
@@ -9320,7 +9492,7 @@ function setupFail(res, err, log) {
 // in a body rather than in a URL that would land in every access log between
 // here and there.
 app.post('/api/crew/:slug/store/projects', async (req, res) => {
-    const gate = crewOwnerGate(req, req.params.slug);
+    const gate = await crewOwnerGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
     try {
         // A VA who kept a token does not have to fetch a new one to move to a
@@ -9372,7 +9544,7 @@ const CREW_SUPABASE_REGIONS = [
 // { ready: false, projectRef } and the dashboard polls with the same token and
 // ref until it is. Every stage is safe to repeat.
 app.post('/api/crew/:slug/store/provision', async (req, res) => {
-    const gate = crewOwnerGate(req, req.params.slug);
+    const gate = await crewOwnerGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
 
     try {
@@ -9471,7 +9643,7 @@ app.post('/api/crew/:slug/store/provision', async (req, res) => {
 // exactly where they were. Either way the token is used only to run our own
 // script against the project this crew center is already connected to.
 app.post('/api/crew/:slug/store/upgrade', async (req, res) => {
-    const gate = crewOwnerGate(req, req.params.slug);
+    const gate = await crewOwnerGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
 
     try {
@@ -9559,7 +9731,7 @@ app.post('/api/crew/:slug/store/upgrade', async (req, res) => {
 // would otherwise cause arrives weeks later, in an automatic update nobody is
 // watching, and would look like the update feature being broken.
 app.post('/api/crew/:slug/store/token', async (req, res) => {
-    const gate = crewOwnerGate(req, req.params.slug);
+    const gate = await crewOwnerGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
     const accessToken = String(req.body?.accessToken || '').trim();
     const hasAuto = req.body?.autoUpdate !== undefined;
@@ -9615,7 +9787,7 @@ app.post('/api/crew/:slug/store/token', async (req, res) => {
 // VA's Supabase account until they revoke it there, and the reply says so
 // rather than letting "forgotten" be mistaken for "revoked".
 app.delete('/api/crew/:slug/store/token', async (req, res) => {
-    const gate = crewOwnerGate(req, req.params.slug);
+    const gate = await crewOwnerGate(req, req.params.slug);
     if (gate.error) return res.status(gate.error).json({ error: gate.message });
     try {
         const va = await resolveCrewVa(req.params.slug);
@@ -13799,6 +13971,9 @@ const PARTNER_SELECT = 'name callsign callsigns callsignMatch rosterTrust logoUr
 // the VA's own call, via `rosterTrust` on the listing:
 //
 //   'off'     — the roster never delivers.
+//   'tagged'  — it vouches for the pilot but never for a missing tag: the
+//     airline must be theirs and the callsign must carry one of their tags, so
+//     a rostered pilot's "UPS 123UP Cargo" arrives and their "UPS 123" does not.
 //   'airline' — (default) it waives the VA's suffix TAG and nothing more, so an
 //     untagged "Ocean 12" by a rostered pilot counts for Ocean while that same
 //     pilot's "Etihad 456FR" does not.
@@ -13836,7 +14011,19 @@ const resolveVaEventPartnerByRoster = async (e) => {
     if (!opted.length) return null;
 
     // Preferred: the roster VA whose airline this pilot is actually flying.
-    const onAirline = opted.filter((a) => vaRosterTrust(a) !== 'off' && callsignFitsVa(e.callsign, a));
+    //
+    // 'tagged' adds the second half of that question. The callsign rule the
+    // roster is widening here ignores the suffix — in 'strict' and 'broad' mode
+    // callsignFitsVa is a shared-airline test — so without this a rostered
+    // pilot's untagged "UPS 123" arrives in the UPS feed. A VA on 'tagged' has
+    // said the tag is not decoration: the airline must be theirs AND the
+    // callsign must wear their tag.
+    const onAirline = opted.filter((a) => {
+        const trust = vaRosterTrust(a);
+        if (trust === 'off') return false;
+        if (!callsignFitsVa(e.callsign, a)) return false;
+        return trust !== 'tagged' || callsignCarriesVaTag(e.callsign, a);
+    });
     // Fallback: VAs that opted into vouching for any callsign at all.
     const anyCallsign = opted.filter((a) => vaRosterTrust(a) === 'any');
     const valid = onAirline.length ? onAirline : anyCallsign;
@@ -14817,7 +15004,62 @@ app.get('/', requireAuthPage, (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
+/* ===========================================================================
+ * An /api path that matched nothing is an ERROR, not a page.
+ *
+ * Below this comment is the SPA catch-all, and until now every mistyped API
+ * path fell into it: no route matched, express.static found no file, and the
+ * request was answered with the Aircraft Database's index.html — or, because
+ * that catch-all is behind requireAuthPage, with a redirect to the staff login.
+ * Status 200 either way. A caller asking for JSON got a page of HTML about
+ * aeroplanes and had to work out for themselves that the URL was wrong.
+ *
+ * The way this bit somebody: an Infinite Flight OAuth client registered with a
+ * redirect URI of /api/crew/if-org/callback, one hyphenated word away from the
+ * real /api/crew/if/callback. Nothing matched, so Infinite Flight's redirect
+ * landed on the aircraft app, and the authorization code went to a handler that
+ * has never heard of one. The sign-in simply did not happen, and the only
+ * visible symptom was a page of plane pictures where a crew center should be.
+ *
+ * So: anything under /api that reaches this point gets an honest 404 in JSON.
+ * ======================================================================== */
+app.use('/api', (req, res) => {
+    const attempted = String(req.originalUrl || '').split('?')[0];
+
+    // A near miss on the OAuth callback is worth its own sentence. This is the
+    // one wrong URL in the codebase that somebody types into ANOTHER system's
+    // dashboard, which means the feedback loop is "consent screen fails days
+    // later" rather than "page 404s now" — so the 404 says what the right one
+    // is, in full, ready to paste back into the OAuth client.
+    //
+    // DELIBERATELY NOT A REDIRECT. Forwarding an authorization code to another
+    // URL is a bad habit at the best of times, and here it would not even work:
+    // Infinite Flight compares the redirect_uri we send at /connect/authorize
+    // against the one registered on the client, character for character, and
+    // refuses BEFORE the browser ever reaches us. A redirect would only paper
+    // over a mismatch that has already stopped the flow — and would leave the
+    // real fault, a wrong URI in the dashboard, undiscovered.
+    if (/^\/api\/crew\/[^/]+\/callback$/.test(attempted) && attempted !== '/api/crew/if/callback') {
+        const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+        const host = String(req.headers['x-forwarded-host'] || req.get('host') || '').split(',')[0].trim();
+        const correct = host ? `${proto}://${host}/api/crew/if/callback` : '/api/crew/if/callback';
+        console.warn(`[if oauth] callback hit at ${attempted} — the registered redirect URI is wrong; it should be ${correct}`);
+        res.set('Cache-Control', 'no-store');
+        return res.status(404).json({
+            error: 'That is not the Infinite Flight callback address.',
+            code: 'wrong_callback_path',
+            attempted,
+            expected: correct,
+            detail: 'Open the OAuth client at infiniteflight.com/account/api-keys and set its redirect URI to the address in `expected`, exactly — no trailing slash. It has to match what this server sends character for character.',
+        });
+    }
+
+    res.set('Cache-Control', 'no-store');
+    return res.status(404).json({ error: 'No such API endpoint.', code: 'not_found', attempted });
+});
+
 // Catch-all for the SPA — also staff-only (the whole site sits behind login).
+// Reached only by non-/api paths now; see the block above.
 app.get(/(.*)/, requireAuthPage, (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
@@ -14962,4 +15204,30 @@ diagnostics.registerSource('mongo', () => {
 
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
+    // One line about the Infinite Flight OAuth configuration, because the
+    // failure it guards against is invisible from the outside: a redirect URI
+    // that is set in the environment and unread by the process reports itself
+    // as a VA's configuration mistake. Neither value is a secret — the client
+    // id travels in every authorization URL and the redirect URI is printed on
+    // the setup panel — so both can be said out loud.
+    const ifRedirect = ifOAuth.REDIRECT_URI;
+    const IF_CALLBACK_PATH = '/api/crew/if/callback';
+    if (!ifRedirect) {
+        console.log('   Infinite Flight redirect URI: NOT SET — falling back to each request’s own host. Set IF_OAUTH_REDIRECT_URI to the URI registered on the OAuth client.');
+    } else if (!ifRedirect.endsWith(IF_CALLBACK_PATH)) {
+        // The one misconfiguration that is invisible until a VA tries to sign
+        // in days later, and which cost real time once: the path is checked
+        // here because it is the only place we can check it BEFORE somebody is
+        // sitting on a consent screen. Only this server knows what its callback
+        // route is actually called, so only this server can say the URI is
+        // pointing somewhere it does not serve.
+        console.warn(`   ⚠️  Infinite Flight redirect URI: ${ifRedirect}`);
+        console.warn(`       This does not end in ${IF_CALLBACK_PATH}, which is the only callback route this server has.`);
+        console.warn('       Infinite Flight will send the browser somewhere nothing handles it, and the sign-in will not complete.');
+    } else {
+        console.log(`   Infinite Flight redirect URI: ${ifRedirect}`);
+    }
+    console.log(`   Infinite Flight platform client: ${ifOAuth.PLATFORM_CLIENT.id
+        ? `${ifOAuth.PLATFORM_CLIENT.id} (${ifOAuth.PLATFORM_CLIENT.type})`
+        : 'none — every VA uses their own'}`);
 });

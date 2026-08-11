@@ -331,6 +331,7 @@
                     <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.roster.trustLabel">Pilots on your roster</label>
                     <select id="pfRosterTrust" class="field pf-edit">
                         <option value="off" data-i18n="fe.roster.trustOff">Only count them on a callsign above</option>
+                        <option value="tagged" data-i18n="fe.roster.trustTagged">Count them on my airline, but only with my tag</option>
                         <option value="airline" selected data-i18n="fe.roster.trustAirline">Count them on my airline even without my tag (recommended)</option>
                         <option value="any" data-i18n="fe.roster.trustAny">Count them on any callsign — including codeshares</option>
                     </select>
@@ -1403,7 +1404,7 @@
             $('pfMatchCard').classList.toggle('hidden', !editable);
             if (editable) {
                 $('pfMatchMode').value = ['exact', 'broad'].includes(va.callsignMatch) ? va.callsignMatch : 'strict';
-                $('pfRosterTrust').value = ['off', 'any'].includes(va.rosterTrust) ? va.rosterTrust : 'airline';
+                $('pfRosterTrust').value = ['off', 'tagged', 'any'].includes(va.rosterTrust) ? va.rosterTrust : 'airline';
                 const cs = Array.isArray(va.callsigns) ? va.callsigns.filter(Boolean) : [];
                 $('pfMatchCallsigns').textContent = cs.length ? t('fe.match.yours') + ' ' + cs.join(', ') : '';
             }
