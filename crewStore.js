@@ -63,7 +63,7 @@ const REQUIRE_OWN_STORE = String(process.env.CREW_STORE_REQUIRE_OWN || 'true').t
 // has existed since v1 — but the health endpoint flags it so the VA knows to
 // re-run the SQL. Pilot logins (crew_accounts) arrived in v3 and are the one
 // feature that genuinely needs the newer schema; see accountsSupported().
-const EXPECTED_SCHEMA_VERSION = 12;
+const EXPECTED_SCHEMA_VERSION = 13;
 
 // The version that introduced crew_accounts.
 const ACCOUNTS_SCHEMA_VERSION = 3;
@@ -104,6 +104,15 @@ const NOTIFICATIONS_SCHEMA_VERSION = 11;
 // rather than reporting a broken store over a VA whose everything else answers.
 const LINKS_SCHEMA_VERSION = 12;
 
+// The version that added the Infinite Flight link columns to crew_schedules.
+// NOT its own feature constant in the mould of the ones above, because it is
+// not its own feature: the Live panel works perfectly on a v12 project — the
+// fleet, the positions and the Live schedules all come from Infinite Flight, not
+// from the VA's Postgres. What a v12 project cannot do is REMEMBER which of its
+// own departures it pushed, so the columns sit in LATE_COLUMNS and the push
+// degrades to "sent, but we cannot record it here yet" instead of failing.
+const IF_LINK_SCHEMA_VERSION = 13;
+
 // ---------------------------------------------------------------------------
 // Columns that arrived after the first release
 //
@@ -134,6 +143,7 @@ const LATE_COLUMNS = {
     crew_members: new Set(['checks_passed', 'retention_warned_at']),
     crew_events: new Set(['route_id']),
     crew_pireps: new Set(['event_id', 'schedule_id']),
+    crew_schedules: new Set(['if_schedule_id', 'if_aircraft_id', 'if_synced_at', 'if_registration']),
     crew_applications: new Set([
         'discord_invite', 'invite_username', 'invite_password',
         'invite_issued_at', 'invite_claimed_at', 'invite_revoked_at', 'invite_account_id',
@@ -147,6 +157,10 @@ const DRIFT_LABELS = {
     'crew_events.route_id': 'events tied to a route',
     'crew_pireps.event_id': 'flights logged against an event',
     'crew_pireps.schedule_id': 'flights logged against a scheduled departure',
+    'crew_schedules.if_schedule_id': 'departures pushed to Infinite Flight',
+    'crew_schedules.if_aircraft_id': 'departures pushed to Infinite Flight',
+    'crew_schedules.if_synced_at': 'departures pushed to Infinite Flight',
+    'crew_schedules.if_registration': 'the aircraft a departure is flown by',
     'crew_routes.kind': 'codeshare routes',
     'crew_routes.partner_name': 'codeshare partner names',
     'crew_routes.partner_logo': 'codeshare partner logos',
@@ -610,6 +624,13 @@ const scheduleFromRow = (r) => r && {
     notes: r.notes || '',
     status: r.status || 'draft',
     createdBy: r.created_by || '',
+    // Where this departure lives in Infinite Flight, when it has been pushed
+    // there. Empty on a project whose schema predates v13 — the columns are in
+    // LATE_COLUMNS, so a write mentioning them degrades rather than failing.
+    ifScheduleId: r.if_schedule_id || '',
+    ifAircraftId: r.if_aircraft_id || '',
+    ifRegistration: r.if_registration || '',
+    ifSyncedAt: date(r.if_synced_at),
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at),
 };
@@ -630,6 +651,20 @@ const scheduleToRow = (s) => {
     pick(s, out, 'notes', 'notes', (v) => str(v, 2000));
     pick(s, out, 'status', 'status', (v) => (['draft', 'published', 'cancelled'].includes(v) ? v : 'draft'));
     pick(s, out, 'createdBy', 'created_by', (v) => str(v, 80));
+    // --- The link to Infinite Flight Live (v13) ---
+    //
+    // A departure that has been pushed to a real aircraft's schedule in
+    // Infinite Flight carries the id it was given there, so the next push is an
+    // update rather than a duplicate leg on somebody's aeroplane. Cleared by
+    // sending '' — which is why these go as null rather than as an empty
+    // string: the columns are text, but "not linked" is an absence and a query
+    // for `is.null` is how the sync finds what it still has to push.
+    pick(s, out, 'ifScheduleId', 'if_schedule_id', (v) => (str(v, 64) || null));
+    pick(s, out, 'ifAircraftId', 'if_aircraft_id', (v) => (str(v, 64) || null));
+    pick(s, out, 'ifSyncedAt', 'if_synced_at', (v) => (date(v) ? date(v).toISOString() : null));
+    // Text, not a uuid column, so '' is a legal value — but null keeps "no
+    // airframe" a single answer across all four of these rather than two.
+    pick(s, out, 'ifRegistration', 'if_registration', (v) => (str(v, 40) || null));
     return out;
 };
 
@@ -1803,6 +1838,12 @@ class SupabaseStore {
                 documents: version >= DOCUMENTS_SCHEMA_VERSION,
                 notifications: version >= NOTIFICATIONS_SCHEMA_VERSION,
                 links: version >= LINKS_SCHEMA_VERSION,
+                // v13. Whether a departure pushed to Infinite Flight can have
+                // the link recorded against it. Reported so the Live panel can
+                // say "sent, but this project cannot remember it yet" with the
+                // update button attached, rather than pushing the same leg
+                // again next time because it forgot the first one.
+                ifLink: version >= IF_LINK_SCHEMA_VERSION,
                 installedAt: (rows && rows[0] && rows[0].installed_at) || null,
             };
         } catch (err) {
@@ -1818,6 +1859,7 @@ class SupabaseStore {
                 documents: false,
                 notifications: false,
                 links: false,
+                ifLink: false,
                 code: err.code || 'store_error',
                 error: err.message,
                 detail: err.detail || '',
@@ -2430,5 +2472,6 @@ module.exports = {
     DOCUMENTS_SCHEMA_VERSION,
     NOTIFICATIONS_SCHEMA_VERSION,
     LINKS_SCHEMA_VERSION,
+    IF_LINK_SCHEMA_VERSION,
     REQUIRE_OWN_STORE,
 };

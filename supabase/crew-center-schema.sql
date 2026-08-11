@@ -757,6 +757,67 @@ create index if not exists crew_pireps_schedule_idx
     on crew_pireps (va_slug, schedule_id) where schedule_id is not null;
 
 -- ----------------------------------------------------------------------------
+-- The link to Infinite Flight Live. v13.
+--
+-- Infinite Flight's PublicApi v3 gives a VA's Live ORGANIZATION a schedule of
+-- its own: real aircraft, each with an ordered list of flights it is going to
+-- operate. A crew center already has a schedule — the table above — and a VA
+-- that keeps both is typing every departure twice.
+--
+-- THIS IS A LINK, NOT A MERGE, and the distinction is the whole design. The two
+-- objects are not the same thing and must not be conflated:
+--
+--   crew_schedules      a departure with SEATS, which pilots book, gated on a
+--                       rank, drafted before it is published.
+--   an IF Live schedule a leg attached to one real aeroplane, with a sequence
+--                       in that aeroplane's running order and a status driven
+--                       by the flight actually happening.
+--
+-- So a row here may REFER to the Infinite Flight schedule it was pushed to, and
+-- that is all. `if_schedule_id` is the id Infinite Flight gave it, which is what
+-- makes the second push an update instead of a duplicate leg on somebody's
+-- aircraft. `if_aircraft_id` is the PERSISTENT organization aircraft id — the
+-- API's `id`, not its `aircraftId`, which is a livery content identifier and a
+-- different thing entirely.
+--
+-- Not foreign keys, and not uuid: these name rows in somebody else's database.
+-- Text, so that an id format change on a preview API is not a migration here.
+--
+-- `if_synced_at` is when we last pushed, which is what lets the panel say
+-- "changed here since it was last sent" rather than making the VA remember.
+--
+-- All three are nullable and all three are in crewStore.js's LATE_COLUMNS: a
+-- project still on v12 keeps working and simply cannot record the link, and the
+-- crew center says so at the time instead of failing the write.
+-- ----------------------------------------------------------------------------
+alter table crew_schedules add column if not exists if_schedule_id text;
+alter table crew_schedules add column if not exists if_aircraft_id text;
+alter table crew_schedules add column if not exists if_synced_at   timestamptz;
+
+-- The airframe's registration, kept next to its id.
+--
+-- Denormalised deliberately. `aircraft` above is the TYPE and livery — what a
+-- VA has always been able to say about a departure. This is the specific
+-- aeroplane, and the registration is the only part of it a pilot reads ("you're
+-- on N682XL"). Resolving it from `if_aircraft_id` would mean calling Infinite
+-- Flight to draw a schedule, on a page the whole roster loads, for a VA who may
+-- not have connected an organization at all.
+--
+-- The id is the truth and the registration is the label. A stale label on a
+-- re-registered airframe is a much smaller problem than a schedule that cannot
+-- render unless a third party answers.
+alter table crew_schedules add column if not exists if_registration text;
+
+-- One crew departure per Infinite Flight schedule. Scoped by slug like every
+-- other unique index here (one project can back several brands), and partial so
+-- the many unpushed departures do not collide on null.
+create unique index if not exists crew_schedules_if_idx
+    on crew_schedules (va_slug, if_schedule_id) where if_schedule_id is not null;
+-- "What have I pushed to this aeroplane?" — the read the sync does every time.
+create index if not exists crew_schedules_if_aircraft_idx
+    on crew_schedules (va_slug, if_aircraft_id) where if_aircraft_id is not null;
+
+-- ----------------------------------------------------------------------------
 -- The document library. v11.
 --
 -- Every VA has an operations manual, and until now every VA hosted it
@@ -1458,5 +1519,5 @@ end $$;
 -- Stamp the version last, so a half-applied script does not advertise itself as
 -- a complete install.
 -- ----------------------------------------------------------------------------
-insert into crew_schema_info (id, version) values (1, 12)
+insert into crew_schema_info (id, version) values (1, 13)
 on conflict (id) do update set version = excluded.version, updated_at = now();

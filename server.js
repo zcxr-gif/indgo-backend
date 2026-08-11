@@ -105,10 +105,26 @@ const crewLinks = require('./crewLinks');
 // supabase.com. See crewSetup.js.
 const crewSetup = require('./crewSetup');
 
-// AES-256-GCM at rest for the VA secrets we do keep — today, the Supabase
-// access token above. The key lives in the environment, not the database. See
-// crewSecrets.js.
+// AES-256-GCM at rest for the VA secrets we do keep — the Supabase access
+// token above, and the Infinite Flight grant below. The key lives in the
+// environment, not the database. See crewSecrets.js.
 const crewSecrets = require('./crewSecrets');
+
+// Infinite Flight Live, through PublicApi v3's OAuth2 preview: a VA's real
+// organization, its real aircraft and the schedules those aircraft will fly.
+// Split the same way the crew modules are — ifLive.js holds the data model and
+// every decision in it (what the numeric enums mean, what a schedule is allowed
+// to say, how one of our departures becomes one of theirs), ifOAuth.js holds
+// the handshake and the transport. The routes below hold the I/O and nothing
+// else.
+//
+// The API is a preview and says so: paths, fields, enum values and rules may
+// change before it is generally available. ifLive.js is written to survive that
+// — an enum value it has not been told about is a label, not an exception — and
+// the base URLs are environment-overridable so a moved path is a config change
+// rather than a deploy.
+const ifLive = require('./ifLive');
+const ifOAuth = require('./ifOAuth');
 
 // Group flights — a VA owner selects the aircraft flying their event and mints
 // one short link to share. Ownership is claimed with the contact email already
@@ -540,6 +556,81 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     supabaseAutoUpdatedAt: { type: Date, default: null },
     supabaseAutoUpdatedTo: { type: Number, default: 0 },
 
+    // --- Infinite Flight Live (PublicApi v3, OAuth2) ---
+    //
+    // A VA's Live ORGANIZATION — its real fleet in Infinite Flight, and the
+    // schedules those aircraft will actually fly — connected to the crew center
+    // through OAuth2 on behalf of one signed-in Infinite Flight user. See
+    // ifOAuth.js for the handshake and ifLive.js for the data model.
+    //
+    // WHOSE ACCOUNT THIS IS. One person's: the VA staff member who pressed
+    // Connect. Every call the crew center makes to /public/v3 is made as them,
+    // and the API's authorization model is theirs too — reads need membership of
+    // the organization, writes need owner or admin. A VA that connects a pilot's
+    // account gets a fleet board and no schedule editing, which is correct
+    // rather than broken, and the panel says which it has.
+    //
+    // WHICH OAUTH CLIENT. Either ours (IF_OAUTH_CLIENT_ID in the environment) or
+    // the VA's own, registered by them at infiniteflight.com/account/api-keys.
+    // Their own is the path that works today: "testing clients are limited to
+    // the owner and invited test users until the app is reviewed and approved by
+    // Infinite Flight", and a client the VA created has the VA as its owner. A
+    // stored client secret is a credential like any other here — sealed, and
+    // never returned to a browser.
+    ifClientId: { type: String, trim: true, default: '' },
+    ifClientSecret: { type: String, default: '', select: false },   // sealed (crewSecrets)
+    ifClientType: { type: String, enum: ['', 'confidential', 'public'], default: '' },
+    // Non-secret companion, so the settings screen can say WHICH secret is
+    // saved without being able to show it.
+    ifClientSecretHint: { type: String, default: '' },
+
+    // The grant. Both tokens are sealed at rest for the same reason the Supabase
+    // access token is: a dump of this collection should be ciphertext, not a
+    // pile of credentials that act on somebody's Infinite Flight organization.
+    //
+    // The refresh token ROTATES — "store the newest refresh token returned by
+    // the token endpoint and discard the old one" — so this field is rewritten
+    // on every refresh, and it is written BEFORE the new access token is used
+    // for anything (see ifTokenFor in the routes).
+    ifAccessToken: { type: String, default: '', select: false },
+    ifRefreshToken: { type: String, default: '', select: false },
+    ifTokenExpiresAt: { type: Date, default: null },
+    // What was actually GRANTED, which can be less than what we asked for. The
+    // panel offers schedule editing off this rather than off our request, so a
+    // narrower consent produces a read-only screen instead of a 403 on save.
+    ifScopes: { type: [String], default: [] },
+
+    ifConnectedAt: { type: Date, default: null },
+    ifConnectedBy: { type: String, trim: true, default: '' },   // the staff member who pressed Connect
+    ifLastUsedAt: { type: Date, default: null },
+
+    // Which organization this crew center is pointed at. An account can belong
+    // to several; the VA picks one and everything after that is scoped to it.
+    // The name and world are cached copies for the screen — the ids are what is
+    // ever sent to the API.
+    ifOrganizationId: { type: String, trim: true, default: '' },
+    ifOrganizationName: { type: String, trim: true, default: '' },
+    ifOrganizationWorld: { type: Number, default: null },
+
+    // Set when Infinite Flight last refused the stored grant. Kept rather than
+    // cleared, exactly as with the Supabase token, so the screen can say "the
+    // connection you made in March stopped working" instead of quietly showing
+    // a Connect button with no explanation of where the last one went.
+    ifTokenFailedAt: { type: Date, default: null },
+    ifTokenError: { type: String, default: '' },
+
+    // May a departure published in the crew center be pushed to the connected
+    // aircraft's Infinite Flight schedule? Off until the VA turns it on: the
+    // crew center's schedule and the Live one are different objects with
+    // different audiences (see ifLive.js), and quietly filling somebody's real
+    // aircraft rota from ours is not a default anybody asked for.
+    ifSyncSchedules: { type: Boolean, default: false },
+    // Which aircraft that sync writes to. One, deliberately: "push the week to
+    // the fleet" needs an assignment model the crew center does not have yet,
+    // and picking an aircraft at random is worse than asking.
+    ifSyncAircraftId: { type: String, trim: true, default: '' },
+    ifSyncedAt: { type: Date, default: null },
+
     // --- Copy ---
     tagline: { type: String, trim: true, maxlength: 140, default: '' }, // short hook
     description: { type: String, trim: true, maxlength: 4000, default: '' },
@@ -709,6 +800,53 @@ VirtualAirlineAdSchema.pre('save', async function (next) {
 });
 
 const VirtualAirlineAd = mongoose.model('VirtualAirlineAd', VirtualAirlineAdSchema);
+
+/* ---------------------------------------------------------------------------
+ * The half-finished Infinite Flight sign-in.
+ *
+ * OAuth2 authorization code flow with PKCE has a gap in the middle: we generate
+ * a verifier and a state, send the VA's browser to Infinite Flight, and then get
+ * a bare GET back some seconds or minutes later carrying only `code` and
+ * `state`. Something has to hold the verifier across that gap, and it cannot be
+ * the browser — the callback arrives at the backend, on a different origin, with
+ * no session of ours attached.
+ *
+ * So: a row, and a short-lived one. It holds the PKCE verifier (the secret half
+ * — the challenge is what travelled), which VA and which staff member started
+ * the flow, what we asked for, and where to send them afterwards.
+ *
+ * WHY IT EXPIRES BY ITSELF. Every one of these is either consumed within a
+ * couple of minutes or abandoned, and an abandoned one is a live verifier for an
+ * authorization request somebody could still complete. The TTL index deletes
+ * them on Mongo's own schedule rather than leaving a sweep for us to forget to
+ * write; ten minutes is generous for "sign in and press approve" and short
+ * enough that an abandoned flow is not sitting there for an afternoon.
+ *
+ * The row is also deleted the moment it is used — a code exchange is
+ * single-use, and a state that can be replayed is the hole `state` exists to
+ * close.
+ * ------------------------------------------------------------------------ */
+const CrewIfAuthStateSchema = new mongoose.Schema({
+    // The opaque value that travels in the URL and comes back in the callback.
+    // Indexed because it is the only thing the callback has to look us up by.
+    state: { type: String, required: true, unique: true, index: true },
+    // The PKCE secret. Never leaves this collection except into the token
+    // exchange, and the row is gone immediately afterwards.
+    verifier: { type: String, required: true },
+    vaId: { type: mongoose.Schema.Types.ObjectId, ref: 'VirtualAirlineAd', required: true },
+    slug: { type: String, required: true },
+    // Who pressed Connect, for the audit line on the connection.
+    startedBy: { type: String, default: '' },
+    scopes: { type: [String], default: [] },
+    clientId: { type: String, default: '' },
+    // Where the browser is sent when this is over. Validated against our own
+    // site origin at both ends — a stored redirect that a request could set
+    // freely is an open redirect with extra steps.
+    returnTo: { type: String, default: '' },
+    createdAt: { type: Date, default: Date.now, expires: 600 },
+});
+const CrewIfAuthState = mongoose.models.CrewIfAuthState
+    || mongoose.model('CrewIfAuthState', CrewIfAuthStateSchema);
 
 // A crew roster member (rich profile). Rank is NOT stored — it's derived from
 // `hours` against the VA's rank ladder. Managed storage so a roster works with
@@ -3884,6 +4022,1755 @@ app.post('/api/crew/:slug/links/:id/open', async (req, res) => {
     }
 });
 
+/* ===========================================================================
+ * Infinite Flight Live — PublicApi v3, over OAuth2 (v13)
+ *
+ * WHAT THIS ADDS
+ *
+ * Until now a crew center knew about a VA's flying only through what pilots
+ * told it: a PIREP filed after the fact, a schedule staff typed by hand, a
+ * roster of Infinite Flight usernames. The aircraft themselves — the ones the
+ * VA actually owns in Infinite Flight, in their Live organization, with the
+ * fleet order and the rota those aircraft will really fly — were somewhere
+ * else entirely, behind the Live portal, invisible from here.
+ *
+ * PublicApi v3 opens that up, and this is the whole of it wired in: the VA's
+ * organizations, the aircraft in them, where each aircraft last was, and full
+ * read/write on the schedules attached to them — create, edit, re-plan, reorder
+ * and delete — plus a two-way bridge to the crew center's own schedule.
+ *
+ * FIVE THINGS TO BE CAREFUL ABOUT HERE. They are why this block is as long as
+ * it is, and every one of them is a decision that would be wrong by default.
+ *
+ * 1. WHOSE ACCOUNT IS ACTING. Everything below is done as ONE Infinite Flight
+ *    user: the staff member who pressed Connect. Infinite Flight's own
+ *    authorization model then applies to them — reads need membership of the
+ *    organization, writes need owner or admin of it. So a crew center is never
+ *    able to do more to a VA's Live organization than the person who connected
+ *    it could do by hand, which is the correct ceiling and is not one we impose;
+ *    it is theirs, and we simply do not try to route around it. Where their
+ *    grant is narrower than the screen, the screen narrows (see `canWrite`).
+ *
+ * 2. THE GRANT IS A CREDENTIAL. Both tokens are sealed at rest (crewSecrets,
+ *    AES-256-GCM under a key from the environment) exactly like the Supabase
+ *    access token, and neither is ever sent to a browser. The refresh token
+ *    ROTATES — the preview is explicit that the newest one must be stored and
+ *    the old one discarded — so refreshTokens() below WRITES BEFORE IT USES.
+ *    A crash between those two would otherwise burn the connection.
+ *
+ * 3. STATE IS NOT DECORATION. The callback is a bare GET from the open
+ *    internet carrying `code` and `state`. `state` is the only thing tying it
+ *    to a VA, a staff member and a PKCE verifier, so it is single-use (the row
+ *    is deleted the moment it is looked up), short-lived (a TTL index), and
+ *    compared in constant time. A callback whose state does not resolve is not
+ *    an error to explain helpfully — it is a request from somebody who was not
+ *    part of the flow, and it gets a flat refusal.
+ *
+ * 4. THE PANEL MUST NOT INVENT. Every figure here comes from Infinite Flight
+ *    or from the VA's own database, and where a call fails the failure is what
+ *    is reported. A fleet board that draws an aircraft at 0,0 because the
+ *    position endpoint was having a bad minute is worse than one that says the
+ *    position is unavailable — see ifLive.publicPosition's `hasFix` and
+ *    `stale`, which exist for precisely that.
+ *
+ * 5. THIS API IS A PREVIEW AND SAYS SO. Paths, fields, enums, validation and
+ *    rate limits may all change before it is generally available. So: no path
+ *    is written in this file (they are all in ifOAuth.js, over
+ *    environment-overridable base URLs), no enum is decoded here (ifLive.js
+ *    labels what it does not recognise instead of throwing), and a 429 is
+ *    treated as a queue while a 403 is treated as an answer.
+ * ======================================================================== */
+
+// Non-secret fields the Live screens need. Deliberately without the two sealed
+// token fields and the sealed client secret: the STATE of a connection is not
+// the connection, and the only place that wants the values asks for them by
+// name (ifConnection below).
+const CREW_IF_META = 'ifClientId ifClientType ifClientSecretHint ifTokenExpiresAt ifScopes '
+    + 'ifConnectedAt ifConnectedBy ifLastUsedAt ifOrganizationId ifOrganizationName ifOrganizationWorld '
+    + 'ifTokenFailedAt ifTokenError ifSyncSchedules ifSyncAircraftId ifSyncedAt';
+
+/** The VA document with the sealed fields, for the few places that need them. */
+const ifConnection = (vaId) => VirtualAirlineAd.findById(vaId)
+    .select(`${CREW_IF_META} +ifAccessToken +ifRefreshToken +ifClientSecret`)
+    .lean();
+
+/**
+ * Which OAuth client this VA signs in with.
+ *
+ * Theirs if they have registered one, ours otherwise. Theirs FIRST, and that
+ * order is the important part: "testing clients are limited to the owner and
+ * invited test users until the app is reviewed and approved by Infinite
+ * Flight", so until our platform client is approved it works for nobody but us,
+ * while a client the VA created at infiniteflight.com/account/api-keys has the
+ * VA themselves as its owner and works for them today.
+ *
+ * A stored client secret that will not unseal (a rotated CREW_SECRET_KEY) comes
+ * back as a public client rather than as a confidential one with an empty
+ * secret — the second would produce a baffling refusal from the token endpoint,
+ * the first produces an honest "PKCE only" attempt that fails with a message
+ * about the client.
+ */
+function ifClientFor(ad) {
+    const own = String((ad && ad.ifClientId) || '').trim();
+    if (own) {
+        const secret = ad.ifClientSecret ? crewSecrets.open(ad.ifClientSecret) : '';
+        return {
+            id: own,
+            secret,
+            type: secret ? 'confidential' : 'public',
+            source: 'va',
+            // Told apart from "the VA registered a public client" so the screen
+            // can say which of the two happened.
+            secretUnavailable: !!(ad.ifClientSecret && !secret),
+        };
+    }
+    if (ifOAuth.PLATFORM_CLIENT.id) {
+        return {
+            id: ifOAuth.PLATFORM_CLIENT.id,
+            secret: ifOAuth.PLATFORM_CLIENT.secret,
+            type: ifOAuth.PLATFORM_CLIENT.type,
+            source: 'platform',
+            secretUnavailable: false,
+        };
+    }
+    return { id: '', secret: '', type: '', source: '', secretUnavailable: false };
+}
+
+/**
+ * Where Infinite Flight sends the browser back to.
+ *
+ * One URI for the whole platform. It has to match what is registered on the
+ * OAuth client character for character, so it is computed from configuration
+ * and never from the request — a redirect_uri a caller could influence is the
+ * classic way an authorization code ends up somewhere it should not.
+ */
+function ifRedirectUri(req) {
+    if (ifOAuth.REDIRECT_URI) return ifOAuth.REDIRECT_URI;
+    // Last resort for a deployment that has set neither IF_OAUTH_REDIRECT_URI
+    // nor PUBLIC_BASE_URL. Derived from the request's own host, which is why it
+    // is the last resort and not the first: behind a proxy that forwards a host
+    // header we do not control, this is a value an attacker has a say in. It is
+    // here so a local development instance works out of the box, and the
+    // connect route refuses to run at all when the result is not https.
+    const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+    const host = String(req.headers['x-forwarded-host'] || req.get('host') || '').split(',')[0].trim();
+    return host ? `${proto}://${host}/api/crew/if/callback` : '';
+}
+
+/**
+ * What a crew center is told about its connection. Never a token, never a
+ * secret — the same rule the Supabase token state follows, for the same reason.
+ */
+function ifState(ad, { owner = false } = {}) {
+    const client = ifClientFor(ad || {});
+    const scopes = (ad && ad.ifScopes) || [];
+    const hasGrant = !!(ad && ad.ifConnectedAt);
+    return {
+        // Is there a usable grant right now? A failed one still reports
+        // `connected: true` with `failed: true`, because "your connection
+        // stopped working" and "you have never connected" need different
+        // screens and different sentences.
+        connected: hasGrant,
+        failed: !!(ad && ad.ifTokenFailedAt),
+        failedAt: (ad && ad.ifTokenFailedAt) || null,
+        error: (ad && ad.ifTokenError) || '',
+        connectedAt: (ad && ad.ifConnectedAt) || null,
+        connectedBy: (ad && ad.ifConnectedBy) || '',
+        lastUsedAt: (ad && ad.ifLastUsedAt) || null,
+        expiresAt: (ad && ad.ifTokenExpiresAt) || null,
+        scopes,
+        // What the panel may offer. Read off what was GRANTED rather than what
+        // we asked for: a VA who unticked schedule writes on the consent screen
+        // gets a read-only board instead of a save button that 403s.
+        canReadAircraft: scopes.includes('live:aircraft.read'),
+        canReadSchedules: scopes.includes('live:schedules.read'),
+        canWrite: ifLive.canWriteSchedules(scopes),
+        organization: (ad && ad.ifOrganizationId) ? {
+            id: ad.ifOrganizationId,
+            name: ad.ifOrganizationName || '',
+            world: ifLive.describeEnum(ifLive.WORLD_TYPE, ad.ifOrganizationWorld),
+        } : null,
+        sync: {
+            enabled: !!(ad && ad.ifSyncSchedules),
+            aircraftId: (ad && ad.ifSyncAircraftId) || '',
+            syncedAt: (ad && ad.ifSyncedAt) || null,
+        },
+        client: {
+            // Which client is in play, and whose. The id is not a secret (it
+            // travels in every authorization URL) so it is shown; the secret
+            // never is, only its hint.
+            configured: !!client.id,
+            source: client.source,
+            type: client.type,
+            id: owner ? client.id : '',
+            secretHint: owner ? ((ad && ad.ifClientSecretHint) || '') : '',
+            secretUnavailable: client.secretUnavailable,
+            // Can this deployment hold a secret at all? When false the screen
+            // hides the confidential-client option rather than offering a field
+            // that silently stores nothing.
+            canStoreSecret: crewSecrets.available(),
+            storeSecretReason: crewSecrets.unavailableReason(),
+        },
+        // Everything the panel needs to render pickers and count characters,
+        // sent from here so the enum tables live in one file rather than three.
+        enums: ifLive.ENUMS,
+        limits: ifLive.LIMITS,
+        scopeCatalog: ifLive.SCOPES,
+    };
+}
+
+/** One error shape for everything this block can fail with. */
+function ifFail(res, err, fallback) {
+    if (err instanceof ifOAuth.IfAuthError) {
+        if (err.detail) console.warn(`if oauth [${err.code || err.status}]:`, err.detail);
+        return res.status(err.reconnect ? 409 : 502).json({
+            error: err.message,
+            code: err.reconnect ? 'if_reconnect' : 'if_auth_failed',
+        });
+    }
+    if (err instanceof ifOAuth.IfApiError) {
+        if (err.detail) console.warn(`if api [${err.status}]:`, err.detail);
+        // Passed through with Infinite Flight's own status where it is one a
+        // browser can act on, so "you are not an admin of that organization"
+        // does not arrive as a 500 that reads as our outage.
+        const status = [400, 401, 403, 404, 429].includes(err.status) ? err.status : 502;
+        return res.status(status).json({
+            error: err.message,
+            code: 'if_api_error',
+            ifStatus: err.status,
+            ifErrorCode: err.errorCode,
+            retryable: !!err.retryable,
+        });
+    }
+    if (err instanceof crewStore.CrewStoreError) return crewFail(res, err, fallback);
+    console.error(`${fallback.log}:`, err);
+    return res.status(500).json({ error: fallback.message });
+}
+
+// --- Gates ------------------------------------------------------------------
+//
+// Three levels, matching who the action actually belongs to:
+//
+//   owner   the CREDENTIAL — connecting, disconnecting, registering an OAuth
+//           client. Same bar as the Supabase data store, because it is the same
+//           kind of thing: a stored credential that acts on somebody's account.
+//   staff   READING the fleet and the rota. Any signed-in staff member; seeing
+//           the aeroplanes is not a power.
+//   cap     WRITING a Live schedule, gated on schedules.manage — the capability
+//           that already means "builds the airline's week".
+
+const ifOwnerGate = (req, slug) => {
+    const p = verifyCrewRequest(req);
+    if (!p) return { error: 401, message: 'Not authenticated.' };
+    if (!(p.kind === 'inflight' || p.role === 'owner')) {
+        return { error: 403, message: 'Only the VA owner can connect an Infinite Flight account.' };
+    }
+    if (p.kind !== 'inflight' && p.slug && p.slug !== String(slug || '').toLowerCase()) {
+        return { error: 403, message: 'Wrong crew center.' };
+    }
+    return { p };
+};
+
+const ifStaffGate = (req, slug) => {
+    const base = crewCanManage(req, slug);
+    return base.error
+        ? { error: base.error, message: base.error === 401 ? 'Not authenticated.' : 'Not allowed.' }
+        : base;
+};
+
+async function ifWriteGate(req, slug) {
+    const gate = await requireCap(req, slug, 'schedules.manage');
+    return gate.error
+        ? { error: gate.error, message: gate.error === 401 ? 'Not authenticated.' : 'You don’t have permission to change the schedule.' }
+        : gate;
+}
+
+/**
+ * The access token to use for this VA, refreshed if it is about to die.
+ *
+ * THE ORDER HERE IS THE POINT. A refresh both mints a new access token AND
+ * invalidates the refresh token we sent — "refresh tokens rotate… store the
+ * newest refresh token returned by the token endpoint and discard the old one".
+ * So the new pair is written to the database BEFORE this function returns, and
+ * certainly before the caller spends the access token on anything. A process
+ * that died between the two would otherwise leave the VA holding a refresh
+ * token Infinite Flight has already retired, which looks exactly like a revoked
+ * connection and can only be fixed by reconnecting.
+ *
+ * A refusal is recorded rather than swallowed: the connection is marked failed
+ * with Infinite Flight's own reason, so the screen can say what happened
+ * instead of showing a Connect button and no explanation.
+ */
+async function ifTokenFor(vaId, { refresh = true } = {}) {
+    const ad = await ifConnection(vaId);
+    if (!ad || !ad.ifConnectedAt) {
+        throw new ifOAuth.IfAuthError('This crew center is not connected to Infinite Flight.', { reconnect: true });
+    }
+    const access = ad.ifAccessToken ? crewSecrets.open(ad.ifAccessToken) : '';
+    const expiresAt = ad.ifTokenExpiresAt ? new Date(ad.ifTokenExpiresAt).getTime() : 0;
+    const fresh = access && expiresAt - Date.now() > ifOAuth.REFRESH_MARGIN_MS;
+    if (fresh || !refresh) {
+        if (!access) {
+            // Sealed with a key we no longer have. Not a revoked grant — a
+            // rotated CREW_SECRET_KEY — and the message says so, because
+            // "reconnect" is the fix either way but the cause is worth knowing.
+            throw new ifOAuth.IfAuthError(
+                'The stored Infinite Flight connection cannot be opened on this server. Connect the account again.',
+                { reconnect: true });
+        }
+        return { token: access, scopes: ad.ifScopes || [], ad };
+    }
+
+    const refreshToken = ad.ifRefreshToken ? crewSecrets.open(ad.ifRefreshToken) : '';
+    if (!refreshToken) {
+        throw new ifOAuth.IfAuthError(
+            'This connection has expired and there is no refresh token to renew it. Connect the account again.',
+            { reconnect: true });
+    }
+    const client = ifClientFor(ad);
+    if (!client.id) {
+        throw new ifOAuth.IfAuthError('No Infinite Flight OAuth client is configured for this crew center.', { reconnect: true });
+    }
+
+    let tokens;
+    try {
+        tokens = await ifOAuth.refresh({
+            clientId: client.id,
+            clientSecret: client.secret,
+            refreshToken,
+        });
+    } catch (err) {
+        if (err instanceof ifOAuth.IfAuthError && err.reconnect) await ifMarkFailed(vaId, err.detail || err.message);
+        throw err;
+    }
+
+    // Write first. See the note above.
+    await ifStoreTokens(vaId, tokens, { scopes: tokens.scopes || ad.ifScopes || [] });
+    return { token: tokens.accessToken, scopes: tokens.scopes || ad.ifScopes || [], ad };
+}
+
+/**
+ * Persist a token pair.
+ *
+ * The refresh token is only overwritten when a new one came back: a token
+ * endpoint that chooses not to rotate on this particular call has left the old
+ * one current, and blanking the field would discard a working credential to no
+ * purpose.
+ *
+ * Refuses to store anything at all when sealing is unavailable. That is not a
+ * silent degradation — the connect route checks crewSecrets.available() before
+ * it starts the flow and refuses with a reason a deployer can act on — but the
+ * check is repeated here because "store the credential in the clear" must not
+ * be reachable by any path.
+ */
+async function ifStoreTokens(vaId, tokens, { scopes, connectedBy } = {}) {
+    const sealedAccess = crewSecrets.seal(tokens.accessToken);
+    if (!sealedAccess) throw new ifOAuth.IfAuthError(crewSecrets.unavailableReason(), { reconnect: false });
+    const $set = {
+        ifAccessToken: sealedAccess,
+        ifTokenExpiresAt: tokens.expiresAt,
+        ifTokenFailedAt: null,
+        ifTokenError: '',
+        ifLastUsedAt: new Date(),
+    };
+    if (tokens.refreshToken) {
+        const sealedRefresh = crewSecrets.seal(tokens.refreshToken);
+        if (sealedRefresh) $set.ifRefreshToken = sealedRefresh;
+    }
+    if (Array.isArray(scopes) && scopes.length) $set.ifScopes = scopes;
+    if (connectedBy !== undefined) {
+        $set.ifConnectedAt = new Date();
+        $set.ifConnectedBy = String(connectedBy || '').slice(0, 80);
+    }
+    await VirtualAirlineAd.updateOne({ _id: vaId }, { $set });
+}
+
+const ifMarkFailed = (vaId, message) => VirtualAirlineAd.updateOne({ _id: vaId }, {
+    $set: { ifTokenFailedAt: new Date(), ifTokenError: String(message || '').slice(0, 300) },
+}).catch(() => {});
+
+/** Forget the grant. Revoking it at Infinite Flight is the VA's separate act. */
+const ifClearConnection = (vaId) => VirtualAirlineAd.updateOne({ _id: vaId }, {
+    $set: {
+        ifAccessToken: '', ifRefreshToken: '', ifTokenExpiresAt: null, ifScopes: [],
+        ifConnectedAt: null, ifConnectedBy: '', ifLastUsedAt: null,
+        ifOrganizationId: '', ifOrganizationName: '', ifOrganizationWorld: null,
+        ifTokenFailedAt: null, ifTokenError: '',
+        ifSyncSchedules: false, ifSyncAircraftId: '', ifSyncedAt: null,
+    },
+});
+
+/**
+ * The organization a request is about.
+ *
+ * The stored one unless the caller names another, and a named one is allowed
+ * because an account can belong to several and the picker has to be able to
+ * look at them before choosing. Infinite Flight is the authority on whether the
+ * caller may see it — passing an id we do not recognise gets a 404 from them,
+ * which is the right answer and not one we need to duplicate.
+ */
+const ifOrgFor = (req, ad) => String(
+    req.query.organizationId || req.body?.organizationId || (ad && ad.ifOrganizationId) || ''
+).trim();
+
+/* ---------------------------------------------------------------------------
+ * A small, short cache in front of the fleet reads.
+ *
+ * Not for speed. A crew dashboard open on three staff members' screens polls
+ * the fleet board, and every one of those is a call against a rate limit the
+ * preview documents but does not quantify ("429 Rate limit exceeded"). Five
+ * seconds of sharing turns a room full of dashboards into one caller, and is
+ * short enough that nobody notices it is there.
+ *
+ * Keyed by VA and by call, never by user: two staff members of the same VA are
+ * asking the same question of the same organization with the same grant. It
+ * holds ONLY organization-level reads — never a schedule write's response, and
+ * never anything a permission decision is made from.
+ * ------------------------------------------------------------------------ */
+const IF_CACHE = new Map();
+const IF_CACHE_TTL_MS = 5000;
+const IF_CACHE_MAX = 500;
+
+async function ifCached(key, produce) {
+    const hit = IF_CACHE.get(key);
+    if (hit && Date.now() - hit.at < IF_CACHE_TTL_MS) return hit.value;
+    const value = await produce();
+    // Bounded by eviction of the oldest insertion rather than by a sweep: Map
+    // preserves insertion order, so the first key is the coldest.
+    if (IF_CACHE.size >= IF_CACHE_MAX) IF_CACHE.delete(IF_CACHE.keys().next().value);
+    IF_CACHE.set(key, { at: Date.now(), value });
+    return value;
+}
+const ifInvalidate = (vaId) => {
+    const prefix = `${vaId}:`;
+    for (const key of IF_CACHE.keys()) if (key.startsWith(prefix)) IF_CACHE.delete(key);
+};
+
+// --- The connection ---------------------------------------------------------
+
+/**
+ * What this crew center's Infinite Flight connection looks like.
+ *
+ * Readable by any staff member — knowing whether the airline is connected is
+ * not a power — but the client id and the secret hint are added only for the
+ * owner, because those are the credential's own details.
+ */
+app.get('/api/crew/:slug/if', async (req, res) => {
+    const gate = ifStaffGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const ad = await ifConnection(va._id);
+        const owner = gate.p.kind === 'inflight' || gate.p.role === 'owner';
+        const canWrite = !(await ifWriteGate(req, req.params.slug)).error;
+        res.json({
+            ...ifState(ad, { owner }),
+            // What the CALLER may do, as distinct from what the grant allows.
+            // Both have to be true for a save button to appear, and the panel
+            // says which one is missing.
+            you: { owner, canManageSchedules: canWrite },
+            redirectUri: owner ? ifRedirectUri(req) : '',
+        });
+    } catch (err) { ifFail(res, err, { log: 'if status error', message: 'Could not read the Infinite Flight connection.' }); }
+});
+
+/**
+ * Register the VA's own OAuth client.
+ *
+ * The path that works today, and the reason this route exists at all: our
+ * platform client, until Infinite Flight reviews and approves it, is limited to
+ * its owner and invited testers — so a VA using it would get a 403 with no
+ * obvious cause. A client the VA creates themselves at
+ * infiniteflight.com/account/api-keys has the VA as its owner, and works for
+ * them immediately.
+ *
+ * The secret is optional and its presence is what makes the client
+ * confidential. A VA who pastes one on a deployment with no CREW_SECRET_KEY is
+ * told plainly that it was not kept, and the client is registered as public —
+ * which still works, because PKCE is mandatory for both types.
+ */
+app.post('/api/crew/:slug/if/client', async (req, res) => {
+    const gate = ifOwnerGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const clientId = String(req.body?.clientId || '').trim().slice(0, 120);
+        if (!clientId) return res.status(400).json({ error: 'Paste the client ID from your Infinite Flight OAuth client.' });
+        const secret = String(req.body?.clientSecret || '').trim();
+
+        const $set = { ifClientId: clientId };
+        let secretWarning = '';
+        if (secret) {
+            const sealed = crewSecrets.seal(secret);
+            if (sealed) {
+                $set.ifClientSecret = sealed;
+                $set.ifClientSecretHint = crewSecrets.hint(secret);
+                $set.ifClientType = 'confidential';
+            } else {
+                // Refused rather than stored in the clear, and the registration
+                // still succeeds as a public client — which is a working
+                // configuration, not a consolation prize.
+                secretWarning = `${crewSecrets.unavailableReason()} The client was saved as a public (PKCE-only) client instead.`;
+                $set.ifClientSecret = '';
+                $set.ifClientSecretHint = '';
+                $set.ifClientType = 'public';
+            }
+        } else if (req.body?.clientSecret === '') {
+            // An explicit empty string means "this is a public client", as
+            // distinct from omitting the field, which leaves any saved secret
+            // alone.
+            $set.ifClientSecret = '';
+            $set.ifClientSecretHint = '';
+            $set.ifClientType = 'public';
+        }
+
+        await VirtualAirlineAd.updateOne({ _id: va._id }, { $set });
+        const ad = await ifConnection(va._id);
+        res.json({
+            ok: true,
+            ...(secretWarning ? { warning: secretWarning } : {}),
+            // Changing the client does not invalidate an existing grant — the
+            // tokens were issued to the old one and keep working until they
+            // expire — but it does mean the next refresh uses different
+            // credentials, which will fail. Said plainly rather than left as a
+            // surprise half an hour later.
+            ...(ad && ad.ifConnectedAt ? {
+                notice: 'The account that is already connected will need reconnecting — the tokens it holds belong to the previous client.',
+            } : {}),
+            ...ifState(ad, { owner: true }),
+            redirectUri: ifRedirectUri(req),
+        });
+    } catch (err) { ifFail(res, err, { log: 'if client save error', message: 'Could not save the OAuth client.' }); }
+});
+
+/** Forget the VA's own client and fall back to the platform's, if there is one. */
+app.delete('/api/crew/:slug/if/client', async (req, res) => {
+    const gate = ifOwnerGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        await VirtualAirlineAd.updateOne({ _id: va._id }, {
+            $set: { ifClientId: '', ifClientSecret: '', ifClientSecretHint: '', ifClientType: '' },
+        });
+        res.json({ ok: true, ...ifState(await ifConnection(va._id), { owner: true }) });
+    } catch (err) { ifFail(res, err, { log: 'if client delete error', message: 'Could not remove the OAuth client.' }); }
+});
+
+/**
+ * Begin the sign-in.
+ *
+ * Returns a URL rather than redirecting, because the caller is a fetch from a
+ * dashboard and not a navigation — the page opens it itself, which also means
+ * the browser keeps its own session while Infinite Flight has the tab.
+ *
+ * `prompt=consent` is offered and off by default, following the preview's own
+ * advice: leaving it off lets a returning VA skip a repeat consent screen, and
+ * turning it on is for redirect mechanisms that need the final hop to follow a
+ * user gesture. A crew center reconnecting in a desktop browser wants it off.
+ */
+app.post('/api/crew/:slug/if/connect', async (req, res) => {
+    const gate = ifOwnerGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+
+        // Checked before the flow starts, not after the VA has signed in and
+        // approved: sending somebody through consent only to drop the token on
+        // the floor at the end is the worst possible place to discover this.
+        if (!crewSecrets.available()) {
+            return res.status(409).json({
+                error: `${crewSecrets.unavailableReason()} Without it the Infinite Flight connection cannot be stored.`,
+                code: 'no_secret_key',
+            });
+        }
+
+        const ad = await ifConnection(va._id);
+        const client = ifClientFor(ad);
+        if (!client.id) {
+            return res.status(409).json({
+                error: 'No Infinite Flight OAuth client is set up. Create one at infiniteflight.com/account/api-keys and paste its client ID here.',
+                code: 'no_client',
+            });
+        }
+
+        const redirectUri = ifRedirectUri(req);
+        if (!redirectUri) {
+            return res.status(500).json({ error: 'This server does not know its own public address. Set IF_OAUTH_REDIRECT_URI.' });
+        }
+        // A redirect URI that is not https is one Infinite Flight will refuse
+        // anyway (barring localhost, which is how somebody develops this), and
+        // catching it here says so in one sentence instead of as an opaque
+        // error on their consent screen.
+        if (!/^https:/i.test(redirectUri) && !/^http:\/\/localhost[:/]/i.test(redirectUri)) {
+            return res.status(500).json({ error: 'The Infinite Flight redirect URI has to be https. Set IF_OAUTH_REDIRECT_URI.' });
+        }
+
+        // What to ask for. Defaults to everything the crew center can use;
+        // `readOnly` gets a VA who only wants the fleet board a grant that
+        // cannot touch their schedules, which is a real thing to want and costs
+        // one flag.
+        const scopes = req.body?.readOnly ? ifLive.READ_SCOPES
+            : ifLive.normalizeScopes(req.body?.scopes || ifLive.DEFAULT_SCOPES);
+
+        const { verifier, challenge } = ifOAuth.pkce();
+        const state = ifOAuth.randomState();
+
+        // Where the browser lands afterwards. Constrained to our own crew center
+        // path and built here rather than taken from the request — a stored
+        // "where to go next" that a caller could set freely is an open redirect,
+        // and this one is handed to a third party who will follow it.
+        const returnTo = `${SITE_ORIGIN}/crew/${encodeURIComponent(String(va.slug || req.params.slug).toLowerCase())}`;
+
+        await CrewIfAuthState.create({
+            state,
+            verifier,
+            vaId: va._id,
+            slug: String(va.slug || req.params.slug).toLowerCase(),
+            startedBy: (gate.p && (gate.p.name || gate.p.username)) || '',
+            scopes,
+            clientId: client.id,
+            returnTo,
+        });
+
+        res.json({
+            url: ifOAuth.authorizeUrl({
+                clientId: client.id,
+                redirectUri,
+                scopes,
+                state,
+                challenge,
+                prompt: req.body?.forceConsent ? 'consent' : '',
+            }),
+            // Echoed so the connect screen can show what is about to be asked
+            // for, in words, before the VA is sent anywhere.
+            scopes,
+            scopeCatalog: ifLive.SCOPES,
+            redirectUri,
+            clientSource: client.source,
+            // Where the VA will actually be typing their password. Worth saying
+            // out loud on a screen that is about to send them off-site.
+            signInAt: ifOAuth.ISSUER,
+        });
+    } catch (err) { ifFail(res, err, { log: 'if connect error', message: 'Could not start the Infinite Flight sign-in.' }); }
+});
+
+/**
+ * Where Infinite Flight sends the browser back.
+ *
+ * PUBLIC by necessity — it is a navigation from Infinite Flight's own site,
+ * carrying none of our cookies — which is exactly why `state` does all the
+ * authentication here. The row it names says which VA this is, who started it
+ * and what the PKCE verifier was; without a row there is nothing to do but
+ * refuse.
+ *
+ * SINGLE USE. The row is deleted by the same call that reads it
+ * (findOneAndDelete), so a replayed callback finds nothing. An authorization
+ * code is single-use at Infinite Flight's end too, but relying on that would
+ * leave the verifier sitting here for anyone who could guess a state.
+ *
+ * Answers with a redirect rather than JSON in every case, success or failure:
+ * there is a human looking at this tab, and they should end up back in their
+ * crew center with a message, not at a page of braces.
+ */
+app.get('/api/crew/if/callback', async (req, res) => {
+    const fallbackHome = `${SITE_ORIGIN}/crew-centers.html`;
+    const back = (url, params) => {
+        const target = new URL(url);
+        for (const [k, v] of Object.entries(params)) if (v) target.searchParams.set(k, v);
+        return res.redirect(302, target.toString());
+    };
+
+    const state = String(req.query.state || '');
+    const code = String(req.query.code || '');
+
+    // The user pressed Deny, or Infinite Flight refused. Their `error` is
+    // carried back so the crew center can say which — but the state row is
+    // still consumed, because that flow is over either way.
+    const denied = String(req.query.error || '');
+
+    let row = null;
+    try {
+        if (state) row = await CrewIfAuthState.findOneAndDelete({ state }).lean();
+    } catch (err) {
+        console.warn('if callback state lookup failed —', err?.message || err);
+    }
+
+    if (!row) {
+        // No row: an expired flow, a replay, or somebody who was never part of
+        // this. All three get the same flat answer, deliberately — a helpful
+        // distinction here is a helpful distinction for whoever is probing.
+        return back(fallbackHome, { if: 'failed', reason: 'expired' });
+    }
+    // Constant-time, even though the lookup above was by exact match. Cheap, and
+    // it keeps the comparison honest if this ever becomes a scan.
+    if (!ifOAuth.safeEqual(state, row.state)) {
+        return back(fallbackHome, { if: 'failed', reason: 'state' });
+    }
+
+    const returnTo = /^https?:\/\//i.test(row.returnTo || '') && row.returnTo.startsWith(SITE_ORIGIN)
+        ? row.returnTo
+        : fallbackHome;
+
+    if (denied || !code) {
+        return back(returnTo, {
+            if: 'failed',
+            reason: denied === 'access_denied' ? 'denied' : (denied || 'no_code'),
+        });
+    }
+
+    try {
+        const ad = await ifConnection(row.vaId);
+        if (!ad) return back(returnTo, { if: 'failed', reason: 'gone' });
+        const client = ifClientFor(ad);
+        // The client that finishes the exchange must be the one that started
+        // it. A VA who changed their client mid-flow would otherwise send a
+        // code issued to one client with the credentials of another, and get a
+        // refusal that reads as a broken integration.
+        if (!client.id || (row.clientId && row.clientId !== client.id)) {
+            return back(returnTo, { if: 'failed', reason: 'client_changed' });
+        }
+
+        const tokens = await ifOAuth.exchangeCode({
+            clientId: client.id,
+            clientSecret: client.secret,
+            code,
+            redirectUri: ifRedirectUri(req),
+            verifier: row.verifier,
+        });
+
+        await ifStoreTokens(row.vaId, tokens, {
+            // What was granted, falling back to what we asked for only when the
+            // token response did not say — some servers omit `scope` when it
+            // matches the request exactly.
+            scopes: tokens.scopes || row.scopes || [],
+            connectedBy: row.startedBy,
+        });
+        ifInvalidate(row.vaId);
+
+        // Pick the organization for them when there is exactly one. An account
+        // with a single Live organization has no choice to make, and making
+        // them make it is a step that exists only because the API returns a
+        // list. More than one, and the panel asks.
+        let picked = '';
+        try {
+            const { token } = await ifTokenFor(row.vaId, { refresh: false });
+            const orgs = await ifOAuth.listOrganizations(token);
+            if (orgs.length === 1) {
+                await VirtualAirlineAd.updateOne({ _id: row.vaId }, {
+                    $set: {
+                        ifOrganizationId: orgs[0].id,
+                        ifOrganizationName: orgs[0].name,
+                        ifOrganizationWorld: orgs[0].worldType ? orgs[0].worldType.value : null,
+                    },
+                });
+                picked = orgs[0].name;
+            }
+        } catch (err) {
+            // Not fatal. The connection is made; the picker will ask.
+            console.warn('if callback org lookup skipped —', err?.message || err);
+        }
+
+        return back(returnTo, { if: 'connected', org: picked });
+    } catch (err) {
+        console.warn('if callback exchange failed —', err?.message || err);
+        await ifMarkFailed(row.vaId, err && err.message);
+        return back(returnTo, { if: 'failed', reason: 'exchange' });
+    }
+});
+
+/**
+ * Disconnect.
+ *
+ * Deletes OUR copy of the grant. It does not revoke it at Infinite Flight — we
+ * have no endpoint for that in this preview — and the reply says so plainly,
+ * because "forgotten" is not "revoked" and a VA who wants the authorization
+ * gone has one more thing to do. Same honesty the Supabase token deletion
+ * offers, for the same reason.
+ */
+app.delete('/api/crew/:slug/if/connection', async (req, res) => {
+    const gate = ifOwnerGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        await ifClearConnection(va._id);
+        ifInvalidate(va._id);
+        res.json({
+            ok: true,
+            notice: 'Disconnected here. To withdraw the authorization at Infinite Flight as well, remove this app from your Infinite Flight account.',
+            ...ifState(await ifConnection(va._id), { owner: true }),
+        });
+    } catch (err) { ifFail(res, err, { log: 'if disconnect error', message: 'Could not disconnect.' }); }
+});
+
+// --- Organizations ----------------------------------------------------------
+
+/** Every organization the connected account belongs to. */
+app.get('/api/crew/:slug/if/organizations', async (req, res) => {
+    const gate = ifStaffGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const { token } = await ifTokenFor(va._id);
+        const organizations = await ifCached(`${va._id}:orgs`, () => ifOAuth.listOrganizations(token));
+        const ad = await ifConnection(va._id);
+        res.json({ organizations, selectedId: (ad && ad.ifOrganizationId) || '' });
+    } catch (err) { ifFail(res, err, { log: 'if orgs error', message: 'Could not read your Infinite Flight organizations.' }); }
+});
+
+/** One organization. */
+app.get('/api/crew/:slug/if/organizations/:organizationId', async (req, res) => {
+    const gate = ifStaffGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const { token } = await ifTokenFor(va._id);
+        res.json({ organization: await ifOAuth.getOrganization(token, req.params.organizationId) });
+    } catch (err) { ifFail(res, err, { log: 'if org error', message: 'Could not read that organization.' }); }
+});
+
+/**
+ * Point this crew center at one organization.
+ *
+ * The name and world are read back from Infinite Flight rather than accepted
+ * from the request — a caller could otherwise store any label they liked
+ * against the id, and the label is what every screen shows.
+ */
+app.post('/api/crew/:slug/if/organization', async (req, res) => {
+    const gate = ifOwnerGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const organizationId = String(req.body?.organizationId || '').trim();
+        if (!organizationId) return res.status(400).json({ error: 'Which organization?' });
+        const { token } = await ifTokenFor(va._id);
+        const organization = await ifOAuth.getOrganization(token, organizationId);
+        if (!organization) return res.status(404).json({ error: 'Infinite Flight has no such organization for this account.' });
+        await VirtualAirlineAd.updateOne({ _id: va._id }, {
+            $set: {
+                ifOrganizationId: organization.id,
+                ifOrganizationName: organization.name,
+                ifOrganizationWorld: organization.worldType ? organization.worldType.value : null,
+                // The chosen aircraft belonged to the previous organization and
+                // means nothing in this one. Cleared rather than left to point
+                // at an aeroplane in somebody else's fleet.
+                ifSyncAircraftId: '',
+            },
+        });
+        ifInvalidate(va._id);
+        res.json({ ok: true, organization, ...ifState(await ifConnection(va._id), { owner: true }) });
+    } catch (err) { ifFail(res, err, { log: 'if org select error', message: 'Could not select that organization.' }); }
+});
+
+// --- The fleet --------------------------------------------------------------
+
+/** The organization's aircraft, in fleet order. */
+app.get('/api/crew/:slug/if/aircraft', async (req, res) => {
+    const gate = ifStaffGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const ad = await ifConnection(va._id);
+        const organizationId = ifOrgFor(req, ad);
+        if (!organizationId) return res.status(409).json({ error: 'Pick an Infinite Flight organization first.', code: 'no_organization' });
+        const { token } = await ifTokenFor(va._id);
+        const aircraft = await ifFleet(va._id, token, organizationId);
+        res.json({ aircraft, organizationId, summary: ifFleetSummary(aircraft) });
+    } catch (err) { ifFail(res, err, { log: 'if fleet error', message: 'Could not read the fleet.' }); }
+});
+
+/**
+ * The fleet with every aircraft's last position attached.
+ *
+ * One request instead of one per aeroplane, because a fleet board wants all of
+ * them and a browser issuing forty parallel fetches against a rate-limited API
+ * is how a VA ends up looking at a wall of 429s.
+ *
+ * Bounded concurrency, and each position failing on its own: an aeroplane whose
+ * position endpoint is unhappy appears on the board without a pin, which is the
+ * truth, rather than taking the board down with it.
+ */
+app.get('/api/crew/:slug/if/fleet', async (req, res) => {
+    const gate = ifStaffGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const ad = await ifConnection(va._id);
+        const organizationId = ifOrgFor(req, ad);
+        if (!organizationId) return res.status(409).json({ error: 'Pick an Infinite Flight organization first.', code: 'no_organization' });
+        const { token, scopes } = await ifTokenFor(va._id);
+
+        const aircraft = await ifFleet(va._id, token, organizationId);
+        const withPositions = req.query.positions !== '0' && scopes.includes('live:aircraft.read');
+        const positions = withPositions
+            ? await ifCached(`${va._id}:positions:${organizationId}`, () => ifPositions(token, aircraft))
+            : {};
+
+        res.json({
+            organizationId,
+            aircraft: aircraft.map((a) => ({ ...a, position: positions[a.id] || null })),
+            summary: ifFleetSummary(aircraft, positions),
+            // Sent so the board can show its own freshness rather than guessing
+            // at it — these positions are "last persisted", not live telemetry.
+            readAt: new Date().toISOString(),
+        });
+    } catch (err) { ifFail(res, err, { log: 'if fleet board error', message: 'Could not read the fleet.' }); }
+});
+
+/**
+ * Put a TYPE NAME on every aircraft in a Live fleet.
+ *
+ * PublicApi v3 hands back `aircraftId`, which the preview describes as "the
+ * Infinite Flight aircraft or livery content identifier" — a UUID, and
+ * deliberately vague about which of the two it is. On its own that is unusable:
+ * a fleet board can show "N682XL" and nothing about what N682XL actually is.
+ *
+ * We already resolve exactly these UUIDs for live flights (resolveFlightNames),
+ * against the aircraft/livery catalogue the ACARS service publishes. Same
+ * lookup, same cache, both maps tried because the id may be either kind.
+ *
+ * NEVER FATAL. The catalogue is a third party's and may be down; a fleet board
+ * that refused to draw because it could not name a type would be trading
+ * something useful for something cosmetic. A type it cannot resolve comes back
+ * empty, and the front-end draws a generic silhouette — which is why the image
+ * chain there has a tier that needs no network at all.
+ */
+async function ifWithTypes(aircraft) {
+    const list = Array.isArray(aircraft) ? aircraft : [];
+    if (!list.length) return list;
+    let meta;
+    try { meta = await loadAircraftMetadata(); } catch { return list; }
+    return list.map((a) => {
+        const { aircraftName, liveryName } = resolveFlightNames(
+            { aircraftId: a.aircraftId, liveryId: a.aircraftId }, meta,
+        );
+        return {
+            ...a,
+            // Absent rather than an empty object when nothing resolved, so a
+            // caller can tell "we don't know what this is" from "it's a 787
+            // with no livery recorded".
+            type: aircraftName ? { name: aircraftName, livery: liveryName || '' } : null,
+        };
+    });
+}
+
+/**
+ * The organization's fleet: cached, and with every aircraft's type resolved.
+ *
+ * One function rather than the same two lines at five call sites — which is not
+ * tidiness but correctness. The cache key and the enrichment have to agree, and
+ * a sixth caller that remembered the cache and forgot the types would produce a
+ * fleet board where some aircraft have a silhouette and some do not, depending
+ * on which screen happened to warm the cache first.
+ */
+const ifFleet = (vaId, token, organizationId) => ifCached(
+    `${vaId}:fleet:${organizationId}`,
+    () => ifOAuth.listAircraft(token, organizationId).then(ifWithTypes),
+);
+
+/**
+ * Positions for a list of aircraft, a few at a time.
+ *
+ * Six in flight at once. High enough that a forty-aircraft fleet resolves in
+ * about seven rounds rather than forty, low enough not to look like an attack
+ * to a rate limiter whose limits are undocumented. A failure is recorded as a
+ * missing position, never as a thrown call — see the note on the route above.
+ */
+async function ifPositions(token, aircraft, concurrency = 6) {
+    const out = {};
+    const queue = aircraft.slice();
+    const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+        for (;;) {
+            const next = queue.shift();
+            if (!next) return;
+            try { out[next.id] = await ifOAuth.getPosition(token, next.id); } catch { out[next.id] = null; }
+        }
+    });
+    await Promise.all(workers);
+    return out;
+}
+
+/**
+ * The fleet in four numbers, computed here so three front-ends do not each
+ * write their own arithmetic and disagree about what "in storage" means.
+ */
+function ifFleetSummary(aircraft, positions) {
+    const list = Array.isArray(aircraft) ? aircraft : [];
+    // "We did not look" and "we looked and none are flying" are different
+    // facts, and both come out as 0 if this counts an absent positions map as
+    // an empty one. A fleet endpoint that skipped the position lookup reports
+    // `airborne: null`, and the board leaves the tile blank rather than
+    // claiming the whole fleet is on the ground.
+    const counted = !!positions;
+    let airborne = 0;
+    for (const a of list) {
+        const p = counted ? positions[a.id] : null;
+        // Only from a position that is not stale: "in flight" derived from a
+        // reading four hours old is a claim, not a fact.
+        if (p && p.state && p.state.name === 'InFlight' && !p.stale) airborne += 1;
+    }
+    return {
+        total: list.length,
+        active: list.filter((a) => a.storage === 'active').length,
+        storage: list.filter((a) => a.storage === 'storage').length,
+        hangared: list.filter((a) => a.storage === 'hangared').length,
+        airborne: counted ? airborne : null,
+    };
+}
+
+/**
+ * The fleet, reduced to what a picker needs.
+ *
+ * Exists because the crew center's own schedule editor wants to offer "which
+ * aeroplane?" and should not have to understand the Live connection to do it.
+ * So this answers **200 with an empty list** for a crew center that has not
+ * connected an organization, has no grant, or whose grant has expired — rather
+ * than the 409 the fleet endpoints correctly return. The editor's question is
+ * "what may I offer?", and "nothing" is a perfectly good answer to it; making a
+ * schedule form handle three failure codes to draw one dropdown would put the
+ * whole Live integration in the path of an unrelated feature.
+ *
+ * Deliberately narrow: id, registration and whether the aeroplane is in the
+ * active fleet. No positions, no fleet priorities, nothing that costs a second
+ * round trip per aircraft.
+ */
+app.get('/api/crew/:slug/if/airframes', async (req, res) => {
+    const gate = ifStaffGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const ad = await ifConnection(va._id);
+        if (!ad || !ad.ifConnectedAt || !ad.ifOrganizationId) return res.json({ airframes: [], connected: false });
+        const { token } = await ifTokenFor(va._id);
+        const aircraft = await ifFleet(va._id, token, ad.ifOrganizationId);
+        res.json({
+            connected: true,
+            airframes: aircraft.map((a) => ({
+                id: a.id,
+                registration: a.registration,
+                type: a.type || null,
+                // Offered but marked, not hidden: a VA may well schedule an
+                // aeroplane they are about to bring out of storage, and a
+                // picker that silently omits it looks broken to the one person
+                // who knows it exists.
+                inFleet: a.storage === 'active',
+                storage: a.storage,
+            })),
+        });
+    } catch (err) {
+        // Same reasoning as the empty list above: a Live connection having a
+        // bad minute must not stop a VA scheduling flights.
+        if (err instanceof ifOAuth.IfAuthError || err instanceof ifOAuth.IfApiError) {
+            return res.json({ airframes: [], connected: false, unavailable: true });
+        }
+        ifFail(res, err, { log: 'if airframes error', message: 'Could not read the fleet.' });
+    }
+});
+
+/** One aircraft, its last position and its rota, in a single answer. */
+app.get('/api/crew/:slug/if/aircraft/:aircraftId', async (req, res) => {
+    const gate = ifStaffGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const { token, scopes } = await ifTokenFor(va._id);
+        const detail = await ifOAuth.aircraftDetail(token, req.params.aircraftId, {
+            position: scopes.includes('live:aircraft.read'),
+            schedules: scopes.includes('live:schedules.read'),
+        });
+        res.json(detail);
+    } catch (err) { ifFail(res, err, { log: 'if aircraft error', message: 'Could not read that aircraft.' }); }
+});
+
+/**
+ * What every aeroplane in the fleet is actually doing.
+ *
+ * The question this answers is the expensive one a VA cannot otherwise ask:
+ * which of my aircraft is nobody using? An airframe sitting unflown for three
+ * weeks that everybody assumes somebody else is on is invisible in a rota
+ * viewed one aeroplane at a time, and it is exactly what a fleet board should
+ * surface.
+ *
+ * COSTS ONE CALL PER AIRCRAFT, so it is not on the fleet board's refresh path —
+ * it is its own tab, loaded when somebody asks for it, and shares the cache
+ * with the schedule tab (same keys) so opening one after the other is free.
+ *
+ * A rota that fails to load is reported as UNKNOWN rather than as an empty one.
+ * The difference matters more here than anywhere else in this integration:
+ * "this aircraft has nothing scheduled" is the headline finding, and producing
+ * it from a failed read would have a VA go looking for a problem that is not
+ * there.
+ */
+app.get('/api/crew/:slug/if/utilisation', async (req, res) => {
+    const gate = ifStaffGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const ad = await ifConnection(va._id);
+        const organizationId = ifOrgFor(req, ad);
+        if (!organizationId) return res.status(409).json({ error: 'Pick an Infinite Flight organization first.', code: 'no_organization' });
+        const { token, scopes } = await ifTokenFor(va._id);
+        if (!scopes.includes('live:schedules.read')) {
+            return res.status(403).json({
+                error: 'This connection wasn’t granted permission to read schedules, so the fleet’s workload can’t be worked out.',
+                code: 'no_schedule_scope',
+            });
+        }
+
+        const aircraft = await ifFleet(va._id, token, organizationId);
+
+        // Same bounded concurrency and same per-aircraft isolation as the
+        // position sweep: one aeroplane's rota failing must leave the other
+        // thirty-nine reported, marked unknown rather than empty.
+        const rotas = {};
+        const queue = aircraft.slice();
+        await Promise.all(Array.from({ length: Math.min(6, queue.length) }, async () => {
+            for (;;) {
+                const next = queue.shift();
+                if (!next) return;
+                try {
+                    rotas[next.id] = await ifCached(`${va._id}:sched:${next.id}`,
+                        () => ifOAuth.listSchedules(token, next.id));
+                } catch { rotas[next.id] = null; }
+            }
+        }));
+
+        res.json({
+            organizationId,
+            ...ifLive.fleetUtilisation(aircraft, rotas),
+            readAt: new Date().toISOString(),
+        });
+    } catch (err) { ifFail(res, err, { log: 'if utilisation error', message: 'Could not work out the fleet’s workload.' }); }
+});
+
+/** Just the position, for a board that is refreshing pins and nothing else. */
+app.get('/api/crew/:slug/if/aircraft/:aircraftId/position', async (req, res) => {
+    const gate = ifStaffGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const { token } = await ifTokenFor(va._id);
+        res.json({ position: await ifOAuth.getPosition(token, req.params.aircraftId) });
+    } catch (err) { ifFail(res, err, { log: 'if position error', message: 'Could not read that aircraft’s position.' }); }
+});
+
+// --- Schedules --------------------------------------------------------------
+
+/**
+ * An aircraft's rota, in sequence.
+ *
+ * Carries `linked` alongside: which of these Infinite Flight schedules this
+ * crew center already has a departure for. That is what lets the panel show a
+ * pushed leg as pushed rather than offering to push it again, and it is looked
+ * up here because only the backend can see both databases.
+ */
+app.get('/api/crew/:slug/if/aircraft/:aircraftId/schedules', async (req, res) => {
+    const gate = ifStaffGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const { token } = await ifTokenFor(va._id);
+        const schedules = await ifOAuth.listSchedules(token, req.params.aircraftId);
+        res.json({
+            schedules,
+            aircraftId: req.params.aircraftId,
+            // The link map is a decoration on somebody else's data, so the VA's
+            // own store is opened separately and allowed to be absent. A crew
+            // center that has not connected a project at all still gets its
+            // aircraft's rota — refusing it because we could not check for
+            // links would make a Live feature depend on a database it does not
+            // read from.
+            linked: await ifLinkMap(await crewStore.forVaOrNull(va), schedules),
+            canWrite: !(await ifWriteGate(req, req.params.slug)).error,
+        });
+    } catch (err) { ifFail(res, err, { log: 'if schedules error', message: 'Could not read that aircraft’s schedule.' }); }
+});
+
+/**
+ * Which of these Infinite Flight schedules the crew center already knows about.
+ *
+ * Best-effort: a project on a pre-v13 schema has no if_schedule_id column, so
+ * the read fails and the answer is "none linked" — which is honest for a
+ * database that cannot record a link, and leaves every other part of the panel
+ * working. Never allowed to fail the route it decorates.
+ */
+async function ifLinkMap(store, schedules) {
+    const ids = (schedules || []).map((s) => s.id).filter(Boolean);
+    if (!store || !ids.length) return {};
+    try {
+        const rows = await store.listSchedules({ limit: 500 });
+        const out = {};
+        for (const row of rows || []) {
+            if (row.ifScheduleId && ids.includes(row.ifScheduleId)) {
+                out[row.ifScheduleId] = {
+                    id: row._id,
+                    flightNumber: row.flightNumber,
+                    status: row.status,
+                    syncedAt: row.ifSyncedAt || null,
+                };
+            }
+        }
+        return out;
+    } catch (err) {
+        console.warn('if link map skipped —', err?.message || err);
+        return {};
+    }
+}
+
+/** Add a leg to the end of an aircraft's rota. */
+app.post('/api/crew/:slug/if/aircraft/:aircraftId/schedules', async (req, res) => {
+    const gate = await ifWriteGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        // Validated here so a mistyped time is a sentence next to the field
+        // rather than an errorCode two seconds later. ifLive is deliberately no
+        // stricter than Infinite Flight, so this can only refuse what they
+        // would have refused.
+        const out = ifLive.scheduleRequest(req.body);
+        if (!out.ok) return res.status(400).json({ error: out.reason, field: out.field });
+        const { token } = await ifTokenFor(va._id);
+        const schedule = await ifOAuth.createSchedule(token, req.params.aircraftId, out.value);
+        res.status(201).json({ schedule });
+    } catch (err) { ifFail(res, err, { log: 'if schedule create error', message: 'Could not add that flight.' }); }
+});
+
+/** Change a leg. Same body as create — the API takes a whole ScheduleRequest. */
+app.put('/api/crew/:slug/if/schedules/:scheduleId', async (req, res) => {
+    const gate = await ifWriteGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const out = ifLive.scheduleRequest(req.body);
+        if (!out.ok) return res.status(400).json({ error: out.reason, field: out.field });
+        const { token } = await ifTokenFor(va._id);
+        res.json({ schedule: await ifOAuth.updateSchedule(token, req.params.scheduleId, out.value) });
+    } catch (err) { ifFail(res, err, { log: 'if schedule update error', message: 'Could not save that flight.' }); }
+});
+
+/**
+ * Replace just the flight plan.
+ *
+ * Its own endpoint upstream, and worth keeping as its own here: re-planning a
+ * leg through the full update would mean sending every other field back, and a
+ * client that got one of them slightly wrong would silently rewrite the
+ * departure time while changing a route.
+ */
+app.put('/api/crew/:slug/if/schedules/:scheduleId/flightplan', async (req, res) => {
+    const gate = await ifWriteGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const out = ifLive.flightPlanRequest(req.body);
+        if (!out.ok) return res.status(400).json({ error: out.reason, field: out.field });
+        const { token } = await ifTokenFor(va._id);
+        const schedule = await ifOAuth.updateFlightPlan(token, req.params.scheduleId, out.value.flightPlan);
+        res.json({ schedule, cleared: out.cleared });
+    } catch (err) { ifFail(res, err, { log: 'if flightplan error', message: 'Could not save the flight plan.' }); }
+});
+
+/**
+ * Reorder the rota.
+ *
+ * Takes the whole arrangement — the order the list is in after a drag — and
+ * turns it into the sequence of single moves the API actually offers. See
+ * ifLive.reorderPlan for why it is n moves and not the theoretical minimum.
+ *
+ * The current list is read first, because the plan drops schedules that cannot
+ * be reordered ("Only schedules with status Scheduled or InFlight are
+ * reordered") rather than spending a call on each to be told so.
+ */
+app.post('/api/crew/:slug/if/aircraft/:aircraftId/schedules/order', async (req, res) => {
+    const gate = await ifWriteGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const ids = Array.isArray(req.body?.ids) ? req.body.ids.slice(0, 200).map(String) : [];
+        if (!ids.length) return res.status(400).json({ error: 'Send the order you want.' });
+        const { token } = await ifTokenFor(va._id);
+        const current = await ifOAuth.listSchedules(token, req.params.aircraftId);
+        const result = await ifOAuth.applyOrder(token, req.params.aircraftId, ids, current);
+        // The list as it now stands, so the page paints from the server's answer
+        // rather than from the order it hoped for.
+        const schedules = await ifOAuth.listSchedules(token, req.params.aircraftId);
+        res.json({ ...result, schedules });
+    } catch (err) { ifFail(res, err, { log: 'if reorder error', message: 'Could not save the order.' }); }
+});
+
+/**
+ * Remove a leg.
+ *
+ * The crew center's own departure, if one is linked to it, is NOT deleted — its
+ * link is cleared instead. A VA's schedule row has bookings hanging off it and
+ * pilots who have taken those seats; deleting it because somebody tidied up the
+ * Infinite Flight rota would take a pilot's booked flight away without telling
+ * them.
+ */
+app.delete('/api/crew/:slug/if/schedules/:scheduleId', async (req, res) => {
+    const gate = await ifWriteGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const { token } = await ifTokenFor(va._id);
+        await ifOAuth.deleteSchedule(token, req.params.scheduleId);
+        let unlinked = 0;
+        try {
+            const rows = await store.listSchedules({ limit: 500 });
+            for (const row of rows || []) {
+                if (row.ifScheduleId === req.params.scheduleId) {
+                    await store.updateSchedule(row._id, { ifScheduleId: '', ifAircraftId: '', ifSyncedAt: null });
+                    unlinked += 1;
+                }
+            }
+        } catch (err) { console.warn('if unlink after delete skipped —', err?.message || err); }
+        res.json({ ok: true, unlinked });
+    } catch (err) { ifFail(res, err, { log: 'if schedule delete error', message: 'Could not remove that flight.' }); }
+});
+
+// --- The bridge to the crew center's own schedule ----------------------------
+//
+// A crew center already publishes a week of departures. Infinite Flight now has
+// a rota per aircraft. These are different objects — one has seats and a rank
+// gate, the other has a sequence and a real aeroplane — and the two routes below
+// move data between them without pretending otherwise.
+
+/** Which aircraft the sync writes to, and whether it is on at all. */
+app.post('/api/crew/:slug/if/sync', async (req, res) => {
+    const gate = await ifWriteGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        const $set = {};
+        if (req.body?.enabled !== undefined) $set.ifSyncSchedules = !!req.body.enabled;
+        if (req.body?.aircraftId !== undefined) $set.ifSyncAircraftId = String(req.body.aircraftId || '').trim().slice(0, 64);
+        await VirtualAirlineAd.updateOne({ _id: va._id }, { $set });
+
+        // Turning the switch on with no default aircraft is now a legitimate
+        // setup, not an error: a VA that assigns an airframe to each departure
+        // wants exactly that and nothing else. It used to be refused, back when
+        // the default was the only way to say where a leg went.
+        //
+        // It is still worth a word, because it is ALSO what an incomplete setup
+        // looks like — a switch that is on and, for most of the week, does
+        // nothing. So the reply says which of the two it is rather than leaving
+        // the VA to find out by publishing something.
+        const ad = await ifConnection(va._id);
+        const bare = ad && ad.ifSyncSchedules && !ad.ifSyncAircraftId;
+        res.json({
+            ok: true,
+            ...(bare ? {
+                notice: 'Only departures with an aircraft assigned to them will be sent. Set a default aircraft to send the rest as well.',
+            } : {}),
+            ...ifState(ad, { owner: true }),
+        });
+    } catch (err) { ifFail(res, err, { log: 'if sync settings error', message: 'Could not save the sync settings.' }); }
+});
+
+/**
+ * Push the crew center's published departures onto an aircraft's Infinite
+ * Flight rota.
+ *
+ * WHAT IT SENDS. Published, upcoming departures — never drafts (staff have not
+ * finished with them) and never cancelled ones (the point of cancelling is that
+ * it is not flying). A departure that has been pushed before is UPDATED using
+ * the id it was given, which is what stops the second push putting the same leg
+ * on the aeroplane twice.
+ *
+ * WHAT IT DOES NOT DO. It does not delete. A leg that has gone from the crew
+ * center's week is left alone in Infinite Flight, because "this disappeared
+ * from one list" is not enough to justify removing a flight from somebody's
+ * aircraft — and a bug in this loop that deleted would be very expensive and
+ * very quiet. Removing is a deliberate act on the panel.
+ *
+ * Serially, and best-effort per departure: a leg Infinite Flight refuses is
+ * reported by name and the rest still go.
+ */
+app.post('/api/crew/:slug/if/push', async (req, res) => {
+    const gate = await ifWriteGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const ad = await ifConnection(va._id);
+        const aircraftId = String(req.body?.aircraftId || (ad && ad.ifSyncAircraftId) || '').trim();
+        if (!aircraftId) return res.status(400).json({ error: 'Choose which aircraft to push to.' });
+
+        const wanted = Array.isArray(req.body?.scheduleIds)
+            ? new Set(req.body.scheduleIds.slice(0, 200).map(String))
+            : null;
+
+        const rows = (await store.listSchedules({ status: 'published', upcomingOnly: true, limit: 200 }))
+            .filter((r) => !wanted || wanted.has(String(r._id)));
+        if (!rows.length) return res.json({ ok: true, pushed: 0, updated: 0, skipped: [], failures: [] });
+
+        const { token } = await ifTokenFor(va._id);
+        const flightType = ifLive.enumValue(ifLive.FLIGHT_TYPE, req.body?.flightType, 1);
+
+        let pushed = 0; let updated = 0;
+        const failures = []; const skipped = []; let linkDrift = false;
+
+        for (const row of rows) {
+            const built = ifLive.fromCrewSchedule(row, { flightType });
+            if (!built.ok) {
+                // A departure the crew center is happy with but Infinite Flight
+                // would not accept — most often one with no arrival time and no
+                // block time, because ours are optional and theirs are not.
+                skipped.push({ id: row._id, flightNumber: row.flightNumber, reason: built.reason });
+                continue;
+            }
+            try {
+                let schedule;
+                if (row.ifScheduleId) {
+                    schedule = await ifOAuth.updateSchedule(token, row.ifScheduleId, built.value);
+                    updated += 1;
+                } else {
+                    schedule = await ifOAuth.createSchedule(token, aircraftId, built.value);
+                    pushed += 1;
+                }
+                try {
+                    await store.updateSchedule(row._id, {
+                        ifScheduleId: schedule && schedule.id ? schedule.id : row.ifScheduleId,
+                        ifAircraftId: aircraftId,
+                        ifSyncedAt: new Date(),
+                    });
+                } catch (err) {
+                    // The leg is on the aeroplane; we just cannot write down
+                    // that it is. Surfaced rather than swallowed, because the
+                    // consequence is a duplicate on the next push.
+                    console.warn('if push link write failed —', err?.message || err);
+                    linkDrift = true;
+                }
+            } catch (err) {
+                failures.push({ id: row._id, flightNumber: row.flightNumber, error: err.message });
+                // A rate limit will refuse the rest just as firmly. Stop, and
+                // say how far we got, rather than burning through the list.
+                if (err instanceof ifOAuth.IfApiError && err.status === 429) break;
+            }
+        }
+
+        await VirtualAirlineAd.updateOne({ _id: va._id }, { $set: { ifSyncedAt: new Date() } });
+        const drift = driftWarning(store);
+        res.json({
+            ok: true, pushed, updated, skipped, failures, aircraftId,
+            // Two different warnings, and they mean different things: `drift` is
+            // "your project is on an old schema", `linkDrift` is "we pushed and
+            // could not record it", which is the one that causes duplicates.
+            ...(drift ? { warning: drift, code: 'store_schema_outdated' } : {}),
+            ...(linkDrift && !drift ? {
+                warning: 'Sent to Infinite Flight, but this crew center could not record which flights were sent — pushing again may duplicate them.',
+            } : {}),
+        });
+    } catch (err) { ifFail(res, err, { log: 'if push error', message: 'Could not push the schedule.' }); }
+});
+
+/**
+ * Pull an aircraft's Infinite Flight rota into the crew center as departures.
+ *
+ * Imported as DRAFTS, always. A schedule appearing in the crew center is a
+ * schedule pilots can book; publishing it is a decision staff make, not one an
+ * import makes for them.
+ *
+ * Legs already linked to a crew departure are updated in place rather than
+ * duplicated — the same id-matching the push uses, from the other direction —
+ * and the fields that are the crew center's own (seats, rank gate, status,
+ * bookings) are never touched by an import. That is why ifLive.toCrewSchedule
+ * returns only the fields that mean the same thing on both sides.
+ */
+app.post('/api/crew/:slug/if/pull', async (req, res) => {
+    const gate = await ifWriteGate(req, req.params.slug);
+    if (gate.error) return res.status(gate.error).json({ error: gate.message });
+    try {
+        const { va, store } = await resolveCrewStore(req.params.slug);
+        const ad = await ifConnection(va._id);
+        const aircraftId = String(req.body?.aircraftId || (ad && ad.ifSyncAircraftId) || '').trim();
+        if (!aircraftId) return res.status(400).json({ error: 'Which aircraft’s schedule?' });
+
+        const { token } = await ifTokenFor(va._id);
+        const schedules = await ifOAuth.listSchedules(token, aircraftId);
+        if (!schedules.length) return res.json({ ok: true, imported: 0, updated: 0, skipped: 0 });
+
+        const existing = new Map();
+        try {
+            for (const row of await store.listSchedules({ limit: 500 })) {
+                if (row.ifScheduleId) existing.set(row.ifScheduleId, row);
+            }
+        } catch (err) { console.warn('if pull existing lookup skipped —', err?.message || err); }
+
+        let imported = 0; let updatedCount = 0; let skipped = 0;
+        const failures = [];
+        for (const s of schedules) {
+            // A cancelled leg is not something to put in front of pilots as a
+            // bookable draft.
+            if (s.status && s.status.name === 'Cancelled') { skipped += 1; continue; }
+            const fields = ifLive.toCrewSchedule(s);
+            try {
+                const hit = existing.get(s.id);
+                if (hit) {
+                    await store.updateSchedule(hit._id, {
+                        ...fields, ifAircraftId: aircraftId, ifSyncedAt: new Date(),
+                    });
+                    updatedCount += 1;
+                } else {
+                    await store.createSchedule({
+                        ...fields,
+                        aircraft: req.body?.aircraftLabel ? String(req.body.aircraftLabel).slice(0, 60) : '',
+                        seats: 1,
+                        status: 'draft',
+                        createdBy: (gate.p && gate.p.name) || 'Infinite Flight',
+                        ifAircraftId: aircraftId,
+                        ifSyncedAt: new Date(),
+                    });
+                    imported += 1;
+                }
+            } catch (err) {
+                failures.push({ id: s.id, callsign: s.callsign, error: err.message });
+            }
+        }
+
+        const drift = driftWarning(store);
+        res.json({
+            ok: true, imported, updated: updatedCount, skipped, failures, aircraftId,
+            ...(drift ? { warning: drift, code: 'store_schema_outdated' } : {}),
+        });
+    } catch (err) { ifFail(res, err, { log: 'if pull error', message: 'Could not import the schedule.' }); }
+});
+
+/* ---------------------------------------------------------------------------
+ * Keeping one aeroplane's rota in step, without anybody pressing anything
+ *
+ * The manual push above is the bulk operation: "send my week". This is the
+ * per-departure half — a leg published in the crew center appears on the
+ * aircraft's Infinite Flight rota, an edit follows it, and cancelling or
+ * deleting it takes it back off.
+ *
+ * TWO SEPARATE CONSENTS, AND THEY ANSWER DIFFERENT QUESTIONS.
+ *
+ *   assigning an airframe   says WHICH aeroplane this departure is flown by.
+ *                           On its own it is a label: pilots see "you're on
+ *                           N682XL" and nothing is written to Infinite Flight.
+ *   the sync switch         says WHETHER we may write to that aeroplane's real
+ *                           rota. Off by default.
+ *
+ * Keeping them apart matters because the first is a thing a VA does constantly
+ * while building a week, and treating it as permission to start editing their
+ * live fleet would be a surprise nobody asked for. A VA that never turns the
+ * switch on gets the registration on every departure and an untouched rota.
+ *
+ * WHY CANCELLING DELETES WHEN A PUSH NEVER DOES. The bulk push deliberately
+ * leaves alone anything that has merely gone from its list: "it stopped
+ * matching my query" is not evidence, and a bug in that loop would quietly
+ * strip somebody's aircraft. Cancelling or deleting a departure is not that.
+ * It is a person deciding, about one flight, that it is not happening — so the
+ * leg comes off the aeroplane, which is the only reading of that action that
+ * makes sense.
+ *
+ * NOTHING HERE MAY FAIL A REQUEST. Every call is fire-and-forget with its own
+ * catch, in the mould of postScheduleNotice above. A VA's schedule is theirs
+ * and lives in their database; Infinite Flight being slow, rate-limiting us or
+ * refusing a scope must never turn "publish this departure" into an error. What
+ * it produces instead is a log line and an unsynced row, which the panel shows.
+ * ------------------------------------------------------------------------ */
+async function syncScheduleToIf(va, action, schedule, store) {
+    if (!va || !schedule) return;
+    try {
+        const ad = await ifConnection(va._id);
+        if (!ad || !ad.ifConnectedAt || !ad.ifSyncSchedules) return;
+        if (!ifLive.canWriteSchedules(ad.ifScopes || [])) return;
+
+        // The departure's own airframe first, the VA's default second. A
+        // departure with neither is not going anywhere and is not an error —
+        // most of a VA's week may be unassigned, and that is a normal state.
+        const aircraftId = String(schedule.ifAircraftId || ad.ifSyncAircraftId || '').trim();
+        if (!aircraftId) return;
+
+        const linkedId = String(schedule.ifScheduleId || '').trim();
+
+        if (action === 'cancelled' || action === 'removed') {
+            if (!linkedId) return;
+            const { token } = await ifTokenFor(va._id);
+            await ifOAuth.deleteSchedule(token, linkedId);
+            // Only when the row still exists. A deleted departure has nothing
+            // left to unlink, and updating it would recreate it on some stores.
+            if (action === 'cancelled' && store) {
+                await store.updateSchedule(schedule._id, { ifScheduleId: '', ifSyncedAt: null }).catch(() => {});
+            }
+            ifInvalidate(va._id);
+            return;
+        }
+
+        // Anything else is a push. Only published departures: a draft is staff
+        // still working, and putting one on a real aeroplane would be acting on
+        // a decision they have not made.
+        if (schedule.status !== 'published') return;
+
+        const built = ifLive.fromCrewSchedule(schedule);
+        if (!built.ok) {
+            // Most often a departure with no arrival and no block time — ours
+            // are optional, theirs are not. Logged rather than surfaced: the
+            // panel already reports these by name on a manual push, which is
+            // where somebody is actually looking for an answer.
+            console.warn('if sync skipped —', built.reason);
+            return;
+        }
+
+        const { token } = await ifTokenFor(va._id);
+        const saved = linkedId
+            ? await ifOAuth.updateSchedule(token, linkedId, built.value)
+            : await ifOAuth.createSchedule(token, aircraftId, built.value);
+
+        if (store && saved && saved.id) {
+            await store.updateSchedule(schedule._id, {
+                ifScheduleId: saved.id,
+                ifAircraftId: aircraftId,
+                ifSyncedAt: new Date(),
+            }).catch((err) => {
+                // Pushed but not recorded. This is the one failure worth a loud
+                // log: the next publish will not find a link and will add the
+                // same leg to the aeroplane a second time.
+                console.warn('if sync wrote to Infinite Flight but could not record the link —', err?.message || err);
+            });
+        }
+        ifInvalidate(va._id);
+    } catch (err) {
+        // A schedule the VA can see and Infinite Flight has not been told
+        // about. Recoverable by hand from the panel, so this is a log and not
+        // an escalation.
+        console.warn(`if sync (${action}) skipped —`, err?.message || err);
+    }
+}
+
+/**
+ * The same, detached from the request that caused it.
+ *
+ * The caller is a route that has already done the thing the VA asked for. The
+ * reply should not wait on a third party to hear about it, and must not change
+ * because that third party said no.
+ */
+const syncScheduleToIfLater = (va, action, schedule, store) => {
+    syncScheduleToIf(va, action, schedule, store).catch(() => {});
+};
+
+/**
+ * The pilot's view: what the airline is flying, without the controls.
+ *
+ * For any signed-in member of the crew — a pilot opening their crew center
+ * should be able to see the fleet they fly and where those aeroplanes are,
+ * which until now was a thing only the Live portal knew. Staff-only detail
+ * (fleet priority, the connection's own state) is not on it, and neither is any
+ * write.
+ *
+ * The VA's stored grant is what reads this, which is correct and worth being
+ * explicit about: the data is the VA's own organization, the VA connected it
+ * deliberately, and showing their own crew their own fleet is what they
+ * connected it FOR. A pilot never gets a token, never reaches the API directly,
+ * and cannot address any organization but the one their VA selected.
+ */
+app.get('/api/crew/:slug/if/board', async (req, res) => {
+    try {
+        // resolveCrewVa, not resolveCrewStore: this board reads Infinite Flight
+        // and never the VA's own database, so a crew center that has not
+        // connected a Supabase project must still be able to show its fleet.
+        const va = await resolveCrewVa(req.params.slug);
+        if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+        // Signed-in crew, staff, or Inflight. Not the public: a VA's fleet
+        // movements are theirs, and this is inside the crew center for a reason.
+        const p = verifyCrewRequest(req);
+        if (!p) return res.status(401).json({ error: 'Sign in to see the fleet.' });
+        // The slug check covers EVERY kind of token except Inflight oversight,
+        // not just a pilot's. A VA staff login is a valid crew token too, and
+        // scoping this to `kind === 'crew'` would let one VA's staff read
+        // another VA's fleet movements — the same rule crewCanManage applies,
+        // for the same reason.
+        if (p.kind !== 'inflight' && p.slug && p.slug !== String(req.params.slug).toLowerCase()) {
+            return res.status(403).json({ error: 'Wrong crew center.' });
+        }
+        const ad = await ifConnection(va._id);
+        if (!ad || !ad.ifConnectedAt || !ad.ifOrganizationId) {
+            // Not an error. A crew center that has not connected one simply has
+            // no board, and the pilot page draws nothing rather than an
+            // apology.
+            return res.json({ connected: false, aircraft: [], departures: [] });
+        }
+
+        const { token, scopes } = await ifTokenFor(va._id);
+        const aircraft = await ifFleet(va._id, token, ad.ifOrganizationId);
+        const positions = scopes.includes('live:aircraft.read')
+            ? await ifCached(`${va._id}:positions:${ad.ifOrganizationId}`, () => ifPositions(token, aircraft))
+            : {};
+
+        // The next few departures across the fleet, when the grant allows it.
+        // Capped at the first eight aircraft: a pilot wants "what is going out
+        // soon", not a complete rota for a forty-aircraft fleet, and each
+        // aircraft is a separate call.
+        let departures = [];
+        if (scopes.includes('live:schedules.read') && req.query.departures !== '0') {
+            const heads = aircraft.filter((a) => a.storage === 'active').slice(0, 8);
+            const lists = await Promise.all(heads.map((a) => ifCached(
+                `${va._id}:sched:${a.id}`,
+                () => ifOAuth.listSchedules(token, a.id)
+            ).then((v) => ({ a, v }), () => ({ a, v: [] }))));
+            const now = Date.now();
+            departures = lists
+                .flatMap(({ a, v }) => v.map((s) => ({ ...s, registration: a.registration, fleetId: a.id })))
+                .filter((s) => {
+                    const t = Date.parse(s.scheduledDepartureUtc || '');
+                    // The same twelve-hour grace listSchedules uses: a departure
+                    // that pushed back an hour ago is exactly what a pilot
+                    // reading this mid-flight is looking for.
+                    return Number.isFinite(t) && t > now - 12 * 3600 * 1000;
+                })
+                .sort((x, y) => Date.parse(x.scheduledDepartureUtc) - Date.parse(y.scheduledDepartureUtc))
+                .slice(0, 20);
+        }
+
+        res.json({
+            connected: true,
+            organization: { id: ad.ifOrganizationId, name: ad.ifOrganizationName || '' },
+            aircraft: aircraft.map((a) => ({
+                id: a.id,
+                registration: a.registration,
+                storage: a.storage,
+                fleetRank: a.fleetRank,
+                // Carried so the pilot board draws the same picture the staff
+                // one does. It is not staff-only information — what type an
+                // aeroplane is, is the least private thing about it.
+                type: a.type || null,
+                position: positions[a.id] || null,
+            })),
+            departures,
+            summary: ifFleetSummary(aircraft, positions),
+            readAt: new Date().toISOString(),
+        });
+    } catch (err) {
+        // A pilot is not the person who can fix a broken connection, so a
+        // failure here is reported as "no board" rather than as an error page
+        // over the rest of their crew center.
+        if (err instanceof ifOAuth.IfAuthError || err instanceof ifOAuth.IfApiError) {
+            console.warn('if board unavailable —', err.message);
+            return res.json({ connected: false, unavailable: true, aircraft: [], departures: [] });
+        }
+        ifFail(res, err, { log: 'if board error', message: 'Could not read the fleet.' });
+    }
+});
+
 // ---- The Inflight partnership, as the VA's own crew center sees it ----
 //
 // A partnered VA has a relationship with us that lives in three places they
@@ -4960,6 +6847,14 @@ app.post('/api/crew/:slug/schedules', async (req, res) => {
         // of flying wants their crew told once that the schedule is up — a
         // Discord channel with sixty identical embeds in it is the same thing
         // as no notice at all.
+        // Each one individually, because each is a leg on an aeroplane — a
+        // fortnight published in one go is a fortnight of flights that aircraft
+        // is really going to operate, and there is no batch endpoint for that.
+        // Detached, so sixty round trips do not sit in front of the reply.
+        if (template.status === 'published') {
+            for (const s of created) syncScheduleToIfLater(va, 'published', s, store);
+        }
+
         if (template.status === 'published' && created.length) {
             postScheduleNotice(va, 'published', created[0], gate.p, created.length);
             postAnnouncement(va, {
@@ -5018,6 +6913,14 @@ app.patch('/api/crew/:slug/schedules/:id', async (req, res) => {
         // people have booked has to reach them.
         if (before.status !== 'published' && s.status === 'published') postScheduleNotice(va, 'published', s, gate.p, 1);
         else if (before.status !== 'cancelled' && s.status === 'cancelled') postScheduleNotice(va, 'cancelled', s, gate.p, 1);
+
+        // The Live rota follows the edit — unlike the notice above, on EVERY
+        // save rather than only on a crossing. A notice is an announcement and
+        // must not repeat; a rota is a statement of fact about an aeroplane, and
+        // a departure whose time moved by an hour has to move by an hour on the
+        // aircraft too. syncScheduleToIf decides whether there is anything to
+        // do; a published leg with no airframe and no sync switch is a no-op.
+        syncScheduleToIfLater(va, s.status === 'cancelled' ? 'cancelled' : 'published', s, store);
         res.json(withDrift(store, { schedule: publicSchedule(s, { canManage: true }) }));
     } catch (err) { crewFail(res, err, { log: 'schedule edit error', message: 'Could not update the departure.' }); }
 });
@@ -5030,6 +6933,12 @@ app.delete('/api/crew/:slug/schedules/:id', async (req, res) => {
         const existing = await store.getSchedule(req.params.id);
         if (!existing) return res.json({ ok: true });
         await store.deleteSchedule(existing._id);
+        // Take the leg off the aeroplane too, before the announcement — and
+        // regardless of whether it was published, because what decides this is
+        // whether Infinite Flight was ever told about it, not whether the
+        // crew's noticeboard was. `store` is not passed: the row is gone, so
+        // there is nothing left to unlink.
+        syncScheduleToIfLater(va, 'removed', existing, null);
         // Only worth announcing if anybody could see it. Deleting a draft is
         // staff tidying up their own working copy.
         if (existing.status === 'published') postScheduleNotice(va, 'removed', existing, gate.p, 1);
