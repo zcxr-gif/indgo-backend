@@ -4636,6 +4636,11 @@ app.post('/api/crew/:slug/if/client', async (req, res) => {
         if (!va) return res.status(404).json({ error: 'Crew center not found.' });
         const clientId = String(req.body?.clientId || '').trim().slice(0, 120);
         if (!clientId) return res.status(400).json({ error: 'Paste the client ID from your Infinite Flight OAuth client.' });
+        // Caught here rather than at Infinite Flight, which only says so after
+        // the VA has been redirected off-site and phrases it as
+        // "The specified 'client_id' is invalid" — true, and useless.
+        const idProblem = ifOAuth.clientIdProblem(clientId);
+        if (idProblem) return res.status(400).json({ error: idProblem, code: 'bad_client_id' });
         const secret = String(req.body?.clientSecret || '').trim();
 
         const $set = { ifClientId: clientId };
@@ -4736,6 +4741,20 @@ app.post('/api/crew/:slug/if/connect', async (req, res) => {
                 code: 'no_client',
             });
         }
+        // The platform client is read from the environment, so a deployment can
+        // hand every VA the same broken id at once — and the VA reading the
+        // message is not the person who can fix it. Named separately for that
+        // reason: "ask an administrator" is the actionable half.
+        const clientProblem = ifOAuth.clientIdProblem(client.id);
+        if (clientProblem) {
+            console.warn(`[if oauth] refusing to start: ${client.source} client id is unusable — ${clientProblem}`);
+            return res.status(500).json({
+                error: client.source === 'platform'
+                    ? `The platform’s Infinite Flight client is misconfigured (${clientProblem}) — this needs an Inflight administrator, not you.`
+                    : clientProblem,
+                code: 'bad_client_id',
+            });
+        }
 
         const redirectUri = ifRedirectUri(req);
         if (!redirectUri) {
@@ -4784,6 +4803,17 @@ app.post('/api/crew/:slug/if/connect', async (req, res) => {
             redirectUri,
             returnTo,
         });
+
+        // Which client this VA is about to be sent with, in the log.
+        //
+        // When Infinite Flight answers "The specified 'client_id' is invalid",
+        // the only question that matters is WHOSE client it was — the VA's own,
+        // or the platform's — and until now nothing recorded that. The id is
+        // not a secret (it travels in the authorization URL the browser is
+        // about to follow) but it is long, so it is trimmed to its ends: enough
+        // to tell two clients apart or spot a pasted quote, without filling the
+        // log with it.
+        console.log(`[if oauth] "${va.name || req.params.slug}" → ${client.source} client ${ifOAuth.redactClientId(client.id)} (${client.type}), redirect ${redirectUri}`);
 
         res.json({
             url: ifOAuth.authorizeUrl({
@@ -4929,7 +4959,11 @@ app.get('/api/crew/if/callback', async (req, res) => {
 
         return back(returnTo, { if: 'connected', org: picked });
     } catch (err) {
-        console.warn('if callback exchange failed —', err?.message || err);
+        // Name the client here too. The exchange presents the same credentials
+        // the authorization request did, so a refusal at this step is as likely
+        // to be the client as the code — and the two are indistinguishable in a
+        // log line that mentions neither.
+        console.warn(`if callback exchange failed [${client.source} client ${ifOAuth.redactClientId(client.id)}] —`, err?.message || err);
         await ifMarkFailed(row.vaId, err && err.message);
         return back(returnTo, { if: 'failed', reason: 'exchange' });
     }
