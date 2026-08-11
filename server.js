@@ -2108,13 +2108,20 @@ const cleanCallsignInput = (raw) => {
     return clean || null;
 };
 
-// Render a stored callsign as "<BASE> ##VA" for read-only display, tolerating a
-// stored value that already ends in the suffix so it isn't doubled.
+// Render a stored callsign as "<BASE> ##<TAG>" for read-only display,
+// tolerating a stored value that already ends in the suffix so it isn't doubled.
+//
+// Mask-aware, for the same reason callsignSharesVaBase is: stripping a literal
+// "VA" only un-doubles the suffix for VAs whose tag IS "VA". A stored
+// "UPS ##UP" matched neither strip and came out as "UPS ##UP ##VA" — the exact
+// doubling this function exists to prevent, wearing somebody else's tag.
 const formatCallsignDisplay = (raw) => {
     if (!raw) return null;
-    const base = String(raw).trim().toUpperCase()
-        .replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim();
-    return base ? `${base} ##VA` : null;
+    const parts = vaCallsignParts(raw);
+    if (!parts || !parts.base) return null;
+    // A tagless mask ("BAW ###") keeps its shape rather than being handed a
+    // "VA" it never had.
+    return parts.tag ? `${parts.base} ##${parts.tag}` : `${parts.base} ###`;
 };
 
 // Expand reduced callsign bases into everything a VA might actually have stored,
@@ -2199,8 +2206,18 @@ const callsignSharesVaBase = (callsign, bases = []) => {
     if (!cs) return false;
     for (const b of (Array.isArray(bases) ? bases : [bases])) {
         // Reduce a stored mask ("OCEAN ##VA") to its airline part before
-        // comparing, or the trailing "VA" would never line up with "OCEAN 12".
-        const base = compactCallsign(String(b || '').replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, ''));
+        // comparing, or the trailing tag would never line up with "OCEAN 12".
+        //
+        // THROUGH vaCallsignParts, which reads the tag off the mask. This used
+        // to strip a literal "VA" with two hard-coded regexes, which is right
+        // for exactly the VAs whose tag is "VA" and wrong for every other one:
+        // "UPS ##UP" reduced to "UPSUP" instead of "UPS", and a real "UPS 123UP"
+        // then failed to start with it. The whole airline stopped matching — no
+        // webhook, no embed row, and the roster fallback's "is this pilot on our
+        // airline" preference silently false as well. normalizeCallsignBase was
+        // moved onto vaCallsignParts for this same reason; this one was missed.
+        const parts = vaCallsignParts(b);
+        const base = parts ? compactCallsign(parts.base) : '';
         if (base && cs.startsWith(base)) return true;
     }
     return false;
