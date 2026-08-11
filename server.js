@@ -631,6 +631,43 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     ifSyncAircraftId: { type: String, trim: true, default: '' },
     ifSyncedAt: { type: Date, default: null },
 
+    // --- Handing the airline to somebody else ---
+    //
+    // A VA's owner account used to be permanent: provisionOwnerAccount makes
+    // exactly one and the portal refused to edit or delete it. That is the
+    // right instinct about a row staff should not be able to tamper with,
+    // applied so absolutely that the ordinary thing — a VA changing hands —
+    // became impossible without an Inflight staff member editing the database.
+    //
+    // A transfer is TWO-SIDED: the owner nominates, the nominee accepts. These
+    // fields are that nomination while it waits. One at a time per VA, which is
+    // why they live here rather than in a collection — a second nomination
+    // replaces the first, which is the behaviour an owner who changed their
+    // mind expects.
+    //
+    // Everything here is a fact about a pending offer and none of it is a
+    // secret: the nominee's id and username so accept() can check who is
+    // answering, the nominator's so the log and the cancel button know whose
+    // offer it is. See vaOwnership.js for what happens on acceptance — in
+    // particular, which credentials do NOT survive it.
+    ownerTransferToId: { type: String, default: '' },
+    ownerTransferToUsername: { type: String, default: '' },
+    ownerTransferToName: { type: String, default: '' },
+    ownerTransferById: { type: String, default: '' },
+    ownerTransferByUsername: { type: String, default: '' },
+    ownerTransferAt: { type: Date, default: null },
+    // Lapses on its own rather than being swept: an offer to hand over an
+    // entire airline should not sit live indefinitely because nobody tidied up.
+    // Read through vaOwnership.isExpired, so an expired row is treated as no
+    // offer at all even before anything overwrites it.
+    ownerTransferExpiresAt: { type: Date, default: null },
+    // The last completed handover, kept for the audit trail. Not a history —
+    // one line, so the portal and Inflight oversight can both answer "when did
+    // this VA change hands, and from whom?" without a separate collection.
+    ownerTransferredAt: { type: Date, default: null },
+    ownerTransferredFrom: { type: String, default: '' },
+    ownerTransferredTo: { type: String, default: '' },
+
     // --- Copy ---
     tagline: { type: String, trim: true, maxlength: 140, default: '' }, // short hook
     description: { type: String, trim: true, maxlength: 4000, default: '' },
@@ -2814,6 +2851,61 @@ async function crewViewer(req, store) {
         return { hours: member ? Number(member.hours) || 0 : 0, memberId: member ? member._id : null };
     } catch { return null; }
 }
+
+/* ---------------------------------------------------------------------------
+ * A crew token that says "owner" has to still be true
+ *
+ * THE HOLE THIS CLOSES. A crew center token is a JWT with the caller's role
+ * baked into it at sign-in and a seven-day life (crewAuth.TOKEN_TTL). Nothing
+ * re-checks that role afterwards — verifyCrewRequest verifies the signature and
+ * returns the claims, and every owner gate in this file trusts `p.role`.
+ *
+ * That was harmless while ownership was permanent. It stops being harmless the
+ * moment a VA can change hands: without this, an owner who handed their airline
+ * over would keep full owner powers in the crew center for up to a week —
+ * settings, the data store, the Infinite Flight connection, the roster sweep.
+ * A transfer that leaves the previous owner in control for seven days is not a
+ * transfer.
+ *
+ * WHY A MIDDLEWARE rather than a check in each gate. There are two dozen places
+ * that ask "is this the owner?", spread across sync helpers (crewOwnerGate,
+ * requireCrewOwner, ifOwnerGate) and inline comparisons. Converting all of them
+ * to async to add a database read would be a large change with a lot of surface
+ * for a regression, and would leave the next inline check to be written without
+ * the guard. One middleware in front of every crew route is a single place that
+ * cannot be forgotten.
+ *
+ * COSTS ONE INDEXED READ, and only on requests that actually claim to be the
+ * owner. A pilot, a staff member, Inflight oversight and the public all fall
+ * straight through — `p.role !== 'owner'` is answered from the token.
+ *
+ * FAILS CLOSED, and says which kind of nothing happened: a 401 with a code the
+ * front-ends can act on, rather than a 403 that reads as "you were never
+ * allowed to do this". The person hitting it was the owner five minutes ago,
+ * and the honest sentence is that their access changed.
+ * ------------------------------------------------------------------------ */
+app.use('/api/crew', async (req, res, next) => {
+    let p;
+    try { p = verifyCrewRequest(req); } catch { return next(); }
+    // Not an owner claim: nothing to verify, and nothing to pay for it.
+    if (!p || p.kind === 'inflight' || p.role !== 'owner') return next();
+    try {
+        const account = await VaPortalAccount.findById(p.sub).select('role active').lean();
+        if (!account || !account.active || account.role !== 'owner') {
+            return res.status(401).json({
+                error: 'Your access to this crew center has changed. Sign in again.',
+                code: 'role_changed',
+            });
+        }
+    } catch (err) {
+        // A database blip must not lock the owner out of their own crew center,
+        // and must not wave a stale claim through either. The safe reading of
+        // "we could not check" is to refuse this request and let them retry.
+        console.warn('crew owner re-check failed —', err?.message || err);
+        return res.status(503).json({ error: 'Could not verify your access. Try again.', code: 'recheck_failed' });
+    }
+    return next();
+});
 
 // Public read — the roster is shown on the crew center.
 app.get('/api/crew/:slug/roster', async (req, res) => {

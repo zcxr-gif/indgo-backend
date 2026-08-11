@@ -33,6 +33,12 @@ const { normalizeCardOptions } = require('./vaEventCard');
 // Shared roster helpers — same module the staff API uses, so a VA managing its
 // own roster and staff managing it see identical parsing/de-dupe/limits.
 const vaPilots = require('./vaPilots');
+
+// Handing a VA to somebody else. Holds who may be nominated, how long an offer
+// stands, and — the part to read first — which stored credentials must NOT
+// survive a change of owner, because they belong to a person rather than to the
+// airline. See vaOwnership.js.
+const vaOwnership = require('./vaOwnership');
 // Single source of truth for the Terms version + the enforcement ladder, shared
 // with the Discord bot and the public Terms page so nothing drifts.
 const {
@@ -1934,6 +1940,252 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
         }
     });
 
+    // =====================================================================
+    // TRANSFERRING THE VA
+    //
+    // A VA changes hands. Somebody leaves the community, hands a project to a
+    // co-founder, or loses the account they signed up with — and until now the
+    // answer to all three was a support ticket and an Inflight staff member
+    // editing the database, because the owner account could not be edited or
+    // removed by anybody.
+    //
+    // TWO-SIDED, ON PURPOSE. The owner nominates and the nominee accepts.
+    // A one-click role swap would mean a mistyped choice, or a session somebody
+    // else is sitting in, could hand an entire airline away silently and
+    // irreversibly. Requiring the other person to say yes makes that impossible
+    // without two accounts agreeing, and gives the outgoing owner a window to
+    // change their mind.
+    //
+    // PASSWORD-CONFIRMED. Nominating re-authenticates. This is the single most
+    // destructive thing a VA owner can do and the only one with no undo once
+    // accepted, so it does not ride on a cookie that has been open in a tab all
+    // week.
+    //
+    // AND THE PART THAT IS EASY TO MISS: credentials do not travel. See
+    // vaOwnership.CREDENTIALS_TO_CLEAR. The Infinite Flight grant acts as one
+    // named person; the Supabase access token opens the whole account that
+    // issued it. Carrying either across a change of owner would hand the new
+    // owner the ability to act as the old one — and would break silently the
+    // moment the old owner revoked it from their own account. The VA's own
+    // project URL and keys are the airline's and stay: losing those would make
+    // a transfer a data loss.
+    // =====================================================================
+
+    /**
+     * Is this VA changing hands?
+     *
+     * One endpoint for both sides. `youAre` tells the caller whether they are
+     * the outgoing owner looking at an offer they can cancel, the nominee
+     * looking at one they can accept, or a colleague who should see that it is
+     * happening without being offered a button that is not theirs.
+     */
+    app.get('/api/va-portal/team/transfer', requirePortal, async (req, res) => {
+        try {
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId)
+                .select('ownerTransferToId ownerTransferToUsername ownerTransferToName '
+                    + 'ownerTransferById ownerTransferByUsername ownerTransferAt ownerTransferExpiresAt '
+                    + 'ifConnectedAt ifClientId supabaseTokenSavedAt').lean();
+            if (!ad) return res.status(404).json({ error: 'VA not found.' });
+            res.json({
+                transfer: vaOwnership.transferState(ad, req.portal),
+                // What the new owner will have to reconnect. Shown to the
+                // OUTGOING owner too, before they nominate — "you will be
+                // disconnecting your Infinite Flight account" is something to
+                // know in advance, not to discover afterwards.
+                handover: vaOwnership.handoverNotes(ad),
+            });
+        } catch (err) {
+            console.error('VA portal transfer read error:', err);
+            res.status(500).json({ error: 'Could not read the transfer.' });
+        }
+    });
+
+    /**
+     * Nominate a successor.
+     *
+     * The candidate must be an active staff account on this VA that has signed
+     * in at least once — see vaOwnership.canNominate, which explains each
+     * refusal in terms of what to do about it.
+     */
+    app.post('/api/va-portal/team/:id/transfer', requirePortalOwner, async (req, res) => {
+        try {
+            const password = String((req.body || {}).password || '');
+            if (!password) {
+                return res.status(400).json({ error: 'Confirm your password to transfer the VA.', code: 'password_required' });
+            }
+            // Re-authentication, and deliberately the same generic refusal
+            // whether the password was wrong or the account is odd — this is a
+            // password check like any other.
+            const me = await VaPortalAccount.findById(req.portal._id);
+            if (!me || !(await bcrypt.compare(password, me.passwordHash))) {
+                return res.status(403).json({ error: 'That password is not right.', code: 'bad_password' });
+            }
+
+            const candidate = await VaPortalAccount.findById(req.params.id).catch(() => null);
+            const check = vaOwnership.canNominate(candidate, {
+                vaAdId: req.portal.vaAdId,
+                currentOwnerId: req.portal._id,
+            });
+            if (!check.ok) return res.status(400).json({ error: check.reason });
+
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId)
+                .select('name ifConnectedAt ifClientId supabaseTokenSavedAt');
+            if (!ad) return res.status(404).json({ error: 'VA not found.' });
+
+            // Replaces any previous nomination rather than refusing. An owner
+            // who picked the wrong person should be able to simply pick the
+            // right one.
+            Object.assign(ad, vaOwnership.pendingTransfer({
+                toId: candidate._id,
+                toUsername: candidate.username,
+                toName: candidate.displayName || candidate.username,
+                byId: req.portal._id,
+                byUsername: req.portal.username,
+            }));
+            await ad.save();
+
+            logActivity({
+                vaAdId: req.portal.vaAdId, vaName: req.portal.vaName,
+                actorName: req.portal.displayName || req.portal.username, actorRole: 'owner',
+                action: 'ownership.nominate',
+                detail: `Offered ownership to @${candidate.username} — awaiting their acceptance`,
+            });
+
+            res.json({
+                ok: true,
+                transfer: vaOwnership.transferState(ad, req.portal),
+                handover: vaOwnership.handoverNotes(ad),
+                notice: `@${candidate.username} has to accept before anything changes.`,
+            });
+        } catch (err) {
+            console.error('VA portal transfer nominate error:', err);
+            res.status(500).json({ error: 'Could not start the transfer.' });
+        }
+    });
+
+    /**
+     * Call it off.
+     *
+     * Either party. The outgoing owner changed their mind, or the nominee does
+     * not want it — both are the same operation and neither needs a reason.
+     */
+    app.delete('/api/va-portal/team/transfer', requirePortal, async (req, res) => {
+        try {
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId)
+                .select('ownerTransferToId ownerTransferById ownerTransferToUsername ownerTransferByUsername');
+            if (!ad || !ad.ownerTransferToId) return res.json({ ok: true, transfer: null });
+
+            const meId = String(req.portal._id);
+            const mine = meId === String(ad.ownerTransferToId) || meId === String(ad.ownerTransferById);
+            if (!mine) return res.status(403).json({ error: 'That transfer is not yours to cancel.' });
+
+            const declined = meId === String(ad.ownerTransferToId);
+            Object.assign(ad, vaOwnership.clearedTransfer());
+            await ad.save();
+
+            logActivity({
+                vaAdId: req.portal.vaAdId, vaName: req.portal.vaName,
+                actorName: req.portal.displayName || req.portal.username, actorRole: req.portal.role,
+                action: declined ? 'ownership.decline' : 'ownership.cancel',
+                detail: declined ? 'Declined the offer of ownership' : 'Cancelled the ownership transfer',
+            });
+            res.json({ ok: true, transfer: null });
+        } catch (err) {
+            console.error('VA portal transfer cancel error:', err);
+            res.status(500).json({ error: 'Could not cancel the transfer.' });
+        }
+    });
+
+    /**
+     * Accept, and become the owner.
+     *
+     * The one irreversible step, so everything it depends on is re-checked here
+     * rather than trusted from when the offer was made: that the offer still
+     * exists, that it has not lapsed, that it is addressed to the caller, and
+     * that the outgoing owner is still the owner. Any of those can have changed
+     * in the days an offer stands.
+     */
+    app.post('/api/va-portal/team/transfer/accept', requirePortal, async (req, res) => {
+        try {
+            const ad = await VirtualAirlineAd.findById(req.portal.vaAdId);
+            if (!ad || !ad.ownerTransferToId) {
+                return res.status(404).json({ error: 'There is no transfer to accept.' });
+            }
+            if (vaOwnership.isExpired(ad)) {
+                Object.assign(ad, vaOwnership.clearedTransfer());
+                await ad.save();
+                return res.status(410).json({
+                    error: 'That offer has expired. Ask the owner to send it again.',
+                    code: 'transfer_expired',
+                });
+            }
+            if (String(ad.ownerTransferToId) !== String(req.portal._id)) {
+                return res.status(403).json({ error: 'That transfer was offered to somebody else.' });
+            }
+
+            const me = await VaPortalAccount.findById(req.portal._id);
+            if (!me || !me.active) return res.status(403).json({ error: 'This account cannot take ownership.' });
+
+            // The outgoing owner, as they are NOW. Found by role rather than by
+            // the id recorded when the offer was made: if ownership has moved
+            // in the meantime — an Inflight-forced transfer, say — the person
+            // being demoted must be whoever actually holds it, not whoever held
+            // it last week.
+            const outgoing = await VaPortalAccount.findOne({ vaAdId: ad._id, role: 'owner' });
+
+            // The swap. Demoted to staff rather than deleted: the outgoing
+            // owner almost always has a handover to do, and removing their
+            // access the instant they hand over is both unkind and a good way
+            // to lose the only person who knows how the VA is set up. The new
+            // owner can remove them.
+            if (outgoing && String(outgoing._id) !== String(me._id)) {
+                outgoing.role = 'staff';
+                await outgoing.save();
+            }
+            me.role = 'owner';
+            await me.save();
+
+            // What the departing owner's credentials were, before we drop them
+            // — so the reply can tell the new owner what to reconnect.
+            const notes = vaOwnership.handoverNotes(ad);
+
+            Object.assign(ad, vaOwnership.clearedTransfer());
+            // THE CREDENTIAL HANDOVER. Not a tidy-up: the Infinite Flight grant
+            // acts as the previous owner and the Supabase access token opens
+            // their whole account. Keeping either would hand this person the
+            // ability to act as their predecessor. See vaOwnership.js.
+            Object.assign(ad, vaOwnership.clearedCredentialFields());
+            ad.ownerTransferredAt = new Date();
+            ad.ownerTransferredFrom = outgoing ? outgoing.username : '';
+            ad.ownerTransferredTo = me.username;
+            await ad.save();
+
+            logActivity({
+                vaAdId: ad._id, vaName: ad.name,
+                actorName: me.displayName || me.username, actorRole: 'owner',
+                action: 'ownership.transfer',
+                detail: `Ownership moved${outgoing ? ` from @${outgoing.username}` : ''} to @${me.username}`
+                    + (notes.length ? ` — ${notes.length} credential(s) disconnected` : ''),
+            });
+
+            res.json({
+                ok: true,
+                account: publicAccount(me),
+                // Both halves said plainly. A transfer that silently
+                // disconnected things would leave the new owner wondering why
+                // their fleet board is empty, which is worse than the
+                // disconnection itself.
+                handover: notes,
+                notice: notes.length
+                    ? 'You are now the owner. Some connections belonged to the previous owner personally and have been disconnected — reconnect them with your own accounts.'
+                    : 'You are now the owner.',
+            });
+        } catch (err) {
+            console.error('VA portal transfer accept error:', err);
+            res.status(500).json({ error: 'Could not complete the transfer.' });
+        }
+    });
+
     app.patch('/api/va-portal/team/:id', requirePortalOwner, async (req, res) => {
         try {
             const account = await VaPortalAccount.findById(req.params.id);
@@ -2079,6 +2331,19 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             const { active, displayName, password, role } = req.body || {};
             if (typeof active === 'boolean') account.active = active;
             if (typeof displayName === 'string') account.displayName = displayName;
+            // Every role but 'owner'. Setting that here used to be allowed and
+            // was quietly wrong twice over: it PROMOTED without demoting, so
+            // the VA ended up with two owner accounts and a portal that picks
+            // whichever findOne returns first — and it carried the previous
+            // owner's Infinite Flight grant and Supabase access token straight
+            // across to somebody new, which is the one thing a change of owner
+            // must never do. /admin/vas/:vaId/transfer below does both halves.
+            if (role === 'owner') {
+                return res.status(400).json({
+                    error: 'Use the ownership transfer to make somebody the owner — it demotes the current one and disconnects their personal credentials.',
+                    code: 'use_transfer',
+                });
+            }
             if (PORTAL_ROLES.includes(role)) account.role = role;
             if (password) {
                 if (String(password).length < 8) {
@@ -2114,6 +2379,81 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
         } catch (err) {
             console.error('VA portal admin delete account error:', err);
             res.status(500).json({ error: 'Could not delete the account.' });
+        }
+    });
+
+    /**
+     * Move a VA's ownership, from Inflight's side.
+     *
+     * WHY THIS EXISTS SEPARATELY from the two-sided transfer above: the case
+     * that actually generates support tickets is an owner who is simply GONE.
+     * They have left the community, lost the account, or stopped answering —
+     * and a handover that requires the outgoing owner to press a button cannot
+     * help a VA whose outgoing owner is the problem. So this one does not ask
+     * them.
+     *
+     * It is otherwise the same operation and, crucially, the same credential
+     * handover: the departing owner's Infinite Flight grant and Supabase access
+     * token are theirs, and a VA rescued from an absent owner must not be
+     * rescued still holding that person's credentials.
+     *
+     * Oversight-gated and logged like everything else here. `reason` is
+     * required — this is Inflight reaching into somebody's account, and an
+     * audit line that does not say why is not an audit line.
+     */
+    app.post('/api/va-portal/admin/vas/:vaId/transfer', requireOversight, async (req, res) => {
+        try {
+            const reason = String((req.body || {}).reason || '').trim();
+            if (reason.length < 4) {
+                return res.status(400).json({ error: 'Give a reason — it goes in the audit log.' });
+            }
+            const ad = await VirtualAirlineAd.findById(req.params.vaId);
+            if (!ad) return res.status(404).json({ error: 'VA not found.' });
+
+            const target = await VaPortalAccount.findById(String((req.body || {}).accountId || '')).catch(() => null);
+            if (!target || String(target.vaAdId) !== String(ad._id)) {
+                return res.status(404).json({ error: 'That account is not on this VA.' });
+            }
+            if (!target.active) return res.status(400).json({ error: 'That account is suspended.' });
+
+            const outgoing = await VaPortalAccount.findOne({ vaAdId: ad._id, role: 'owner' });
+            if (outgoing && String(outgoing._id) === String(target._id)) {
+                return res.status(400).json({ error: 'That account already owns this VA.' });
+            }
+
+            // Demote whoever holds it, then promote. In that order, so a
+            // failure between the two leaves the VA with NO owner rather than
+            // two — which is the recoverable direction: this endpoint can be
+            // run again, whereas two owners is a state the portal cannot
+            // reason about.
+            if (outgoing) { outgoing.role = 'staff'; await outgoing.save(); }
+            target.role = 'owner';
+            await target.save();
+
+            const notes = vaOwnership.handoverNotes(ad);
+            Object.assign(ad, vaOwnership.clearedTransfer());
+            Object.assign(ad, vaOwnership.clearedCredentialFields());
+            ad.ownerTransferredAt = new Date();
+            ad.ownerTransferredFrom = outgoing ? outgoing.username : '';
+            ad.ownerTransferredTo = target.username;
+            await ad.save();
+
+            logActivity({
+                vaAdId: ad._id, vaName: ad.name,
+                actorName: req.staff.displayName || req.staff.username, actorRole: 'inflight-staff',
+                action: 'ownership.force',
+                detail: `Ownership moved${outgoing ? ` from @${outgoing.username}` : ''} to @${target.username} — ${reason}`,
+            });
+
+            res.json({
+                ok: true,
+                account: publicAccount(target),
+                previousOwner: outgoing ? publicAccount(outgoing) : null,
+                handover: notes,
+            });
+        } catch (err) {
+            console.error('VA portal admin transfer error:', err);
+            res.status(500).json({ error: 'Could not transfer ownership.' });
         }
     });
 

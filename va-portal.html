@@ -183,6 +183,14 @@
         <!-- High-severity standing banner (final warning / termination) -->
         <div id="standingBanner" class="hidden mb-5 rounded-2xl p-4 fade-in"></div>
 
+        <!-- Ownership transfer.
+             A BANNER rather than a row on the Team tab, because the person who
+             most needs to see it cannot reach that tab: the nominee is a staff
+             account, and Team is owner-only. An offer to hand over an airline
+             that is invisible to the person being offered it is not an offer.
+             Painted by renderTransfer(); empty for everybody else. -->
+        <div id="transferBanner" class="hidden mb-5 rounded-2xl p-4 fade-in"></div>
+
         <!-- Tab nav -->
         <nav class="surface rounded-2xl p-1.5 mb-6 flex items-center gap-1 overflow-x-auto fade-in">
             <button class="tab active" data-tab="submit" onclick="switchTab('submit')"><i data-lucide="send" class="w-4 h-4"></i> <span data-i18n="tab.submit">Submit</span></button>
@@ -890,6 +898,7 @@
                 loadSubmissions(); loadEvents(); loadEmbeds(); loadCompliance();
                 if (vaProfile) { paintHero(); fillProfileForm(vaProfile, me.role === 'owner'); }
                 if (me.role === 'owner') loadTeam();
+            loadTransfer();   // every role: the nominee is staff and cannot open Team
             }
         });
 
@@ -990,6 +999,7 @@
             loadEmbeds();
             loadCompliance();     // Terms banner + warnings + standing
             if (me.role === 'owner') loadTeam();
+            loadTransfer();   // every role: the nominee is staff and cannot open Team
             setThemeIcons();
             drawIcons();
         }
@@ -2163,6 +2173,7 @@
                     <p class="text-xs text-zinc-400">@${esc(m.username)} ${m.active ? '' : `· <span class="text-rose-500">${esc(t('team.disabled'))}</span>`}</p>
                 </div>
                 ${isOwner ? '' : `<div class="flex items-center gap-1.5">
+                    <button onclick="transferTo('${m.id}', '${esc(m.username)}')" title="Transfer ownership to this member" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-amber-50 dark:hover:bg-amber-500/10 text-amber-600"><i data-lucide="crown" class="w-4 h-4"></i></button>
                     <button onclick="resetMember('${m.id}')" title="${esc(t('team.reset'))}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"><i data-lucide="key-round" class="w-4 h-4"></i></button>
                     <button onclick="toggleMember('${m.id}', ${!m.active})" title="${m.active ? esc(t('team.disable')) : esc(t('team.enable'))}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"><i data-lucide="${m.active ? 'user-x' : 'user-check'}" class="w-4 h-4"></i></button>
                     <button onclick="deleteMember('${m.id}')" title="${esc(t('common.remove'))}" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-rose-50 dark:hover:bg-rose-500/10 text-rose-500"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
@@ -2198,6 +2209,135 @@
             if (!confirm(t('team.confirmRemove'))) return;
             try { await api('/team/' + id, { method: 'DELETE' }); loadTeam(); }
             catch (err) { alert(err.message); }
+        }
+
+        // ---------- Ownership transfer ----------
+        //
+        // Loaded for EVERY portal account, not just owners. The nominee is a
+        // staff account and cannot open the Team tab, so an offer shown only
+        // there would be invisible to the one person who has to act on it.
+        //
+        // Silent on failure. This runs on every portal load, including for VAs
+        // on a backend that predates the feature; an error box above somebody's
+        // dashboard because a nice-to-have endpoint 404'd is worse than no
+        // banner at all.
+        let TRANSFER = null;
+        let HANDOVER = [];
+        async function loadTransfer() {
+            try {
+                const d = await api('/team/transfer');
+                TRANSFER = d.transfer || null;
+                HANDOVER = Array.isArray(d.handover) ? d.handover : [];
+            } catch { TRANSFER = null; HANDOVER = []; }
+            renderTransfer();
+        }
+
+        function renderTransfer() {
+            const host = $('transferBanner');
+            if (!host) return;
+            if (!TRANSFER) { host.className = 'hidden'; host.innerHTML = ''; return; }
+            const when = TRANSFER.expiresAt
+                ? new Date(TRANSFER.expiresAt).toLocaleDateString(undefined, { day: 'numeric', month: 'short' })
+                : '';
+            // What the new owner will have to reconnect. Said on BOTH sides —
+            // the outgoing owner should know they are about to disconnect their
+            // own accounts, not discover it afterwards.
+            const notes = HANDOVER.length
+                ? `<ul class="mt-2 space-y-1">${HANDOVER.map(n =>
+                    `<li class="text-xs text-amber-700/80 dark:text-amber-300/70">· ${esc(n.tells)}</li>`).join('')}</ul>`
+                : '';
+
+            if (TRANSFER.youAre === 'nominee') {
+                host.className = 'mb-5 surface rounded-2xl p-4 border-emerald-300/60 bg-emerald-50/60 dark:bg-emerald-500/5 fade-in';
+                host.innerHTML = `<div class="flex items-start gap-3">
+                    <i data-lucide="key-round" class="w-5 h-5 shrink-0 text-emerald-600 dark:text-emerald-400 mt-0.5"></i>
+                    <div class="flex-1 min-w-0">
+                        <p class="text-sm font-semibold text-emerald-800 dark:text-emerald-300">
+                            @${esc(TRANSFER.byUsername)} has offered you ownership of this VA</p>
+                        <p class="text-xs text-emerald-700/80 dark:text-emerald-300/70 mt-0.5">
+                            Accepting makes you the owner and moves them to staff.${when ? ` This offer expires ${esc(when)}.` : ''}</p>
+                        ${notes}
+                        <div class="flex flex-wrap items-center gap-2 mt-3">
+                            <button onclick="acceptTransfer()" class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 transition">Accept ownership</button>
+                            <button onclick="cancelTransfer()" class="text-xs font-semibold px-3 py-1.5 rounded-lg border border-emerald-300/60 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100/50 dark:hover:bg-emerald-500/10 transition">Decline</button>
+                        </div>
+                    </div>
+                </div>`;
+            } else {
+                // The outgoing owner, or a colleague. Both see that it is
+                // happening; only the owner gets the button.
+                const mine = TRANSFER.youAre === 'nominator';
+                host.className = 'mb-5 surface rounded-2xl p-4 border-amber-300/60 bg-amber-50/60 dark:bg-amber-500/5 fade-in';
+                host.innerHTML = `<div class="flex items-start gap-3">
+                    <i data-lucide="hourglass" class="w-5 h-5 shrink-0 text-amber-600 dark:text-amber-400 mt-0.5"></i>
+                    <div class="flex-1 min-w-0">
+                        <p class="text-sm font-semibold text-amber-800 dark:text-amber-300">
+                            ${mine ? 'You have offered' : 'The owner has offered'} ownership to
+                            ${esc(TRANSFER.toName || ('@' + TRANSFER.toUsername))}</p>
+                        <p class="text-xs text-amber-700/80 dark:text-amber-300/70 mt-0.5">
+                            Nothing changes until they accept.${when ? ` The offer expires ${esc(when)}.` : ''}</p>
+                        ${mine ? notes : ''}
+                        ${mine ? `<div class="mt-3"><button onclick="cancelTransfer()" class="text-xs font-semibold px-3 py-1.5 rounded-lg border border-amber-300/60 text-amber-700 dark:text-amber-300 hover:bg-amber-100/50 dark:hover:bg-amber-500/10 transition">Cancel the transfer</button></div>` : ''}
+                    </div>
+                </div>`;
+            }
+            drawIcons();
+        }
+
+        /**
+         * Offer the VA to a team member.
+         *
+         * Two confirmations, and they are not the same question. The first
+         * spells out what changes hands — including which of the owner's own
+         * connections are about to be dropped — because "transfer ownership" on
+         * a button says nothing about losing an Infinite Flight connection. The
+         * second is the password, which the server requires: this is the most
+         * destructive thing a VA owner can do and it should not ride on a
+         * session that has been open in a tab all week.
+         */
+        async function transferTo(id, username) {
+            const losing = HANDOVER.length
+                ? '\n\nThese are connected with YOUR accounts and will be disconnected:\n'
+                    + HANDOVER.map(n => '  · ' + n.because).join('\n')
+                : '';
+            if (!confirm(
+                `Offer ownership of this VA to @${username}?\n\n`
+                + 'They become the owner and you become staff. Nothing happens until they accept.'
+                + losing
+            )) return;
+            const password = prompt('Confirm your password to offer ownership:');
+            if (!password) return;
+            try {
+                const d = await api('/team/' + id + '/transfer', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password }),
+                });
+                TRANSFER = d.transfer || null;
+                HANDOVER = Array.isArray(d.handover) ? d.handover : HANDOVER;
+                renderTransfer();
+                alert(d.notice || 'Offer sent.');
+            } catch (err) { alert(err.message); }
+        }
+
+        async function cancelTransfer() {
+            try {
+                await api('/team/transfer', { method: 'DELETE' });
+                TRANSFER = null;
+                renderTransfer();
+            } catch (err) { alert(err.message); }
+        }
+
+        async function acceptTransfer() {
+            if (!confirm('Become the owner of this VA?\n\nThe current owner moves to staff.')) return;
+            try {
+                const d = await api('/team/transfer/accept', { method: 'POST' });
+                alert(d.notice || 'You are now the owner.');
+                // A full reload rather than repainting: the whole portal is
+                // gated on role — tabs, forms, what /me returns — and patching
+                // that up in place would leave a page that half believes it is
+                // still staff.
+                location.reload();
+            } catch (err) { alert(err.message); }
         }
 
         // ---------- Password ----------

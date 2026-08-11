@@ -716,6 +716,98 @@ literally a `discord.gg` or `discord.com/invite` URL is rejected outright rather
 than sanitised, and what is stored is rebuilt from the parsed URL so a pilot is
 never shown a path-traversal or a tracking query as their invite link.
 
+## Transferring a VA
+
+A VA's owner account used to be permanent. `provisionOwnerAccount` makes exactly
+one and the portal refused to edit or delete it — the right instinct about a row
+staff should not be able to tamper with, applied so absolutely that the ordinary
+thing became impossible. VAs change hands: people leave, hand a project to a
+co-founder, or lose the account they signed up with, and every one of those was
+a support ticket that ended in somebody editing the database.
+
+`vaOwnership.js` holds the decisions; the endpoints are in `vaPortal.js`.
+
+### Two-sided, and password-confirmed
+
+The owner nominates a **staff** account, and that person **accepts**. A one-click
+role swap would let a mistyped choice — or a session somebody else is sitting in
+— hand an entire airline away silently and irreversibly. Nominating
+re-authenticates, because this is the most destructive thing a VA owner can do
+and the only one with no undo once accepted.
+
+An offer lapses after seven days, and a lapsed offer reads as *no offer* rather
+than as a live one with a date in the past. The outgoing owner is demoted to
+staff rather than deleted — they almost always have a handover to do, and
+removing the only person who knows how the VA is set up is both unkind and
+unwise. The new owner can remove them.
+
+| endpoint | who | what |
+|---|---|---|
+| `GET /api/va-portal/team/transfer` | any portal login | is this VA changing hands, and which side am I on |
+| `POST /api/va-portal/team/:id/transfer` | owner | nominate a successor (password required) |
+| `DELETE /api/va-portal/team/transfer` | either party | cancel, or decline |
+| `POST /api/va-portal/team/transfer/accept` | the nominee | become the owner |
+| `POST /api/va-portal/admin/vas/:vaId/transfer` | Inflight oversight | force it, for an owner who has vanished |
+
+The forced variant exists because the case that actually generates tickets is an
+owner who is *gone* — and a handover requiring the outgoing owner to press a
+button cannot help a VA whose outgoing owner is the problem. It requires a
+written reason, which goes in the audit log.
+
+> Route order matters here. `/team/:id` is registered in the same router and
+> will happily swallow `/team/transfer` with `id='transfer'`, so the literal
+> paths are registered **first**. `scratchpad/test-va-ownership.js` asserts that
+> against real express routing rather than by reading the file.
+
+### Ownership moves; credentials do not
+
+This is the part that makes a transfer dangerous if it is written as a role swap.
+
+A VA accumulates credentials that are not the VA's at all — they belong to the
+**person** who happened to be owner when they were created:
+
+- the **Infinite Flight OAuth grant**, consented to by one named human, acting
+  as that human, bounded by what they may do in their own Live organization;
+- the **Supabase personal access token**, which opens the whole Supabase
+  *account* that issued it, not merely the one project;
+- the **registered OAuth client**, which while in testing works only for its
+  owner and their invited testers — worse than useless to a new owner, because
+  it *looks* configured.
+
+Carry any of those across and you have handed the new owner the ability to act
+as the old one. It is unreliable in the other direction too: the departing owner
+can revoke them at any moment without telling anybody, so a VA still running on
+them is one waiting to break in a way its new owner cannot diagnose.
+
+So: **a transfer clears every credential that belongs to a person and keeps
+every credential that belongs to the airline.** The VA's own `supabaseUrl`,
+`supabaseAnonKey` and `supabaseServiceKey` stay — the data is the airline's, and
+clearing those would make a transfer a data-loss event. `CREDENTIALS_TO_CLEAR`
+in `vaOwnership.js` is that line written as data, with the reason travelling
+beside each field, so the next person to store a credential on a VA has to
+decide which side of it they are on. The new owner is told what to reconnect,
+because a transfer that silently disconnects things is worse than one that
+explains itself.
+
+### A stale "owner" token stops working
+
+A crew center token bakes the caller's role in and lives seven days, and nothing
+re-checked it — harmless while ownership was permanent, and a hole the moment a
+VA can change hands: the previous owner would keep settings, the data store and
+the Infinite Flight connection for a week.
+
+One middleware in front of every `/api/crew` route re-checks any token that
+*claims* owner against the database, and refuses with `role_changed`. It is a
+middleware rather than a check in each of the two dozen owner gates because one
+place cannot be forgotten by the next inline check somebody writes, and it costs
+an indexed read only on requests that claim ownership — pilots, staff, oversight
+and the public fall straight through on the token alone.
+
+Two related fixes went in with it: `PATCH /admin/accounts/:id` no longer accepts
+`role: 'owner'`, which used to promote **without** demoting (leaving a VA with
+two owner accounts and a portal that picks whichever `findOne` returns first)
+and carried the previous owner's credentials straight across.
+
 ## Infinite Flight Live
 
 A VA runs two things that could not see each other. One is this crew center. The
@@ -1038,6 +1130,17 @@ reason rather than given an invented one. The utilisation block is written
 against the two ways to get "which aircraft is nobody using?" wrong, both worse
 than not answering: calling an aircraft idle when its rota merely failed to
 load, and calling it busy on the strength of a schedule nobody flew.
+
+`node scratchpad/test-va-ownership.js` covers handing a VA to somebody else. A
+transfer is three lines if you write it as a role swap, and writing it that way
+is a security bug — so most of this file is the credential split, pinned in both
+directions: that the personal tokens go (an Infinite Flight grant acting as one
+human, a Supabase PAT opening their whole account) and that the airline's own
+project URL and keys stay, because clearing those would turn a change of owner
+into a data-loss event. Then who may be handed an airline, that a lapsed offer
+reads as no offer, that a demoted owner's still-valid crew token is refused, and
+— against real express routing — that `/team/:id` does not swallow
+`/team/transfer`.
 
 `bash scratchpad/test-schema-postgres.sh` runs the schema against a **real**
 Postgres, which is the only thing that catches what the impersonators cannot: it
