@@ -13190,25 +13190,37 @@ const IF_CARD_SUPABASE_ANON = process.env.SUPABASE_ANON_KEY
  * session fails here exactly as it would anywhere else, rather than continuing
  * to pass a local signature check until it expires on paper.
  *
- * `profiles` is read with the caller's OWN token, so the existing row-level
- * policy that lets a member read their own profile is the whole authorization
- * story.
+ * ENTITLEMENT COMES FROM `pro_entitlement()`, AND ONLY FROM THERE.
  *
- * ENTITLEMENT IS THE APP'S RULE, NOT A STRICTER ONE OF OUR OWN. This route used
- * to answer `profiles.is_pro === true` and nothing else, which is why a paying
- * pilot could hold Pro everywhere in Inflight and still be told the card's
- * monthly refresh needs Pro. `profiles.is_pro` is documented in the tracker as
- * frequently null or false for real paying accounts (see refreshProStatus in
- * flight.js, and the same rule in authUI.js and MobileDashboardUI.js): it is
- * trusted only as an explicit true, and a FREE account is identified positively
- * instead, by the `user_metadata.is_pro === false` stamp that free sign-up
- * writes. Anything else signed in is a legacy or paid Pro account.
+ * What this used to do, and why it had to change. The rule was: trust
+ * `profiles.is_pro` when it is explicitly true, otherwise treat the account as
+ * Pro UNLESS `user_metadata.is_pro === false` — the stamp free sign-up writes.
+ * "Pro unless stamped free" was a fair reading of the old client at the time,
+ * and it has two holes that only got worse as the product grew:
  *
- * Two surfaces disagreeing about who is Pro is worse than either answer, so
- * this now matches the client rather than second-guessing it. The stakes here
- * are one monthly stat re-read, and the same rule already gates far more.
+ *   1. `user_metadata` IS WRITABLE BY THE USER IT BELONGS TO. That is the whole
+ *      point of it — GoTrue's PUT /auth/v1/user lets an account edit its own
+ *      metadata, which is exactly how the tracker stores somebody's Infinite
+ *      Flight handle. So a free account could clear its own `is_pro: false`
+ *      stamp with one request and be Pro here from then on. The gate was a
+ *      client-side flag wearing a server's clothes.
+ *   2. NOTHING STAMPS ACCOUNTS MADE IN THE iOS APP. Sign in with Apple, and
+ *      email sign-up through the app, both create accounts with no `is_pro`
+ *      key at all — so every one of them read as Pro by default.
  *
- * @returns {Promise<{id,email,ifUsername,isPro}|null>} null when unauthenticated
+ * `public.pro_entitlement()` is the answer the rest of the product already
+ * uses: one `security definer` function that folds together the App Store
+ * subscription, the Stripe subscription and the grandfathering flags, and
+ * returns the same five columns to the website, the iOS app and this server.
+ * It is called with the CALLER'S OWN token, so it can only ever answer about
+ * them, and there is nothing in its inputs a client can write.
+ *
+ * A failure to reach it means FREE, not Pro. That is the correct direction for
+ * a gate: the cost of being wrong is one monthly stat refresh a paying pilot
+ * can trigger again by reloading, against a paywall that stops working for
+ * everybody the moment Supabase has a bad minute.
+ *
+ * @returns {Promise<{id,email,ifUsername,isPro,proSource}|null>} null when unauthenticated
  */
 async function supabaseCaller(req) {
     const header = String(req.get('authorization') || '');
@@ -13225,28 +13237,38 @@ async function supabaseCaller(req) {
     } catch (_) { return null; }
     if (!user || !user.id) return null;
 
-    let profilePro = null;   // null = we could not read the row at all
+    // The one question, asked of the one function, with the caller's own token.
+    let isPro = false;
+    let proSource = 'unknown';
     try {
-        const resp = await axios.get(`${IF_CARD_SUPABASE_URL}/rest/v1/profiles`, {
-            timeout: 8000,
-            params: { id: `eq.${user.id}`, select: 'is_pro' },
-            headers: { apikey: IF_CARD_SUPABASE_ANON, Authorization: `Bearer ${token}` },
-        });
-        profilePro = resp?.data?.[0]?.is_pro === true;
-    } catch (_) { /* falls through to the metadata stamp below */ }
-
-    // A stamped-free account is the only thing that is definitely not Pro. An
-    // unreadable profiles row therefore does not demote anybody — it just leaves
-    // the stamp as the deciding evidence, which is the same failure direction
-    // the client takes.
-    const stampedFree = user.user_metadata?.is_pro === false;
-    const isPro = profilePro === true ? true : !stampedFree;
+        const resp = await axios.post(
+            `${IF_CARD_SUPABASE_URL}/rest/v1/rpc/pro_entitlement`,
+            {},
+            {
+                timeout: 8000,
+                headers: {
+                    apikey: IF_CARD_SUPABASE_ANON,
+                    Authorization: `Bearer ${token}`,
+                    'Content-Type': 'application/json',
+                },
+            },
+        );
+        // A `returns table` function answers with an array of one row.
+        const row = Array.isArray(resp?.data) ? resp.data[0] : resp?.data;
+        isPro = row?.is_pro === true;
+        proSource = String(row?.source || 'unknown');
+    } catch (err) {
+        // Free. See the note above: an entitlement we cannot read is not an
+        // entitlement we may assume.
+        console.warn('[pro] entitlement lookup failed, treating as free:', err?.message || err);
+    }
 
     return {
         id: String(user.id),
         email: user.email || null,
         ifUsername: String(user.user_metadata?.if_username || '').trim(),
         isPro,
+        proSource,
     };
 }
 
@@ -15105,6 +15127,88 @@ app.get('/graphic-designer', (req, res) => {
 // management. Accessible via yoursite.com/va-submissions (staff-only — see guard above).
 app.get('/va-submissions', (req, res) => {
     res.sendFile(path.join(__dirname, 'va-submissions.html'));
+});
+
+/* ===========================================================================
+ * The public pilot profile.
+ *
+ * PUBLIC, on a site where everything else is not. The catch-all at the bottom
+ * of this file puts the whole of the rest of it behind the staff login, so this
+ * route has to be declared above it — and being above it is the entire reason
+ * it is reachable. Anything added below the catch-all is staff-only whether its
+ * author meant that or not.
+ *
+ * What it serves is what a signed-out stranger is allowed to see, decided by
+ * `pilot_profile_card()` on Supabase and not here: a private profile, a hidden
+ * one and a handle nobody has claimed all come back as nothing, and all three
+ * render the same page. See pilotProfile.js.
+ *
+ * Rendered server-side for link previews. A forum's unfurler, Discord and
+ * iMessage all fetch this URL and none of them run JavaScript, so a
+ * client-rendered profile would preview as a blank card — which for a page
+ * whose whole purpose is being pasted somewhere is the one failure that
+ * matters.
+ * ======================================================================== */
+const pilotProfile = require('./pilotProfile');
+
+app.get('/pilot/:handle', async (req, res) => {
+    const handle = String(req.params.handle || '').trim().toLowerCase();
+
+    res.type('html');
+
+    // Shape-checked before it is spent on a request. A handle that cannot exist
+    // is answered here rather than turned into a round trip anybody can
+    // generate by the thousand.
+    if (!pilotProfile.HANDLE_RE.test(handle)) {
+        res.set('Cache-Control', 'no-store');
+        return res.status(404).send(pilotProfile.renderPilotMissing(handle));
+    }
+
+    let data = null;
+    try {
+        data = await pilotProfile.fetchPilotProfile({
+            supabaseUrl: IF_CARD_SUPABASE_URL,
+            anonKey: IF_CARD_SUPABASE_ANON,
+            handle,
+        });
+    } catch (err) {
+        console.error('[pilot] profile fetch failed:', err?.message || err);
+    }
+
+    if (!data) {
+        res.set('Cache-Control', 'public, max-age=60');
+        return res.status(404).send(pilotProfile.renderPilotMissing(handle));
+    }
+
+    // The favourite aircraft's community photo, read straight from the
+    // collection rather than through our own HTTP API — same process, same
+    // data, and a server that fetches itself is a request that can time out for
+    // no reason. Same helper the IFC profile card uses, so a pilot's aeroplane
+    // looks the same wherever it is drawn.
+    let aircraftPhotoUrl = null;
+    if (data.card.favourite_aircraft) {
+        aircraftPhotoUrl = await ifCardPhotoUrl({
+            aircraft: data.card.favourite_aircraft,
+            livery: data.card.favourite_livery,
+        });
+    }
+
+    const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https')
+        .split(',')[0].trim();
+    const host = String(req.headers['x-forwarded-host'] || req.get('host') || '')
+        .split(',')[0].trim();
+
+    // Short, and shared. A profile changes when its owner edits it, which is
+    // rare; a link pasted into a busy thread is fetched by everybody who reads
+    // the thread, which is not.
+    res.set('Cache-Control', 'public, max-age=120, stale-while-revalidate=600');
+
+    res.send(pilotProfile.renderPilotPage({
+        data,
+        supabaseUrl: IF_CARD_SUPABASE_URL,
+        siteOrigin: host ? `${proto}://${host}` : 'https://inflight.info',
+        aircraftPhotoUrl,
+    }));
 });
 
 // 3. The Aircraft Database app (homepage) — staff-only.
