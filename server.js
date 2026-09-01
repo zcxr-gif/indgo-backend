@@ -279,6 +279,28 @@ const VA_CALLSIGN_MATCH_MODES = ['exact', 'strict', 'tag', 'broad'];
 // separate from callsignMatch because they answer different questions: one is
 // "how do we read a callsign", the other is "may the roster override it".
 const VA_ROSTER_TRUST_MODES = ['off', 'tagged', 'airline', 'any'];
+// The rosterTrust levels whose flights the ACARS matcher cannot recognise from
+// the callsign alone, so their pilots have to be watched by name instead (see
+// GET /api/va/roster-watch).
+//
+// That is every level except 'off', because the matcher forwards on the CALLSIGN
+// RULE, and for a VA that registered a tag that rule requires the tag. Each
+// level waives some part of it that the matcher cannot check:
+//
+//   'airline' — waives the TAG. An untagged "Red Nose 000" by a member is
+//     exactly what this level promises to count, and it fails the callsign rule,
+//     so without a watch it was never forwarded: the flight showed on the VA's
+//     map (the widget has the roster locally) and never once reached Discord.
+//     This is the default every VA runs on.
+//   'tagged'  — waives the AIRLINE. The codeshare leg matches no VA callsign.
+//   'any'     — waives the callsign entirely.
+//
+// 'off' is the only level the callsign rule already covers completely.
+//
+// The cost is forwarding some flights that delivery then drops. That is the
+// right way round: this side has no rosters, and the alternative is a setting
+// that silently does nothing.
+const VA_ROSTER_WATCH_TRUST_MODES = VA_ROSTER_TRUST_MODES.filter((m) => m !== 'off');
 
 const VirtualAirlineAdSchema = new mongoose.Schema({
     // --- Identity ---
@@ -2244,6 +2266,17 @@ const tokenHasSuffixTag = (token, tag) => {
     return /[0-9]/.test(t.charAt(t.length - g.length - 1));
 };
 
+// A live callsign reduced to the tokens that matter: uppercased, split on any
+// separator, with the spoken weight-class word peeled off the end. "United 2UA
+// Heavy" -> ["UNITED", "2UA"]. Without the peel the trailing token reads as
+// "HEAVY", the tag test fails, and every member flying a heavy drops out.
+const VA_WEIGHT_WORDS = new Set(['HEAVY', 'SUPER']);
+const liveCallsignTokens = (callsign) => {
+    const t = String(callsign || '').trim().toUpperCase().split(/[\s\-_/]+/).filter(Boolean);
+    while (t.length > 1 && VA_WEIGHT_WORDS.has(t[t.length - 1])) t.pop();
+    return t;
+};
+
 // Does this live callsign carry one of the VA's own suffix tags?
 //
 // The tags come off the stored masks ("UPS ##UP" → "UP"), so a VA that never
@@ -2254,14 +2287,14 @@ const tokenHasSuffixTag = (token, tag) => {
 // appends a second one: "UPS 123UP Cargo" and "UPS 123UP Heavy" are both
 // carrying "UP". Same two-token window va_filter.cjs and embed.js use.
 const callsignCarriesVaTag = (callsign, ad) => {
-    const bases = Array.isArray(ad?.callsigns) && ad.callsigns.length
-        ? ad.callsigns
-        : (ad?.callsign ? [ad.callsign] : []);
-    const tags = [...new Set(bases.map((b) => (vaCallsignParts(b) || {}).tag).filter(Boolean))];
+    const tags = [...new Set(vaCallsignBases(ad).map((b) => (vaCallsignParts(b) || {}).tag).filter(Boolean))];
     if (!tags.length) return false;
-    const tokens = String(callsign || '').trim().toUpperCase().split(/[\s\-_/]+/).filter(Boolean);
-    const tail = tokens.slice(-2);
-    return tags.some((tag) => tail.some((t) => tokenHasSuffixTag(t, tag)));
+    // liveCallsignTokens, not a raw split: the weight-class word has to come off
+    // FIRST or it eats one of the two trailing slots. A pilot writing the tag as
+    // its own token — "Shamrock 000 NV Cargo Heavy" — pushes "NV" to the third
+    // position from the end and the tag went unseen.
+    const tokens = liveCallsignTokens(callsign);
+    return tags.some((tag) => callsignTailHasTag(tokens, tag));
 };
 
 // Every callsign mask a listing has registered, preferring the multi-value
@@ -2319,17 +2352,6 @@ const vaCallsignMode = (ad) => {
 const vaRosterTrust = (ad) => {
     const r = String(ad?.rosterTrust || '').trim().toLowerCase();
     return VA_ROSTER_TRUST_MODES.includes(r) ? r : 'airline';
-};
-
-// A live callsign reduced to the tokens that matter: uppercased, split on any
-// separator, with the spoken weight-class word peeled off the end. "United 2UA
-// Heavy" -> ["UNITED", "2UA"]. Without the peel the trailing token reads as
-// "HEAVY", the tag test fails, and every member flying a heavy drops out.
-const VA_WEIGHT_WORDS = new Set(['HEAVY', 'SUPER']);
-const liveCallsignTokens = (callsign) => {
-    const t = String(callsign || '').trim().toUpperCase().split(/[\s\-_/]+/).filter(Boolean);
-    while (t.length > 1 && VA_WEIGHT_WORDS.has(t[t.length - 1])) t.pop();
-    return t;
 };
 
 /**
@@ -12622,25 +12644,43 @@ app.delete('/api/va-ads/:id/pilots', requireAuth, async (req, res) => {
  * when the callsign says nothing.
  *
  * The event pipeline only forwards a flight once its CALLSIGN matches some VA,
- * which is exactly the flight a `rosterTrust: 'any'` VA has asked to receive and
+ * which is exactly the flight a roster-trusting VA has asked to receive and
  * would never see: a member on a codeshare or partner callsign matches nobody,
  * so nothing is ever pushed and the roster never gets a chance to vouch. This is
  * the small extra signal that closes that hole — the ACARS side folds it into
  * its poll and forwards those pilots' flights unattributed, leaving the
  * attribution itself to resolveVaEventPartner here.
  *
- * Only VAs that BOTH opted into flight events (staff-approved, enabled, live
- * webhook) and set `rosterTrust: 'any'` contribute. Usernames go out expanded
- * through rosterMatchKeys, so the matcher can test a live IF username with a
- * plain lowercase lookup instead of reimplementing the separator rules.
+ * Contributed by VAs that opted into flight events (staff-approved, enabled,
+ * live webhook) AND set a rosterTrust their own callsigns cannot satisfy:
+ *
+ *   'any'     — the callsign is waived entirely.
+ *   'tagged'  — the callsign must carry their TAG, but the airline may be
+ *     anyone's. "Norwegian, roster plus NV" is the whole reason this level
+ *     exists, and its codeshare legs match no VA callsign at all.
+ *   'airline' — the callsign must be on their AIRLINE, but the tag is waived.
+ *     An untagged "Red Nose 000" by a member is what this level promises to
+ *     count, and it fails the callsign rule the matcher forwards on. This is the
+ *     DEFAULT every VA runs on, and it was missing here: the flight appeared on
+ *     the VA's map, where the widget holds the roster itself, and never once
+ *     reached Discord.
+ *
+ * Only 'off' is absent — it is the one level that waives nothing, so the
+ * callsign rule already forwards everything it can claim.
+ *
+ * Usernames go out expanded through rosterMatchKeys, so the matcher can test a
+ * live IF username with a plain lowercase lookup instead of reimplementing the
+ * separator rules.
  *
  * Public, like the per-VA roster route below it — it exposes strictly less than
  * that one does (no VA linkage, no display casing, no timestamps).
  */
 app.get('/api/va/roster-watch', async (req, res) => {
     try {
-        const ads = await VirtualAirlineAd.find({ ...OPTED_IN_PARTNER_FILTER, rosterTrust: 'any' })
-            .select('_id').lean();
+        const ads = await VirtualAirlineAd.find({
+            ...OPTED_IN_PARTNER_FILTER,
+            rosterTrust: { $in: VA_ROSTER_WATCH_TRUST_MODES },
+        }).select('_id').lean();
         if (!ads.length) {
             res.set('Cache-Control', 'public, max-age=120');
             return res.json({ ok: true, count: 0, usernames: [] });

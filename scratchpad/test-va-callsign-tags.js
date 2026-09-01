@@ -68,6 +68,7 @@ function lift(name) {
 // Order matters: the later helpers close over the earlier ones.
 const NAMES = [
     'VA_CALLSIGN_MATCH_MODES',
+    'VA_ROSTER_TRUST_MODES',
     'vaCallsignParts',
     'normalizeCallsignBase',
     'compactCallsign',
@@ -79,6 +80,7 @@ const NAMES = [
     'vaCallsignMode',
     'VA_WEIGHT_WORDS',
     'liveCallsignTokens',
+    'VA_ROSTER_WATCH_TRUST_MODES',
     'isDistinctiveVaTag',
     'vaDistinctiveTags',
     'callsignTailHasTag',
@@ -332,6 +334,54 @@ T('airline: our airline untagged counts', vouches('airline', 'RED NOSE 12', NOR)
 T('airline: the tagged codeshare does NOT — that is what tagged is for',
     vouches('airline', 'SHAMROCK 12NV', NOR), false);
 T('off: neither counts', vouches('off', 'SHAMROCK 12NV', NOR), false);
+
+/* ===========================================================================
+ * The tag written as its own token — "000 NV"
+ *
+ * Pilots type the tag both glued to the number ("000NV") and spaced off it
+ * ("000 NV"). tokenHasSuffixTag accepts a standalone tag, but the tail window is
+ * only two tokens wide, so anything appended after it — a division word, a
+ * weight class, or both — has to be peeled off first or the tag falls out of
+ * range. callsignCarriesVaTag used a raw split and did not peel.
+ * ======================================================================== */
+console.log('\nthe tag as a separate token');
+const NORW = { callsigns: ['RED NOSE ##NV'] };
+T('a standalone tag is carried', H.callsignCarriesVaTag('Shamrock 000 NV', NORW), true);
+T('…behind a weight class', H.callsignCarriesVaTag('Shamrock 000 NV Heavy', NORW), true);
+T('…behind a word and a weight class', H.callsignCarriesVaTag('Shamrock 000 NV Cargo Heavy', NORW), true);
+T('…on the VA\u2019s own airline too', H.callsignCarriesVaTag('Red Nose 000 NV', NORW), true);
+T('a standalone foreign tag is not ours', H.callsignCarriesVaTag('Shamrock 000 EX', NORW), false);
+T('no tag at all', H.callsignCarriesVaTag('Shamrock 000', NORW), false);
+
+T('tag mode takes the spaced codeshare',
+    H.callsignFitsVa('Shamrock 000 NV', { callsignMatch: 'tag', ...NORW }), true);
+T('strict takes the spaced tag on our own airline',
+    H.callsignFitsVa('Red Nose 000 NV', { callsignMatch: 'strict', ...NORW }), true);
+T('exact takes it too — it compacts before testing the shape',
+    H.callsignFitsVa('Red Nose 000 NV', { callsignMatch: 'exact', ...NORW }), true);
+
+/* ===========================================================================
+ * Which rosters the ACARS matcher has to watch by name
+ *
+ * That side forwards on the CALLSIGN RULE, which for a VA with a tag requires
+ * the tag. Every rosterTrust level except 'off' waives some part of that rule,
+ * so every one of them needs its pilots watched — otherwise the flight the
+ * level exists for is dropped before delivery can apply the roster at all.
+ *
+ * 'airline' is the default, and it was missing: an untagged "Red Nose 000" by a
+ * member showed on the VA's map (the widget holds the roster itself) and never
+ * once reached Discord.
+ * ======================================================================== */
+console.log('\nroster-watch eligibility');
+T('airline is watched — the tag it waives is what the matcher requires',
+    H.VA_ROSTER_WATCH_TRUST_MODES.includes('airline'), true);
+T('tagged is watched — the airline it waives is a partner\u2019s',
+    H.VA_ROSTER_WATCH_TRUST_MODES.includes('tagged'), true);
+T('any is watched', H.VA_ROSTER_WATCH_TRUST_MODES.includes('any'), true);
+T('off is NOT watched — it waives nothing, so the callsign rule covers it',
+    H.VA_ROSTER_WATCH_TRUST_MODES.includes('off'), false);
+T('and it stays derived from the real list, never a second hand-kept copy',
+    H.VA_ROSTER_WATCH_TRUST_MODES.length, H.VA_ROSTER_TRUST_MODES.length - 1);
 
 console.log(failures ? `\n${failures} failure(s)\n` : '\nAll good.\n');
 process.exit(failures ? 1 : 0);
