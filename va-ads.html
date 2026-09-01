@@ -156,34 +156,32 @@
                     </div>
                 </div>
 
-                <!-- How closely a live callsign has to follow the callsigns
-                     above before a flight counts as this VA's. Governs the
-                     flight-event feed end to end (ACARS matcher + delivery). -->
-                <div>
-                    <label class="block text-sm font-semibold mb-1.5">Callsign matching</label>
-                    <select id="f_callsignMatch" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
-                        <option value="exact">Exact — "OCEAN 12VA" and nothing else</option>
-                        <!-- `selected` keeps adForm.reset() (a fresh listing) on the
-                             schema default rather than the first option. -->
-                        <option value="strict" selected>Strict (default) — allows a second trailing tag and the pilot roster</option>
-                        <option value="broad">Broad — the airline name alone is enough</option>
-                    </select>
-                    <p class="text-xs text-zinc-400 mt-1">Exact drops a flight whose callsign carries an extra tag, no tag, or belongs to another airline. Use it when a VA reports flights that aren't theirs.</p>
+                <!-- How a live callsign is read, and whether the roster may
+                     overrule it. Governs the flight-event feed end to end (ACARS
+                     matcher + delivery) and the VA's live map. One line each —
+                     the VA portal is where this gets explained to owners. -->
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-sm font-semibold mb-1.5">Callsign matching</label>
+                        <select id="f_callsignMatch" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                            <option value="exact">Exact — "OCEAN 12VA", nothing after</option>
+                            <!-- `selected` keeps adForm.reset() (a fresh listing) on the
+                                 schema default rather than the first option. -->
+                            <option value="strict" selected>Strict — tag required, extra trailing tag OK</option>
+                            <option value="broad">Broad — airline name alone, tag optional</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-semibold mb-1.5">Pilot roster trust</label>
+                        <select id="f_rosterTrust" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                            <option value="off">Off — callsign rule only</option>
+                            <option value="tagged">Airline + tag</option>
+                            <option value="airline" selected>Airline, tag waived</option>
+                            <option value="any">Any callsign — the codeshare opt-in</option>
+                        </select>
+                    </div>
                 </div>
-
-                <!-- Separate question: may the roster overrule the callsign rule?
-                     'any' is the codeshare opt-in and the only setting that lets
-                     a VA receive flights on callsigns it never registered. -->
-                <div>
-                    <label class="block text-sm font-semibold mb-1.5">Pilot roster trust</label>
-                    <select id="f_rosterTrust" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
-                        <option value="off">Off — only callsigns that fit the rule above</option>
-                        <option value="tagged">Airline + tag — the roster never waives the VA's tag</option>
-                        <option value="airline" selected>Airline (default) — the roster waives their tag, not their airline</option>
-                        <option value="any">Any callsign — a rostered pilot counts whatever they fly</option>
-                    </select>
-                    <p class="text-xs text-zinc-400 mt-1">"Any callsign" is the codeshare opt-in: it catches members flying partner callsigns, and also brings in everything else those pilots fly — including their flights for another VA. A flight matching another VA's registered callsign still goes to that VA first.</p>
-                </div>
+                <p class="text-xs text-zinc-400 -mt-2">Use Exact when a VA reports flights that aren't theirs. "Any callsign" is the only setting that delivers a callsign the VA never registered, and it delivers everything else those pilots fly too.</p>
 
                 <div>
                     <label class="block text-sm font-semibold mb-1.5">Tagline</label>

@@ -54,6 +54,9 @@
         .tab { padding: .5rem .9rem; border-radius: .75rem; font-size: .8125rem; font-weight: 600; color: #71717a; transition: .15s; white-space: nowrap; display: inline-flex; align-items: center; gap: .4rem; }
         .tab:hover { color: #18181b; } .dark .tab:hover { color: #fafafa; }
         .tab.active { background: #18181b; color: #fff; } .dark .tab.active { background: #fafafa; color: #18181b; }
+        /* A <summary> that draws its own chevron. `list-none` alone leaves
+           WebKit's marker in place, so the row shows two arrows. */
+        summary.list-none::-webkit-details-marker { display: none; }
     </style>
 </head>
 <body class="bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 antialiased min-h-screen transition-colors duration-300">
@@ -302,43 +305,62 @@
                 </div>
             </div>
 
-            <!-- Which flights count as this VA's. The lever for "flights that
-                 aren't ours keep showing up" — it decides how closely a live
-                 callsign has to follow the callsigns the VA registered. -->
+            <!-- Who counts as this VA's pilot.
+                 One question, three answers. Underneath there are still two
+                 independent settings with 3 and 4 values — twelve combinations,
+                 of which about three are ones a VA actually wants. Asking an
+                 owner to assemble their own from two dropdowns and four
+                 paragraphs was how "flights that aren't ours keep showing up"
+                 went unfixed: the pair that fixes it was never obvious. The raw
+                 settings live under Advanced for the rest. -->
             <div id="pfMatchCard" class="hidden surface rounded-2xl p-5 sm:p-6 space-y-4 mt-4">
                 <div class="flex items-start gap-3">
                     <div class="w-9 h-9 rounded-xl bg-zinc-100 dark:bg-zinc-800 grid place-items-center shrink-0"><i data-lucide="filter" class="w-4 h-4 text-zinc-500 dark:text-zinc-400"></i></div>
                     <div class="min-w-0">
-                        <p class="text-sm font-semibold" data-i18n="fe.match.title">Which flights count as yours</p>
-                        <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5" data-i18n="fe.match.sub">Choose how closely a live callsign has to follow the callsigns you registered with us before we post the flight. Tighten this if flights that aren't yours keep showing up.</p>
+                        <p class="text-sm font-semibold" data-i18n="fe.match.title">Who counts as your pilot</p>
+                        <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5" data-i18n="fe.match.sub">Applies to your Discord posts and your live map.</p>
                     </div>
                 </div>
                 <div>
-                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.match.label">Callsign matching</label>
-                    <select id="pfMatchMode" class="field pf-edit">
-                        <option value="exact" data-i18n="fe.match.exact">Exactly my callsigns — the number and tag, nothing after</option>
-                        <option value="strict" selected data-i18n="fe.match.strict">My callsigns, with a little room (recommended)</option>
-                        <option value="broad" data-i18n="fe.match.broad">Anything on my airline name — catches more, and others</option>
+                    <select id="pfMatchPreset" class="field pf-edit">
+                        <option value="tight" data-i18n="fe.match.pTight">Only my exact callsigns</option>
+                        <option value="balanced" selected data-i18n="fe.match.pBalanced">My callsigns, plus my roster on my airline</option>
+                        <option value="roster" data-i18n="fe.match.pRoster">Anyone on my roster, whatever they fly</option>
+                        <option value="custom" hidden data-i18n="fe.match.pCustom">Custom</option>
                     </select>
-                    <p id="pfMatchCallsigns" class="text-xs text-zinc-500 dark:text-zinc-400 mt-1.5 break-words"></p>
-                    <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-1.5 leading-relaxed" data-i18n="fe.match.help">"Exactly my callsigns" takes only your callsign followed by the flight number and your tag — a second trailing tag or a missing tag are left out. The middle option also allows an extra trailing tag after yours.</p>
+                    <p id="pfMatchWhat" class="text-xs text-zinc-500 dark:text-zinc-400 mt-1.5 break-words"></p>
+                    <p id="pfMatchCallsigns" class="text-xs text-zinc-400 mt-1 break-words"></p>
+                    <p id="pfMatchMsg" class="hidden text-sm font-medium mt-2 break-words"></p>
                 </div>
 
-                <!-- The codeshare opt-in. Separate question from the one above:
-                     that decides how a callsign is read, this decides whether the
-                     roster may overrule it. -->
-                <div>
-                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.roster.trustLabel">Pilots on your roster</label>
-                    <select id="pfRosterTrust" class="field pf-edit">
-                        <option value="off" data-i18n="fe.roster.trustOff">Only count them on a callsign above</option>
-                        <option value="tagged" data-i18n="fe.roster.trustTagged">Count them on my airline, but only with my tag</option>
-                        <option value="airline" selected data-i18n="fe.roster.trustAirline">Count them on my airline even without my tag (recommended)</option>
-                        <option value="any" data-i18n="fe.roster.trustAny">Count them on any callsign — including codeshares</option>
-                    </select>
-                    <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-1.5 leading-relaxed" data-i18n="fe.roster.trustHelp">A live flight only tells us the callsign the pilot typed, so a member on a codeshare leg looks like anyone else. "Any callsign" fixes that using your roster — and means everything else those pilots fly arrives too, including flights for another VA. Only your roster is used, so add your pilots below first.</p>
-                    <p id="pfMatchMsg" class="hidden text-sm font-medium mt-2 break-words"></p>
-                    <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-2 leading-relaxed" data-i18n="fe.match.applies">Both settings apply to your Discord notifications and your live map embed.</p>
-                </div>
+                <!-- The raw pair. Open by default only for a VA already on a
+                     combination the presets don't name, so it can still see and
+                     change what it is set to. -->
+                <details id="pfMatchAdv" class="group">
+                    <summary class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 cursor-pointer select-none list-none flex items-center gap-1.5">
+                        <i data-lucide="chevron-right" class="w-3.5 h-3.5 transition-transform group-open:rotate-90"></i>
+                        <span data-i18n="fe.match.advanced">Advanced</span>
+                    </summary>
+                    <div class="mt-3 space-y-3">
+                        <div>
+                            <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.match.label">Callsign matching</label>
+                            <select id="pfMatchMode" class="field pf-edit">
+                                <option value="exact" data-i18n="fe.match.exact">Exactly my callsigns</option>
+                                <option value="strict" selected data-i18n="fe.match.strict">My callsigns, extra trailing tag allowed</option>
+                                <option value="broad" data-i18n="fe.match.broad">My airline name alone</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.roster.trustLabel">Pilots on your roster</label>
+                            <select id="pfRosterTrust" class="field pf-edit">
+                                <option value="off" data-i18n="fe.roster.trustOff">Don't count for anything extra</option>
+                                <option value="tagged" data-i18n="fe.roster.trustTagged">My airline, with my tag</option>
+                                <option value="airline" selected data-i18n="fe.roster.trustAirline">My airline, tag or no tag</option>
+                                <option value="any" data-i18n="fe.roster.trustAny">Any callsign</option>
+                            </select>
+                        </div>
+                    </div>
+                </details>
             </div>
 
             <!-- Card appearance customization (shown once a webhook is on file) -->
@@ -594,12 +616,11 @@
                     <div>
                         <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block"><span data-i18n="pf.callsigns">Callsigns</span> <span class="font-normal text-zinc-400" data-i18n="pf.callsignsNote">· comma separated</span></label>
                         <input id="pfCallsigns" type="text" placeholder="e.g. OCEAN ##VA, SHAMROCK ###EX" data-i18n-ph="pf.callsignsPh" class="field pf-edit">
-                        <p class="text-[11px] text-zinc-400 mt-1" data-i18n="pf.callsignsHelp">Write each one as a mask, tag included: "OCEAN ##VA", "SHAMROCK ###EX", or "BAW ###" if your pilots fly no tag. The "#" stands in for the pilot number, and the letters after it are the tag we match on — so this is where you tell us your tag is EX and not VA. The first callsign is your primary.</p>
-                        <!-- Reading the mask back to the owner in the form their
-                             pilots actually fly is the only way they can tell
-                             which tag is being matched. A VA on "###EX" that was
-                             shown "##VA" had no way to see why its flights were
-                             being dropped. -->
+                        <p class="text-[11px] text-zinc-400 mt-1" data-i18n="pf.callsignsHelp">Include your tag — "#" is the pilot number, the letters after it are the tag we match on.</p>
+                        <!-- Reading the mask back in the form their pilots
+                             actually fly says more than a paragraph can: a VA on
+                             "###EX" that was shown "##VA" had no way to see why
+                             its flights were being dropped. -->
                         <p id="pfCallsignsPreview" class="text-[11px] text-zinc-400 mt-1"></p>
                     </div>
                 </div>
@@ -1406,23 +1427,78 @@
                 flash('pfFlightMsg', e.target.checked ? t('fe.resumed') : t('fe.paused'), true);
             } catch (err) { e.target.checked = !e.target.checked; flash('pfFlightMsg', err.message, false); }
         });
-        // Which flights count as this VA's: how a callsign is read, and how far
-        // the roster may overrule it. Both save immediately — each is one choice,
-        // and an owner reaching for either wants the next flight filtered.
-        const saveMatching = async (el, field, prevValue) => {
+        // Who counts as this VA's pilot. Underneath: callsignMatch (3 values) and
+        // rosterTrust (4). The portal offers the three pairings a VA actually
+        // asks for and keeps the raw two under Advanced, in sync both ways.
+        const MATCH_PRESETS = {
+            tight:    { callsignMatch: 'exact',  rosterTrust: 'off' },
+            balanced: { callsignMatch: 'strict', rosterTrust: 'airline' },
+            roster:   { callsignMatch: 'strict', rosterTrust: 'any' },
+        };
+        // Which preset a stored pair is, or 'custom' for anything else — a VA
+        // set to a combination we no longer name must still see what it is on.
+        const presetFor = (mode, trust) =>
+            Object.keys(MATCH_PRESETS).find(k =>
+                MATCH_PRESETS[k].callsignMatch === mode && MATCH_PRESETS[k].rosterTrust === trust) || 'custom';
+
+        // One line saying what the current pair actually does, built from the
+        // VA's own tag rather than from an example. This replaces four
+        // paragraphs of prose that described every option at once — an owner
+        // only needs to know what the setting they are looking at will do.
+        function renderMatchSummary(va) {
+            const el = $('pfMatchWhat');
+            if (!el) return;
+            const mode = $('pfMatchMode').value;
+            const trust = $('pfRosterTrust').value;
+            // The VA's own tag, so the sentence reads "…and “EX” — nothing after
+            // it" rather than quoting a generic example back at them.
+            const tags = vaCallsignTags((va && va.callsigns) || (vaProfile && vaProfile.callsigns) || []);
+            const tag = tags[0] || 'VA';
+            el.textContent = `${t('fe.match.w.' + mode, { tag })} ${t('fe.match.w.r.' + trust, { tag })}`;
+        }
+
+        const saveMatching = async (body, revert) => {
             try {
                 const { va } = await api('/flight-events/matching', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ [field]: el.value }),
+                    body: JSON.stringify(body),
                 });
                 vaProfile = va;
+                syncMatchControls(va);
                 flash('pfMatchMsg', t('fe.match.saved'), true);
-            } catch (err) { el.value = prevValue; flash('pfMatchMsg', err.message, false); }
+            } catch (err) { revert(); flash('pfMatchMsg', err.message, false); }
         };
-        $('pfMatchMode').addEventListener('change', (e) =>
-            saveMatching(e.target, 'callsignMatch', (vaProfile && vaProfile.callsignMatch) || 'strict'));
-        $('pfRosterTrust').addEventListener('change', (e) =>
-            saveMatching(e.target, 'rosterTrust', (vaProfile && vaProfile.rosterTrust) || 'airline'));
+        // Point every control at the saved pair. Called after a load and after a
+        // save, so the preset picker and the two advanced selects can never show
+        // three different answers to the same question.
+        function syncMatchControls(va) {
+            const mode = ['exact', 'strict', 'broad'].includes(va.callsignMatch) ? va.callsignMatch : 'strict';
+            const trust = ['off', 'tagged', 'airline', 'any'].includes(va.rosterTrust) ? va.rosterTrust : 'airline';
+            $('pfMatchMode').value = mode;
+            $('pfRosterTrust').value = trust;
+            const preset = presetFor(mode, trust);
+            $('pfMatchPreset').value = preset;
+            // "Custom" is only ever reachable by already being on one, so it is
+            // hidden until it applies — and then Advanced opens, because that is
+            // the only place the VA can see what it is set to.
+            $('pfMatchPreset').querySelector('option[value="custom"]').hidden = preset !== 'custom';
+            if (preset === 'custom') $('pfMatchAdv').open = true;
+            renderMatchSummary(va);
+        }
+
+        $('pfMatchPreset').addEventListener('change', (e) => {
+            const pick = MATCH_PRESETS[e.target.value];
+            if (!pick) return;                       // "Custom" is a label, not a choice
+            const before = vaProfile || {};
+            saveMatching(pick, () => syncMatchControls(before));
+        });
+        const advChanged = () => {
+            const before = vaProfile || {};
+            saveMatching({ callsignMatch: $('pfMatchMode').value, rosterTrust: $('pfRosterTrust').value },
+                () => syncMatchControls(before));
+        };
+        $('pfMatchMode').addEventListener('change', advChanged);
+        $('pfRosterTrust').addEventListener('change', advChanged);
         // Echo the callsign field back as the callsigns pilots actually fly, so
         // an owner can see the tag we will match on before they save — "EX", not
         // the "VA" we used to assume on their behalf.
@@ -1465,17 +1541,13 @@
             // whenever the owner can edit, not only once a webhook exists.
             $('pfMatchCard').classList.toggle('hidden', !editable);
             if (editable) {
-                $('pfMatchMode').value = ['exact', 'broad'].includes(va.callsignMatch) ? va.callsignMatch : 'strict';
-                $('pfRosterTrust').value = ['off', 'tagged', 'any'].includes(va.rosterTrust) ? va.rosterTrust : 'airline';
-                // Show the callsigns in the form pilots fly them AND the tag
-                // read off them — this line is what an owner checks when
-                // "flights that aren't ours keep showing up", and the raw
-                // stored value did not tell them which tag was in play.
+                syncMatchControls(va);
+                // The callsigns the rule is applied to, in the form pilots fly
+                // them. An owner checking "why is that flight not ours" needs to
+                // see the tag being matched, which the raw stored value hides.
                 const cs = Array.isArray(va.callsigns) ? va.callsigns.filter(Boolean) : [];
-                const csTags = vaCallsignTags(cs);
                 $('pfMatchCallsigns').textContent = cs.length
                     ? t('fe.match.yours') + ' ' + cs.map(fmtCallsign).filter(Boolean).join(', ')
-                      + ' — ' + (csTags.length ? `${t('pf.callsignsTag')} ${csTags.join(', ')}` : t('pf.callsignsNoTag'))
                     : '';
             }
             wrap.classList.toggle('hidden', !show);
