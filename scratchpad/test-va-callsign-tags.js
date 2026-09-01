@@ -79,6 +79,9 @@ const NAMES = [
     'vaCallsignMode',
     'VA_WEIGHT_WORDS',
     'liveCallsignTokens',
+    'isDistinctiveVaTag',
+    'vaDistinctiveTags',
+    'callsignTailHasTag',
     'callsignFitsVaMode',
     'callsignFitsVa',
     'embedCallsignsFromAd',
@@ -170,24 +173,6 @@ T('a VA with no registered callsigns has nothing to check',
     H.callsignCarriesVaTag('UPS 123UP', {}), false);
 T('the single-callsign field is read too',
     H.callsignCarriesVaTag('UPS 123UP', { callsign: 'UPS ##UP' }), true);
-
-console.log('\nrosterTrust: the decision the feed actually makes');
-// Mirrors the onAirline filter in resolveVaEventPartnerByRoster: a rostered
-// pilot on a listing in 'strict' mode, where callsignFitsVa is the loose
-// shared-airline test. This is the table the VA is choosing between.
-const decide = (trust, callsign, ad) => {
-    if (trust === 'off') return false;
-    if (!H.callsignSharesVaBase(callsign, ad.callsigns)) return false;
-    return trust !== 'tagged' || H.callsignCarriesVaTag(callsign, ad);
-};
-T('tagged: a tagged flight by a member counts', decide('tagged', 'UPS 123UP', UPS), true);
-T('tagged: an untagged flight by a member does NOT', decide('tagged', 'UPS 123', UPS), false);
-T('tagged: our tag on another airline does not', decide('tagged', 'DELTA 9UP', UPS), false);
-T('tagged: a trailing word is still forgiven', decide('tagged', 'UPS 123UP Cargo', UPS), true);
-// The behaviour every existing VA keeps, unchanged.
-T('airline: an untagged flight by a member still counts', decide('airline', 'UPS 123', UPS), true);
-T('airline: another airline still does not', decide('airline', 'DELTA 9UP', UPS), false);
-T('off: nothing counts', decide('off', 'UPS 123UP', UPS), false);
 
 /* ===========================================================================
  * callsignFitsVa — the three modes a VA actually chooses between
@@ -284,6 +269,69 @@ T('what staff typed on the embed always wins',
 T('with no listing to read, the embed code is reduced to its airline',
     H.embedCallsignsFromAd(cfgOf({ va: { code: 'OCEAN ##VA' } }), null),
     { prefixes: ['OCEAN'], suffixes: [] });
+
+/* ===========================================================================
+ * 'tag' mode — the codeshare case the whole dial used to miss
+ *
+ * Norwegian registers "RED NOSE ##NV" and its pilots keep the "NV" when they
+ * fly a partner's metal: "Shamrock 12NV". Every rule tested the AIRLINE first
+ * and returned early, so the tag could confirm a flight on Red Nose but never
+ * claim one on Shamrock — and the ACARS matcher dropped the leg before the feed
+ * ever saw it. 'tag' asks about the tag first.
+ * ======================================================================== */
+const NORWEGIAN = (mode) => ({ callsignMatch: mode, callsigns: ['RED NOSE ##NV'] });
+
+console.log('\ncallsignFitsVa — tag mode (the codeshare answer)');
+T('own metal still counts', H.callsignFitsVa('RED NOSE 12NV', NORWEGIAN('tag')), true);
+T('a codeshare carrying our tag counts', H.callsignFitsVa('SHAMROCK 12NV', NORWEGIAN('tag')), true);
+T('…however it is spaced', H.callsignFitsVa('Shamrock 12NV', NORWEGIAN('tag')), true);
+T('…with a trailing word', H.callsignFitsVa('SHAMROCK 12NV Cargo', NORWEGIAN('tag')), true);
+T('…or a weight class', H.callsignFitsVa('SHAMROCK 12NV Heavy', NORWEGIAN('tag')), true);
+T('the same codeshare WITHOUT our tag does not', H.callsignFitsVa('SHAMROCK 12', NORWEGIAN('tag')), false);
+T('somebody else\u2019s tag does not', H.callsignFitsVa('SHAMROCK 12EX', NORWEGIAN('tag')), false);
+T('our airline untagged still needs the tag', H.callsignFitsVa('RED NOSE 12', NORWEGIAN('tag')), false);
+// The regression this mode exists for: every other mode says no.
+T('strict rejects the codeshare', H.callsignFitsVa('SHAMROCK 12NV', NORWEGIAN('strict')), false);
+T('broad rejects it too — it tests the airline, not the tag',
+    H.callsignFitsVa('SHAMROCK 12NV', NORWEGIAN('broad')), false);
+T('exact rejects it', H.callsignFitsVa('SHAMROCK 12NV', NORWEGIAN('exact')), false);
+
+console.log('\ntag mode — a tag has to identify ONE VA to claim a flight alone');
+T('"VA" is not distinctive', H.isDistinctiveVaTag('VA'), false);
+T('a single letter is not', H.isDistinctiveVaTag('X'), false);
+T('"NV" is', H.isDistinctiveVaTag('NV'), true);
+T('a VA whose tag is "VA" gains nothing on another airline',
+    H.callsignFitsVa('SHAMROCK 12VA', { callsignMatch: 'tag', callsigns: ['OCEAN ##VA'] }), false);
+T('…but its own airline still matches',
+    H.callsignFitsVa('OCEAN 12VA', { callsignMatch: 'tag', callsigns: ['OCEAN ##VA'] }), true);
+T('only the distinctive tag of a mixed listing claims other airlines',
+    H.callsignFitsVa('SHAMROCK 9NV', { callsignMatch: 'tag', callsigns: ['OCEAN ##VA', 'RED NOSE ##NV'] }), true);
+
+/* ===========================================================================
+ * rosterTrust: 'tagged' — the mirror image of 'airline', not a tighter one
+ *
+ * It used to demand the airline AND the tag, which made it strictly narrower
+ * than 'airline' and useless for the case it is named after. It keeps the tag
+ * and waives the AIRLINE.
+ * ======================================================================== */
+console.log('\nrosterTrust — which half of the callsign each level keeps');
+const NOR = { callsigns: ['RED NOSE ##NV'] };
+// Mirrors the `recognised` filter in resolveVaEventPartnerByRoster.
+const vouches = (trust, callsign, va) => {
+    if (trust === 'off') return false;
+    if (trust === 'tagged') return H.callsignCarriesVaTag(callsign, va);
+    if (trust === 'airline') return H.callsignSharesVaBase(callsign, va.callsigns);
+    return H.callsignSharesVaBase(callsign, va.callsigns) || H.callsignCarriesVaTag(callsign, va);
+};
+T('tagged: a rostered pilot\u2019s codeshare with our tag counts',
+    vouches('tagged', 'SHAMROCK 12NV', NOR), true);
+T('tagged: the same codeshare untagged does not', vouches('tagged', 'SHAMROCK 12', NOR), false);
+T('tagged: our own airline with the tag counts', vouches('tagged', 'RED NOSE 12NV', NOR), true);
+T('tagged: our own airline WITHOUT the tag does not', vouches('tagged', 'RED NOSE 12', NOR), false);
+T('airline: our airline untagged counts', vouches('airline', 'RED NOSE 12', NOR), true);
+T('airline: the tagged codeshare does NOT — that is what tagged is for',
+    vouches('airline', 'SHAMROCK 12NV', NOR), false);
+T('off: neither counts', vouches('off', 'SHAMROCK 12NV', NOR), false);
 
 console.log(failures ? `\n${failures} failure(s)\n` : '\nAll good.\n');
 process.exit(failures ? 1 : 0);

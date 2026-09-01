@@ -168,6 +168,7 @@
                             <!-- `selected` keeps adForm.reset() (a fresh listing) on the
                                  schema default rather than the first option. -->
                             <option value="strict" selected>Strict — tag required, extra trailing tag OK</option>
+                            <option value="tag">Tag — strict, plus my tag on any airline (codeshare)</option>
                             <option value="broad">Broad — airline name alone, tag optional</option>
                         </select>
                     </div>
@@ -175,13 +176,13 @@
                         <label class="block text-sm font-semibold mb-1.5">Pilot roster trust</label>
                         <select id="f_rosterTrust" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                             <option value="off">Off — callsign rule only</option>
-                            <option value="tagged">Airline + tag</option>
+                            <option value="tagged">Tag, any airline</option>
                             <option value="airline" selected>Airline, tag waived</option>
                             <option value="any">Any callsign — the codeshare opt-in</option>
                         </select>
                     </div>
                 </div>
-                <p class="text-xs text-zinc-400 -mt-2">Use Exact when a VA reports flights that aren't theirs. "Any callsign" is the only setting that delivers a callsign the VA never registered, and it delivers everything else those pilots fly too.</p>
+                <p class="text-xs text-zinc-400 -mt-2">Use Exact when a VA reports flights that aren't theirs. Use Tag when they report codeshare legs missing and their pilots keep the tag on partner metal — a distinctive tag only, "VA" identifies nobody. "Any callsign" is the last resort for pilots who keep no tag at all; it delivers everything else they fly too.</p>
 
                 <div>
                     <label class="block text-sm font-semibold mb-1.5">Tagline</label>
@@ -528,7 +529,7 @@
                 // Show every callsign the VA flies under (comma-separated); fall
                 // back to the legacy single callsign for older records.
                 set('f_callsign', (ad.callsigns && ad.callsigns.length ? ad.callsigns : (ad.callsign ? [ad.callsign] : [])).join(', '));
-                set('f_callsignMatch', ['exact', 'broad'].includes(ad.callsignMatch) ? ad.callsignMatch : 'strict');
+                set('f_callsignMatch', ['exact', 'tag', 'broad'].includes(ad.callsignMatch) ? ad.callsignMatch : 'strict');
                 set('f_rosterTrust', ['off', 'tagged', 'any'].includes(ad.rosterTrust) ? ad.rosterTrust : 'airline');
                 set('f_tagline', ad.tagline);
                 set('f_description', ad.description); set('f_region', ad.region); set('f_pilotCount', ad.pilotCount ?? 0);

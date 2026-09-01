@@ -47,7 +47,7 @@ To embed it on their site, they paste this iframe:
 | `prefixes`   | `Air%20Canada,United`                     | **Full airline name(s)** you fly under (see Callsign matching). Defaults to `[va]`. |
 | `suffixes`   | `VA,EX`                                    | Your trailing tag(s) (see Callsign matching). |
 | `regulars`   | `OCEAN%20STAFF,Shamrock`                  | Untagged callsigns, prefix-only, always included (alias `callsigns`). See §2. |
-| `match`      | `exact` \| `strict` \| `broad`            | How closely a callsign must follow the pattern. Default `strict`. See §2. |
+| `match`      | `exact` \| `strict` \| `tag` \| `broad`    | How closely a callsign must follow the pattern. Default `strict`. See §2. |
 | `roster`     | `off` \| `tagged` \| `airline` \| `any`    | How far the VA's pilot roster may vouch for a callsign the rule rejects. Default `airline`. See §2a. |
 | `hubs`       | `CYYZ,CYUL,CYVR`                          | Hub ICAOs. Each becomes a map marker listing your inbound pilots. |
 | `provider`   | `mapbox` or `free`                        | Auto: `free` when no Mapbox token. |
@@ -193,14 +193,27 @@ A prefix that still arrives as a whole mask is split the same way by the widget,
 so a hand-written `?prefixes=OCEAN%20%23%23VA` behaves like `?prefixes=OCEAN` +
 `?suffixes=VA` rather than matching nobody.
 
-- **Match mode** (`callsignMatch`) — `"exact"`, `"strict"` (default) or
-  `"broad"`. Chooses which mistake the VA would rather live with; see the
+- **Match mode** (`callsignMatch`) — `"exact"`, `"strict"` (default), `"tag"`
+  or `"broad"`. Chooses which mistake the VA would rather live with; see the
   limitation below. `"exact"` demands the registered shape and nothing else;
   `"broad"` waives the suffix requirement in step 2, so a declared prefix is
   enough on its own even when tags are configured. Preview-URL alias: `match`.
 
+  `"tag"` is `"strict"` plus one thing: the VA's own **distinctive** tag claims
+  a flight on *any* airline. That is the codeshare answer for a VA whose pilots
+  keep their tag on partner metal — Norwegian flies `Red Nose 12NV` on its own
+  aircraft and `Shamrock 12NV` on a codeshare, and the `NV` is the VA saying the
+  flight is theirs. Every other mode tests the **prefix first and returns
+  early**, so the tag could confirm a flight on the VA's own airline but never
+  claim one on somebody else's. A tag only qualifies when it identifies one VA:
+  `VA` is what nearly everyone appends, so it is excluded, as are single
+  letters.
+
 **How they combine (per flight):**
 
+0. In `"tag"` mode only: if one of the last two tokens carries a **distinctive**
+   configured tag → **included**, whatever the airline. This is asked first
+   because the flight it exists for carries none of the VA's prefixes.
 1. If it prefix-matches any `regularCallsigns` → **included** (no tag needed).
    In `"exact"` mode the callsign has to *be* that regular — the bare name, or
    the name plus a flight number — not merely start with it.

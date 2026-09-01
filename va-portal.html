@@ -325,6 +325,7 @@
                     <select id="pfMatchPreset" class="field pf-edit">
                         <option value="tight" data-i18n="fe.match.pTight">Only my exact callsigns</option>
                         <option value="balanced" selected data-i18n="fe.match.pBalanced">My callsigns, plus my roster on my airline</option>
+                        <option value="codeshare" data-i18n="fe.match.pCodeshare">My callsigns, plus anything carrying my tag</option>
                         <option value="roster" data-i18n="fe.match.pRoster">Anyone on my roster, whatever they fly</option>
                         <option value="custom" hidden data-i18n="fe.match.pCustom">Custom</option>
                     </select>
@@ -347,6 +348,7 @@
                             <select id="pfMatchMode" class="field pf-edit">
                                 <option value="exact" data-i18n="fe.match.exact">Exactly my callsigns</option>
                                 <option value="strict" selected data-i18n="fe.match.strict">My callsigns, extra trailing tag allowed</option>
+                                <option value="tag" data-i18n="fe.match.tag">My callsigns, plus my tag on any airline</option>
                                 <option value="broad" data-i18n="fe.match.broad">My airline name alone</option>
                             </select>
                         </div>
@@ -354,7 +356,7 @@
                             <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-1.5 block" data-i18n="fe.roster.trustLabel">Pilots on your roster</label>
                             <select id="pfRosterTrust" class="field pf-edit">
                                 <option value="off" data-i18n="fe.roster.trustOff">Don't count for anything extra</option>
-                                <option value="tagged" data-i18n="fe.roster.trustTagged">My airline, with my tag</option>
+                                <option value="tagged" data-i18n="fe.roster.trustTagged">My tag, on any airline</option>
                                 <option value="airline" selected data-i18n="fe.roster.trustAirline">My airline, tag or no tag</option>
                                 <option value="any" data-i18n="fe.roster.trustAny">Any callsign</option>
                             </select>
@@ -844,6 +846,13 @@
             const p = vaCallsignParts(raw);
             if (!p || !p.base) return '';
             return p.tag ? `${p.base} ##${p.tag}` : `${p.base} ###`;
+        };
+        // Can this tag name a VA on its own, with no airline in front of it?
+        // "VA" cannot — nearly every VA appends it. Mirrors isDistinctiveVaTag
+        // on the server, isDistinctiveTag in the widget and the ACARS matcher.
+        const isDistinctiveTag = (tag) => {
+            const v = String(tag || '').trim().toUpperCase();
+            return v.length >= 2 && v !== 'VA';
         };
         // The distinct tags a VA's registered callsigns carry, e.g. ["VA","EX"].
         const vaCallsignTags = (list) => [...new Set(
@@ -1431,9 +1440,15 @@
         // rosterTrust (4). The portal offers the three pairings a VA actually
         // asks for and keeps the raw two under Advanced, in sync both ways.
         const MATCH_PRESETS = {
-            tight:    { callsignMatch: 'exact',  rosterTrust: 'off' },
-            balanced: { callsignMatch: 'strict', rosterTrust: 'airline' },
-            roster:   { callsignMatch: 'strict', rosterTrust: 'any' },
+            tight:     { callsignMatch: 'exact',  rosterTrust: 'off' },
+            balanced:  { callsignMatch: 'strict', rosterTrust: 'airline' },
+            // For a VA whose pilots keep the tag on partner metal — Norwegian
+            // flying "Red Nose 12NV" and "Shamrock 12NV". The tag claims the
+            // flight; no roster needed, and nothing untagged comes with it.
+            codeshare: { callsignMatch: 'tag',    rosterTrust: 'tagged' },
+            // For members who fly codeshare with no tag at all. Costs you
+            // everything else those pilots fly.
+            roster:    { callsignMatch: 'strict', rosterTrust: 'any' },
         };
         // Which preset a stored pair is, or 'custom' for anything else — a VA
         // set to a combination we no longer name must still see what it is on.
@@ -1454,7 +1469,13 @@
             // it" rather than quoting a generic example back at them.
             const tags = vaCallsignTags((va && va.callsigns) || (vaProfile && vaProfile.callsigns) || []);
             const tag = tags[0] || 'VA';
-            el.textContent = `${t('fe.match.w.' + mode, { tag })} ${t('fe.match.w.r.' + trust, { tag })}`;
+            let line = `${t('fe.match.w.' + mode, { tag })} ${t('fe.match.w.r.' + trust, { tag })}`;
+            // "My tag on any airline" needs a tag that names one VA. Almost
+            // everybody appends "VA", so on its own it identifies nobody and the
+            // rule quietly does nothing — say so rather than let the VA think it
+            // is on and wonder why the map never changed.
+            if (mode === 'tag' && !tags.some(isDistinctiveTag)) line += ' ' + t('fe.match.w.tagTooCommon');
+            el.textContent = line;
         }
 
         const saveMatching = async (body, revert) => {
@@ -1472,7 +1493,7 @@
         // save, so the preset picker and the two advanced selects can never show
         // three different answers to the same question.
         function syncMatchControls(va) {
-            const mode = ['exact', 'strict', 'broad'].includes(va.callsignMatch) ? va.callsignMatch : 'strict';
+            const mode = ['exact', 'strict', 'tag', 'broad'].includes(va.callsignMatch) ? va.callsignMatch : 'strict';
             const trust = ['off', 'tagged', 'airline', 'any'].includes(va.rosterTrust) ? va.rosterTrust : 'airline';
             $('pfMatchMode').value = mode;
             $('pfRosterTrust').value = trust;
