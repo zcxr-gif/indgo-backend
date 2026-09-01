@@ -252,12 +252,12 @@
                     <div>
                         <label class="block text-sm font-semibold mb-1.5">Callsign prefixes</label>
                         <input id="f_prefixes" placeholder="Air Canada, United" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
-                        <p class="text-xs text-zinc-400 mt-1">Full airline name(s) you fly under — not an ICAO code. Blank = the VA code.</p>
+                        <p class="text-xs text-zinc-400 mt-1">Full airline name(s) you fly under — not an ICAO code. Blank = whatever the VA registered on its listing.</p>
                     </div>
                     <div>
                         <label class="block text-sm font-semibold mb-1.5">Callsign suffixes</label>
                         <input id="f_suffixes" placeholder="VA, EX" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
-                        <p class="text-xs text-zinc-400 mt-1">Your tag(s), e.g. matches "Air Canada 001VA". A bare tag never matches alone.</p>
+                        <p class="text-xs text-zinc-400 mt-1">Your tag(s), e.g. matches "Air Canada 001VA". A bare tag never matches alone. Blank = the tag on the VA's registered callsigns ("SHAMROCK ###EX" → EX), so leave it blank unless this embed needs something different.</p>
                     </div>
                 </div>
 
@@ -267,60 +267,34 @@
                     <p class="text-xs text-zinc-400 mt-1">Untagged callsigns matched by name only and <em>always</em> included — even when suffixes run in tag mode. Use for staff / charter / plain airline callsigns.</p>
                 </div>
 
-                <!-- The honest bit. A VA setting this up will otherwise read a
-                     missing pilot as a bug in the map, and a stranger on the map
-                     as a bug in the matching. Both are the same limit. -->
-                <div>
-                    <label class="block text-sm font-semibold mb-1.5">Who appears on the map</label>
-                    <select id="f_callsignMatch" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
-                        <option value="exact">Exactly my callsigns — "Air Canada 001VA" and nothing else</option>
-                        <!-- `selected` keeps form.reset() (a new embed) on the
-                             schema default rather than the first option. -->
-                        <option value="strict" selected>Only my VA callsigns — no one else's pilots</option>
-                        <option value="broad">Catch more of my pilots — may include someone else's</option>
-                    </select>
-                    <div class="mt-2 rounded-xl border-2 border-amber-200 dark:border-amber-900/60 bg-amber-50 dark:bg-amber-950/30 p-3">
-                        <p class="text-xs font-semibold text-amber-800 dark:text-amber-300">A limit worth knowing about</p>
-                        <p class="text-xs text-amber-800/90 dark:text-amber-300/80 mt-1 leading-relaxed">
-                            The only thing a live flight tells us is the callsign the pilot typed —
-                            nothing else says which VA they fly for. So a member on a <strong>codeshare
-                            leg</strong> types the partner airline's callsign, carries no tag of yours, and
-                            <strong>cannot</strong> be shown as one of yours. And because
-                            <strong>VA</strong> is a tag almost everyone uses, a pilot flying for a
-                            different airline's VA on a similar callsign looks exactly like one of yours.
-                        </p>
-                        <p class="text-xs text-amber-800/90 dark:text-amber-300/80 mt-2 leading-relaxed">
-                            <strong>Exactly my callsigns</strong> is the tightest filter: the callsign must be
-                            the airline, the flight number and the tag glued to it — "Air Canada 001VA" — and
-                            stop there. A second trailing tag ("001VA CX") or a missing tag ("001") are left
-                            off. Nothing that isn't yours gets through; a member who types their callsign
-                            loosely does not get on. The <strong>codeshare</strong> case above has its own
-                            answer — see "Pilots on the roster" below.
-                        </p>
-                        <p class="text-xs text-amber-800/90 dark:text-amber-300/80 mt-2 leading-relaxed">
-                            <strong>Only my VA callsigns</strong> shows nobody who isn't yours, but members
-                            flying codeshare or unregistered callsigns will be missing.
-                            <strong>Catch more of my pilots</strong> finds those members, and accepts that
-                            somebody else's pilot may occasionally appear as one of yours.
-                            This is a choice between the two, not a setting that fixes either.
-                        </p>
+                <!-- Two settings, side by side, because staff read them
+                     together: how a callsign is read, and whether the roster may
+                     overrule it. They used to carry three paragraphs of prose
+                     about a limit staff already know — a live flight only tells
+                     us the callsign the pilot typed. Kept to one line each; the
+                     VA portal states it once for owners. -->
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-sm font-semibold mb-1.5">Callsign matching</label>
+                        <select id="f_callsignMatch" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                            <option value="exact">Exact — "Air Canada 001VA", nothing after</option>
+                            <!-- `selected` keeps form.reset() (a new embed) on the
+                                 schema default rather than the first option. -->
+                            <option value="strict" selected>Strict — tag required, extra trailing tag OK</option>
+                            <option value="broad">Broad — airline name alone, tag optional</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-semibold mb-1.5">Pilots on the roster</label>
+                        <select id="f_rosterTrust" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
+                            <option value="off">Off — callsign rule only</option>
+                            <option value="tagged">Airline + tag</option>
+                            <option value="airline" selected>Airline, tag waived</option>
+                            <option value="any">Any callsign — the codeshare opt-in</option>
+                        </select>
                     </div>
                 </div>
-
-                <!-- The one thing that DOES fix the codeshare half of the limit
-                     above, because it stops reading the callsign and reads the
-                     roster instead. Opt-in: it also brings in whatever else
-                     those pilots fly. -->
-                <div>
-                    <label class="block text-sm font-semibold mb-1.5">Pilots on the roster</label>
-                    <select id="f_rosterTrust" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
-                        <option value="off">Off — only callsigns that fit the rule above</option>
-                        <option value="tagged">On my airline, with my tag — the roster never waives the tag</option>
-                        <option value="airline" selected>On my airline — the roster waives my tag, not my airline</option>
-                        <option value="any">Any callsign — a rostered pilot counts whatever they fly</option>
-                    </select>
-                    <p class="text-xs text-zinc-400 mt-1">"Any callsign" is the codeshare opt-in: it uses the VA's pilot roster instead of the callsign, so members on partner callsigns appear — along with everything else those pilots fly, including their flights for another VA. Needs a roster; a VA with none sees no change. "With my tag" is the opposite end: a rostered pilot's "UPS 123UP Cargo" counts, their untagged "UPS 123" does not.</p>
-                </div>
+                <p class="text-xs text-zinc-400 -mt-1">A codeshare leg carries the partner's callsign and no tag, so only "Any callsign" can catch it — and it brings in everything else those pilots fly. Needs a roster.</p>
 
                 <div>
                     <label class="block text-sm font-semibold mb-1.5">Hubs (ICAO)</label>

@@ -161,7 +161,8 @@ grabbing every callsign that merely ends in a common tag like `VA`.
   ICAO code `ACA`). The widget compacts it (removes spaces/separators) and
   matches it against the START of the flight's compacted callsign, so it matches
   the whole airline — `"Air Canada"` matches `Air Canada 001VA` and **only** Air
-  Canada, never Air France or AirAsia. Defaults to `[va]` when omitted.
+  Canada, never Air France or AirAsia. Defaults to the VA listing's registered
+  callsigns when omitted — see *Inherited from the VA listing* below.
 - **Suffix rule** (`callsignSuffixes`) — optional tags (tag mode). When set, a
   flight must match a declared prefix **and** carry one of these tags on
   **either of the callsign's last two tokens** — so a pilot may append a second
@@ -173,6 +174,24 @@ grabbing every callsign that merely ends in a common tag like `VA`.
   the prefixes above are running in tag mode. Use for staff / charter / plain
   airline callsigns alongside your tagged members. Alias in preview URLs:
   `callsigns`.
+
+**Inherited from the VA listing.** Most embeds are created without prefix or
+suffix lists of their own, so a blank list is filled in from the VA listing's
+own registered callsign masks (`OCEAN ##VA`, `SHAMROCK ###EX`, `BAW ###`): the
+airline part becomes the prefix and the mask's tag becomes the suffix. Each
+list is filled independently, and anything typed on the embed always wins.
+
+This is how a tag a VA registered reaches the map at all. The old fallback was
+the bare `va.code` with **no suffix**, which meant a VA could register
+`SHAMROCK ###EX`, set matching to "only my VA callsigns", and still get a map
+showing every `Shamrock` in the sky — the tag it had chosen was never handed to
+the widget. `va.code` is also read as a *single token* by the widget, so a VA on
+`AIR CANADA ##VA` matched on `AIR` and picked up Air France with it. Both are
+fixed by reading the listing.
+
+A prefix that still arrives as a whole mask is split the same way by the widget,
+so a hand-written `?prefixes=OCEAN%20%23%23VA` behaves like `?prefixes=OCEAN` +
+`?suffixes=VA` rather than matching nobody.
 
 - **Match mode** (`callsignMatch`) — `"exact"`, `"strict"` (default) or
   `"broad"`. Chooses which mistake the VA would rather live with; see the
@@ -507,8 +526,10 @@ router.get('/api/embed/resolve', (req, res) => {
   return res.json({
     ok: true,
     va: cfg.va,
-    callsignPrefixes: cfg.callsignPrefixes || [cfg.va.code],
-    callsignSuffixes: cfg.callsignSuffixes || [],
+    // Blank lists inherit the VA listing's registered callsign masks — the
+    // airline part becomes the prefix, the mask's tag the suffix.
+    callsignPrefixes: cfg.callsignPrefixes.length ? cfg.callsignPrefixes : prefixesFromVa,
+    callsignSuffixes: cfg.callsignSuffixes.length ? cfg.callsignSuffixes : suffixesFromVa,
     regularCallsigns: cfg.regularCallsigns || [],
     hubs: cfg.hubs || [],
     mode: cfg.mode || 'roster',

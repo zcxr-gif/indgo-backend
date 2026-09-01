@@ -736,18 +736,31 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         return slug || 'virtual-airline';
     };
 
-    // Render a VA's stored base radio callsign in Infinite Flight VA format.
-    // We store just the base (e.g. "OCEAN"); pilots fly as "OCEAN ##VA", with the
-    // "##" standing in for their individual pilot number — like Discover Virtual's
-    // "Ocean ##VA". Tolerates a base that already carries the suffix so we never
-    // double it up (e.g. "OCEAN VA" or "OCEAN ##VA" → "OCEAN ##VA").
-    const formatVaCallsign = (base) => {
-        if (!base) return null;
-        const clean = String(base).trim().toUpperCase()
-            .replace(/\s*#+\s*VA$/i, '')   // strip an existing "##VA"
-            .replace(/\s+VA$/i, '')         // ...or a bare trailing "VA"
-            .trim();
-        return clean ? `${clean} ##VA` : null;
+    // Render a VA's stored callsign the way its pilots actually fly it, e.g.
+    // "OCEAN ##VA" — the "##" standing in for their individual pilot number.
+    //
+    // The tag is READ OFF the stored mask rather than assumed to be "VA". A VA
+    // may register "SHAMROCK ###EX" or no tag at all ("BAW ###"); the old
+    // version stripped a literal "VA" and glued one back on, so those VAs were
+    // told their pilots fly "SHAMROCK ###EX ##VA" — a callsign nobody flies and
+    // nothing matches. Mirrors vaCallsignParts / formatCallsignDisplay on the
+    // server so the bot, the portals and the feed all describe one callsign.
+    const vaCallsignParts = (raw) => {
+        const s = String(raw || '').trim().toUpperCase().replace(/\s+/g, ' ');
+        if (!s) return null;
+        const first = s.indexOf('#');
+        if (first !== -1) {
+            const base = s.slice(0, first).trim();
+            return base ? { base, tag: s.slice(s.lastIndexOf('#') + 1).trim() } : null;
+        }
+        const m = s.match(/^(.*?)\s+VA$/);
+        if (m && m[1].trim()) return { base: m[1].trim(), tag: 'VA' };
+        return { base: s, tag: 'VA' };   // legacy bare base
+    };
+    const formatVaCallsign = (raw) => {
+        const p = vaCallsignParts(raw);
+        if (!p || !p.base) return null;
+        return p.tag ? `${p.base} ##${p.tag}` : `${p.base} ###`;
     };
 
     // The card pinned inside a VA's private channel (and shown on approval).
@@ -926,7 +939,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
         const modal = new ModalBuilder().setCustomId('va_apply_modal').setTitle('VA / VO Application');
         modal.addComponents(
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_name').setLabel('VA / VO Name').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(80)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_callsign').setLabel('Radio Callsign (pilots fly as NAME ##VA)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(20).setPlaceholder('e.g. Ocean (pilots fly as OCEAN ##VA)')),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_callsign').setLabel('Callsign mask, tag included').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(20).setPlaceholder('e.g. OCEAN ##VA — or SHAMROCK ###EX')),
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_type').setLabel('Type — VA or VO').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(2).setPlaceholder('VA')),
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_tagline').setLabel('Short description / tagline').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(140)),
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('va_links').setLabel('Website / Discord invite (both optional)').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(300).setPlaceholder('https://yourva.com\ndiscord.gg/… (optional — one per line)'))
@@ -3194,12 +3207,16 @@ client.on('interactionCreate', async (interaction) => {
                 if (!VirtualAirlineAd) return interaction.editReply('❌ VA system unavailable (database not connected).');
 
                 const name = interaction.fields.getTextInputValue('va_name').trim();
-                // Store just the base radio callsign (e.g. "OCEAN"); the "##VA"
-                // suffix is rendered at display time via formatVaCallsign().
-                const callsignRaw = (interaction.fields.getTextInputValue('va_callsign') || '').trim().toUpperCase();
-                const callsign = callsignRaw
-                    ? (callsignRaw.replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim() || null)
-                    : null;
+                // Store the mask exactly as the applicant wrote it, tag and all
+                // — "OCEAN ##VA", "SHAMROCK ###EX", "BAW ###". The tag is the
+                // half every matcher reads (vaCallsignParts), so stripping it
+                // here to a bare base threw away the one thing a VA with a
+                // non-"VA" tag needs us to keep; a bare base is then read as the
+                // legacy "##VA" form and their real callsigns stop matching.
+                // Same rule as cleanCallsignInput on the server: trim, uppercase,
+                // store. Display collapses the mask, so nothing doubles up.
+                const callsign = (interaction.fields.getTextInputValue('va_callsign') || '')
+                    .trim().toUpperCase().replace(/\s+/g, ' ') || null;
                 let type = (interaction.fields.getTextInputValue('va_type') || 'VA').trim().toUpperCase();
                 if (type !== 'VA' && type !== 'VO') type = 'VA';
                 const tagline = (interaction.fields.getTextInputValue('va_tagline') || '').trim().slice(0, 140);

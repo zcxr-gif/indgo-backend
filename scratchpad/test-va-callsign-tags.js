@@ -67,12 +67,21 @@ function lift(name) {
 
 // Order matters: the later helpers close over the earlier ones.
 const NAMES = [
+    'VA_CALLSIGN_MATCH_MODES',
     'vaCallsignParts',
+    'normalizeCallsignBase',
     'compactCallsign',
     'callsignSharesVaBase',
     'formatCallsignDisplay',
     'tokenHasSuffixTag',
     'callsignCarriesVaTag',
+    'vaCallsignBases',
+    'vaCallsignMode',
+    'VA_WEIGHT_WORDS',
+    'liveCallsignTokens',
+    'callsignFitsVaMode',
+    'callsignFitsVa',
+    'embedCallsignsFromAd',
 ];
 const source = NAMES.map(lift).join('\n');
 // eslint-disable-next-line no-new-func
@@ -179,6 +188,102 @@ T('tagged: a trailing word is still forgiven', decide('tagged', 'UPS 123UP Cargo
 T('airline: an untagged flight by a member still counts', decide('airline', 'UPS 123', UPS), true);
 T('airline: another airline still does not', decide('airline', 'DELTA 9UP', UPS), false);
 T('off: nothing counts', decide('off', 'UPS 123UP', UPS), false);
+
+/* ===========================================================================
+ * callsignFitsVa — the three modes a VA actually chooses between
+ *
+ * The portal offers "exactly my callsigns" / "only my VA callsigns" / "catch
+ * more of my pilots", and the middle one is the default every VA starts on. It
+ * used to be neither of the things it claimed: callsignFitsVa answered 'strict'
+ * with a bare airline test (so it was 'broad', tag ignored, other VAs' pilots on
+ * the same airline delivered) while the callsign-fallback path answered the same
+ * mode with the exact-shape regex (so it was 'exact', and a member who appended
+ * a division tag or flew a heavy was dropped). One matcher now answers all three
+ * in one place; these are the rows that distinguish them.
+ * ======================================================================== */
+const ad = (mode, ...callsigns) => ({ callsignMatch: mode, callsigns });
+
+console.log('\ncallsignFitsVa — exact');
+T('the registered shape fits', H.callsignFitsVa('OCEAN 12VA', ad('exact', 'OCEAN ##VA')), true);
+T('spacing does not matter', H.callsignFitsVa('OCEAN12VA', ad('exact', 'OCEAN ##VA')), true);
+T('a second trailing tag does not', H.callsignFitsVa('OCEAN 12VA CX', ad('exact', 'OCEAN ##VA')), false);
+T('a missing tag does not', H.callsignFitsVa('OCEAN 12', ad('exact', 'OCEAN ##VA')), false);
+T('another airline does not', H.callsignFitsVa('DELTA 12VA', ad('exact', 'OCEAN ##VA')), false);
+T('a non-"VA" tag behaves identically',
+    H.callsignFitsVa('SHAMROCK 4EX', ad('exact', 'SHAMROCK ###EX')), true);
+T('a tagless mask wants the bare number', H.callsignFitsVa('BAW 42', ad('exact', 'BAW ###')), true);
+T('…and nothing after it', H.callsignFitsVa('BAW 42VA', ad('exact', 'BAW ###')), false);
+// Each mask is held to ITS OWN tag — not the cross-product of every base
+// against every tag the listing happens to carry.
+T('a VA with two masks does not mix them',
+    H.callsignFitsVa('OCEAN 4EX', ad('exact', 'OCEAN ##VA', 'SHAMROCK ###EX')), false);
+T('…while each mask still fits itself',
+    H.callsignFitsVa('SHAMROCK 4EX', ad('exact', 'OCEAN ##VA', 'SHAMROCK ###EX')), true);
+
+console.log('\ncallsignFitsVa — strict (the default, and the one that was broken)');
+T('the registered shape fits', H.callsignFitsVa('OCEAN 12VA', ad('strict', 'OCEAN ##VA')), true);
+T('a second trailing tag is allowed', H.callsignFitsVa('OCEAN 12VA CX', ad('strict', 'OCEAN ##VA')), true);
+T('a weight class does not hide the tag', H.callsignFitsVa('OCEAN 12VA Heavy', ad('strict', 'OCEAN ##VA')), true);
+// The leak: an untagged stranger on the VA's airline used to be delivered,
+// because 'strict' was answered with the tag-blind test.
+T('an untagged callsign on our airline does NOT', H.callsignFitsVa('OCEAN 12', ad('strict', 'OCEAN ##VA')), false);
+T('somebody else’s tag on our airline does not', H.callsignFitsVa('OCEAN 12XY', ad('strict', 'OCEAN ##VA')), false);
+T('our tag on somebody else’s airline does not', H.callsignFitsVa('DELTA 12VA', ad('strict', 'OCEAN ##VA')), false);
+T('a non-"VA" tag behaves identically', H.callsignFitsVa('SHAMROCK 4EX', ad('strict', 'SHAMROCK ###EX')), true);
+T('…and its untagged form is refused too', H.callsignFitsVa('SHAMROCK 4', ad('strict', 'SHAMROCK ###EX')), false);
+// A VA that registered no tag has nothing to require, so strict is the airline.
+T('a tagless mask matches on the airline alone', H.callsignFitsVa('BAW 42', ad('strict', 'BAW ###')), true);
+T('a multi-word airline is matched whole, not on its first word',
+    H.callsignFitsVa('AIR FRANCE 001VA', ad('strict', 'AIR CANADA ##VA')), false);
+
+console.log('\ncallsignFitsVa — broad');
+T('the tag is waived', H.callsignFitsVa('OCEAN 12', ad('broad', 'OCEAN ##VA')), true);
+T('so is a foreign tag', H.callsignFitsVa('OCEAN 12XY', ad('broad', 'OCEAN ##VA')), true);
+T('the airline is not', H.callsignFitsVa('DELTA 12VA', ad('broad', 'OCEAN ##VA')), false);
+
+console.log('\ncallsignFitsVa — the edges');
+T('an unknown mode is strict, never the loosest',
+    H.callsignFitsVa('OCEAN 12', ad('whatever', 'OCEAN ##VA')), false);
+T('a listing with no callsigns fits nothing', H.callsignFitsVa('OCEAN 12VA', ad('broad')), false);
+T('an empty callsign fits nothing', H.callsignFitsVa('', ad('broad', 'OCEAN ##VA')), false);
+T('the legacy single-callsign field is read too',
+    H.callsignFitsVa('OCEAN 12VA', { callsignMatch: 'strict', callsigns: [], callsign: 'OCEAN ##VA' }), true);
+T('a legacy bare base is read as the "VA" tag',
+    H.callsignFitsVa('OCEAN 12VA', ad('strict', 'OCEAN')), true);
+
+/* ===========================================================================
+ * embedCallsignsFromAd — what the live map is handed to match on
+ *
+ * An embed created without prefix/suffix lists used to fall back to the bare
+ * `va.code` and NO suffix, so the tag the VA had registered never reached the
+ * widget: "only my VA callsigns" was selected, and the map showed every flight
+ * on the airline anyway. Worse, `va.code` is read as a single token by the
+ * widget, so a two-word airline matched on its first word alone.
+ * ======================================================================== */
+console.log('\nembedCallsignsFromAd — the embed inherits what the VA registered');
+const cfgOf = (over) => Object.assign({ va: { code: 'OCEAN' }, callsignPrefixes: [], callsignSuffixes: [] }, over);
+
+T('an empty embed inherits the airline and the tag',
+    H.embedCallsignsFromAd(cfgOf(), { callsigns: ['OCEAN ##VA'] }),
+    { prefixes: ['OCEAN'], suffixes: ['VA'] });
+T('…including a tag that is not "VA"',
+    H.embedCallsignsFromAd(cfgOf(), { callsigns: ['SHAMROCK ###EX'] }),
+    { prefixes: ['SHAMROCK'], suffixes: ['EX'] });
+T('a two-word airline arrives whole, not as its first word',
+    H.embedCallsignsFromAd(cfgOf({ va: { code: 'AIR CANADA' } }), { callsigns: ['AIR CANADA ##VA'] }),
+    { prefixes: ['AIR CANADA'], suffixes: ['VA'] });
+T('every registered callsign contributes',
+    H.embedCallsignsFromAd(cfgOf(), { callsigns: ['OCEAN ##VA', 'SHAMROCK ###EX'] }),
+    { prefixes: ['OCEAN', 'SHAMROCK'], suffixes: ['VA', 'EX'] });
+T('a VA that registered no tag hands the widget none',
+    H.embedCallsignsFromAd(cfgOf(), { callsigns: ['BAW ###'] }),
+    { prefixes: ['BAW'], suffixes: [] });
+T('what staff typed on the embed always wins',
+    H.embedCallsignsFromAd(cfgOf({ callsignPrefixes: ['Jazz'], callsignSuffixes: ['JZ'] }), { callsigns: ['OCEAN ##VA'] }),
+    { prefixes: ['Jazz'], suffixes: ['JZ'] });
+T('with no listing to read, the embed code is reduced to its airline',
+    H.embedCallsignsFromAd(cfgOf({ va: { code: 'OCEAN ##VA' } }), null),
+    { prefixes: ['OCEAN'], suffixes: [] });
 
 console.log(failures ? `\n${failures} failure(s)\n` : '\nAll good.\n');
 process.exit(failures ? 1 : 0);
