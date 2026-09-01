@@ -151,8 +151,8 @@
                         <input id="f_name" required class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                     </div>
                     <div>
-                        <label class="block text-sm font-semibold mb-1.5">Callsign(s) <span class="font-normal text-zinc-400">— pilots fly as "NAME ##VA". Separate multiple with commas (parent brand + sub-fleets).</span></label>
-                        <input id="f_callsign" placeholder="e.g. Ocean, Jazz → OCEAN ##VA, JAZZ ##VA" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
+                        <label class="block text-sm font-semibold mb-1.5">Callsign(s) <span class="font-normal text-zinc-400">— write the mask, tag and all: "OCEAN ##VA", "SHAMROCK ###EX". The "#" stands in for the pilot number; whatever follows it is the VA's tag and is what the matching below tests. Separate multiple with commas (parent brand + sub-fleets).</span></label>
+                        <input id="f_callsign" placeholder="e.g. OCEAN ##VA, SHAMROCK ###EX, BAW ###" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none uppercase">
                     </div>
                 </div>
 
@@ -384,12 +384,36 @@
 
         // ---------- Helpers ----------
         const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-        // Render the stored base radio callsign in Infinite Flight VA format,
-        // e.g. "OCEAN" -> "OCEAN ##VA" (pilots substitute their pilot number).
-        const fmtCallsign = (base) => {
-            if (!base) return '';
-            const clean = String(base).trim().toUpperCase().replace(/\s*#+\s*VA$/i, '').replace(/\s+VA$/i, '').trim();
-            return clean ? clean + ' ##VA' : '';
+        /**
+         * Render a stored VA callsign the way its pilots actually fly it.
+         *
+         * The tag has to be READ OFF the stored mask, never assumed to be "VA":
+         * a VA may register "SHAMROCK ###EX", and telling its staff their pilots
+         * fly "SHAMROCK ##VA" is both wrong and the reason the tag they set
+         * looked like it did nothing. Mirrors vaCallsignParts /
+         * formatCallsignDisplay on the server.
+         *
+         *   "OCEAN ##VA"     -> "OCEAN ##VA"
+         *   "SHAMROCK ###EX" -> "SHAMROCK ##EX"
+         *   "BAW ###"        -> "BAW ###"      (registered without a tag)
+         *   "OCEAN"          -> "OCEAN ##VA"   (legacy bare base)
+         */
+        const vaCallsignParts = (raw) => {
+            const s = String(raw || '').trim().toUpperCase().replace(/\s+/g, ' ');
+            if (!s) return null;
+            const first = s.indexOf('#');
+            if (first !== -1) {
+                const base = s.slice(0, first).trim();
+                return base ? { base, tag: s.slice(s.lastIndexOf('#') + 1).trim() } : null;
+            }
+            const m = s.match(/^(.*?)\s+VA$/);
+            if (m && m[1].trim()) return { base: m[1].trim(), tag: 'VA' };
+            return { base: s, tag: 'VA' };
+        };
+        const fmtCallsign = (raw) => {
+            const p = vaCallsignParts(raw);
+            if (!p || !p.base) return '';
+            return p.tag ? `${p.base} ##${p.tag}` : `${p.base} ###`;
         };
         const statusBadge = (s) => {
             const map = { approved: ['Live','bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300'],
