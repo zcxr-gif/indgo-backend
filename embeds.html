@@ -281,6 +281,7 @@
                             <!-- `selected` keeps form.reset() (a new embed) on the
                                  schema default rather than the first option. -->
                             <option value="strict" selected>Strict — tag required, extra trailing tag OK</option>
+                            <option value="tag">Tag — strict, plus my tag on any airline (codeshare)</option>
                             <option value="broad">Broad — airline name alone, tag optional</option>
                         </select>
                     </div>
@@ -288,13 +289,13 @@
                         <label class="block text-sm font-semibold mb-1.5">Pilots on the roster</label>
                         <select id="f_rosterTrust" class="w-full px-3 py-2.5 rounded-xl border-2 border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 focus:border-zinc-700 outline-none">
                             <option value="off">Off — callsign rule only</option>
-                            <option value="tagged">Airline + tag</option>
+                            <option value="tagged">Tag, any airline</option>
                             <option value="airline" selected>Airline, tag waived</option>
                             <option value="any">Any callsign — the codeshare opt-in</option>
                         </select>
                     </div>
                 </div>
-                <p class="text-xs text-zinc-400 -mt-1">A codeshare leg carries the partner's callsign and no tag, so only "Any callsign" can catch it — and it brings in everything else those pilots fly. Needs a roster.</p>
+                <p class="text-xs text-zinc-400 -mt-1">A codeshare leg carries the partner's callsign. If the VA's pilots keep their tag on it ("Shamrock 12NV"), "Tag" catches it with no roster needed — the tag must be distinctive, "VA" identifies nobody. If they drop the tag too, only "Any callsign" can, and it brings in everything else those pilots fly.</p>
 
                 <div>
                     <label class="block text-sm font-semibold mb-1.5">Hubs (ICAO)</label>
@@ -1114,7 +1115,7 @@
             document.getElementById('f_prefixes').value = (c.callsignPrefixes || []).join(', ');
             document.getElementById('f_suffixes').value = (c.callsignSuffixes || []).join(', ');
             document.getElementById('f_regulars').value = (c.regularCallsigns || []).join(', ');
-            document.getElementById('f_callsignMatch').value = ['exact', 'broad'].includes(c.callsignMatch) ? c.callsignMatch : 'strict';
+            document.getElementById('f_callsignMatch').value = ['exact', 'tag', 'broad'].includes(c.callsignMatch) ? c.callsignMatch : 'strict';
             document.getElementById('f_rosterTrust').value = ['off', 'tagged', 'any'].includes(c.rosterTrust) ? c.rosterTrust : 'airline';
             document.getElementById('f_hubs').value = (c.hubs || []).join(', ');
             document.getElementById('f_mode').value = c.mode || 'roster';
