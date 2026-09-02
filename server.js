@@ -12131,6 +12131,43 @@ app.patch('/api/crew-admin/vas/:id', requireAuth, async (req, res) => {
     }
 });
 
+/*
+ * The approved VAs whose roster a given community username is actually on.
+ *
+ * The same answer /api/if-card/vas gives, under a name that is true of every
+ * caller rather than of the first one. The iOS app asks this so a pilot can
+ * rep a VA on their profile, and so a badge somebody else is wearing can be
+ * checked before it is drawn — neither of which is anything to do with an IFC
+ * signature card, and an app that shipped against a URL called `if-card` would
+ * have baked in the wrong dependency for as long as that build is installed.
+ *
+ * ONE HELPER, DELIBERATELY. `ifCardVaOptions` is the roster check, and both
+ * routes call it rather than either re-implementing it. What may be worn is
+ * one rule, and it has one implementation.
+ *
+ * Public, read-only and CORS-open for the same reason the card's copy is: it
+ * reveals nothing a VA has not already published. The listings are the public
+ * partner directory, and the answer is only ever "this name appears on these
+ * approved rosters".
+ *
+ * Declared BEFORE /api/va-ads/:id, which has the same segment count and would
+ * otherwise match first and go looking for an ad whose id is "for-pilot".
+ */
+app.get('/api/va-ads/for-pilot', async (req, res) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    try {
+        const username = String(req.query.user || '').trim();
+        if (!username) {
+            return res.status(400).json({ message: 'A community username is required.' });
+        }
+        const vaOptions = await ifCardVaOptions(username);
+        res.json({ ok: true, username, maxVas: IF_CARD_MAX_VAS, vaOptions });
+    } catch (error) {
+        console.error('VA roster lookup error:', error.message);
+        res.status(500).json({ message: 'Could not check that pilot\'s VA rosters.' });
+    }
+});
+
 // GET: A single VA ad by id.
 //   ?track=view   atomically increment the view counter (for the detail page).
 app.get('/api/va-ads/:id', async (req, res) => {
