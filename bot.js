@@ -42,6 +42,7 @@ const { uploadAirportImage, getAirportInfo, deleteAirportImages } = require('./a
 // Import VA image helpers so the bot can accept banner/logo uploads in-channel
 // and push them to S3, exactly like the web dashboard does.
 const { uploadVaImage, deleteVaImage } = require('./vaAds');
+const { forgetVaIdentity } = require('./vaIdentity');
 // Shared Terms version + enforcement config (source of truth for the portal too).
 const { TOS_VERSION: VA_TOS_VERSION, TOS_PAGE_PATH: VA_TOS_PAGE_PATH } = require('./vaTos');
 
@@ -1100,6 +1101,9 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
                 // Keep the in-memory ad in sync for the confirmation embed.
                 if (updated) { ad.bannerUrl = updated.bannerUrl; ad.logoUrl = updated.logoUrl; }
                 else { ad[field] = url; await ad.save().catch(() => {}); }
+                // The web surfaces cache identities; a new logo should not wait
+                // out the TTL before it appears beside the airline's name.
+                forgetVaIdentity(ad._id);
 
                 await channel.send({ content: `✅ ${kind === 'banner' ? 'Banner' : 'Logo'} updated!`, embeds: [buildVaInfoEmbed(updated || ad)] }).catch(() => {});
 

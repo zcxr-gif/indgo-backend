@@ -43,6 +43,7 @@ const mongoose = require('mongoose');
 const axios = require('axios');
 
 const { extractRoute } = require('./vaEventCard');
+const { attachVaIdentity } = require('./vaIdentity');
 
 const TZ_OFFSET_MIN = parseInt(process.env.VA_STATS_TZ_OFFSET_MINUTES, 10) || 0;
 const RETENTION_DAYS = parseInt(process.env.VA_STATS_RETENTION_DAYS, 10) || 120;
@@ -1234,6 +1235,16 @@ function registerVaStatsRoutes(app, { requireAuth, requireAdmin, requirePortal }
                     leaderboard({ day, sort: req.query.sort, limit: 100 }),
                     recentLegs({ day, limit: 40 }),
                 ]);
+                // Every row that names a VA gets that VA's mark alongside the
+                // name it was recorded under, so the dashboard reads as a list
+                // of airlines rather than a list of strings.
+                const live = liveSnapshot({ limit: 200 });
+                await Promise.all([
+                    attachVaIdentity(board),
+                    attachVaIdentity(legs),
+                    attachVaIdentity(live.vas),
+                    attachVaIdentity(live.flights),
+                ]);
                 res.json({
                     ok: true,
                     day,
@@ -1244,7 +1255,7 @@ function registerVaStatsRoutes(app, { requireAuth, requireAdmin, requirePortal }
                     last7: sumSeries(series.slice(-7), 'Last 7 days'),
                     last30: sumSeries(series, `Last ${series.length} days`),
                     series,
-                    live: liveSnapshot({ limit: 200 }),
+                    live,
                     leaderboard: board,
                     legs,
                     pendingLegs: dbUp() ? await VaFlightLeg.countDocuments({ day }) : 0,

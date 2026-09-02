@@ -19,6 +19,7 @@
         })();
     </script>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="/assets/va-chip.js"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet">
     <script>
         tailwind.config = {
@@ -714,7 +715,9 @@
                     <div class="flex items-start justify-between gap-2 mb-3">
                         <div class="min-w-0">
                             <div class="flex items-center gap-2">
-                                <h3 class="font-bold text-lg tracking-tight truncate">${esc(c.va && c.va.name ? c.va.name : (c.va && c.va.code) || '—')}</h3>
+                                <h3 class="font-bold text-lg tracking-tight truncate">${VaChip.html(
+                                    { name: (c.va && c.va.name) || (c.va && c.va.code) || '', code: c.va && c.va.code, logoUrl: c.va && c.va.logo },
+                                    { size: 22 })}</h3>
                                 <span class="text-xs font-mono px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500">${esc(c.va && c.va.code)}</span>
                             </div>
                             ${c.label ? `<p class="text-sm text-zinc-400 truncate">${esc(c.label)}</p>` : ''}
@@ -813,9 +816,7 @@
                 const signs = (Array.isArray(v.callsigns) && v.callsigns.length ? v.callsigns : (v.callsign ? [v.callsign] : []))
                     .map(c => String(c).trim()).filter(Boolean);
                 const signLabel = signs.join(', ');
-                const logo = v.logoUrl
-                    ? `<img src="${esc(v.logoUrl)}" alt="" class="w-8 h-8 rounded-lg object-cover bg-zinc-100 dark:bg-zinc-800 shrink-0">`
-                    : `<div class="w-8 h-8 rounded-lg bg-zinc-100 dark:bg-zinc-800 grid place-items-center text-zinc-400 shrink-0"><i class="fa-solid fa-plane"></i></div>`;
+                const logo = VaChip.html(v, { size: 32, nameOnly: true });
                 return `
                 <button type="button" onmousedown="event.preventDefault()" onclick="pickVa(${idx})" class="w-full flex items-center gap-3 px-3 py-2.5 text-left hover:bg-zinc-50 dark:hover:bg-zinc-800 transition ${i ? 'border-t border-zinc-100 dark:border-zinc-800' : ''}">
                     ${logo}

@@ -30,6 +30,7 @@ const { PutObjectCommand } = require('@aws-sdk/client-s3');
 // Reuse the staff portal's auth so our oversight routes accept a staff session.
 const { requireAuth: requireStaffSession } = require('./staffAuth');
 const { normalizeCardOptions } = require('./vaEventCard');
+const { attachVaIdentity, forgetVaIdentity } = require('./vaIdentity');
 // Shared roster helpers — same module the staff API uses, so a VA managing its
 // own roster and staff managing it see identical parsing/de-dupe/limits.
 const vaPilots = require('./vaPilots');
@@ -1235,6 +1236,9 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             // Keep the portal account's denormalized VA name in step (name is
             // not editable here, but this is cheap insurance).
             await ad.save();
+            // Drop the cached identity so a logo the owner just uploaded shows
+            // up on the next page paint, not at the end of the cache TTL.
+            forgetVaIdentity(ad._id);
             // Keep this VA's embeds in step with the head (e.g. a new logo).
             if (EmbedConfig) {
                 EmbedConfig.updateMany(
@@ -2022,7 +2026,7 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
         const filter = {};
         if (req.query.vaAdId) filter.vaAdId = req.query.vaAdId;
         const accounts = await VaPortalAccount.find(filter).sort({ vaName: 1, role: 1, createdAt: 1 });
-        res.json({ accounts: accounts.map(publicAccount) });
+        res.json({ accounts: await attachVaIdentity(accounts.map(publicAccount)) });
     });
 
     // Manually create a portal account for any VA. If no password is provided we
@@ -2131,7 +2135,7 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             if (SUBMISSION_STATUSES.includes(req.query.status)) filter.status = req.query.status;
             if (SUBMISSION_CATEGORIES.includes(req.query.category)) filter.category = req.query.category;
             const subs = await VaSubmission.find(filter).sort({ createdAt: -1 }).limit(500);
-            res.json({ submissions: subs.map(adminSubmission) });
+            res.json({ submissions: await attachVaIdentity(subs.map(adminSubmission)) });
         } catch (err) {
             console.error('VA portal admin list submissions error:', err);
             res.status(500).json({ error: 'Could not load submissions.' });
@@ -2167,7 +2171,7 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             const filter = { startsAt: { $gte: since } };
             if (req.query.vaAdId) filter.vaAdId = req.query.vaAdId;
             const events = await VaEvent.find(filter).sort({ startsAt: 1 }).limit(500);
-            res.json({ events: events.map(publicEvent) });
+            res.json({ events: await attachVaIdentity(events.map(publicEvent)) });
         } catch (err) {
             console.error('VA portal admin events error:', err);
             res.status(500).json({ error: 'Could not load events.' });
@@ -2180,10 +2184,10 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
         if (req.query.vaAdId) filter.vaAdId = req.query.vaAdId;
         const items = await VaPortalActivity.find(filter).sort({ createdAt: -1 }).limit(200);
         res.json({
-            activity: items.map(a => ({
-                id: a._id, vaName: a.vaName, actorName: a.actorName, actorRole: a.actorRole,
-                action: a.action, detail: a.detail, createdAt: a.createdAt,
-            })),
+            activity: await attachVaIdentity(items.map(a => ({
+                id: a._id, vaAdId: a.vaAdId, vaName: a.vaName, actorName: a.actorName,
+                actorRole: a.actorRole, action: a.action, detail: a.detail, createdAt: a.createdAt,
+            }))),
         });
     });
 
@@ -2197,7 +2201,7 @@ function registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s
             if (req.query.vaAdId) filter.vaAdId = req.query.vaAdId;
             if (req.query.status && ['active', 'rescinded'].includes(req.query.status)) filter.status = req.query.status;
             const warnings = await VaWarning.find(filter).sort({ createdAt: -1 }).limit(500);
-            res.json({ warnings: warnings.map(publicWarning), levels: warningLevelsPublic() });
+            res.json({ warnings: await attachVaIdentity(warnings.map(publicWarning)), levels: warningLevelsPublic() });
         } catch (err) {
             console.error('VA portal admin warnings error:', err);
             res.status(500).json({ error: 'Could not load warnings.' });

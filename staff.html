@@ -6,6 +6,7 @@
     <title>Staff Hub — Inflight</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="/assets/va-chip.js"></script>
     <script>
         tailwind.config = { darkMode: 'class' };
     </script>
@@ -679,7 +680,7 @@
                     '<span class="w-9 h-9 rounded-xl grid place-items-center shrink-0 bg-amber-50 text-amber-500 dark:bg-amber-950/40"><i data-lucide="webhook" class="w-[18px] h-[18px]"></i></span>' +
                     '<div class="min-w-0 flex-1">' +
                         '<div class="flex items-center gap-2 flex-wrap">' +
-                            '<span class="font-semibold text-sm truncate">' + esc(w.name) + '</span>' +
+                            '<span class="font-semibold text-sm truncate">' + VaChip.html(w.va || w.name, { size: 17, link: true }) + '</span>' +
                             (w.code ? '<span class="text-[11px] font-mono px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500">' + esc(w.code) + '</span>' : '') +
                         '</div>' +
                         '<div class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5 truncate">' +
@@ -711,7 +712,8 @@
             }
             box.innerHTML = items.map(t => {
                 const icon = CAT_ICON[t.category] || 'circle-dot';
-                const who = [t.vaName, t.submittedByName].filter(Boolean).join(' · ');
+                const whoElse = t.submittedByName ? ' · ' + esc(t.submittedByName) : '';
+                const who = (t.va || t.vaName) ? VaChip.html(t.va || t.vaName, { size: 14 }) + whoElse : whoElse.replace(/^ · /, '');
                 const newBadge = t.status === 'open'
                     ? '<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300">new</span>'
                     : '<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-blue-100 text-blue-700 dark:bg-blue-950/60 dark:text-blue-300">in review</span>';
@@ -722,7 +724,7 @@
                             '<span class="font-semibold text-sm truncate">' + esc(t.title) + '</span>' + newBadge +
                         '</div>' +
                         '<div class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5 truncate">' +
-                            esc(t.category) + (who ? ' · ' + esc(who) : '') +
+                            esc(t.category) + (who ? ' · ' + who : '') +
                         '</div>' +
                     '</div>' +
                     '<span class="text-[11px] text-zinc-400 dark:text-zinc-600 shrink-0 whitespace-nowrap">' + relTime(t.createdAt) + '</span>' +
@@ -821,7 +823,9 @@
                     '<span class="w-9 h-9 rounded-xl grid place-items-center shrink-0 ' + tone + '"><i data-lucide="' + icon + '" class="w-[18px] h-[18px]"></i></span>' +
                     '<div class="min-w-0 flex-1">' +
                         '<div class="flex items-center gap-2 flex-wrap">' +
-                            '<span class="font-semibold text-sm truncate">' + esc(va.name || va.code || 'VA') + '</span>' +
+                            '<span class="font-semibold text-sm truncate">' + VaChip.html(
+                                { name: va.name || va.code || 'VA', code: va.code, slug: va.slug, logoUrl: va.logoUrl },
+                                { size: 16, link: true }) + '</span>' +
                             '<span class="text-[11px] font-semibold px-1.5 py-0.5 rounded ' + badge + '">' + (isT ? 'departed' : 'landed') + '</span>' +
                             hookTag +
                         '</div>' +
@@ -898,7 +902,7 @@
                     '<div class="flex items-center gap-3.5 px-5 py-3 hover:bg-zinc-50/60 dark:hover:bg-zinc-800/30 transition">' +
                         '<span class="text-xs tabular-nums text-zinc-400 w-5 shrink-0">' + (i + 1) + '</span>' +
                         '<div class="min-w-0 flex-1">' +
-                            '<p class="font-semibold text-sm truncate">' + esc(r.vaName || 'Unknown VA') + '</p>' +
+                            '<p class="font-semibold text-sm truncate">' + VaChip.html(r.va || r.vaName, { size: 17, link: true, mono: 'Unknown VA' }) + '</p>' +
                             '<p class="text-xs text-zinc-500 dark:text-zinc-400 truncate">' +
                                 vsNum(r.takeoffs) + ' dep · ' + vsNum(r.landings) + ' arr · ' + vsNum(r.uniquePilots) + ' pilots · ' +
                                 vsNum(r.adImpressions) + ' impressions · ' + vsNum(r.adClicks) + ' clicks' +
@@ -914,7 +918,8 @@
                     '<div class="px-5 py-2.5">' +
                         '<p class="text-sm font-semibold truncate">' + esc(f.callsign || f.pilot || '—') + '</p>' +
                         '<p class="text-xs text-zinc-500 dark:text-zinc-400 truncate">' +
-                            esc(f.vaName || 'Unattributed') + ' · ' + esc(f.dep || '????') + ' → ' + esc(f.arr || '????') + ' · ' + vsDur(f.minutesAirborne) +
+                            VaChip.html(f.va || f.vaName, { size: 14, mono: 'Unattributed' }) +
+                            ' · ' + esc(f.dep || '????') + ' → ' + esc(f.arr || '????') + ' · ' + vsDur(f.minutesAirborne) +
                         '</p>' +
                     '</div>').join('')
                 : '<div class="px-5 py-10 text-center text-sm text-zinc-400">Nothing airborne right now.</div>';
