@@ -1141,10 +1141,14 @@ async function postCrewNotice(url, { title, description, color, fields, image })
 // email is ever sent and applicants rely on the status page.
 const SITE_ORIGIN = (process.env.CREW_SITE_ORIGIN || 'https://inflight.info').replace(/\/+$/, '');
 const CREW_EMAIL_PROVIDERS = ['resend', 'sendgrid', 'postmark', 'mailgun'];
+const CREW_EMAIL_LABELS = { resend: 'Resend', sendgrid: 'SendGrid', postmark: 'Postmark', mailgun: 'Mailgun' };
 const escHtml = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const isEmail = (s) => EMAIL_RE.test(String(s || '').trim());
 const maskKey = (k) => k ? '••••••' + String(k).slice(-4) : '';
+// A From on one of these can never be verified with a sending provider, so a
+// test using one fails every time — worth naming rather than making the VA guess.
+const FREE_MAIL_DOMAINS = ['gmail.com', 'googlemail.com', 'yahoo.com', 'outlook.com', 'hotmail.com', 'live.com', 'icloud.com', 'me.com', 'aol.com', 'proton.me', 'protonmail.com'];
 // Split "Name <email>" → { name, email }.
 function parseAddress(s) {
     const m = String(s || '').match(/^\s*(.*?)\s*<([^>]+)>\s*$/);
@@ -1158,10 +1162,26 @@ function emailCfgReady(cfg) {
     return true;
 }
 
+// Pull the human-readable complaint out of a provider's error response. Each
+// one nests it somewhere different, and the text is the whole value of a failed
+// test — "the domain is not verified" is a fix, "it didn't work" is not.
+function providerErrorText(err) {
+    const d = err?.response?.data;
+    const raw = (typeof d === 'string' ? d : null)
+        || d?.message                                   // Resend, Mailgun
+        || d?.Message                                   // Postmark
+        || (Array.isArray(d?.errors) && d.errors[0]?.message)  // SendGrid
+        || err?.message || '';
+    return String(raw).replace(/\s+/g, ' ').trim().slice(0, 300);
+}
+
 // One send, dispatched to whichever provider the config names. Every provider
 // here is a pure HTTPS JSON/form API (no SMTP), so axios covers them all.
-async function sendCrewEmail(cfg, { to, subject, html, replyTo }) {
-    if (!emailCfgReady(cfg) || !isEmail(to)) return false;
+// Returns { ok, error } — the error text is surfaced by the settings test so a
+// VA sees the provider's own reason rather than a generic failure.
+async function sendCrewEmailDetailed(cfg, { to, subject, html, replyTo }) {
+    if (!emailCfgReady(cfg)) return { ok: false, error: 'Email is not configured.' };
+    if (!isEmail(to)) return { ok: false, error: 'That recipient address is not valid.' };
     const rt = (replyTo && isEmail(replyTo)) ? replyTo : (isEmail(cfg.replyTo) ? cfg.replyTo : undefined);
     const subj = String(subject || '').slice(0, 200);
     try {
@@ -1189,10 +1209,17 @@ async function sendCrewEmail(cfg, { to, subject, html, replyTo }) {
             if (rt) form.append('h:Reply-To', rt);
             await axios.post(`${base}/v3/${encodeURIComponent(cfg.domain)}/messages`, form,
                 { timeout: 10000, auth: { username: 'api', password: cfg.key }, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
-        } else return false;
-        return true;
-    } catch (err) { console.error(`crew email failed (${cfg.provider}):`, err?.response?.data || err?.message || err); return false; }
+        } else return { ok: false, error: 'Unknown email provider.' };
+        return { ok: true, error: '' };
+    } catch (err) {
+        const detail = providerErrorText(err);
+        console.error(`crew email failed (${cfg.provider}):`, err?.response?.data || err?.message || err);
+        return { ok: false, error: detail };
+    }
 }
+// Fire-and-forget callers only care whether it went. Applicant mail must never
+// fail a decision, so this stays boolean and the detail goes to the log.
+async function sendCrewEmail(cfg, msg) { return (await sendCrewEmailDetailed(cfg, msg)).ok; }
 // Resolve the email config for a VA: their OWN provider if configured, else null
 // (email off — there is no platform fallback).
 async function crewEmailConfigFor(vaId) {
@@ -10226,8 +10253,9 @@ app.post('/api/crew/:slug/webhook', async (req, res) => {
     } catch (err) { console.error('crew webhook set error:', err); res.status(500).json({ error: 'Could not save the webhook.' }); }
 });
 
-// Staff: read the VA's email-provider config (never the secret key). Reports
-// whether the platform fallback is available so the UI can explain what happens.
+// Staff: read the VA's email-provider config (never the secret key). `configured`
+// tells the UI whether applicant email is on at all — there is no platform
+// fallback, so an unconfigured VA simply sends nothing.
 app.get('/api/crew/:slug/email', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'settings.notifications');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
@@ -10288,12 +10316,26 @@ app.post('/api/crew/:slug/email', async (req, res) => {
             if (!isEmail(to)) return res.status(400).json({ error: 'Enter a valid address to send the test to.' });
             const cfg = { provider: ad.crewEmailProvider, key: ad.crewEmailKey, from: ad.crewEmailFrom, replyTo: ad.crewEmailReplyTo || ad.contactEmail || '', domain: ad.crewEmailDomain || '', region: ad.crewEmailRegion || 'us' };
             if (!emailCfgReady(cfg)) return res.status(400).json({ error: 'Add a provider, From address and API key first.' });
-            const ok = await sendCrewEmail(cfg, {
+            const sent = await sendCrewEmailDetailed(cfg, {
                 to, subject: `${ad.name || 'Crew Center'} — email test`,
                 html: crewEmailHtml({ vaName: ad.name, accent: ad.crewAccent, heading: 'Email is working 🎉',
                     bodyHtml: 'This is a test from your Crew Center. Applicant notifications will be delivered through your own provider.' }),
             });
-            if (!ok) return res.status(502).json({ error: 'The provider rejected the test — double-check the From address, API key and (for Mailgun) the sending domain.' });
+            if (!sent.ok) {
+                // The provider's own words first — they name the actual problem,
+                // and by far the most common one is a From address on a domain
+                // the VA has not verified with the provider (a gmail.com or
+                // outlook.com From is always rejected).
+                const label = CREW_EMAIL_LABELS[cfg.provider] || 'The provider';
+                const base = sent.error
+                    ? `${label} rejected the test: ${sent.error}`
+                    : `${label} rejected the test.`;
+                const fromDomain = (parseAddress(cfg.from).email.split('@')[1] || '').toLowerCase();
+                const hint = FREE_MAIL_DOMAINS.includes(fromDomain)
+                    ? ` You cannot send from ${fromDomain} — providers only accept a From address on a domain you have verified with them. Add your own domain in ${label}, or use their test sender while you set that up.`
+                    : ' Check the From address is on a domain you have verified with the provider, and that the API key is right.';
+                return res.status(502).json({ error: base + hint });
+            }
         }
         res.set('Cache-Control', 'no-store');
         res.json({
