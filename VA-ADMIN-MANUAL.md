@@ -496,6 +496,42 @@ Because both fronts edit the same record, keep them coherent:
 - The **callsign** is stored as the base everywhere (bot and web strip `##VA`); the
   suffix is added only at display time. Enter the base in both places.
 
+### 8B.7 Applicant email (bring-your-own sender)
+Decision emails — *application received*, *accepted* (carrying the pilot's
+one-time password and the VA's Discord invite), *declined* — go out through the
+**VA's own email provider**. There is **no platform sender and no fallback**: a
+VA that has not configured one sends nothing at all, and its applicants rely on
+the status page. That is by design, not a gap — a shared sender would put every
+VA on one quota and one sending reputation.
+
+Set it in **Crew Dashboard → Settings → Alerts → Email applicants** (needs the
+`settings.notifications` capability, so any staff member with it — not just the
+owner). Providers: **Resend, SendGrid, Postmark, Mailgun**.
+
+**The one thing that trips up nearly everyone: the From address.** Every provider
+rejects a From on a domain you have not verified with them. A `gmail.com`,
+`outlook.com` or `icloud.com` From **will never work**, no matter how valid the
+API key is. The VA needs a domain it controls. A Netlify/Vercel subdomain
+(`yourva.netlify.app`) does not count — the VA cannot add DNS records to it.
+
+Verifying a domain (Resend; the others are the same shape):
+
+| Step | What to do |
+|------|------------|
+| 1 | Resend → **Domains → Add Domain**. Use a **subdomain** (`mail.yourva.com`), not the root — it keeps sending reputation off the main domain and avoids clashing with existing root SPF/MX records. |
+| 2 | Resend prints three DNS records: a **DKIM** `TXT`, an **SPF** `TXT`, and an **MX** for bounce handling. Copy the values **from the console** — the region is baked into the MX host and the DKIM key is unique per domain. |
+| 3 | Add them wherever the domain's nameservers point (registrar, Netlify DNS, Cloudflare). **Watch the host field**: some panels auto-append the zone, so pasting the full `resend._domainkey.mail.yourva.com` produces `…yourva.com.yourva.com`. If the panel appends, enter only the left-hand part. |
+| 4 | Wait for **Verified** — usually minutes. |
+| 5 | Back in Alerts, set From to `Your VA <crew@mail.yourva.com>` and **Send test**. |
+
+**Reply-to is not restricted** — point it at whatever inbox the team actually
+reads, a free Gmail included. Mail then leaves from the VA's domain and replies
+land somewhere they'll be seen.
+
+If the test fails, the note under the buttons now prints **the provider's own
+error** ("The … domain is not verified"), so it names the fix. Free-mail From
+addresses are called out explicitly.
+
 ---
 
 ## 8C. The Inflight VA Rep & VA Partnership Tickets
