@@ -946,6 +946,69 @@ function registerCrewAuthRoutes(app) {
         }
     });
 
+
+    // --- Who there is to assign (owner, Inflight, or a delegate with team.manage) ---
+    //
+    // The team editor keys an assignment on a staff member's LOGIN username,
+    // and until now the owner had to remember it and type it correctly. That
+    // is the step the whole permission system was failing at: a name typed
+    // with a typo, or a pilot's roster name typed instead of their login,
+    // saves cleanly and grants nothing, with nothing on screen to say so.
+    //
+    // Nothing here is secret — these accounts already appear in the VA portal's
+    // own team list, to the same people. Pilot logins are deliberately NOT
+    // returned: a pilot cannot hold a staff role, so offering one would be
+    // offering an assignment that does nothing.
+    app.get('/api/crew/:slug/staff-accounts', async (req, res) => {
+        const p = verifyCrewRequest(req);
+        if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+
+        const slug = String(req.params.slug || '').toLowerCase();
+        const isInflight = p.kind === 'inflight';
+        if (!(isInflight || p.role === 'owner' || p.role === 'staff')) {
+            return res.status(403).json({ error: 'Not allowed.' });
+        }
+        if (!isInflight && p.slug && p.slug !== slug) {
+            return res.status(403).json({ error: 'Wrong crew center.' });
+        }
+
+        try {
+            const va = await resolveVa(slug);
+            if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+
+            // Same gate as the team editor itself: an owner, Inflight, or a
+            // delegate the owner handed team.manage to. A staff member without
+            // it has no business reading their colleagues' login names.
+            if (!(isInflight || p.role === 'owner')) {
+                const VirtualAirlineAd = mongoose.model('VirtualAirlineAd');
+                const ad = await VirtualAirlineAd.findById(va._id).select('staffRoles staffAssignments').lean();
+                if (!effectiveCaps(ad, p).includes('team.manage')) {
+                    return res.status(403).json({ error: 'Not allowed.' });
+                }
+            }
+
+            const VaPortalAccount = mongoose.model('VaPortalAccount');
+            const rows = await VaPortalAccount
+                .find({ vaAdId: va._id, role: { $in: ['owner', 'staff'] } })
+                .select('username displayName role active')
+                .sort({ role: 1, username: 1 })
+                .lean();
+
+            res.set('Cache-Control', 'no-store');
+            res.json({
+                accounts: rows.map(a => ({
+                    username: a.username,
+                    displayName: a.displayName || a.username,
+                    role: a.role,
+                    active: a.active !== false,
+                })),
+            });
+        } catch (err) {
+            console.error('Crew staff-accounts error:', err);
+            res.status(500).json({ error: 'Could not load the staff accounts.' });
+        }
+    });
+
     // --- Connect the VA's Supabase project (owner or Inflight only) ---
     // Stores the project URL + public anon key (browser-safe) and, optionally,
     // the secret service-role key (never returned). Staff/pilots cannot touch it.
