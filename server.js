@@ -10226,8 +10226,9 @@ app.post('/api/crew/:slug/webhook', async (req, res) => {
     } catch (err) { console.error('crew webhook set error:', err); res.status(500).json({ error: 'Could not save the webhook.' }); }
 });
 
-// Staff: read the VA's email-provider config (never the secret key). Reports
-// whether the platform fallback is available so the UI can explain what happens.
+// Staff: read the VA's email-provider config (never the secret key). `configured`
+// tells the UI whether applicant email is on at all — there is no platform
+// fallback, so an unconfigured VA simply sends nothing.
 app.get('/api/crew/:slug/email', async (req, res) => {
     const gate = await requireCap(req, req.params.slug, 'settings.notifications');
     if (gate.error) return res.status(gate.error).json({ error: gate.error === 401 ? 'Not authenticated.' : 'Not allowed.' });
