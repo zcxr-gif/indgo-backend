@@ -168,6 +168,10 @@ const os = require('os');
 // MEMORY FIX: Disable Sharp's internal cache to prevent RAM balloons
 sharp.cache(false);
 sharp.concurrency(1);
+// ...and a ceiling on how large a single decode may be, which is the one bound
+// neither of the above provides. See imageLimits.js for why the byte caps
+// elsewhere do not cover this.
+const { uploadOpts, isPixelLimitError, PIXEL_LIMIT_MESSAGE } = require('./imageLimits');
 
 // STABILITY: Keep the backend alive when the bot (or anything else) misbehaves.
 // Without these, a single rejected promise inside discord.js takes down the API.
@@ -191,9 +195,27 @@ const PORT = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors()); // Allow all origins
-// Increase limit for JSON body (trails can be large)
-app.use(express.json({ limit: '100mb' })); 
-app.use(express.urlencoded({ extended: true, limit: '100mb' }));
+// Body size ceiling. Trails and CSV rosters are genuinely large, so this cannot
+// be express's 100kb default — but it was 100mb, and that is not a limit, it is
+// the absence of one.
+//
+// What 100mb actually permits: body-parser buffers the whole request before
+// parsing, and JSON.parse then expands it into JS objects at roughly 5-10x the
+// text size, because every small object carries a header, a hash map and
+// pointer-aligned slots. A single 100mb POST is therefore a half-gigabyte heap
+// spike from one request, reachable by anyone who can reach the endpoint, with
+// no file and no special content needed. Concurrent copies multiply it. That is
+// a far cheaper way to kill this process than any image.
+//
+// 8mb is set against the largest legitimate body, which is a merged flight
+// trail: a 16-hour flight sampled every second is ~57,000 points at ~90 bytes
+// of JSON each, a little over 5mb, and the recorder samples slower than that.
+// A CSV roster is far smaller — 8mb of CSV is ~40,000 pilots. So this is
+// comfortably above anything real while cutting the worst case by 12x, and an
+// oversized body now gets a clean 413 from body-parser instead of being parsed.
+const BODY_LIMIT = process.env.BODY_LIMIT || '8mb';
+app.use(express.json({ limit: BODY_LIMIT }));
+app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
 
 // Trust Proxy (Required if behind Nginx/Heroku/Cloudflare to get real IPs)
 app.set('trust proxy', 1);
@@ -2676,7 +2698,11 @@ const queueAircraftImage = (task) => {
 
 // Helper: Optimize a single image file and upload it to S3, returning the public URL.
 const processAndUploadAircraftImage = (file, tailRef) => queueAircraftImage(async () => {
-    const optimizedBuffer = await sharp(file.path)
+    // The queue above bounds how MANY pipelines run at once; the ceiling here
+    // bounds how big ONE of them can get. Both are needed — a single 20000x12000
+    // photo decodes to about a gigabyte outside the V8 heap, which no amount of
+    // serialization survives. See imageLimits.js.
+    const optimizedBuffer = await sharp(file.path, uploadOpts())
         .resize({ width: 1920, withoutEnlargement: true })
         .webp({ quality: 80 })
         .toBuffer();
@@ -2701,7 +2727,7 @@ const processAndUploadAircraftImage = (file, tailRef) => queueAircraftImage(asyn
 // S3 (mirroring the DM flow). Runs through the same single-slot sharp queue so it
 // can't stack native image buffers with other uploads.
 const optimizeAircraftImageBuffer = (file) => queueAircraftImage(() =>
-    sharp(file.path)
+    sharp(file.path, uploadOpts())
         .resize({ width: 1920, withoutEnlargement: true })
         .webp({ quality: 80 })
         .toBuffer()
@@ -2765,6 +2791,103 @@ const uploadAircraftImages = upload.fields([
     { name: 'images', maxCount: MAX_AIRCRAFT_IMAGES },
     { name: 'image', maxCount: 1 }
 ]);
+
+/* ---------------------------------------------------------------------------
+ * Streaming a collection out as JSON
+ *
+ * `res.json(await Model.find().lean())` holds the whole answer three times over
+ * at its peak: the array of documents, the single JSON string JSON.stringify
+ * builds from it, and the Buffer express writes to the socket. For an endpoint
+ * that returns an entire collection — one that grows every time a contributor
+ * uploads something, and that the homepage hits on every load — that is the
+ * largest allocation in the process, it scales with concurrent readers, and it
+ * has no ceiling at all. It is also invisible until the collection is big
+ * enough to matter, which is exactly the "ran fine for months" shape.
+ *
+ * A cursor turns that into one document at a time. Two details make it real
+ * rather than cosmetic:
+ *
+ *   • BACKPRESSURE. If `res.write()` returns false and we keep writing anyway,
+ *     Node queues the unwritten chunks in memory and we have rebuilt the whole
+ *     response on the heap with extra steps. Awaiting 'drain' is the part that
+ *     makes this bounded — without it this optimisation is a no-op.
+ *   • The cursor is closed in `finally`, including when the client disconnects
+ *     mid-response. An abandoned cursor holds a server-side batch and a
+ *     connection from the pool.
+ *
+ * Output is byte-identical to `res.json(array)`: JSON.stringify per document
+ * joined by commas is the same text as JSON.stringify of the array, and lean()
+ * documents serialize identically (ObjectId and Date both have toJSON).
+ *
+ * Errors are only recoverable BEFORE the first byte. Afterwards the status line
+ * is already sent and the only honest signal left is to destroy the response so
+ * the client sees a truncated body rather than a valid-looking short array.
+ * ------------------------------------------------------------------------- */
+const STREAM_CHUNK_CHARS = 64 * 1024;
+const streamJsonArray = async (res, query, { prefix = '', suffix = '' } = {}) => {
+    const cursor = query.cursor();
+    let started = false;
+    // Documents are accumulated and written in ~64KB chunks rather than one
+    // write per document. Writing each document separately is correct but
+    // wasteful: every write is its own chunked-transfer framing and its own
+    // trip through the socket, so a 60,000-document response became 60,000 of
+    // them. Batching cuts that by two or three orders of magnitude while
+    // keeping memory bounded — this buffer holds one chunk, not one response,
+    // which is the entire distinction being drawn here.
+    let buf = '';
+    const flush = async (force) => {
+        if (!buf || (!force && buf.length < STREAM_CHUNK_CHARS)) return;
+        const chunk = buf;
+        buf = '';
+        if (!res.write(chunk)) {
+            // The socket is full. Wait for it to drain before reading more
+            // documents, so the cursor advances no faster than the client
+            // consumes and memory stays flat on a slow connection.
+            //
+            // 'close' is raced against 'drain' because a client that hangs up
+            // while the socket is full never drains — and waiting on 'drain'
+            // alone would then suspend this function forever, so the `finally`
+            // below never runs and the cursor is never released. An abandoned
+            // download is not exotic on these endpoints (closing the tab on a
+            // large response does it), so that would leak a cursor per abort
+            // and quietly become the very thing this helper exists to prevent.
+            // Both listeners are removed on whichever fires, so a long response
+            // cannot accumulate them either.
+            await new Promise((resolve) => {
+                const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+                res.once('drain', done);
+                res.once('close', done);
+            });
+        }
+    };
+    try {
+        for (let doc = await cursor.next(); doc !== null; doc = await cursor.next()) {
+            if (!started) {
+                res.set('Content-Type', 'application/json; charset=utf-8');
+                buf += `${prefix}[`;
+                started = true;
+            } else {
+                buf += ',';
+            }
+            buf += JSON.stringify(doc);
+            await flush(false);
+            // Nobody is listening any more. Stop pulling documents for a socket
+            // that is gone rather than reading the collection to its end.
+            if (res.destroyed) return;
+        }
+        if (!started) {
+            res.set('Content-Type', 'application/json; charset=utf-8');
+            buf += `${prefix}[`;
+        }
+        res.end(`${buf}]${suffix}`);
+    } catch (err) {
+        if (!started && !res.headersSent) throw err;
+        console.error('Stream Error (response already started):', err?.message || err);
+        res.destroy(err);
+    } finally {
+        try { await cursor.close(); } catch { /* already closed, or the socket went first */ }
+    }
+};
 
 // Helper: Convert S3 Stream to Buffer, transparently un-gzipping if needed.
 //
@@ -8877,6 +9000,10 @@ app.delete('/api/crew/:slug/applications/:id/invite', async (req, res) => {
 // status token. Everything is computed inside the VA's own database.
 const CREW_STATS_TTL_MS = 60 * 1000;
 const _crewStatsCache = new Map();   // slug -> { at, payload }
+// Well above any plausible number of partner VAs, so in practice this never
+// evicts anything — it is here so that "one entry per slug, kept forever" has
+// a ceiling at all rather than being trusted to stay small.
+const CREW_STATS_CACHE_MAX = 500;
 
 // How many people are queued up to join is the VA's business, not the public's:
 // it says something about a private queue that no public page needs. The cache
@@ -9058,6 +9185,16 @@ app.get('/api/crew/:slug/stats', async (req, res) => {
             stats,
         };
         _crewStatsCache.set(slug, { at: Date.now(), payload });
+        // Entries are deliberately never expired — a stale snapshot is what
+        // keeps a VA's homepage up when their database blips (see the catch
+        // below) — so the TTL above bounds freshness but nothing bounds SIZE.
+        // Each value is a full stats payload, and one is kept per slug ever
+        // requested, forever. A count cap costs the least-recently-written VA
+        // its fallback and keeps the map from being a slow leak; Map iterates
+        // in insertion order, so the first key is the oldest.
+        if (_crewStatsCache.size > CREW_STATS_CACHE_MAX) {
+            _crewStatsCache.delete(_crewStatsCache.keys().next().value);
+        }
         res.set('Cache-Control', isManager ? 'no-store' : 'public, max-age=60');
         res.json(scopeStats(payload, isManager));
     } catch (err) {
@@ -9690,6 +9827,15 @@ async function autoUpdateStore(va, health) {
     if (Date.now() - last < AUTO_UPDATE_COOLDOWN_MS) return null;
     _autoUpdateSeen.set(id, Date.now());     // set BEFORE the work, so a second
                                              // request during it does not stack
+    // An entry older than the cooldown can never change an outcome — the check
+    // above would pass regardless — so it is pure retention. Tiny (an id and a
+    // timestamp), but it is the only map here that nothing ever removes from,
+    // and "small and unbounded" is how every leak starts. Swept only once the
+    // map is big enough for the pass to be worth making.
+    if (_autoUpdateSeen.size > 200) {
+        const stale = Date.now() - AUTO_UPDATE_COOLDOWN_MS;
+        for (const [k, t] of _autoUpdateSeen) if (t < stale) _autoUpdateSeen.delete(k);
+    }
 
     const ad = await VirtualAirlineAd.findById(va._id).select(CREW_TOKEN_META + ' +supabaseAccessToken').lean();
     if (!ad || !ad.supabaseAccessToken || ad.supabaseAutoUpdate === false || ad.supabaseTokenFailedAt) return null;
@@ -10579,11 +10725,13 @@ app.get('/api/gates/:icao', async (req, res) => {
     }
 });
 
-// GET: Fetch all gates (Use with caution if dataset is massive)
+// GET: Fetch all gates. Streamed — every airport's full gate list in one
+// response is precisely the "massive dataset" the old comment here warned about,
+// and buffering it held the documents, the JSON string and the write buffer at
+// the same time.
 app.get('/api/gates', async (req, res) => {
     try {
-        const allGates = await AirportGate.find({}).lean();
-        res.json(allGates);
+        await streamJsonArray(res, AirportGate.find({}).lean());
     } catch (error) {
         console.error('Global Gates Fetch Error:', error);
         res.status(500).json({ message: 'Failed to fetch global gates dataset.' });
@@ -10697,19 +10845,85 @@ app.get('/api/leaderboard/top', async (req, res) => {
 /* =========================
  * IMAGE PROXY FOR SCREENSHOTS
  * ========================= */
+
+/**
+ * Is this hostname on the private side of the network?
+ *
+ * A literal-address check, deliberately: it covers the addresses that are
+ * reachable from inside the container but not from the internet, which is the
+ * class this proxy must not be pointed at. It is not a complete SSRF defence —
+ * a hostname that RESOLVES to a private address still passes, because the
+ * resolution happens later inside axios — and closing that properly means
+ * resolving first and pinning the connection to the address checked. Worth
+ * doing if this endpoint ever handles anything sensitive; the literal check is
+ * what stops the trivial `?url=http://169.254.169.254/...` today.
+ */
+function isPrivateHost(hostname) {
+    const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+    if (!h || h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.internal') || h.endsWith('.local')) return true;
+    // IPv6 loopback / link-local / unique-local.
+    if (h === '::1' || h === '::' || /^f[cd][0-9a-f]{2}:/.test(h) || /^fe80:/.test(h)) return true;
+    // IPv4-mapped IPv6 (::ffff:127.0.0.1) is checked on its embedded address.
+    const mapped = h.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    const v4 = mapped ? mapped[1] : h;
+    const m = v4.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (!m) return false;                       // a name — resolved later, see above
+    const [a, b] = [Number(m[1]), Number(m[2])];
+    if ([a, Number(m[2]), Number(m[3]), Number(m[4])].some((n) => n > 255)) return true;
+    return a === 0 || a === 10 || a === 127                       // this-host, private, loopback
+        || (a === 169 && b === 254)                               // link-local, incl. cloud metadata
+        || (a === 172 && b >= 16 && b <= 31)                      // private
+        || (a === 192 && b === 168)                               // private
+        || (a === 100 && b >= 64 && b <= 127)                     // carrier-grade NAT
+        || a >= 224;                                              // multicast / reserved
+}
 app.get('/api/image-proxy', async (req, res) => {
     const imageUrl = req.query.url;
     if (!imageUrl) {
         return res.status(400).send('No URL provided');
     }
 
+    // Only http(s), and not at ourselves or anything else on the private side of
+    // the network. This endpoint takes a URL from the query string, is
+    // unauthenticated, and fetches it from inside the container — which without
+    // a check makes it a general-purpose way to ask our host to make requests on
+    // the caller's behalf, including to cloud metadata (169.254.169.254),
+    // localhost and anything else the container can reach but the internet
+    // cannot. It exists to relay public screenshot images, so it is restricted
+    // to that. IMAGE_PROXY_ALLOW_PRIVATE=1 restores the old reach if some
+    // deployment genuinely proxies an internal host.
+    let target;
+    try {
+        target = new URL(String(imageUrl));
+    } catch {
+        return res.status(400).send('Invalid URL');
+    }
+    if (!/^https?:$/.test(target.protocol)) {
+        return res.status(400).send('Only http and https URLs can be proxied');
+    }
+    if (process.env.IMAGE_PROXY_ALLOW_PRIVATE !== '1' && isPrivateHost(target.hostname)) {
+        return res.status(400).send('That host cannot be proxied');
+    }
+
+    let upstream = null;
     try {
         // Fetch the external image as a stream
         const response = await axios({
             method: 'get',
-            url: imageUrl,
-            responseType: 'stream'
+            url: target.href,
+            responseType: 'stream',
+            // Without a timeout an upstream that accepts the connection and then
+            // says nothing holds this request, its socket and its buffers open
+            // indefinitely. Handles that only ever accumulate are the shape the
+            // diagnostics terminal calls a leak, and they precede an OOM.
+            timeout: 15000,
+            maxRedirects: 3,
+            // Bounds what we are willing to relay. Applies to the stream, so an
+            // endless response is cut off rather than piped forever.
+            maxContentLength: 25 * 1024 * 1024,
+            maxBodyLength: 25 * 1024 * 1024,
         });
+        upstream = response.data;
 
         // 1. Force Allow Origin * (The magic permission slip)
         res.header("Access-Control-Allow-Origin", "*");
@@ -10721,12 +10935,27 @@ app.get('/api/image-proxy', async (req, res) => {
             res.header("Content-Type", response.headers['content-type']);
         }
 
-        // 3. Pipe the image data straight to the frontend
-        response.data.pipe(res);
+        // 3. Pipe the image data straight to the frontend.
+        //
+        // pipe() does NOT tear down the source when the destination goes away,
+        // and the destination going away is the normal case here: a browser
+        // that navigates, or an <img> removed from the page, closes the socket
+        // mid-transfer. The upstream request would then stay open — holding a
+        // connection and its buffers — until it finished on its own, which for
+        // a slow origin is a long time and for a hanging one is forever. So the
+        // client's disconnect is forwarded upstream explicitly.
+        res.once('close', () => { if (!upstream.destroyed) upstream.destroy(); });
+        upstream.once('error', (err) => {
+            console.error('Image Proxy Error (upstream):', err.message);
+            if (!res.headersSent) res.status(502).send('Failed to fetch image');
+            else res.destroy(err);
+        });
+        upstream.pipe(res);
 
     } catch (error) {
         console.error("Image Proxy Error:", error.message);
-        res.status(500).send('Failed to fetch image');
+        if (upstream && !upstream.destroyed) upstream.destroy();
+        if (!res.headersSent) res.status(502).send('Failed to fetch image');
     }
 });
 
@@ -10756,6 +10985,30 @@ const TRAIL_MAX_PER_USER = (() => {
 const TRAIL_MAX_AGE_MS = (() => {
     const n = parseInt(process.env.TRAIL_ARCHIVE_MAX_AGE_DAYS ?? '', 10);
     return Number.isFinite(n) && n > 0 ? n * 24 * 60 * 60 * 1000 : 0;
+})();
+
+/**
+ * The most points one stored trail may keep.
+ *
+ * The archive bounds how many trails a pilot keeps and how old they get. It
+ * does not bound how big ONE of them becomes, and the save path appends: each
+ * POST reads the stored trail, concatenates the new points and writes the union
+ * back. Nothing ever removes a point, so a recorder that keeps reporting — a
+ * flight left running overnight, a client that retries, a session that never
+ * ends — grows a single object forever, and every later append pays for the
+ * whole accumulated history at once. Merging holds several copies at the same
+ * time (the parsed original, the concatenation, the deduplicated filter result,
+ * the serialized string, the gzip buffer), so the cost of one save is a
+ * multiple of a file with no ceiling on it.
+ *
+ * 60,000 points is about 17 hours at one point per second, comfortably longer
+ * than the longest flight anyone can fly, so no real trail reaches it. When one
+ * does, the OLDEST points are dropped: a trail that has overrun is a recorder
+ * that never stopped, and the recent end is the part a replay is about.
+ */
+const TRAIL_MAX_POINTS = (() => {
+    const n = parseInt(process.env.TRAIL_MAX_POINTS ?? '', 10);
+    return Number.isFinite(n) && n > 0 ? n : 60000;
 })();
 
 /**
@@ -10931,6 +11184,19 @@ app.post('/api/trails', async (req, res) => {
             }
         }
 
+        // Enforce the per-trail ceiling. Applied after the merge and outside it,
+        // so it also catches a first write that arrives oversized rather than
+        // only trails that grew into it. Sliced from the END: the points kept
+        // are the most recent ones (see TRAIL_MAX_POINTS).
+        if (finalTrail.length > TRAIL_MAX_POINTS) {
+            const dropped = finalTrail.length - TRAIL_MAX_POINTS;
+            finalTrail = finalTrail.slice(-TRAIL_MAX_POINTS);
+            console.warn(
+                `✂️  Trail ${newFileKey} exceeded ${TRAIL_MAX_POINTS} points — dropped the oldest ${dropped}. `
+                + 'A trail this long means a recorder that never stopped; raise TRAIL_MAX_POINTS if this is legitimate.'
+            );
+        }
+
         // 2. PRUNE: keep the pilot's archive within its limits.
         // Only on a NEW file — an update cannot grow the folder, so it would be
         // paying for a listing that can never find anything to do.
@@ -10984,8 +11250,16 @@ app.post('/api/trails', async (req, res) => {
         // path above, so marking these immutable would let a stale replay
         // survive an update — and no-cache still revalidates against S3's ETag,
         // which already avoids re-downloading an unchanged trail.
+        // gzip, off the event loop. This was gzipSync, which compresses several
+        // megabytes on the main thread with every other request stopped behind
+        // it — the p99 event-loop spikes the diagnostics terminal flags as an
+        // "irregular rhythm" are partly this. zlib's async form does the same
+        // work on the threadpool for the same bytes out; the only thing that
+        // changes is that the process keeps answering while it happens.
         const rawBody = Buffer.from(JSON.stringify(finalTrail));
-        const bodyBuffer = zlib.gzipSync(rawBody);
+        const bodyBuffer = await new Promise((resolve, reject) => {
+            zlib.gzip(rawBody, (err, buf) => (err ? reject(err) : resolve(buf)));
+        });
 
         await s3Client.send(new PutObjectCommand({
             Bucket: process.env.AWS_S3_BUCKET_NAME,
@@ -11016,8 +11290,11 @@ app.get('/api/aircraft', async (req, res) => {
         // skip Mongoose document hydration (change-tracking, getters/setters) and
         // hand back plain objects. Cuts both the CPU per request and the peak RSS
         // of the response by several times — the result is only serialized to JSON.
-        const aircraft = await CommunityAircraft.find().sort({ uploadedAt: -1 }).lean();
-        res.json(aircraft);
+        //
+        // Streamed rather than buffered: this is the single largest allocation
+        // in the process and it grows with the collection forever. Same bytes to
+        // the client, one document at a time on this side. See streamJsonArray.
+        await streamJsonArray(res, CommunityAircraft.find().sort({ uploadedAt: -1 }).lean());
     } catch (error) {
         console.error(error);
         res.status(500).json({ message: 'Error fetching aircraft.' });
@@ -11040,14 +11317,39 @@ app.get('/api/aircraft/lookup', async (req, res) => {
         }
 
         // 3. Build the MongoDB Query
+        //
+        // The search terms are escaped before becoming a regex. They arrive
+        // straight off the query string, so unescaped they are not a search but
+        // a pattern: a livery containing `(` is a syntax error, and one like
+        // `(a+)+$` is a catastrophic-backtracking pattern that pins a CPU inside
+        // the matcher for every document scanned. Escaping makes them mean
+        // themselves, which is also what a user typing "A350-900(F)" intends.
+        const rx = (v) => ({ $regex: String(v).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' });
         let query = {};
-        if (finalType) query.aircraftType = { $regex: finalType, $options: 'i' };
-        if (finalLivery) query.liveryName = { $regex: finalLivery, $options: 'i' };
+        if (finalType) query.aircraftType = rx(finalType);
+        if (finalLivery) query.liveryName = rx(finalLivery);
         if (finalTail) query.tailNumber = finalTail;
 
-        // .lean(): results are only inspected and serialized (no doc methods),
-        // so return plain objects and skip Mongoose hydration.
-        const results = await CommunityAircraft.find(query).lean();
+        // This endpoint returns exactly ONE aircraft, and it used to load every
+        // match to do it — a broad type like "737" pulls the whole fleet into
+        // memory so that one document can be picked and the rest thrown away.
+        //
+        // The exact-livery preference is asked of the database instead of
+        // scanned for in a materialised array: an anchored, case-insensitive
+        // match on liveryName, limited to one. Same answer as the old
+        // `results.find(exact)` — and, unlike a naive `.limit(n)` on the loose
+        // query, it cannot miss an exact match that happened to sort past the
+        // limit. Only when there is no exact match do we fall back to "any
+        // match", also limited to one.
+        // .lean(): the result is only serialized, so skip Mongoose hydration.
+        if (finalLivery) {
+            const exact = await CommunityAircraft.findOne({
+                ...query,
+                liveryName: { $regex: `^${String(finalLivery).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' },
+            }).lean();
+            if (exact) return res.json(exact);
+        }
+        const results = await CommunityAircraft.find(query).limit(1).lean();
 
         // 4. FIX: If no results found, return placeholder using the normalized 'finalTail'
         if (results.length === 0) {
@@ -11063,16 +11365,10 @@ app.get('/api/aircraft/lookup', async (req, res) => {
             });
         }
 
-        // --- EXISTING INTELLIGENT SORTING LOGIC ---
-        if (finalLivery) {
-            const searchLower = finalLivery.toLowerCase();
-            const exactMatch = results.find(
-                item => item.liveryName.toLowerCase() === searchLower
-            );
-            if (exactMatch) return res.json(exactMatch);
-        }
-
-        res.json(results[0]); 
+        // The exact-livery preference that used to live here now runs as its own
+        // query above, so by this point the answer is simply the one match we
+        // asked the database for.
+        res.json(results[0]);
 
     } catch (error) {
         console.error('Error looking up aircraft:', error);
@@ -11191,6 +11487,14 @@ app.post('/api/aircraft', requireAuth, uploadAircraftImages, async (req, res) =>
     } catch (error) {
         // Ensure cleanup happens even on error
         cleanupTempFiles(files);
+
+        // An image refused by the decode ceiling is not a server fault and a 500
+        // tells the contributor to try again, which will not work. Answer with
+        // what they can actually do about it.
+        if (isPixelLimitError(error)) {
+            console.warn('Upload refused — image over the decode ceiling:', error.message);
+            return res.status(413).json({ message: PIXEL_LIMIT_MESSAGE });
+        }
 
         console.error('Upload Error:', error);
         res.status(500).json({ message: 'Server error during upload.' });
@@ -13622,6 +13926,67 @@ async function ifCardVasFor(card) {
     return wanted.map((id) => options.find((o) => o.id === id)).filter(Boolean);
 }
 
+/* ---------------------------------------------------------------------------
+ * Which of the matching photos to show
+ *
+ * The lookup below regularly matches many photos — up to 20 rows, each carrying
+ * up to 3 images — and the picker used to take `rows[0].imageUrl` and stop. So
+ * a pilot whose favourite is a 737 saw the same 737, from the same angle, every
+ * time anyone loaded their card, forever, while a few dozen other photographs of
+ * the same aircraft sat in the collection unseen. That is a waste of the whole
+ * community gallery, and it makes every card of a popular type look identical.
+ *
+ * So the photo rotates. The interesting part is what "random" has to mean here,
+ * because the naive version is actively harmful:
+ *
+ * A fresh pick per render CANNOT be used. The rendered PNG is memoized, and
+ * `photoUrl` is part of the cache key (see ifCardCacheKey) — as it must be,
+ * since two cards differing only in their photo are not the same picture. Rolling
+ * the dice per render therefore misses the cache on every single request, and
+ * every miss is a full sharp pipeline: fetch a photograph, decode it, crop it
+ * with `position: 'attention'`, composite, re-encode. That is precisely the work
+ * the memory ceiling in imageLimits.js exists to keep bounded, and turning a
+ * cached read into a guaranteed render on a hotlinked public <img> would push
+ * the process back toward the OOM this same change is fixing. Randomness that
+ * defeats the cache buys variety by paying in crashes.
+ *
+ * Instead the pick is a pure function of (who the card belongs to, which
+ * half-day it is). Two consequences, both wanted:
+ *
+ *   • Inside a window the answer is STABLE, so the render cache, the browser
+ *     cache and the CDN all behave exactly as they did before. No extra renders.
+ *   • Across windows it moves, so the card genuinely does show a different
+ *     aircraft through the day — which is the thing being asked for.
+ *
+ * Seeding on the card as well as the clock matters: without it every card of a
+ * given type would rotate in lockstep and show the SAME photo as each other,
+ * which is the original complaint moved rather than fixed. With it, two pilots
+ * who both favour the 737 get different photographs at the same moment.
+ * ------------------------------------------------------------------------- */
+
+// How long a card keeps the same photograph. Six hours ≈ four different
+// aircraft a day, which reads as variety without the picture changing under a
+// reader mid-scroll. Well above the 10-minute render TTL and the 5-minute
+// browser freshness window, so rotation costs one render per card per window
+// and never invalidates anything early.
+const IF_CARD_PHOTO_ROTATE_MS = Math.max(
+    60 * 1000,
+    parseInt(process.env.IF_CARD_PHOTO_ROTATE_MS, 10) || 6 * 3600 * 1000,
+);
+
+// FNV-1a. Not for security — this only has to spread nearby seeds ("pilot-a" vs
+// "pilot-b" in the same window) across the candidate list, which a plain
+// character sum does not do: it would map adjacent names to adjacent buckets and
+// hand half the fleet the same photo.
+const seedHash = (str) => {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h >>> 0;
+};
+
 /**
  * The community photo URL for a favourite aircraft, or null.
  *
@@ -13632,9 +13997,15 @@ async function ifCardVasFor(card) {
  *
  * Matching mirrors that endpoint — type is required, livery narrows it, and an
  * exact livery match wins over a loose one — so the photo a pilot gets here is
- * the photo they would see anywhere else in the product.
+ * from the same set they would see anywhere else in the product.
+ *
+ * @param {object} fav   the card's favourites ({ aircraft, livery })
+ * @param {string} seed  who this card belongs to (slug, or username for the
+ *                       preview). Only affects WHICH of the equally-valid
+ *                       photos is chosen; an empty seed still works, it just
+ *                       means every unseeded card rotates together.
  */
-async function ifCardPhotoUrl(fav) {
+async function ifCardPhotoUrl(fav, seed = '') {
     const type = String(fav?.aircraft || '').trim();
     if (!type) return null;
     const livery = String(fav?.livery || '').trim();
@@ -13644,12 +14015,43 @@ async function ifCardPhotoUrl(fav) {
         if (livery) query.liveryName = { $regex: esc(livery), $options: 'i' };
         const rows = await CommunityAircraft.find(query).lean().limit(20);
         if (!rows.length) return null;
+
+        // Exact-livery rows still win outright — a pilot who said "British
+        // Airways" gets a British Airways aircraft, and rotation happens WITHIN
+        // that set rather than across it. Variety must not cost accuracy.
         const exact = livery
-            ? rows.find((r) => String(r.liveryName || '').toLowerCase() === livery.toLowerCase())
-            : null;
-        const pick = exact || rows[0];
-        const url = pick.imageUrl || (Array.isArray(pick.imageUrls) ? pick.imageUrls[0] : null);
-        return url || null;
+            ? rows.filter((r) => String(r.liveryName || '').toLowerCase() === livery.toLowerCase())
+            : [];
+        const pool = exact.length ? exact : rows;
+
+        // Every image of every eligible row, not just each row's primary. A row
+        // with three photographs of the same airframe contributes all three;
+        // `imageUrl` mirrors `imageUrls[0]`, so dedupe keeps that from counting
+        // twice and weighting the older single-image rows differently.
+        const candidates = [];
+        for (const r of pool) {
+            const urls = Array.isArray(r.imageUrls) && r.imageUrls.length
+                ? r.imageUrls
+                : (r.imageUrl ? [r.imageUrl] : []);
+            for (const u of urls) {
+                const url = String(u || '').trim();
+                if (url && !candidates.includes(url)) candidates.push(url);
+            }
+        }
+        if (!candidates.length) return null;
+        if (candidates.length === 1) return candidates[0];
+
+        // Sorted before indexing. Mongo makes no promise about the order of an
+        // unsorted find, so without this the index would be applied to a list
+        // that can reshuffle between calls — the same seed and the same window
+        // could then pick a different URL, which is exactly the cache-missing
+        // behaviour this design avoids. The order itself is arbitrary; that it
+        // is REPEATABLE is the point.
+        candidates.sort();
+
+        const window = Math.floor(Date.now() / IF_CARD_PHOTO_ROTATE_MS);
+        const idx = seedHash(`${seed}|${type}|${livery}|${window}`) % candidates.length;
+        return candidates[idx];
     } catch (err) {
         console.error('[if-card] photo lookup failed:', err?.message || err);
         return null;
@@ -13790,7 +14192,10 @@ app.get('/api/if-card/preview', async (req, res) => {
             aircraft: req.query.favAircraft,
             livery: req.query.favLivery,
         });
-        const photoUrl = req.query.photo === '0' ? null : await ifCardPhotoUrl(fav);
+        // Seeded on the username: the preview has no slug yet, and this keeps a
+        // pilot's preview showing the same aircraft as the card they are about
+        // to save rather than a different one.
+        const photoUrl = req.query.photo === '0' ? null : await ifCardPhotoUrl(fav, stats.username || username);
 
         // The preview verifies the roster exactly as a save would. A pilot
         // cannot preview themselves into a VA they are not on — which matters,
@@ -13890,7 +14295,7 @@ app.post('/api/if-card', async (req, res) => {
             // Whether their favourite aircraft actually has a photo behind it.
             // The page can then say "we have no photo of that one" instead of
             // leaving them wondering why the band never appeared.
-            photoFound: card.showPhoto ? !!(await ifCardPhotoUrl(card.favourites)) : false,
+            photoFound: card.showPhoto ? !!(await ifCardPhotoUrl(card.favourites, card.slug)) : false,
             vaAdIds: card.vaAdIds,
             vaOptions,
             // Asked for VAs and did not get all of them: they are not on those
@@ -14027,7 +14432,7 @@ app.get('/api/if-card/:file', async (req, res) => {
             theme: card.theme,
             pro: card.pro && card.autoRefresh,
             statsAt: card.statsAt,
-            photoUrl: card.showPhoto ? await ifCardPhotoUrl(card.favourites) : null,
+            photoUrl: card.showPhoto ? await ifCardPhotoUrl(card.favourites, card.slug) : null,
             // Re-checked against the roster on every render, so leaving a VA
             // takes its colours off the card without the pilot doing anything.
             vas: await ifCardVasFor(card),
@@ -15205,8 +15610,9 @@ const applyEmbedAppearance = (cfg, body = {}) => {
 // GET /api/embed/configs — STAFF. List every token config (newest first).
 app.get('/api/embed/configs', requireAuth, async (req, res) => {
     try {
-        const configs = await EmbedConfig.find().sort({ createdAt: -1 }).lean();
-        res.json({ data: configs });
+        await streamJsonArray(res, EmbedConfig.find().sort({ createdAt: -1 }).lean(), {
+            prefix: '{"data":', suffix: '}',
+        });
     } catch (error) {
         console.error('Embed Config List Error:', error);
         res.status(500).json({ message: 'Error fetching embed configs.' });
@@ -15644,7 +16050,20 @@ const imageCacheLine = () => {
  * too big for this container, or something else in here is growing.
  */
 let memoryShedCount = 0;
+// Shedding is cheap; the global.gc() that follows it is not — it is a
+// stop-the-world pause, and the sampler now runs every 30s. RSS that stays above
+// the shed ratio because something OTHER than these caches is holding it would
+// otherwise mean a forced full GC twice a minute, forever: an event-loop stall
+// on a fixed cadence, which is a worse fault than the one being guarded against
+// and reads in the diagnostics terminal as the "irregular rhythm" it would be
+// causing. Once every two minutes is often enough to matter and rare enough not
+// to be the problem.
+const MEMORY_SHED_COOLDOWN_MS = 2 * 60 * 1000;
+let lastShedAt = 0;
 const shedImageCaches = (rssMb) => {
+    const now = Date.now();
+    if (now - lastShedAt < MEMORY_SHED_COOLDOWN_MS) return false;
+    lastShedAt = now;
     const before = imageCacheLine();
     let freed = 0;
     for (const cache of [routeMapCache, ifCardRenderCache]) {
@@ -15662,21 +16081,53 @@ const shedImageCaches = (rssMb) => {
     // whenever V8 next feels like it — which is the whole point of doing this
     // before the cap rather than after.
     if (typeof global.gc === 'function') { try { global.gc(); } catch { /* best effort */ } }
+    return true;
 };
 
+// Checked every 30s, logged every 5 minutes.
+//
+// These were one number, and it was 5 minutes — which is a fine cadence for a
+// log line and far too slow for a guard. RSS does not drift up to the cap; it
+// steps, in the time one image pipeline takes to allocate, and a sampler that
+// looks twelve times an hour will usually look just after the process was
+// already killed. Sampling is a `process.memoryUsage()` call and two
+// comparisons, so the frequent one is free and there is no reason for the guard
+// to inherit the log's interval.
+//
+// Note what this can and cannot do, because it is easy to over-trust: shedding
+// releases what we are RETAINING, so it helps against a slow climb through the
+// caches. It cannot save a single decode that asks for a gigabyte in one go —
+// nothing observing from out here can. That case is bounded at the source, by
+// the pixel ceiling in imageLimits.js; this is the second line, not the first.
+const MEMORY_SAMPLE_MS = 30 * 1000;
+const MEMORY_LOG_EVERY = 10; // 10 x 30s = the original 5-minute log cadence
+let memoryTicks = 0;
 setInterval(() => {
     const m = process.memoryUsage();
     const rssMb = mb(m.rss);
-    const line = `[mem] rss=${rssMb}MB heapUsed=${mb(m.heapUsed)}MB heapTotal=${mb(m.heapTotal)}MB`
+    const shouldLog = (memoryTicks++ % MEMORY_LOG_EVERY) === 0;
+    // Shedding reports itself loudly, with the figures. When it declines because
+    // of its cooldown we still fall through to the warn below, so an RSS parked
+    // above the shed line leaves a continuous trail rather than going quiet
+    // between sheds — going quiet at the top of the range is the exact failure
+    // this whole block exists to stop.
+    const shed = (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_SHED_RATIO)
+        ? shedImageCaches(rssMb)
+        : false;
+    if (shed) return;
+    // Build the line only when it is going to be used — imageCacheLine() walks
+    // both caches, and at this cadence that is 120 pointless walks an hour.
+    const line = () => `[mem] rss=${rssMb}MB heapUsed=${mb(m.heapUsed)}MB heapTotal=${mb(m.heapTotal)}MB`
         + ` external=${mb(m.external)}MB${imageCacheLine()}`;
-    if (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_SHED_RATIO) {
-        shedImageCaches(rssMb);
-    } else if (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_WARN_RATIO) {
-        console.warn(`⚠️  ${line} — near ${MEMORY_LIMIT_MB}MB cap (${Math.round((rssMb / MEMORY_LIMIT_MB) * 100)}%)`);
-    } else {
-        console.log(line);
+    if (MEMORY_LIMIT_MB && rssMb >= MEMORY_LIMIT_MB * MEMORY_WARN_RATIO) {
+        // Always warned, on every sample: crossing the warn line is the trail
+        // that explains a kill afterwards, and thinning it to one-in-ten is
+        // thinning exactly the part worth having.
+        console.warn(`⚠️  ${line()} — near ${MEMORY_LIMIT_MB}MB cap (${Math.round((rssMb / MEMORY_LIMIT_MB) * 100)}%)`);
+    } else if (shouldLog) {
+        console.log(line());
     }
-}, 5 * 60 * 1000).unref();
+}, MEMORY_SAMPLE_MS).unref();
 
 // ---- The roster sweep, on a timer ----
 //

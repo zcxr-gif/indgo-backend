@@ -51,7 +51,12 @@ const pipeline = util.promisify(stream.pipeline);
 // MEMORY FIX: Disable Sharp's internal cache
 sharp.cache(false);
 // MEMORY FIX: limit concurrency to prevent CPU/RAM saturation
-sharp.concurrency(1); 
+sharp.concurrency(1);
+// MEMORY FIX: cap the DECODED size of any one image. Streaming the download
+// into sharp (see below) keeps the compressed bytes off the heap but does
+// nothing about the decoded pixels — libvips still holds the full raster, and
+// that is what the container kills us for. See imageLimits.js.
+const { uploadOpts } = require('./imageLimits');
 
 // CONFIGURATION - REPLACE THESE WITH YOUR REAL CHANNEL IDS
 const ADMIN_CHANNEL_ID = '1448137363795742942'; 
@@ -1240,7 +1245,7 @@ const startDiscordBot = (CommunityAircraftModel, s3Client, bucketName, region, m
             // 2. Create the Sharp pipeline
             // We pipe the Axios stream directly into Sharp, then to the file system.
             // This prevents loading the full image into RAM and avoids writing a raw temp file.
-            const transformer = sharp()
+            const transformer = sharp(uploadOpts())
                 .resize({ width: 1920, withoutEnlargement: true })
                 .webp({ quality: 80 });
 

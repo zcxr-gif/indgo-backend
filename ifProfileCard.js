@@ -33,6 +33,11 @@
 const sharp = require('sharp');
 const axios = require('axios');
 const { resolveGrade } = require('./ifGrade');
+// Every image on this card comes from a URL somebody else typed into a database
+// row, so every decode below runs under a pixel ceiling. See imageLimits.js:
+// the 8 MB fetch cap bounds the compressed bytes and not the decoded ones, and
+// it is the decoded ones that OOM-kill the container.
+const { remoteOpts } = require('./imageLimits');
 
 const ACARS_BACKEND_URL = (process.env.ACARS_BACKEND_URL || 'https://site--acars-backend--6dmjph8ltlhv.code.run').replace(/\/+$/, '');
 
@@ -393,7 +398,10 @@ async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, pho
         let w = VA_LOGO_H;
         if (logo) {
             try {
-                const meta = await sharp(logo).metadata();
+                // Under the ceiling even though metadata() only reads a header:
+                // it makes an oversized logo fail HERE, cheaply, instead of at
+                // the composite below where the decode would actually happen.
+                const meta = await sharp(logo, remoteOpts()).metadata();
                 if (meta.width && meta.height) {
                     const ceiling = wearing.length > 1 ? VA_LOGO_MULTI_MAX_W : VA_LOGO_MAX_W;
                     const aspect = meta.width / meta.height;
@@ -634,7 +642,7 @@ async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, pho
         if (!b.logo) continue;
         try {
             marks.push({
-                input: await sharp(b.logo)
+                input: await sharp(b.logo, remoteOpts())
                     .resize(b.w, VA_LOGO_H, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
                     .composite([{
                         input: Buffer.from(
@@ -658,10 +666,27 @@ async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, pho
     // a scrim so text on top of an arbitrary photograph is readable, then the
     // aircraft name and the panel's hairline border.
     if (photo) {
-        const band = await sharp(photo)
-            .resize(PHOTO_W, PHOTO_H, { fit: 'cover', position: 'attention' })
-            .composite([{ input: panelMask(), blend: 'dest-in' }])
-            .png().toBuffer();
+        // The single largest decode on this card, and the one most exposed: an
+        // arbitrary aircraft photograph off the internet. `position: 'attention'`
+        // makes it costlier still — sharp analyses the image to choose the crop,
+        // which means the whole thing is resident. Ceiling applies here first.
+        //
+        // Guarded, because the layout above has ALREADY reserved the panel: by
+        // the time we are here the card is taller by PHOTO_H whether or not
+        // these bytes turn out to be decodable. Letting a throw escape would
+        // trade "a card with an empty plate where the photo goes" for "no card
+        // at all, on a public forum profile" — and the plate is drawn precisely
+        // so that the first of those still reads as a card (see the panel above).
+        // Refusal by the pixel ceiling arrives here as an ordinary error.
+        let band = null;
+        try {
+            band = await sharp(photo, remoteOpts())
+                .resize(PHOTO_W, PHOTO_H, { fit: 'cover', position: 'attention' })
+                .composite([{ input: panelMask(), blend: 'dest-in' }])
+                .png().toBuffer();
+        } catch (err) {
+            console.error('[if-card] photo decode failed, rendering the panel empty:', err?.message || err);
+        }
 
         const label = s.fav?.aircraft ? clamp(s.fav.aircraft, 30) : null;
         const sub = s.fav?.livery ? clamp(s.fav.livery, 34) : null;
@@ -694,8 +719,13 @@ async function renderIfProfileCardImpl({ stats, fields, theme, pro, statsAt, pho
                     fill="none" stroke="${pal.tileLine}" stroke-width="1.5"/>
             </svg>`);
 
-        out = sharp(await out.png().toBuffer())
-            .composite([{ input: band, left: PAD, top: photoTop }, { input: overlay, left: 0, top: 0 }]);
+        // The caption and the hairline border go on regardless — they belong to
+        // the panel, not to the picture, so a photo that would not decode still
+        // leaves a labelled tile rather than a bare rectangle.
+        out = sharp(await out.png().toBuffer()).composite([
+            ...(band ? [{ input: band, left: PAD, top: photoTop }] : []),
+            { input: overlay, left: 0, top: 0 },
+        ]);
     }
 
     return out.png().toBuffer();
