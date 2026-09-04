@@ -6,6 +6,7 @@
     <title>Crew Centers — Staff Hub</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="/assets/va-chip.js"></script>
     <script>tailwind.config = { darkMode: 'class' };</script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
@@ -73,7 +74,6 @@
 
         // ---- Helpers ----
         function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-        function initials(name){const s=(name||'VA').trim();const w=s.split(/\s+/).filter(Boolean);return (w.length>=2?(w[0][0]+w[1][0]):s.slice(0,2)).toUpperCase();}
         let toastTimer=null;
         function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.remove('hidden'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.add('hidden'),2200); }
 
@@ -95,9 +95,7 @@
         function rowHtml(v){
             const slug = v.slug || '';
             const link = slug ? `${CREW_BASE}/crew/${slug}` : (v.code ? `${CREW_BASE}/crew/${v.code.toLowerCase()}` : '');
-            const logo = v.logo
-                ? `<img src="${escapeHtml(v.logo)}" alt="" class="w-11 h-11 rounded-xl object-cover bg-zinc-100 dark:bg-zinc-800">`
-                : `<div class="w-11 h-11 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 grid place-items-center font-bold">${escapeHtml(initials(v.name))}</div>`;
+            const logo = VaChip.html({ name: v.name, code: v.code, slug, logoUrl: v.logo }, { size: 44, nameOnly: true });
             const statusTag = v.status && v.status!=='approved'
                 ? `<span class="text-[11px] font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-400">${escapeHtml(v.status)}</span>` : '';
             return `

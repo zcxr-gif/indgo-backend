@@ -723,7 +723,10 @@ function registerCrewAuthRoutes(app) {
                 mustChangePassword: !!identity.mustChangePassword,
                 canChangePassword: identity.kind === 'crew',
                 caps, capabilities: CREW_CAPABILITIES, rolePresets: CREW_ROLE_PRESETS,
-                va: { name: va.name, slug: va.slug || null, code: va.callsign || null },
+                // The crew center paints its own header from this, so it gets
+                // the mark as well as the name — same identity shape the rest of
+                // the product uses (vaIdentity.js).
+                va: { name: va.name, slug: va.slug || null, code: va.callsign || null, logoUrl: va.logoUrl || '' },
             });
         } catch (err) {
             console.error('Crew login error:', err);

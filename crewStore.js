@@ -2426,7 +2426,7 @@ function computeStats({ members = [], pireps = [], routes = [], applications = [
 // crew route — the roster, the route network's gating, a promotion notice — and
 // fetching the same small array again in each handler would be a second query
 // per request for a field that is a few hundred bytes.
-const SELECT = '_id slug callsign name contactEmail crewAccent ranks supabaseUrl supabaseAnonKey +supabaseServiceKey';
+const SELECT = '_id slug callsign name logoUrl contactEmail crewAccent ranks supabaseUrl supabaseAnonKey +supabaseServiceKey';
 
 function isConnected(va) {
     return !!(va && va.supabaseUrl && va.supabaseServiceKey);

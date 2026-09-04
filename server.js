@@ -25,6 +25,12 @@ const {
 
 // VA Advertisement image helpers (banner + logo -> S3 as WebP)
 const { uploadVaImage, deleteVaImage } = require('./vaAds');
+const {
+    IDENTITY_SELECT: VA_IDENTITY_SELECT,
+    vaIdentity,
+    attachVaIdentity,
+    forgetVaIdentity,
+} = require('./vaIdentity');
 
 // Staff portal authentication (per-user accounts, JWT cookie).
 const {
@@ -10454,7 +10460,7 @@ app.get('/api/staff/inbox', requireAuth, async (req, res) => {
             // expose a masked hint and a boolean for whether one is on file.
             VirtualAirlineAd
                 .find({ flightEventsRequestedAt: { $ne: null }, flightEventsApproved: { $ne: true } })
-                .select('+flightEventsWebhookUrl name callsign callsigns flightEventsEnabled flightEventsRequestedAt')
+                .select(`+flightEventsWebhookUrl callsigns flightEventsEnabled flightEventsRequestedAt ${VA_IDENTITY_SELECT}`)
                 .sort({ flightEventsRequestedAt: 1 })
                 .limit(50)
                 .lean(),
@@ -10470,21 +10476,24 @@ app.get('/api/staff/inbox', requireAuth, async (req, res) => {
             id: ad._id,
             name: ad.name || ad.callsign || (ad.callsigns && ad.callsigns[0]) || 'Unnamed VA',
             code: ad.callsign || (ad.callsigns && ad.callsigns[0]) || '',
+            // The listing is already in hand here, so the mark comes free.
+            va: vaIdentity(ad),
             requestedAt: ad.flightEventsRequestedAt,
             enabled: !!ad.flightEventsEnabled,
             configured: !!ad.flightEventsWebhookUrl,
             hint: maskWebhookUrl(ad.flightEventsWebhookUrl),
         }));
 
-        const tickets = openSubs.map(s => ({
+        const tickets = await attachVaIdentity(openSubs.map(s => ({
             id: s._id,
             title: s.title || '(untitled)',
             category: s.category || 'other',
             status: s.status || 'open',
+            vaAdId: s.vaAdId ? String(s.vaAdId) : null,
             vaName: s.vaName || '',
             submittedByName: s.submittedByName || '',
             createdAt: s.createdAt,
-        }));
+        })));
 
         res.json({
             webhookApprovals,
@@ -12380,6 +12389,11 @@ app.put('/api/va-ads/:id', requireAuth, uploadVaImages, async (req, res) => {
 
         await ad.save();
 
+        // The name, slug or logo may have just changed — drop the cached
+        // identity so every surface that shows this airline's mark repaints
+        // with the new one rather than waiting out the TTL.
+        forgetVaIdentity(ad._id);
+
         // Keep linked embeds in sync with the head: push the ad's name/logo onto
         // every embed that points at it (and adopt embeds newly matched by a
         // just-edited callsign). Fire-and-forget — never block the ad save on it.
@@ -13040,6 +13054,7 @@ app.delete('/api/va-ads/:id', requireAuth, async (req, res) => {
             deleteVaImage(s3Client, ad.logoUrl)
         ]);
         await VirtualAirlineAd.findByIdAndDelete(req.params.id);
+        forgetVaIdentity(req.params.id);
 
         res.json({ message: 'VA advertisement deleted.' });
     } catch (error) {
@@ -13113,14 +13128,25 @@ const pruneVaEventFeed = () => {
 // will be) delivered — e.g. ['central', 'Air Canada Virtual'] — or is empty when
 // nothing is hooked to it, which the staff UI surfaces so a missing hook is
 // obvious at a glance.
-const recordVaEventForFeed = (e, targets = []) => {
+const recordVaEventForFeed = (e, targets = [], ad = null) => {
     const now = new Date();
     const ac = e.aircraft || {};
+    // `ad` is the listing this event was attributed to, when we found one. The
+    // code and name still come off the EVENT — that is what the sender claimed,
+    // and a feed that quietly rewrote it would hide exactly the mismatches staff
+    // are watching this feed for. The listing only supplies the branding.
+    const identity = vaIdentity(ad);
     vaEventFeed.unshift({
         ts: now.getTime(),
         event: e.event,
         flightId: e.flightId,
-        va: { code: e.va?.code || '', name: e.va?.name || '' },
+        va: {
+            code: e.va?.code || '',
+            name: e.va?.name || '',
+            id: identity ? identity.id : '',
+            slug: identity ? identity.slug : '',
+            logoUrl: identity ? identity.logoUrl : '',
+        },
         callsign: e.callsign || '',
         username: e.username || '',
         server: e.server || '',
@@ -14308,7 +14334,9 @@ const OPTED_IN_PARTNER_FILTER = {
     flightEventsEnabled: true,
     flightEventsWebhookUrl: { $ne: null },
 };
-const PARTNER_SELECT = 'name callsign callsigns callsignMatch rosterTrust logoUrl flightEventsCard +flightEventsWebhookUrl';
+// `slug` rides along so a delivered event can be branded AND linked to the
+// VA's crew center in the staff feed without a second lookup.
+const PARTNER_SELECT = 'name callsign callsigns callsignMatch rosterTrust logoUrl slug flightEventsCard +flightEventsWebhookUrl';
 
 // Attribute an event to an opted-in VA by PILOT ROSTER: the flight's pilot
 // (e.username) is on that VA's roster of Infinite Flight usernames. This is what
@@ -14552,7 +14580,8 @@ const resolveVaEventPartner = async (e) => {
 // waiting on staff approval) should still accumulate its own numbers, so this
 // drops the opted-in gate and matches on the same code/name signals. Cached for
 // a few minutes because every takeoff and landing hits it, and the answer only
-// changes when a listing is renamed. Returns { _id, name } or null; never throws.
+// changes when a listing is renamed. Returns the listing's identity fields
+// (see vaIdentity.js) or null; never throws.
 const VA_STATS_RESOLVE_TTL = 5 * 60 * 1000;
 const vaStatsResolveCache = new Map(); // signature -> { at, va }
 
@@ -14577,7 +14606,7 @@ const resolveVaAdForStats = async (e) => {
 
     let va = null;
     try {
-        va = await VirtualAirlineAd.findOne({ $or: or }).select('_id name').lean();
+        va = await VirtualAirlineAd.findOne({ $or: or }).select(VA_IDENTITY_SELECT).lean();
     } catch (err) {
         console.warn('[va-stats] listing lookup failed:', err.message);
         return null;
@@ -14617,16 +14646,24 @@ const handleVaEvent = async (e) => {
     const targets = [];
     if (centralWebhook) targets.push('central');
     if (partnerAd) targets.push(partnerAd.name);
-    recordVaEventForFeed(e, targets);
+
+    // Which listing is this flight's? Resolved once, up front, and used for both
+    // the feed row's branding and the statistics below. Prefer the delivery
+    // partner we already resolved (no second query in the common case) and fall
+    // back to the looser listing lookup — which is cached — so a VA with no
+    // webhook still gets its mark in the feed and its numbers in the stats.
+    let statsAd = partnerAd;
+    if (!statsAd) {
+        try { statsAd = await resolveVaAdForStats(e); }
+        catch (err) { console.warn('[va-stats] listing lookup failed:', err.message); }
+    }
+    recordVaEventForFeed(e, targets, statsAd);
 
     // Statistics. Runs for EVERY event, hooked or not — a VA's takeoff/landing
     // counts, airborne time and "who's flying right now" shouldn't depend on
-    // whether it has a Discord webhook. Prefer the delivery partner we already
-    // resolved (no second query in the common case) and fall back to the looser
-    // listing lookup so non-partner VAs still get their numbers. Best-effort:
-    // stats can never break or delay delivery.
+    // whether it has a Discord webhook. Best-effort: stats can never break or
+    // delay delivery.
     try {
-        const statsAd = partnerAd || await resolveVaAdForStats(e);
         vaStats.recordFlightEvent(e, statsAd);
     } catch (err) {
         console.warn('[va-stats] flight event not recorded:', err.message);

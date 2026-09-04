@@ -6,6 +6,7 @@
     <title>VA Partnership Portal — Staff Oversight</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="/assets/va-chip.js"></script>
     <script>tailwind.config = { darkMode: 'class' };</script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
@@ -277,7 +278,7 @@
                         <div class="flex items-center gap-2 flex-wrap mb-1">
                             <span class="text-[11px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400">${esc(s.category)}</span>
                             <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full ${STATUS_STYLE[s.status]||''}">${STATUS_LABEL[s.status]||esc(s.status)}</span>
-                            <span class="text-[11px] font-semibold text-zinc-400">${esc(s.vaName||'—')}</span>
+                            <span class="text-[11px] font-semibold text-zinc-400">${VaChip.html(s.va || s.vaName, { size: 14, link: true })}</span>
                         </div>
                         <h3 class="font-semibold tracking-tight">${esc(s.title)}</h3>
                     </div>
@@ -328,7 +329,7 @@
                         ${e.bannerUrl ? `<img src="${esc(e.bannerUrl)}" alt="" loading="lazy" class="w-full h-32 object-cover rounded-xl mb-3" onerror="this.style.display='none'">` : ''}
                         <div class="flex items-start justify-between gap-3">
                             <div class="min-w-0">
-                                <p class="font-semibold text-sm">${esc(e.title)} <span class="text-[11px] font-semibold text-zinc-400 ml-1">${esc(e.vaName||'—')}</span></p>
+                                <p class="font-semibold text-sm">${esc(e.title)} <span class="text-[11px] font-semibold text-zinc-400 ml-1">${VaChip.html(e.va || e.vaName, { size: 14, link: true })}</span></p>
                                 <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5 flex items-center gap-2 flex-wrap"><span class="inline-flex items-center gap-1.5"><i data-lucide="calendar-clock" class="w-3.5 h-3.5"></i>${fmtEvent(e.startsAt)}</span>${e.departureIcao ? `<span class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300"><i data-lucide="plane-takeoff" class="w-3 h-3"></i>${esc(e.departureIcao)}</span>` : ''}</p>
                             </div>
                         </div>
@@ -390,7 +391,7 @@
                 <div class="flex items-start justify-between gap-3 flex-wrap">
                     <div class="flex items-center gap-2 flex-wrap">
                         <span class="text-[11px] font-bold px-2 py-0.5 rounded-full ${warnPalette(w.palette)}">${esc(w.levelLabel)}</span>
-                        <span class="text-[11px] font-semibold text-zinc-400">${esc(w.vaName||'—')}</span>
+                        <span class="text-[11px] font-semibold text-zinc-400">${VaChip.html(w.va || w.vaName, { size: 14, link: true })}</span>
                         ${rescinded ? '<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400 line-through">Rescinded</span>' : ''}
                         ${acked && !rescinded ? '<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300 inline-flex items-center gap-1"><i data-lucide="check" class="w-3 h-3"></i>Acknowledged</span>' : ''}
                         ${w.discordDelivered ? '<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-300">Discord ✓</span>' : ''}
@@ -460,7 +461,7 @@
             return `<div class="surface rounded-2xl p-4 flex items-center justify-between gap-3">
                 <div class="min-w-0">
                     <p class="font-semibold text-sm truncate">${esc(a.displayName)} <span class="text-[10px] uppercase tracking-wide text-zinc-400 ml-1">${esc(a.role)}</span> ${a.active ? '' : '<span class="text-[10px] text-rose-500 ml-1">disabled</span>'}</p>
-                    <p class="text-xs text-zinc-400">@${esc(a.username)} · ${esc(a.vaName||'—')} · ${a.lastLoginAt ? 'last in ' + fmtDate(a.lastLoginAt) : 'never signed in'} · via ${esc(a.createdVia)}</p>
+                    <p class="text-xs text-zinc-400 flex items-center gap-1 flex-wrap">@${esc(a.username)} · ${VaChip.html(a.va || a.vaName, { size: 14, link: true })} · ${a.lastLoginAt ? 'last in ' + fmtDate(a.lastLoginAt) : 'never signed in'} · via ${esc(a.createdVia)}</p>
                 </div>
                 <div class="flex items-center gap-1.5">
                     <button onclick="resetAcct('${a.id}')" title="Reset password" class="w-8 h-8 grid place-items-center rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"><i data-lucide="key-round" class="w-4 h-4"></i></button>
@@ -515,7 +516,7 @@
                     <div class="px-5 py-3 flex items-center justify-between gap-3">
                         <div class="min-w-0">
                             <p class="text-sm"><span class="font-semibold">${esc(a.actorName||'—')}</span> <span class="text-zinc-400">${esc(a.actorRole||'')}</span> · <span class="text-zinc-600 dark:text-zinc-300">${esc(a.action)}</span></p>
-                            <p class="text-xs text-zinc-400 truncate">${esc(a.vaName||'')}${a.detail ? ' · ' + esc(a.detail) : ''}</p>
+                            <p class="text-xs text-zinc-400 truncate">${VaChip.html(a.va || a.vaName, { size: 14, mono: '' })}${a.detail ? ' · ' + esc(a.detail) : ''}</p>
                         </div>
                         <span class="text-[11px] text-zinc-400 whitespace-nowrap">${fmtDate(a.createdAt)}</span>
                     </div>`).join('');
