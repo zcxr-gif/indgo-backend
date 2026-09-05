@@ -523,16 +523,55 @@ function teamSaveFailure({ roles, assignments }, prev, held) {
         }
     }
 
+    // 3. No assignment may GAIN a per-person capability the saver lacks.
+    //
+    // The same hole as 1 and 2, through the third door that now exists: ticking
+    // a box directly on a person is granting a capability, so it answers to the
+    // same ceiling. Judged as a DIFFERENCE for the same reason — the whole
+    // config is re-sent on every save, and a tick the owner put there last
+    // month is a fact, not something this save is adding.
+    if (Array.isArray(assignments)) {
+        for (const a of assignments) {
+            const uname = String((a && a.username) || '').toLowerCase();
+            if (!uname) continue;
+            const before = prevAsn.find(x => String((x && x.username) || '').toLowerCase() === uname);
+            const had = new Set((before && before.permissions) || []);
+            for (const cap of (Array.isArray(a && a.permissions) ? a.permissions : [])) {
+                if (!CREW_CAP_IDS.includes(cap) || allowed.has(cap) || had.has(cap)) continue;
+                return `You can’t give @${uname} “${capLabel(cap)}” — it isn’t one of your own permissions.`;
+            }
+        }
+    }
+
     return '';
 }
-// Which staff account (by login username) maps to which staff role.
+// Which staff account (by login username) holds which role, and what it holds
+// on top of that role.
+//
+// `permissions` is the per-PERSON grant, and it is what makes "give this one
+// person this one extra thing" possible without inventing a role for it. Roles
+// were the only unit before, so an airline that wanted its events organiser to
+// also approve PIREPs — just that one person, just that one extra — had to
+// build and maintain a second role that differed by a single tick. The two
+// coexist deliberately: a role is the reusable job, the per-person list is the
+// exception, and what somebody holds is the union.
+//
+// `roleId` is therefore optional now. An assignment with permissions and no
+// role is a person configured entirely by hand, which is the whole point of
+// this; an assignment with neither is not an assignment and is dropped.
 function sanitizeAssignments(arr) {
     if (!Array.isArray(arr)) return null;
     const seen = new Set();
     return arr.slice(0, 300).map(a => ({
         username: clampStr(a && a.username, 60).toLowerCase(),
         roleId: clampStr(a && a.roleId, 40),
-    })).filter(a => { if (!a.username || !a.roleId || seen.has(a.username)) return false; seen.add(a.username); return true; });
+        permissions: [...new Set((Array.isArray(a && a.permissions) ? a.permissions : [])
+            .filter(c => CREW_CAP_IDS.includes(c)))],
+    })).filter(a => {
+        if (!a.username || seen.has(a.username)) return false;
+        if (!a.roleId && !a.permissions.length) return false;
+        seen.add(a.username); return true;
+    });
 }
 /**
  * Capabilities that used to be part of another one.
@@ -571,9 +610,17 @@ function effectiveCaps(va, p) {
     const uname = String(p.uname || '').toLowerCase();
     const a = uname && asn.find(x => String(x.username || '').toLowerCase() === uname);
     if (a) {
-        const role = roles.find(r => r.id === a.roleId);
-        if (!role) return [];
-        const held = new Set((role.permissions || []).filter(c => CREW_CAP_IDS.includes(c)));
+        // The union of the reusable job and the exceptions made for this
+        // person. Either half may be empty: a role with nothing ticked is the
+        // Observer, and a person with permissions and no role is configured
+        // entirely by hand. A roleId that no longer resolves contributes
+        // nothing rather than voiding the whole assignment — deleting a role
+        // should not silently revoke a tick made against the person.
+        const held = new Set();
+        const role = a.roleId ? roles.find(r => r.id === a.roleId) : null;
+        if (role) (role.permissions || []).filter(c => CREW_CAP_IDS.includes(c)).forEach(c => held.add(c));
+        (Array.isArray(a.permissions) ? a.permissions : [])
+            .filter(c => CREW_CAP_IDS.includes(c)).forEach(c => held.add(c));
         for (const [older, heirs] of Object.entries(CAPABILITY_HEIRS)) {
             if (held.has(older)) heirs.forEach((h) => held.add(h));
         }

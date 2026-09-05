@@ -401,7 +401,12 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // username) holds each. Distinct from the display `roles` above: these gate
     // what a signed-in staff member can do. See crewAuth CREW_CAPABILITIES.
     staffRoles: { type: [{ _id: false, id: String, name: String, color: String, permissions: [String] }], default: [] },
-    staffAssignments: { type: [{ _id: false, username: String, roleId: String }], default: [] },
+    // `permissions` is the PER-PERSON grant, held on top of whatever the role
+    // carries (union — see crewAuth effectiveCaps). It is what lets one staff
+    // member have one extra thing without an airline having to invent a role
+    // that differs by a single tick. roleId is optional as a result: somebody
+    // can be configured entirely by hand.
+    staffAssignments: { type: [{ _id: false, username: String, roleId: String, permissions: [String] }], default: [] },
     // The VA's fleet — aircraft they operate (name/type + optional livery image).
     // NOTE: named crewFleet (not fleet) to avoid colliding with the older
     // directory-level `fleet: [String]` field further down this schema.
