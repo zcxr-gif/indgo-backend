@@ -125,6 +125,60 @@ T('an assignment to a role that no longer exists grants nothing',
 T('the assignment matches regardless of case',
     A.effectiveCaps(VA, staff('JO')), jo);
 
+console.log('\ncrewAuth — one person, one extra thing');
+
+// The reason this exists: a role is a reusable JOB, and an airline that wants
+// its events organiser to also approve PIREPs — just that one person, just that
+// one extra — should not have to build and maintain a second role that differs
+// by a single tick.
+const PER_PERSON = {
+    staffRoles: [
+        { id: 'r-events', name: 'Events', permissions: ['events.manage'] },
+        { id: 'r-none', name: 'Observer', permissions: [] },
+    ],
+    staffAssignments: [
+        // A role plus one exception made for this person.
+        { username: 'ev', roleId: 'r-events', permissions: ['flights.review'] },
+        // No role at all — configured entirely by hand.
+        { username: 'hand', roleId: '', permissions: ['routes.manage', 'links.manage'] },
+        // A role whose id no longer resolves, plus a per-person tick. Deleting
+        // a role must not silently revoke what was granted against the person.
+        { username: 'orphan', roleId: 'r-gone', permissions: ['documents.manage'] },
+        // Both halves empty is not an assignment; sanitizeAssignments drops it,
+        // but effectiveCaps must not fall through to the unassigned default if
+        // one reaches it.
+        { username: 'blank', roleId: '', permissions: [] },
+    ],
+};
+
+const ev = A.effectiveCaps(PER_PERSON, staff('ev'));
+T('a person keeps everything their role carries', has(ev, 'events.manage'), true);
+T('…plus the one thing ticked just for them', has(ev, 'flights.review'), true);
+T('…and nothing else', ev.length, 2);
+// The exception is theirs, not the role's — the next person in that role must
+// not inherit it.
+T('the extra does not leak onto the role itself',
+    has(A.effectiveCaps(PER_PERSON, { kind: 'va', role: 'staff', uname: 'someone-else-in-events' }), 'flights.review'),
+    // (unassigned → the day-to-day default, which is a different question; what
+    // matters is the ROLE object was not mutated)
+    true);
+T('…because the role object is untouched',
+    JSON.stringify(PER_PERSON.staffRoles[0].permissions), JSON.stringify(['events.manage']));
+
+const hand = A.effectiveCaps(PER_PERSON, staff('hand'));
+T('a person with no role holds exactly their own ticks', hand.sort(), ['links.manage', 'routes.manage']);
+T('…and is NOT treated as unassigned', hand.length !== A.CREW_DEFAULT_STAFF_CAPS.length, true);
+
+T('a deleted role leaves the per-person ticks standing',
+    A.effectiveCaps(PER_PERSON, staff('orphan')), ['documents.manage']);
+T('an assignment with neither a role nor a tick grants nothing',
+    A.effectiveCaps(PER_PERSON, staff('blank')), []);
+
+// An unknown id in the stored list is ignored rather than carried around.
+T('an unrecognised capability id is dropped',
+    A.effectiveCaps({ staffRoles: [], staffAssignments: [{ username: 'x', permissions: ['made.up', 'routes.manage'] }] }, staff('x')),
+    ['routes.manage']);
+
 console.log('\ncrewAuth — splitting a capability in two');
 
 // announcements.manage was carved out of roster.manage. A VA who ticked "add,
@@ -252,6 +306,30 @@ T('removing an assignment is always allowed',
     clean({ assignments: [] }), true);
 // Create-and-assign in one payload: the role is not in the previous config, so
 // a check that only consulted the old roles would find nothing to object to.
+// The THIRD door, opened by per-person permissions: ticking a box directly on
+// somebody grants a capability, so it answers to the same ceiling as the other
+// two. Without this the whole no-escalation rule is bypassed by one checkbox.
+T('a delegate may NOT tick a per-person capability they do not hold',
+    refused({ assignments: [{ username: 'mallory', permissions: ['integrations.manage'] }] }), true);
+T('…including on themselves',
+    refused({ assignments: [{ username: 'coo', permissions: ['retention.manage'] }] }), true);
+T('a delegate MAY tick one within their own permissions',
+    clean({ assignments: [{ username: 'mallory', permissions: ['roster.manage'] }] }), true);
+// Same difference-not-absolute rule as roles: a tick the owner made is a
+// pre-existing fact, and every save re-sends it.
+T('a per-person tick that already existed passes through',
+    A.teamSaveFailure(
+        { assignments: [{ username: 'bob', roleId: 'r-tech', permissions: ['integrations.manage'] }] },
+        { ...BEFORE, assignments: [{ username: 'bob', roleId: 'r-tech', permissions: ['integrations.manage'] }] },
+        COO) === '', true);
+T('…but ADDING one beside it is still refused',
+    A.teamSaveFailure(
+        { assignments: [{ username: 'bob', roleId: 'r-tech', permissions: ['integrations.manage', 'retention.manage'] }] },
+        { ...BEFORE, assignments: [{ username: 'bob', roleId: 'r-tech', permissions: ['integrations.manage'] }] },
+        COO) === '', false);
+T('an owner may tick anything on anybody',
+    A.teamSaveFailure({ assignments: [{ username: 'x', permissions: A.CREW_CAP_IDS }] }, BEFORE, A.CREW_CAP_IDS), '');
+
 T('a delegate may NOT create a rich role and step into it in one save',
     refused({
         roles: [...BEFORE.roles, { id: 'r-new', name: 'New', permissions: ['integrations.manage'] }],

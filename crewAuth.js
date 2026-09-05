@@ -523,16 +523,55 @@ function teamSaveFailure({ roles, assignments }, prev, held) {
         }
     }
 
+    // 3. No assignment may GAIN a per-person capability the saver lacks.
+    //
+    // The same hole as 1 and 2, through the third door that now exists: ticking
+    // a box directly on a person is granting a capability, so it answers to the
+    // same ceiling. Judged as a DIFFERENCE for the same reason — the whole
+    // config is re-sent on every save, and a tick the owner put there last
+    // month is a fact, not something this save is adding.
+    if (Array.isArray(assignments)) {
+        for (const a of assignments) {
+            const uname = String((a && a.username) || '').toLowerCase();
+            if (!uname) continue;
+            const before = prevAsn.find(x => String((x && x.username) || '').toLowerCase() === uname);
+            const had = new Set((before && before.permissions) || []);
+            for (const cap of (Array.isArray(a && a.permissions) ? a.permissions : [])) {
+                if (!CREW_CAP_IDS.includes(cap) || allowed.has(cap) || had.has(cap)) continue;
+                return `You can’t give @${uname} “${capLabel(cap)}” — it isn’t one of your own permissions.`;
+            }
+        }
+    }
+
     return '';
 }
-// Which staff account (by login username) maps to which staff role.
+// Which staff account (by login username) holds which role, and what it holds
+// on top of that role.
+//
+// `permissions` is the per-PERSON grant, and it is what makes "give this one
+// person this one extra thing" possible without inventing a role for it. Roles
+// were the only unit before, so an airline that wanted its events organiser to
+// also approve PIREPs — just that one person, just that one extra — had to
+// build and maintain a second role that differed by a single tick. The two
+// coexist deliberately: a role is the reusable job, the per-person list is the
+// exception, and what somebody holds is the union.
+//
+// `roleId` is therefore optional now. An assignment with permissions and no
+// role is a person configured entirely by hand, which is the whole point of
+// this; an assignment with neither is not an assignment and is dropped.
 function sanitizeAssignments(arr) {
     if (!Array.isArray(arr)) return null;
     const seen = new Set();
     return arr.slice(0, 300).map(a => ({
         username: clampStr(a && a.username, 60).toLowerCase(),
         roleId: clampStr(a && a.roleId, 40),
-    })).filter(a => { if (!a.username || !a.roleId || seen.has(a.username)) return false; seen.add(a.username); return true; });
+        permissions: [...new Set((Array.isArray(a && a.permissions) ? a.permissions : [])
+            .filter(c => CREW_CAP_IDS.includes(c)))],
+    })).filter(a => {
+        if (!a.username || seen.has(a.username)) return false;
+        if (!a.roleId && !a.permissions.length) return false;
+        seen.add(a.username); return true;
+    });
 }
 /**
  * Capabilities that used to be part of another one.
@@ -571,9 +610,17 @@ function effectiveCaps(va, p) {
     const uname = String(p.uname || '').toLowerCase();
     const a = uname && asn.find(x => String(x.username || '').toLowerCase() === uname);
     if (a) {
-        const role = roles.find(r => r.id === a.roleId);
-        if (!role) return [];
-        const held = new Set((role.permissions || []).filter(c => CREW_CAP_IDS.includes(c)));
+        // The union of the reusable job and the exceptions made for this
+        // person. Either half may be empty: a role with nothing ticked is the
+        // Observer, and a person with permissions and no role is configured
+        // entirely by hand. A roleId that no longer resolves contributes
+        // nothing rather than voiding the whole assignment — deleting a role
+        // should not silently revoke a tick made against the person.
+        const held = new Set();
+        const role = a.roleId ? roles.find(r => r.id === a.roleId) : null;
+        if (role) (role.permissions || []).filter(c => CREW_CAP_IDS.includes(c)).forEach(c => held.add(c));
+        (Array.isArray(a.permissions) ? a.permissions : [])
+            .filter(c => CREW_CAP_IDS.includes(c)).forEach(c => held.add(c));
         for (const [older, heirs] of Object.entries(CAPABILITY_HEIRS)) {
             if (held.has(older)) heirs.forEach((h) => held.add(h));
         }
@@ -943,6 +990,69 @@ function registerCrewAuthRoutes(app) {
         } catch (err) {
             console.error('Crew settings error:', err);
             res.status(500).json({ error: 'Could not save settings.' });
+        }
+    });
+
+
+    // --- Who there is to assign (owner, Inflight, or a delegate with team.manage) ---
+    //
+    // The team editor keys an assignment on a staff member's LOGIN username,
+    // and until now the owner had to remember it and type it correctly. That
+    // is the step the whole permission system was failing at: a name typed
+    // with a typo, or a pilot's roster name typed instead of their login,
+    // saves cleanly and grants nothing, with nothing on screen to say so.
+    //
+    // Nothing here is secret — these accounts already appear in the VA portal's
+    // own team list, to the same people. Pilot logins are deliberately NOT
+    // returned: a pilot cannot hold a staff role, so offering one would be
+    // offering an assignment that does nothing.
+    app.get('/api/crew/:slug/staff-accounts', async (req, res) => {
+        const p = verifyCrewRequest(req);
+        if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+
+        const slug = String(req.params.slug || '').toLowerCase();
+        const isInflight = p.kind === 'inflight';
+        if (!(isInflight || p.role === 'owner' || p.role === 'staff')) {
+            return res.status(403).json({ error: 'Not allowed.' });
+        }
+        if (!isInflight && p.slug && p.slug !== slug) {
+            return res.status(403).json({ error: 'Wrong crew center.' });
+        }
+
+        try {
+            const va = await resolveVa(slug);
+            if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+
+            // Same gate as the team editor itself: an owner, Inflight, or a
+            // delegate the owner handed team.manage to. A staff member without
+            // it has no business reading their colleagues' login names.
+            if (!(isInflight || p.role === 'owner')) {
+                const VirtualAirlineAd = mongoose.model('VirtualAirlineAd');
+                const ad = await VirtualAirlineAd.findById(va._id).select('staffRoles staffAssignments').lean();
+                if (!effectiveCaps(ad, p).includes('team.manage')) {
+                    return res.status(403).json({ error: 'Not allowed.' });
+                }
+            }
+
+            const VaPortalAccount = mongoose.model('VaPortalAccount');
+            const rows = await VaPortalAccount
+                .find({ vaAdId: va._id, role: { $in: ['owner', 'staff'] } })
+                .select('username displayName role active')
+                .sort({ role: 1, username: 1 })
+                .lean();
+
+            res.set('Cache-Control', 'no-store');
+            res.json({
+                accounts: rows.map(a => ({
+                    username: a.username,
+                    displayName: a.displayName || a.username,
+                    role: a.role,
+                    active: a.active !== false,
+                })),
+            });
+        } catch (err) {
+            console.error('Crew staff-accounts error:', err);
+            res.status(500).json({ error: 'Could not load the staff accounts.' });
         }
     });
 
