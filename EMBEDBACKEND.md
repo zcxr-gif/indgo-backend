@@ -954,14 +954,62 @@ Inflight-side moderation is `GET /api/crew-admin/sites` and
 session. `blocked` outranks the VA's `enabled`, refuses further publishing, and
 records why.
 
-### The starter
+### Designs, blocks and the theme — `vaSiteTemplates.js`
 
-`POST /site/starter` lays out a working airline homepage — hero, figures band,
-network list, activity, notices, events — with every live number already wired
-to `crew-feed.js`, plus a second page, a stylesheet and a README. Plain HTML and
-CSS, no build step and no framework: a VA staff member with an afternoon can
-edit it, and a VA with a developer can throw it away.
+A VA picks a design and sees their own airline in it. Six ship today
+(`GET /api/va-portal/site/templates` returns the catalogue):
 
+| id | What it is |
+|---|---|
+| `flightline` | Editorial. Serif headline, band of live figures. The default. |
+| `concourse` | A departure board. Dark, dense, monospaced. |
+| `horizon` | Airy and modern. Lots of white, a wide hero. |
+| `terminal` | Type and rules only. Loads instantly, ages well. |
+| `cabin` | Warm and rounded, card-based. For a smaller crew. |
+| `livery` | Colour-forward. Full-bleed blocks of the accent. |
+
+**The invariant, and the reason the module is arranged as it is.** Every
+template is a different design and none of them is a different data wiring. The
+`data-crew-*` markup lives once, in `BLOCKS`, and every template composes the
+same blocks. If each carried its own copy, then the day `data-crew-stat` gains a
+field five of the six would quietly stop showing a number and nobody would find
+out until a VA asked why their pilot count was missing. **The variety belongs in
+the CSS, where being wrong is visible; the wiring belongs in one place, where
+being wrong is not.**
+
+A template is not a colour swap — swap any two accents and you still have two
+pages nothing like each other. That is the bar for adding a seventh.
+
+**What differs per template:** `tokens` (written to `theme.css`), `css` (the
+personality — layout, density, how a heading sits), `pages` (which blocks, in
+what order, on which pages), and `thumb`. Thumbnails are hand-drawn SVG of each
+layout in its own colours rather than screenshots: they cannot go stale when a
+template is edited, cost no binary, and stay legible at 140px in a way a
+shrunken page never is.
+
+**Theme.** `POST /site/theme` with `{ accent, font, mode }` rewrites `theme.css`
+and nothing else — which is why every template keeps its colours and type in one
+small file of custom properties. Four typeface pairings, three modes (`light`,
+`dark`, `auto`). `--on-accent` is derived from the accent's own luminance rather
+than assumed white, because Livery sets body text on a block of the accent and a
+VA who picks a pale yellow would otherwise publish invisible words.
+
+An accent that is not a hex colour falls back to the design's own. A token file
+is CSS: an unvalidated value there closes a declaration and opens whatever the
+author fancies.
+
+**Blocks.** `GET /site/block/:id` returns one section's markup, for the editor's
+*Insert a section* menu. Every design uses the same class names, so a block
+looks right in any of them. `nav` and `footer` are not offered — a page has one
+of each, and offering them is offering a way to end up with two. The route
+returns HTML rather than writing it: where a section goes in the open file is
+the cursor's business, and a server that inserted it would be guessing.
+
+Each design also ships `site.js`, which does the two things markup cannot —
+mounting the Instagram wall lazily, and removing a `[data-crew-section]` block
+whose list came back empty. `crew-feed.js` deliberately does not remove empty
+lists, because on most pages an empty list still has a fallback row worth
+showing; a block marked `[data-crew-section]` is saying the opposite.
 ---
 
 ## 8. `crew-feed.js` — the same data on a site we do not host

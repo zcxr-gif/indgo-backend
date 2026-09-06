@@ -849,6 +849,18 @@ Text files only, 2 MB in total. **No image uploads** — a VA links to an
 that is not us. That matters when a takedown lands: the picture is not ours to
 remove, but the page carrying it is.
 
+### They pick a design, they do not start from a blank file
+
+The Website tab opens on a gallery of six designs — Flightline, Concourse,
+Horizon, Terminal, Cabin, Livery. Picking one lays out a working airline
+homepage with that VA's real figures already wired in, and they change the words
+from there. Accent colour, typeface and light/dark are three controls on top.
+
+Practical consequence for you: **a hosted site being well-made is not evidence
+the VA is well-run.** Every one of them starts from the same six layouts and
+arrives looking deliberate. Judge the listing on §2 activity signals as you
+always have; the website tells you nothing about whether anybody is flying.
+
 ### The two switches
 
 | Switch | Whose | Effect |

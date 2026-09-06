@@ -77,6 +77,11 @@
 const mongoose = require('mongoose');
 const crypto = require('crypto');
 
+// The designs a VA picks from, and the blocks they are built out of. Kept in
+// its own module because the catalogue grows and this file does not need to:
+// nothing here knows what a template looks like, only how to store one.
+const templates = require('./vaSiteTemplates');
+
 /* ===========================================================================
  * CAPS
  *
@@ -213,6 +218,22 @@ const CrewSiteSchema = new mongoose.Schema({
     blockedReason: { type: String, default: '' },
     blockedAt: Date,
 
+    // Which design the draft was laid out from, and the theme on top of it.
+    //
+    // Stored rather than inferred from the files, because it cannot be inferred:
+    // a VA who has edited style.css has a site that is still Concourse in every
+    // way that matters to them, and re-deriving "which template is this" from
+    // markup would be a guess that goes wrong exactly when somebody has done
+    // the most work. It is what the picker highlights and what the theme
+    // controls write against.
+    template: { type: String, default: '' },
+    theme: {
+        _id: false,
+        accent: { type: String, default: '' },
+        font: { type: String, default: '' },
+        mode: { type: String, default: '' },
+    },
+
     // Short-lived preview credential. The site host has no session — that is
     // the point of it — so a token in the URL is the only way to show a VA
     // their unpublished draft on the origin it will actually run on.
@@ -225,273 +246,23 @@ const CrewSiteSchema = new mongoose.Schema({
 const CrewSite = mongoose.models.CrewSite || mongoose.model('CrewSite', CrewSiteSchema);
 
 /* ===========================================================================
- * THE STARTER
+ * LAYING OUT A DESIGN
  *
- * A VA that opens an empty editor writes nothing. This is a working airline
- * homepage — a hero, a figures band, a network list, a noticeboard and events —
- * with every live number already wired to crew-feed.js, so the first thing a VA
- * does is change the words rather than work out the plumbing.
- *
- * Plain HTML and CSS, no build step and no framework, on purpose. A VA staff
- * member with an afternoon and a search engine can edit it; a VA with a
- * developer can throw it away.
+ * The catalogue lives in vaSiteTemplates.js. This file's only interest in it is
+ * that a template produces a list of {path, content} and that every path it
+ * produces is one a VA would have been allowed to write by hand — checked
+ * below, not assumed, because a template that shipped a path cleanPath refuses
+ * would create a file the editor could never save again.
  * ======================================================================== */
-function starterFiles(va, feedSrc, crewBase) {
-    const name = String((va && va.name) || 'Our Virtual Airline');
-    const slug = String((va && va.slug) || '');
-    const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-    const crew = `${crewBase}/crew/${esc(slug)}`;
-
-    const index = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(name)}</title>
-<link rel="stylesheet" href="/style.css">
-</head>
-<body>
-
-<header class="bar">
-  <b>${esc(name)}</b>
-  <nav>
-    <a href="/fleet.html">Fleet</a>
-    <a href="${crew}">Crew centre</a>
-    <a class="cta" href="${crew}/join">Apply</a>
-  </nav>
-</header>
-
-<main>
-
-  <section class="hero">
-    <h1>Fly with ${esc(name)}.</h1>
-    <p>Write the sentence here that says what your airline is for. One sentence.
-       The numbers below look after themselves.</p>
-    <a class="cta" href="${crew}/join">Apply to fly</a>
-  </section>
-
-  <!-- FIGURES.
-       Each number is written into the page by crew-feed.js from your crew
-       centre. Type a true fallback between the tags: if the feed is quiet the
-       page keeps what you wrote, and a figure the crew centre does not have is
-       REMOVED along with its label rather than printed as 0. -->
-  <section class="figures">
-    <div data-crew-figure><b data-crew-stat="pilots">&mdash;</b><span>pilots</span></div>
-    <div data-crew-figure><b data-crew-stat="hours" data-crew-suffix="+">&mdash;</b><span>hours flown</span></div>
-    <div data-crew-figure><b data-crew-stat="destinations">&mdash;</b><span>destinations</span></div>
-    <div data-crew-figure><b data-crew-stat="routesActive">&mdash;</b><span>routes</span></div>
-  </section>
-
-  <!-- THE NETWORK. One copy of the <template> per row, filled from your
-       published routes. Anything in {{ }} is escaped on the way in, so a note
-       somebody typed in the crew centre can never write HTML into this page. -->
-  <section>
-    <h2>Where we fly</h2>
-    <ul class="rows" data-crew-list="routes" data-crew-limit="12">
-      <template><li><b>{{from}} &rarr; {{to}}</b> <span>{{flight}} &middot; {{ac}}</span></li></template>
-      <li>Add your sectors in the crew centre and they appear here.</li>
-    </ul>
-  </section>
-
-  <!-- WHAT WE HAVE BEEN DOING. The rows your crew centre writes by itself —
-       a pilot joined, somebody was promoted, an event went up. -->
-  <section>
-    <h2>Lately</h2>
-    <ul class="rows" data-crew-list="activity" data-crew-limit="6">
-      <template><li><b>{{title}}</b> <span>{{body}}</span></li></template>
-    </ul>
-  </section>
-
-  <!-- THE NOTICEBOARD, the written half only. Drop data-crew-written to get
-       the whole board including the automatic rows above. -->
-  <section>
-    <h2>Notices</h2>
-    <ul class="rows" data-crew-list="notices" data-crew-written="on" data-crew-limit="4">
-      <template><li><b>{{title}}</b> <span>{{body}}</span></li></template>
-    </ul>
-  </section>
-
-  <!-- THE NEXT DEPARTURES. -->
-  <section>
-    <h2>Events</h2>
-    <ul class="rows" data-crew-list="events" data-crew-limit="4">
-      <template><li><b>{{title}}</b> <span>{{from}} &rarr; {{to}}</span></li></template>
-    </ul>
-  </section>
-
-</main>
-
-<footer>
-  <p>${esc(name)} is a virtual airline on Infinite Flight. Not affiliated with any real-world carrier.</p>
-  <p>Crew centre hosted by <a href="${crewBase}">Inflight</a>.</p>
-</footer>
-
-<!-- The feed. One line: it reads your crew centre and fills in everything
-     marked up above. No key, nothing to keep secret, and every endpoint it
-     reads is the same public one a visitor to your crew centre reads. -->
-<script src="${feedSrc}" data-va="${esc(slug)}"></script>
-</body>
-</html>
-`;
-
-    const fleet = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Fleet &mdash; ${esc(name)}</title>
-<link rel="stylesheet" href="/style.css">
-</head>
-<body>
-<header class="bar">
-  <b><a href="/">${esc(name)}</a></b>
-  <nav><a href="/">Home</a></nav>
-</header>
-<main>
-  <section class="hero"><h1>The fleet</h1></section>
-  <section>
-    <!-- Your fleet, written here. It is the one list the crew centre does not
-         publish on a public endpoint, so it stays yours to keep true. -->
-    <ul class="rows">
-      <li><b>Aircraft type</b> <span>What you use it for</span></li>
-    </ul>
-  </section>
-</main>
-<footer><p><a href="/">Back</a></p></footer>
-<script src="${feedSrc}" data-va="${esc(slug)}"></script>
-</body>
-</html>
-`;
-
-    const css = `/* ${name} — everything the pages look like, in one file.
-   Plain CSS on purpose: no build step, no framework, nothing to install. */
-
-:root {
-  --ink: #16181d;
-  --muted: #5c6470;
-  --line: #e4e7ec;
-  --bg: #ffffff;
-  --accent: #14375e;      /* change this one line to re-colour the whole site */
-}
-@media (prefers-color-scheme: dark) {
-  :root { --ink:#eef1f6; --muted:#9aa4b2; --line:#272b33; --bg:#0e1014; --accent:#7fa6e8; }
-}
-
-* { box-sizing: border-box; }
-body {
-  margin: 0; background: var(--bg); color: var(--ink);
-  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
-}
-a { color: var(--accent); }
-
-.bar {
-  display: flex; align-items: center; justify-content: space-between;
-  gap: 1rem; padding: 1rem clamp(1rem, 4vw, 3rem);
-  border-bottom: 1px solid var(--line);
-}
-.bar b a { text-decoration: none; color: inherit; }
-.bar nav { display: flex; gap: 1.2rem; flex-wrap: wrap; align-items: center; }
-.bar nav a { text-decoration: none; font-size: .92rem; }
-
-main { max-width: 62rem; margin: 0 auto; padding: 0 clamp(1rem, 4vw, 3rem); }
-section { padding: clamp(2.5rem, 6vw, 4.5rem) 0; border-bottom: 1px solid var(--line); }
-h1 { font-size: clamp(2rem, 6vw, 3.4rem); line-height: 1.1; margin: 0 0 1rem; letter-spacing: -.02em; }
-h2 { font-size: 1.25rem; margin: 0 0 1.2rem; letter-spacing: -.01em; }
-.hero p { color: var(--muted); max-width: 48ch; font-size: 1.1rem; }
-
-.cta {
-  display: inline-block; margin-top: 1.4rem; padding: .8rem 1.4rem;
-  background: var(--accent); color: var(--bg); border-radius: 8px;
-  text-decoration: none; font-weight: 600;
-}
-.bar .cta { margin: 0; padding: .45rem .9rem; font-size: .88rem; }
-
-/* The figures band. A figure the crew centre did not send takes its whole
-   block with it, which is why the label lives inside the same element. */
-.figures { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: 1.5rem; }
-.figures > div { display: grid; gap: .2rem; }
-.figures b { font-size: clamp(1.8rem, 5vw, 2.6rem); line-height: 1; letter-spacing: -.03em; }
-.figures span { color: var(--muted); font-size: .9rem; }
-
-.rows { list-style: none; margin: 0; padding: 0; }
-.rows li {
-  display: flex; flex-wrap: wrap; gap: .2rem 1rem; align-items: baseline;
-  padding: .85rem 0; border-top: 1px solid var(--line);
-}
-.rows li:last-child { border-bottom: 1px solid var(--line); }
-.rows span { color: var(--muted); font-size: .92rem; }
-
-footer {
-  max-width: 62rem; margin: 0 auto; padding: 2.5rem clamp(1rem, 4vw, 3rem) 4rem;
-  color: var(--muted); font-size: .86rem;
-}
-footer p { margin: .3rem 0; }
-`;
-
-    const readme = `# ${name} — your website
-
-You write this site. We serve it. The numbers come from your crew centre.
-
-## The files
-
-- \`index.html\` — the homepage
-- \`fleet.html\` — a second page, as an example of adding one
-- \`style.css\` — everything the pages look like
-
-Add files in the editor. \`index.html\` is what a visitor gets at \`/\`, and a
-folder's \`index.html\` is what they get at that folder.
-
-## Where the numbers come from
-
-The last line of each page loads \`crew-feed.js\` with your VA's address. It
-reads your crew centre's public endpoints and fills in anything marked up with
-\`data-crew-*\`:
-
-- \`<b data-crew-stat="pilots">\` — a figure. Wrap it and its label in
-  \`data-crew-figure\` and the whole block disappears when the figure does not
-  arrive, rather than leaving a dash next to a label.
-- \`<ul data-crew-list="routes">\` with a \`<template>\` inside — a list, one
-  copy of the template per row. Lists available: \`routes\`, \`events\`,
-  \`schedule\`, \`notices\`, \`activity\`, \`posts\`.
-- \`data-crew-limit\` caps how many rows. \`data-crew-written="on"\` narrows
-  \`notices\` to what a person actually typed.
-
-Write a true fallback inside the markup. If the feed is quiet the page keeps
-what you wrote — it never goes blank because a request timed out.
-
-You can read the feed yourself too: \`await CrewFeed.routes()\`,
-\`CrewFeed.stats()\`, \`CrewFeed.posts()\`. Every one resolves to \`null\`
-rather than throwing, and \`null\` means "leave the page alone".
-
-## What you can put here
-
-Text files: \`.html\`, \`.css\`, \`.js\`, \`.json\`, \`.svg\`, \`.txt\`,
-\`.md\`, \`.xml\`, \`.webmanifest\`. Up to ${MAX_FILES} files,
-${Math.round(MAX_FILE_BYTES / 1024)} KB each, ${Math.round(MAX_TOTAL_BYTES / 1024 / 1024)} MB in total.
-
-Images are not stored here — put them on an \`https://\` URL and link to them.
-Your logo and banner already have URLs; the VA Profile tab shows them.
-
-## What your code can reach
-
-Your site runs on its own address, separate from ours. Your JavaScript can call
-your own VA's public crew endpoints — the same ones any visitor to your crew
-centre reads — and nothing else of ours. There is no key in this site and
-nothing in it is secret, so you can paste it anywhere.
-
-## Publishing
-
-**Save** writes to your draft. **Preview** shows the draft on the real address.
-**Publish** makes the draft live. The last ${MAX_VERSIONS} published versions are kept, so
-publishing something broken is not a disaster.
-`;
-
-    return [
-        { path: 'index.html', content: index },
-        { path: 'fleet.html', content: fleet },
-        { path: 'style.css', content: css },
-        { path: 'README.md', content: readme },
-    ].map(f => ({ path: f.path, content: f.content, bytes: bytesOf(f.content), updatedAt: new Date() }));
+function layOutTemplate(templateId, va, theme) {
+    const files = templates.renderTemplate(templateId, va, {
+        feedSrc: `${CREW_BASE}/crew-feed.js`,
+        crewBase: CREW_BASE,
+        theme,
+    });
+    const bad = files.find(f => !cleanPath(f.path).path);
+    if (bad) throw new Error(`Template "${templateId}" produced an unusable path: ${bad.path}`);
+    return files;
 }
 
 /* ===========================================================================
@@ -792,6 +563,11 @@ function publicSite(site, va) {
     return {
         url: siteUrlFor(site.slug || (va && va.slug)),
         slug: site.slug || (va && va.slug) || '',
+        // Which design is laid out, and the theme on top of it — so the picker
+        // can highlight the current one and the theme controls can open on the
+        // values actually in force rather than on a design's defaults.
+        template: site.template || '',
+        theme: templates.normaliseTheme(site.theme, site.template || templates.DEFAULT_TEMPLATE),
         enabled: !!site.enabled,
         blocked: !!site.blocked,
         blockedReason: site.blocked ? (site.blockedReason || '') : '',
@@ -931,9 +707,30 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
         }
     });
 
-    // --- Seed the starter ---------------------------------------------------
+    /* --- The catalogue -----------------------------------------------------
+     * What the picker draws. No file is rendered to answer this — it is names,
+     * blurbs and a small drawn SVG of each layout, so the gallery costs one
+     * request whatever a VA does next.
+     *
+     * On the portal session rather than public: it is a product surface, not a
+     * fact about a VA, and there is no reason for it to be a URL anybody can
+     * enumerate our designs from.
+     * --------------------------------------------------------------------- */
+    app.get('/api/va-portal/site/templates', requirePortal, (req, res) => {
+        if (!DOMAIN) return notConfigured(res);
+        res.set('Cache-Control', 'private, max-age=300');
+        res.json(templates.catalogue());
+    });
+
+    // --- Lay out a design ---------------------------------------------------
     app.post('/api/va-portal/site/starter', requirePortalOwner, async (req, res) => {
         if (!DOMAIN) return notConfigured(res);
+        const body = req.body || {};
+        const wanted = String(body.template || '').trim();
+        if (wanted && !templates.TEMPLATES[wanted]) {
+            return res.status(400).json({ error: 'No such design.' });
+        }
+        const templateId = wanted || templates.DEFAULT_TEMPLATE;
         try {
             const r = await siteFor(req.portal);
             if (r.error) return fail(res, r);
@@ -941,19 +738,89 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
             const existing = ensureDraft(site);
             // Refuse to overwrite work. The editor asks first and sends
             // `replace` only once somebody has said yes out loud.
-            if (existing.length && !(req.body && req.body.replace === true)) {
+            if (existing.length && !(body.replace === true)) {
                 return res.status(409).json({
-                    error: 'Your draft already has files. Send replace:true to start it over from the template.',
+                    error: 'Your draft already has files. Send replace:true to lay this design out over them.',
                     code: 'draft_not_empty',
                 });
             }
-            site.draft.files = starterFiles(r.va, `${CREW_BASE}/crew-feed.js`, CREW_BASE);
+            // A theme sent with the design wins; otherwise the design's own
+            // accent, type and mode are used, which is what makes picking one a
+            // single click rather than a form.
+            const theme = templates.normaliseTheme(body.theme, templateId);
+            site.draft.files = layOutTemplate(templateId, r.va, theme);
+            site.template = templateId;
+            site.theme = theme;
             touchDraft(site, req.portal);
             await site.save();
             res.json(publicSite(site.toObject(), r.va));
         } catch (err) {
             console.error('VA site starter error:', err);
-            res.status(500).json({ error: 'Could not lay out the template.' });
+            res.status(500).json({ error: 'Could not lay out that design.' });
+        }
+    });
+
+    /* --- The theme ---------------------------------------------------------
+     * Rewrites theme.css and nothing else. That is the whole reason the
+     * templates keep every colour and family in one small file of custom
+     * properties: recolouring a site is one file replaced, not a search and
+     * replace across five, and a VA who has rewritten their markup completely
+     * still gets working theme controls.
+     *
+     * It deliberately does NOT touch style.css or any page. A VA who has edited
+     * their theme.css by hand loses those edits and is told so by the editor
+     * before the request is sent — that is the trade for a picker that cannot
+     * half-apply.
+     * --------------------------------------------------------------------- */
+    app.post('/api/va-portal/site/theme', requirePortalOwner, async (req, res) => {
+        if (!DOMAIN) return notConfigured(res);
+        try {
+            const r = await siteFor(req.portal);
+            if (r.error) return fail(res, r);
+            const site = r.site;
+            const files = ensureDraft(site);
+            if (!files.length) {
+                return res.status(400).json({ error: 'Lay out a design first — there is nothing to re-colour yet.' });
+            }
+            const theme = templates.normaliseTheme(
+                { ...(site.theme || {}), ...(req.body || {}) },
+                site.template || templates.DEFAULT_TEMPLATE,
+            );
+            const content = templates.renderThemeCss(theme);
+            const row = { path: 'theme.css', content, bytes: bytesOf(content), updatedAt: new Date() };
+            const at = files.findIndex(f => f.path === 'theme.css');
+            if (at < 0) files.push(row); else files[at] = row;
+
+            site.draft.files = files;
+            site.theme = theme;
+            touchDraft(site, req.portal);
+            await site.save();
+            res.json(publicSite(site.toObject(), r.va));
+        } catch (err) {
+            console.error('VA site theme error:', err);
+            res.status(500).json({ error: 'Could not change the theme.' });
+        }
+    });
+
+    /* --- One block's markup ------------------------------------------------
+     * For the editor's "Insert a section". Returns the HTML rather than writing
+     * it: where it goes in the open file is the editor's business and the
+     * cursor's, and a server that inserted it would have to guess.
+     *
+     * Every design uses the same class names, so a block rendered here looks
+     * right in any of them — which is the point of the blocks being shared.
+     * --------------------------------------------------------------------- */
+    app.get('/api/va-portal/site/block/:id', requirePortalOwner, async (req, res) => {
+        if (!DOMAIN) return notConfigured(res);
+        try {
+            const r = await siteFor(req.portal);
+            if (r.error) return fail(res, r);
+            const html = templates.renderBlock(req.params.id, r.va, { crewBase: CREW_BASE });
+            if (!html) return res.status(404).json({ error: 'No such section.' });
+            res.json({ id: req.params.id, html });
+        } catch (err) {
+            console.error('VA site block error:', err);
+            res.status(500).json({ error: 'Could not build that section.' });
         }
     });
 
@@ -1148,7 +1015,7 @@ module.exports = {
     CrewSite,
     MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES, MAX_VERSIONS, PREVIEW_TTL_MS,
     TYPES, PREVIEW_PREFIX, DOMAIN,
-    cleanPath, extOf, bytesOf, starterFiles,
+    cleanPath, extOf, bytesOf, layOutTemplate,
     parseSiteHost, siteUrlFor, pickFile, registrableGuess,
     mountVaSiteHost, registerVaSiteRoutes,
 };

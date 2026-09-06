@@ -755,6 +755,47 @@
             </div>
             <p id="wsState" class="hidden text-sm font-medium mb-4"></p>
 
+            <!-- Design + theme. The gallery is collapsed once a design is laid
+                 out: picking one is a thing a VA does rarely and editing is a
+                 thing they do constantly, so the editor gets the room. -->
+            <div class="surface rounded-2xl p-4 sm:p-5 mb-4">
+                <div class="flex items-center justify-between gap-3 flex-wrap mb-1">
+                    <div class="flex items-center gap-3 min-w-0">
+                        <span id="wsAccentDot" class="w-8 h-8 rounded-xl shrink-0 border border-black/5 dark:border-white/10"></span>
+                        <div class="min-w-0">
+                            <p class="text-sm font-semibold truncate"><span id="wsTemplateName">—</span></p>
+                            <p id="wsTemplateBlurb" class="text-xs text-zinc-500 dark:text-zinc-400 truncate"></p>
+                        </div>
+                    </div>
+                    <button type="button" id="wsGalleryBtn" class="text-xs font-semibold px-3 py-1.5 rounded-xl border border-zinc-200 dark:border-zinc-700" data-i18n="ws.changeDesign">Change design</button>
+                </div>
+
+                <!-- The gallery -->
+                <div id="wsGallery" class="hidden mt-4 grid grid-cols-2 sm:grid-cols-3 gap-3"></div>
+
+                <!-- Theme. Three controls that rewrite theme.css and nothing
+                     else — the reason every design keeps its colours and type
+                     in one small file of custom properties. -->
+                <div id="wsTheme" class="hidden mt-4 pt-4 border-t border-zinc-100 dark:border-zinc-800 grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400">
+                        <span data-i18n="ws.accent">Accent colour</span>
+                        <span class="mt-1.5 flex items-center gap-2">
+                            <input id="wsAccent" type="color" class="w-9 h-9 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-transparent p-0.5 cursor-pointer">
+                            <input id="wsAccentHex" type="text" spellcheck="false" class="field font-mono text-xs" placeholder="#14375e">
+                        </span>
+                    </label>
+                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400">
+                        <span data-i18n="ws.type">Type</span>
+                        <select id="wsFont" class="field mt-1.5 text-sm"></select>
+                    </label>
+                    <label class="text-xs font-semibold text-zinc-500 dark:text-zinc-400">
+                        <span data-i18n="ws.mode">Light or dark</span>
+                        <select id="wsMode" class="field mt-1.5 text-sm"></select>
+                    </label>
+                </div>
+                <p id="wsThemeNote" class="hidden text-xs mt-2"></p>
+            </div>
+
             <div class="grid grid-cols-1 lg:grid-cols-[16rem_1fr] gap-4">
                 <!-- Files -->
                 <div class="surface rounded-2xl p-4">
@@ -765,7 +806,7 @@
                     <div id="wsFiles" class="space-y-1"></div>
                     <p id="wsUsage" class="mt-3 text-[11px] text-zinc-400 font-mono"></p>
                     <div class="mt-3 pt-3 border-t border-zinc-100 dark:border-zinc-800 space-y-2">
-                        <button type="button" id="wsStarterBtn" class="w-full text-left text-xs font-semibold text-zinc-500 hover:text-zinc-900 dark:hover:text-white" data-i18n="ws.starter">Start from the template</button>
+                        <button type="button" id="wsStarterBtn" class="w-full text-left text-xs font-semibold text-zinc-500 hover:text-zinc-900 dark:hover:text-white" data-i18n="ws.starter">Pick a design</button>
                         <button type="button" id="wsRevertBtn" class="w-full text-left text-xs font-semibold text-zinc-500 hover:text-zinc-900 dark:hover:text-white" data-i18n="ws.revert">Discard changes</button>
                     </div>
                 </div>
@@ -775,6 +816,7 @@
                     <div class="flex items-center justify-between gap-3 mb-3">
                         <p id="wsOpenName" class="font-mono text-sm truncate text-zinc-500" data-i18n="ws.pickFile">Pick a file on the left to edit it.</p>
                         <div class="flex items-center gap-2 shrink-0">
+                            <select id="wsInsert" class="field text-xs py-1.5 w-auto" disabled></select>
                             <button type="button" id="wsDeleteBtn" class="hidden text-xs font-semibold text-rose-600 dark:text-rose-400" data-i18n="ws.delete">Delete</button>
                             <button type="button" id="wsSaveBtn" class="btn text-xs px-3 py-1.5" disabled><span data-i18n="ws.save">Save</span></button>
                         </div>
@@ -1135,7 +1177,13 @@
             // Website. loadSite() decides whether the tab appears at all: this
             // deployment may not have hosting configured, and a tab that opens
             // onto "hosting is off" is worse than no tab.
-            if (me.role === 'owner') { wireWebsite(); loadSite(); }
+            if (me.role === 'owner') {
+                wireWebsite(); wireDesign();
+                // The catalogue first: loadSite() paints the design card from
+                // it, and a card that renders before the names arrive shows a
+                // template id where a name should be.
+                loadTemplates().then(loadSite, loadSite);
+            }
             loadProfile();        // also paints the hero banner/logo/callsigns
             loadSubmissions();
             loadEvents();
@@ -1260,11 +1308,13 @@
 
             // Keep the open file open across a reload; drop it if it is gone.
             if (wsOpen && !files.some(f => f.path === wsOpen)) closeFile();
+            renderDesign();
             drawIcons();
         }
 
         function closeFile() {
             wsOpen = null; wsDirty = false;
+            $('wsInsert').disabled = true;
             $('wsEditor').value = ''; $('wsEditor').disabled = true;
             $('wsOpenName').textContent = t('ws.pickFile');
             $('wsSaveBtn').disabled = true;
@@ -1277,6 +1327,9 @@
             const f = (wsSite.draft.files || []).find(x => x.path === path);
             if (!f) return;
             wsOpen = path; wsDirty = false;
+            // Sections are HTML. Offering to drop one into a stylesheet is
+            // offering to break it.
+            $('wsInsert').disabled = !/\.html$/.test(path);
             $('wsEditor').value = f.content || '';
             $('wsEditor').disabled = false;
             $('wsOpenName').textContent = path;
@@ -1368,18 +1421,13 @@
                 } catch (err) { wsMsg('wsState', err.message, 'text-rose-600 dark:text-rose-400'); }
             });
 
+            // Opens the gallery rather than laying out a default. A VA whose
+            // draft is empty should be choosing, not accepting.
             $('wsStarterBtn').addEventListener('click', async () => {
-                const has = wsSite && wsSite.draft.files.length;
-                if (has && !confirm(t('ws.replacePrompt'))) return;
-                try {
-                    wsSite = await api('/site/starter', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ replace: true }),
-                    });
-                    closeFile(); renderSite();
-                    openFile('index.html');
-                } catch (err) { wsMsg('wsState', err.message, 'text-rose-600 dark:text-rose-400'); }
+                await loadTemplates();
+                renderGallery();
+                $('wsGallery').classList.remove('hidden');
+                $('wsGallery').scrollIntoView({ block: 'nearest' });
             });
 
             $('wsRevertBtn').addEventListener('click', async () => {
@@ -1432,6 +1480,195 @@
                     e.target.checked = !e.target.checked;
                     wsMsg('wsState', err.message, 'text-rose-600 dark:text-rose-400');
                 }
+            });
+        }
+
+        /* ---------- Designs, the theme, and dropping a section in ----------
+           The catalogue is fetched once and never changes inside a session, so
+           it is held here rather than re-requested each time the gallery opens.
+
+           THE THUMBNAILS ARE OUR OWN SVG, NOT A SCREENSHOT. They come out of
+           vaSiteTemplates.js as the geometry of each layout in that design's
+           own colours: they cannot go stale the way a rendered screenshot does
+           when somebody edits a template, they cost no binary, and they are
+           legible at 140px in a way a shrunken page never is. They are our
+           markup, from our own module, which is why setting them with innerHTML
+           is not the thing it looks like — nothing a VA typed reaches here. */
+        let wsCatalogue = null;
+
+        async function loadTemplates() {
+            if (wsCatalogue) return wsCatalogue;
+            wsCatalogue = await api('/site/templates');
+            // The theme controls are populated from the same payload, so the
+            // portal can never offer a typeface the backend would reject.
+            $('wsFont').innerHTML = wsCatalogue.fonts
+                .map(f => `<option value="${esc(f.id)}">${esc(f.label)}</option>`).join('');
+            $('wsMode').innerHTML = wsCatalogue.modes
+                .map(m => `<option value="${esc(m.id)}">${esc(m.label)}</option>`).join('');
+            $('wsInsert').innerHTML = `<option value="">${esc(t('ws.insert'))}</option>`
+                + wsCatalogue.blocks.map(b => `<option value="${esc(b.id)}">${esc(b.label)}</option>`).join('');
+            return wsCatalogue;
+        }
+
+        function renderGallery() {
+            if (!wsCatalogue) return;
+            const current = wsSite && wsSite.template;
+            $('wsGallery').innerHTML = wsCatalogue.templates.map(tpl => `
+                <button type="button" data-ws-template="${esc(tpl.id)}"
+                    class="text-left rounded-xl overflow-hidden border transition
+                           ${tpl.id === current
+                               ? 'border-zinc-900 dark:border-white ring-2 ring-zinc-900/10 dark:ring-white/10'
+                               : 'border-zinc-200 dark:border-zinc-700 hover:border-zinc-400 dark:hover:border-zinc-500'}">
+                    <svg viewBox="0 0 160 120" class="w-full block" role="img"
+                         aria-label="${esc(tpl.name)} layout">${tpl.thumb}</svg>
+                    <span class="block px-2.5 py-2 border-t border-zinc-100 dark:border-zinc-800">
+                        <span class="block text-xs font-semibold truncate">${esc(tpl.name)}</span>
+                        <span class="block text-[11px] text-zinc-500 dark:text-zinc-400 leading-snug mt-0.5">${esc(tpl.blurb)}</span>
+                    </span>
+                </button>`).join('');
+        }
+
+        // The design card at the top: what is laid out right now.
+        function renderDesign() {
+            if (!wsSite) return;
+            const tpl = wsCatalogue && wsCatalogue.templates.find(x => x.id === wsSite.template);
+            $('wsTemplateName').textContent = tpl ? tpl.name : t('ws.noDesign');
+            $('wsTemplateBlurb').textContent = tpl ? tpl.blurb : t('ws.noDesignSub');
+
+            const theme = wsSite.theme || {};
+            $('wsAccentDot').style.background = theme.accent || 'transparent';
+            $('wsAccent').value = theme.accent || '#14375e';
+            $('wsAccentHex').value = theme.accent || '';
+            if (theme.font) $('wsFont').value = theme.font;
+            if (theme.mode) $('wsMode').value = theme.mode;
+
+            // The theme controls only mean anything once there are files to
+            // re-colour, so they appear with the first design rather than
+            // sitting there doing nothing.
+            $('wsTheme').classList.toggle('hidden', !(wsSite.draft.files || []).length);
+            renderGallery();
+        }
+
+        async function applyTemplate(id) {
+            const has = wsSite && wsSite.draft.files.length;
+            // Laying a design out REPLACES the draft. That is destructive and
+            // it is asked about out loud, naming the design, because "Change
+            // design" reads like a theme switch and is not one.
+            if (has && !confirm(t('ws.replaceDesign'))) return;
+            try {
+                wsSite = await api('/site/starter', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ template: id, replace: true }),
+                });
+                closeFile();
+                $('wsGallery').classList.add('hidden');
+                renderSite();
+                openFile('index.html');
+                toast(t('ws.designApplied'));
+            } catch (err) { wsMsg('wsState', err.message, 'text-rose-600 dark:text-rose-400'); }
+        }
+
+        // Rewrites theme.css and nothing else. Debounced because the colour
+        // input fires continuously while somebody drags around the picker, and
+        // one request per pixel is one request per pixel.
+        let wsThemeTimer = null;
+        function queueTheme() {
+            clearTimeout(wsThemeTimer);
+            wsThemeTimer = setTimeout(applyTheme, 400);
+        }
+
+        async function applyTheme() {
+            if (!wsSite || !wsSite.draft.files.length) return;
+            const note = $('wsThemeNote');
+            const body = {
+                accent: $('wsAccent').value,
+                font: $('wsFont').value,
+                mode: $('wsMode').value,
+            };
+            try {
+                wsSite = await api('/site/theme', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                // theme.css has been rewritten under the editor. If that is the
+                // file somebody has open, show them what is now there rather
+                // than leaving a stale buffer that Save would write back.
+                if (wsOpen === 'theme.css') openFile('theme.css');
+                renderSite();
+                note.textContent = t('ws.themeSaved');
+                note.className = 'text-xs mt-2 text-emerald-600 dark:text-emerald-400';
+                note.classList.remove('hidden');
+            } catch (err) {
+                note.textContent = err.message;
+                note.className = 'text-xs mt-2 text-rose-600 dark:text-rose-400';
+                note.classList.remove('hidden');
+            }
+        }
+
+        // Drop a ready-made section into the open file, at the cursor.
+        async function insertBlock(id) {
+            if (!id || !wsOpen) return;
+            try {
+                const r = await api('/site/block/' + encodeURIComponent(id));
+                const ed = $('wsEditor');
+                const at = ed.selectionStart;
+                const before = ed.value.slice(0, at);
+                const after = ed.value.slice(ed.selectionEnd);
+                // On its own lines. A section pasted mid-tag is a broken page,
+                // and the cursor is wherever somebody last clicked.
+                const chunk = (before && !before.endsWith('\n') ? '\n\n' : '\n') + r.html + '\n';
+                ed.value = before + chunk + after;
+                ed.selectionStart = ed.selectionEnd = at + chunk.length;
+                ed.focus();
+                wsDirty = true;
+                $('wsSaveBtn').disabled = false;
+                wsMsg('wsEditorMsg', t('ws.inserted'), 'text-zinc-500');
+            } catch (err) {
+                wsMsg('wsEditorMsg', err.message, 'text-rose-600 dark:text-rose-400');
+            }
+        }
+
+        function wireDesign() {
+            $('wsGalleryBtn').addEventListener('click', async () => {
+                await loadTemplates();
+                renderGallery();
+                $('wsGallery').classList.toggle('hidden');
+            });
+            $('wsGallery').addEventListener('click', (e) => {
+                const btn = e.target.closest('[data-ws-template]');
+                if (btn) applyTemplate(btn.getAttribute('data-ws-template'));
+            });
+
+            // The two colour inputs are one control: the swatch for picking and
+            // the hex field for pasting a brand colour out of a style guide.
+            $('wsAccent').addEventListener('input', () => {
+                $('wsAccentHex').value = $('wsAccent').value;
+                $('wsAccentDot').style.background = $('wsAccent').value;
+                queueTheme();
+            });
+            $('wsAccentHex').addEventListener('change', () => {
+                const v = $('wsAccentHex').value.trim();
+                if (!/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(v)) {
+                    // Put back what is actually in force rather than sending a
+                    // value the backend will silently replace with the design's
+                    // default — a control that lies about what it did is worse
+                    // than one that refuses.
+                    $('wsAccentHex').value = (wsSite && wsSite.theme.accent) || '';
+                    return;
+                }
+                $('wsAccent').value = v;
+                $('wsAccentDot').style.background = v;
+                applyTheme();
+            });
+            $('wsFont').addEventListener('change', applyTheme);
+            $('wsMode').addEventListener('change', applyTheme);
+
+            $('wsInsert').addEventListener('change', (e) => {
+                const id = e.target.value;
+                e.target.value = '';
+                insertBlock(id);
             });
         }
 
