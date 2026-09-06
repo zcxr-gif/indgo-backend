@@ -61,9 +61,44 @@
             'tab.stats': 'Statistics',
             'tab.profile': 'VA Profile',
             'tab.embed': 'Embed',
+            'tab.website': 'Website',
             'tab.team': 'Team',
             'tab.account': 'Account',
             'tab.compliance': 'Terms & standing',
+            // Website tab.
+            //
+            // Only the English strings exist for this screen so far, and that is
+            // fine rather than a gap left open: t() falls back to English for a
+            // key a language does not have, so a Spanish-speaking VA gets an
+            // English Website tab inside an otherwise Spanish portal instead of
+            // a wall of raw keys. Translations drop in additively.
+            'ws.heading': 'Your website',
+            'ws.sub': 'Write your airline’s public site. We host it, and the numbers on it come from your crew centre — so the website cannot disagree with the airline.',
+            'ws.live': 'Live at',
+            'ws.notPublished': 'Nothing published yet',
+            'ws.offline': 'Switched off',
+            'ws.blocked': 'On hold',
+            'ws.files': 'Files',
+            'ws.newFile': 'New file',
+            'ws.delete': 'Delete',
+            'ws.save': 'Save',
+            'ws.saved': 'Saved',
+            'ws.preview': 'Preview',
+            'ws.publish': 'Publish',
+            'ws.published': 'Published',
+            'ws.revert': 'Discard changes',
+            'ws.starter': 'Start from the template',
+            'ws.unpublished': 'You have unsaved changes to publish.',
+            'ws.upToDate': 'The live site matches your draft.',
+            'ws.history': 'Published history',
+            'ws.restore': 'Restore',
+            'ws.enable': 'Site is live',
+            'ws.empty': 'Nothing here yet. Start from the template — it is a working airline homepage with your figures already wired in.',
+            'ws.pickFile': 'Pick a file on the left to edit it.',
+            'ws.newPrompt': 'File name (e.g. about.html)',
+            'ws.replacePrompt': 'This replaces every file in your draft with the template. Your published site is untouched. Continue?',
+            'ws.deletePrompt': 'Delete {file} from your draft?',
+            'ws.help': 'What you can put here',
             // Statistics tab
             'st.heading': 'Your statistics',
             'st.sub': 'Live operations, daily flights and how your listing is performing on the tracker.',

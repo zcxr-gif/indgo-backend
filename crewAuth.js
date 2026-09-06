@@ -163,6 +163,72 @@ function sanitizeFleet(arr) {
         image: cleanImageUrl(a && a.image),
     })).filter(a => a.type || a.name);
 }
+// The Instagram wall. A handle, and up to MAX_SOCIAL_POSTS posts.
+//
+// THE URL IS NEVER STORED. Staff paste a share link; this parses it down to the
+// `{kind, code}` pair and keeps only that. Every consumer rebuilds the embed
+// address from the code, so a pasted `javascript:`, a look-alike host
+// (`instagram.com.evil.test`) or a tracking-laden redirect cannot survive as
+// far as an iframe `src` — not here, not in the public feed, and not on a VA's
+// hosted site. This mirrors parsePost in the tracker's crewSocial.js, which
+// does the same job at the point of drawing; doing it in both places means
+// neither has to trust the other.
+//
+// An unparseable entry is DROPPED rather than refused. The crew dashboard
+// already refuses one at the point of typing with a message naming the bad
+// link, which is where a person can act on it; a save that 400s on one stale
+// row would take the other eleven down with it.
+const MAX_SOCIAL_POSTS = 12;
+function parseSocialPost(input) {
+    const raw = String(input == null ? '' : input).trim();
+    if (!raw) return null;
+    let u;
+    try { u = new URL(/^https?:\/\//i.test(raw) ? raw : 'https://' + raw); } catch { return null; }
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+    // The host must BE instagram, not merely end with it.
+    const host = u.hostname.toLowerCase().replace(/^www\./, '');
+    if (host !== 'instagram.com' && !host.endsWith('.instagram.com')) return null;
+    const m = u.pathname.match(/(?:^|\/)(p|reel|reels|tv)\/([A-Za-z0-9_-]{1,64})/);
+    if (!m) return null;
+    return { kind: m[1] === 'reels' ? 'reel' : m[1], code: m[2] };
+}
+function sanitizeSocial(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const handle = clampStr(String(raw.handle || '').replace(/^@+/, ''), 40);
+    const seen = new Set();
+    const posts = [];
+    (Array.isArray(raw.posts) ? raw.posts : []).forEach((entry) => {
+        if (posts.length >= MAX_SOCIAL_POSTS) return;
+        // Accept either what a person pasted or what we stored, so a round trip
+        // through the settings screen does not empty the wall.
+        const p = (entry && typeof entry === 'object' && entry.code && entry.kind)
+            ? parseSocialPost(`https://www.instagram.com/${entry.kind}/${entry.code}/`)
+            : parseSocialPost(typeof entry === 'string' ? entry : (entry && entry.url));
+        if (!p || seen.has(p.code)) return;
+        seen.add(p.code);
+        posts.push(p);
+    });
+    return { handle, posts };
+}
+// The wall, on the way out. Built from the stored code every time, which is
+// the whole point of storing the code: a consumer that renders `embedUrl`
+// without thinking still cannot be handed a hostile address.
+//
+// `url` is the canonical post (for an "open on Instagram" link), `embedUrl` the
+// frame. Both are ours, assembled here from `[A-Za-z0-9_-]`.
+function publicSocial(ad) {
+    const sc = (ad && ad.crewSocial) || {};
+    const posts = (Array.isArray(sc.posts) ? sc.posts : [])
+        .filter(p => p && p.code && (p.kind === 'p' || p.kind === 'reel' || p.kind === 'tv'))
+        .slice(0, MAX_SOCIAL_POSTS)
+        .map(p => ({
+            kind: p.kind,
+            code: p.code,
+            url: `https://www.instagram.com/${p.kind}/${p.code}/`,
+            embedUrl: `https://www.instagram.com/${p.kind}/${p.code}/embed/`,
+        }));
+    return { handle: String(sc.handle || ''), posts };
+}
 function sanitizeForm(arr) {
     if (!Array.isArray(arr)) return null;
     return arr.slice(0, 30).map(q => ({
@@ -807,7 +873,7 @@ function registerCrewAuthRoutes(app) {
             const caps = effectiveCaps(ad, p);
             const can = (c) => caps.includes(c);
             const body = req.body || {};
-            const touchesBranding = ['layout', 'accent', 'loginLook', 'topicMode', 'ranks', 'roles', 'fleet'].some(f => body[f] !== undefined);
+            const touchesBranding = ['layout', 'accent', 'loginLook', 'topicMode', 'ranks', 'roles', 'fleet', 'social'].some(f => body[f] !== undefined);
             const touchesRecruit = ['joinMode', 'minGrade', 'callsignPrefix', 'discordInvite', 'applicationForm', 'joinRequirements'].some(f => body[f] !== undefined);
             const touchesTeam = body.staffRoles !== undefined || body.staffAssignments !== undefined;
             const touchesOps = body.pirepAutoApprove !== undefined;
@@ -898,6 +964,13 @@ function registerCrewAuthRoutes(app) {
                 const f = sanitizeFleet(req.body.fleet);
                 if (f) ad.crewFleet = f;
             }
+            // The Instagram wall. Note the shape: `social` in and out, `crewSocial`
+            // on the document — the settings screen has always spoken the short
+            // name, and the VA record prefixes crew-center fields.
+            if (req.body?.social !== undefined) {
+                const sc = sanitizeSocial(req.body.social);
+                if (sc) ad.crewSocial = sc;
+            }
             // How this VA runs its schedule. Normalised by the same module that
             // ENFORCES these rules, so what is stored and what is applied
             // cannot disagree — a settings screen with its own idea of the
@@ -986,6 +1059,11 @@ function registerCrewAuthRoutes(app) {
                 applicationForm: ad.applicationForm || [], joinRequirements: ad.joinRequirements || [],
                 staffRoles: ad.staffRoles || [], staffAssignments: ad.staffAssignments || [],
                 pirepAutoApprove: !!ad.crewPirepAutoApprove,
+                // Echoed unconditionally. The crew dashboard treats a missing
+                // `social` in this reply as "the backend does not store it yet"
+                // and warns that the wall will be empty after a reload, so an
+                // empty wall must come back as {handle:'',posts:[]}, not absent.
+                social: publicSocial(ad),
             });
         } catch (err) {
             console.error('Crew settings error:', err);
@@ -1166,4 +1244,5 @@ module.exports = {
     isDiscordInviteUrl, cleanDiscordInvite,
     CREW_CAPABILITIES, CREW_CAP_IDS, CREW_ROLE_PRESETS, CAPABILITY_HEIRS,
     CREW_OWNER_GRADE_CAPS, CREW_DEFAULT_STAFF_CAPS, teamSaveFailure,
+    parseSocialPost, sanitizeSocial, publicSocial, MAX_SOCIAL_POSTS,
 };

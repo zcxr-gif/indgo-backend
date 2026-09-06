@@ -828,6 +828,63 @@ pilots can't wear their colours, upload their banner.
 
 ---
 
+## 13D. Hosted VA websites
+
+A VA can write their own public website in the **Website** tab of their portal
+and we serve it at `https://<slug>.<our sites domain>`. The pages are theirs;
+the address is ours, and that is the whole of your interest in it.
+
+### What a VA controls, and what it can reach
+
+They write the HTML, CSS and JavaScript. Their code runs on **their own
+address**, which is a different origin from `inflight.info` — it cannot read a
+crew centre session, touch our pages, or call anything of ours that needs a
+login. It can read the same public crew endpoints a visitor to their crew centre
+reads (routes, stats, events, the noticeboard, their Instagram wall) and nothing
+else. There is no key in a hosted site, so nothing there is a secret they could
+leak or you could accidentally publish.
+
+Text files only, 2 MB in total. **No image uploads** — a VA links to an
+`https://` address, so anything pictorial on a hosted site is hosted somewhere
+that is not us. That matters when a takedown lands: the picture is not ours to
+remove, but the page carrying it is.
+
+### The two switches
+
+| Switch | Whose | Effect |
+|---|---|---|
+| **Site is live** | The VA's, in their portal | They can take their own site down and put it back |
+| **Blocked** | Ours, `/api/crew-admin/sites` | Takes the site down, **refuses further publishing**, and records the reason |
+
+`Blocked` outranks the VA's own switch — a site you take down for cause cannot
+be put back by the VA toggling their side. A blocked, switched-off and
+never-published site all answer the same plain 404: we do not publish a sentence
+about a VA on the VA's own address.
+
+### When to block
+
+Same bar as a listing, because it is the same programme and our domain either
+way — **§5 content standards**, **§6 copyright and trademarks**, **§12
+takedowns**. The ones that actually come up:
+
+* imagery or branding the VA does not own (§6) — the usual case;
+* a page that presents the VA as a real-world carrier rather than a virtual one
+  (§5), which a website makes far easier to do than a listing did;
+* anything that would be a takedown if it were on a listing.
+
+Block first, then message the VA with the reason and what to change. Their draft
+is untouched, so fixing it and asking you to unblock is a short loop.
+
+**A blocked website is not automatically a suspended listing.** They are
+separate decisions on separate evidence: a copyright problem on one page is a
+page problem. Use the warning ladder (§7.3) if the same VA earns a second one.
+
+**Log it like any other action** (§10): date, who, VA, blocked/unblocked,
+reason, the URL of the page in question. If it came in as a rights-holder
+complaint, escalate rather than self-authorise — that is a §11 takedown.
+
+---
+
 ## 14. Quick Reference Card
 
 **List it only if:** genuine + **active** (≥2 signals, no hard disqualifier — §2)
