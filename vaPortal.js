@@ -2324,6 +2324,14 @@ module.exports = {
     // partner-facing routes (e.g. vaStats) gate them on the same session
     // instead of re-implementing the cookie/JWT check.
     requirePortal,
+    // Same, for the routes that CHANGE something. Every mutation in this file
+    // is owner-only, and a module registering partner-facing writes elsewhere
+    // (vaSites) holds to the same line rather than inventing a softer one.
+    requirePortalOwner,
+    // The portal's Discord activity log, so a module registering partner-facing
+    // writes elsewhere (vaSites) lands in the same audit trail rather than
+    // publishing changes nobody can see the history of.
+    logActivity,
     SUBMISSION_CATEGORIES,
     SUBMISSION_STATUSES,
 };

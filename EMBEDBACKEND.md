@@ -811,3 +811,304 @@ curl -X POST https://<backend>/api/community/aircraft/submit \
   -F "sourceSite=partner-gallery" \
   -F "images=@/path/to/photo.jpg"
 ```
+
+---
+
+## 7. Hosted VA websites
+
+A VA writes their own public site; we serve it from an address of their own.
+The editor is the **Website** tab of the VA portal (owner accounts only), and
+everything behind it is `/api/va-portal/site/*`. The module is `vaSites.js`.
+
+### The one thing that makes this safe
+
+A VA writes JavaScript and we run it in a browser. There is exactly one defence
+that works for that, and it is not a sanitiser, a script allow-list, or a review
+queue: **their code must not share an origin with ours.**
+
+Every site is served from `<slug>.$VA_SITES_DOMAIN` and nothing else is served
+from there. On that origin a VA's script cannot read our `localStorage` or
+`sessionStorage` (where the crew centre's session token lives), cannot touch our
+DOM, cannot call our authenticated endpoints as a signed-in staff member, and is
+never handed a cookie of ours — every cookie this platform sets is host-only
+(no `Domain` attribute, see `setAuthCookie` in `vaPortal.js` and `staffAuth.js`),
+so none is sent to a subdomain.
+
+Two invariants hold that up, and both have tests:
+
+* `mountVaSiteHost` is mounted **before every other route** and never calls
+  `next()` once it recognises the host. This file ends with
+  `app.use(express.static(__dirname))`, so a fall-through on a VA host would
+  answer out of the repository directory.
+* Every cookie stays host-only. If one ever gains a `Domain`, this feature's
+  main claim stops being true.
+
+### Configuration
+
+| Variable | Default | What it does |
+|---|---|---|
+| `VA_SITES_DOMAIN` | *(unset)* | The whole switch. Unset, no host is claimed and the authoring API answers `503 hosting_off`. Set it to e.g. `vasites.inflight.info` and point a wildcard DNS record + certificate at the app. |
+| `PUBLIC_SITE_ORIGIN` | `https://inflight.info` | Where `crew-feed.js` is served from. Goes into every hosted site's CSP. |
+| `PUBLIC_BACKEND_ORIGIN` | the Northflank URL | Where the public crew endpoints are. Goes into `connect-src`. |
+| `VA_SITES_SCRIPT_CDNS` | jsdelivr, cdnjs, unpkg, tailwind | Script sources a hosted site may pull from. |
+| `VA_SITES_FRAME_SRC` | Instagram, YouTube, Twitch, Discord | What a hosted site may frame. |
+
+**Prefer a separate registrable domain.** `vasites.inflight.info` is a separate
+*origin* but not a separate *site* — it shares the registrable domain
+`inflight.info`. A VA's script can therefore write
+`document.cookie = 'x=1; domain=inflight.info'` and have it sent to the platform
+on every request: cookie tossing. It cannot **read** our cookies, but it can
+shadow one. Pointing `VA_SITES_DOMAIN` at a registrable domain we own that is
+*not* the platform's closes that and needs no code change. The app prints a
+warning at boot when the two share a registrable domain.
+
+### What a hosted site can reach of ours
+
+The public crew endpoints for **its own VA**, and that is the entire list —
+the same URLs any visitor to the crew centre reads:
+
+```
+GET /api/crew/<slug>/routes        GET /api/crew/<slug>/events
+GET /api/crew/<slug>/route-map     GET /api/crew/<slug>/schedules
+GET /api/crew/<slug>/stats         GET /api/crew/<slug>/announcements
+GET /api/crew/<slug>/social
+```
+
+Rosters, applications, applicant emails, flight reports, staff logins, our
+Mongo and the VA's Supabase service key are on none of these, so none of them is
+reachable from a hosted site. There is no key in a hosted site and nothing to
+leak by publishing one.
+
+### Storage and caps
+
+Site source lives in our Mongo (`CrewSite`), not in the VA's Supabase project.
+That is a deliberate exception to `crewStore.js`'s rule and not a weakening of
+it: that rule is about data *about people*, and a homepage exists to be
+published to strangers. Putting it in the VA's project would also mean every
+page view of every VA site waited on that VA's database.
+
+| Cap | Value |
+|---|---|
+| Files | 60 |
+| Bytes per file | 256 KB |
+| Bytes per site | 2 MB |
+| Path depth | 6 segments |
+| Published versions kept | 10 |
+| Preview token life | 30 minutes |
+
+Text only: `.html .css .js .mjs .json .svg .txt .md .xml .webmanifest`. Images
+are not stored here — a VA links to an `https://` URL. Accepting binaries would
+turn a 2 MB text quota into an image host with none of an image host's answers
+about takedowns.
+
+### Serving rules
+
+`/` is `index.html`; a trailing slash is that folder's `index.html`; an
+extensionless path tries the file, then `.html`, then the folder's index. A VA's
+own `404.html` is used when they wrote one.
+
+A site that is **off** (the VA's switch), **blocked** (ours, for moderation) or
+**never published** answers identically: a plain 404. "This site is disabled" is
+a sentence about a VA that the VA did not ask us to publish on their own address.
+
+Every response — pages, 404s and previews alike — carries the CSP,
+`X-Content-Type-Options: nosniff`, `Referrer-Policy`,
+`Cross-Origin-Opener-Policy: same-origin` and a `Permissions-Policy`, and has
+the app-wide `Access-Control-Allow-Origin` removed.
+
+### Preview
+
+The site host has no session — that is the point of it — so an unpublished draft
+is reached with a short-lived token in the URL:
+
+```
+POST /api/va-portal/site/preview  →  { url, expiresAt, minutes }
+    url = https://<slug>.<domain>/__preview/<token>/
+```
+
+A fresh token is minted on every request, so a preview link pasted into a
+Discord channel last month is not a way into a draft. Preview responses are
+`no-store` and `X-Robots-Tag: noindex, nofollow`. The token opens exactly one
+thing: the draft of the site whose label is already in the Host header.
+
+### Authoring API
+
+All under `/api/va-portal/site`, on the portal session. **Reads** need any
+portal account; **every write is owner-only**, matching every other mutation in
+`vaPortal.js`.
+
+| Method | Path | What |
+|---|---|---|
+| `GET` | `/` | Draft (with content), published (paths only), history, limits, usage, `hasUnpublishedChanges` |
+| `PUT` | `/file` | `{ path, content }` — write one file to the draft |
+| `DELETE` | `/file?path=` | Remove one file from the draft |
+| `POST` | `/starter` | `{ replace }` — lay out the template (refuses `409 draft_not_empty` without `replace:true`) |
+| `POST` | `/preview` | Mint a preview token and address |
+| `POST` | `/publish` | Draft → live. Requires an `index.html`; snapshots the version |
+| `POST` | `/revert` | Draft ← live |
+| `POST` | `/restore` | `{ version }` — an old version into the **draft**, never straight to live |
+| `POST` | `/enabled` | `{ enabled }` — the VA's own on/off switch |
+
+Inflight-side moderation is `GET /api/crew-admin/sites` and
+`PATCH /api/crew-admin/sites/:id` with `{ blocked, reason }`, on a staff
+session. `blocked` outranks the VA's `enabled`, refuses further publishing, and
+records why.
+
+### Designs, blocks and the theme — `vaSiteTemplates.js`
+
+A VA picks a design and sees their own airline in it. Six ship today
+(`GET /api/va-portal/site/templates` returns the catalogue):
+
+| id | What it is |
+|---|---|
+| `flightline` | Editorial. Serif headline, band of live figures. The default. |
+| `concourse` | A departure board. Dark, dense, monospaced. |
+| `horizon` | Airy and modern. Lots of white, a wide hero. |
+| `terminal` | Type and rules only. Loads instantly, ages well. |
+| `cabin` | Warm and rounded, card-based. For a smaller crew. |
+| `livery` | Colour-forward. Full-bleed blocks of the accent. |
+
+**The invariant, and the reason the module is arranged as it is.** Every
+template is a different design and none of them is a different data wiring. The
+`data-crew-*` markup lives once, in `BLOCKS`, and every template composes the
+same blocks. If each carried its own copy, then the day `data-crew-stat` gains a
+field five of the six would quietly stop showing a number and nobody would find
+out until a VA asked why their pilot count was missing. **The variety belongs in
+the CSS, where being wrong is visible; the wiring belongs in one place, where
+being wrong is not.**
+
+A template is not a colour swap — swap any two accents and you still have two
+pages nothing like each other. That is the bar for adding a seventh.
+
+**What differs per template:** `tokens` (written to `theme.css`), `css` (the
+personality — layout, density, how a heading sits), `pages` (which blocks, in
+what order, on which pages), and `thumb`. Thumbnails are hand-drawn SVG of each
+layout in its own colours rather than screenshots: they cannot go stale when a
+template is edited, cost no binary, and stay legible at 140px in a way a
+shrunken page never is.
+
+**Theme.** `POST /site/theme` with `{ accent, font, mode }` rewrites `theme.css`
+and nothing else — which is why every template keeps its colours and type in one
+small file of custom properties. Four typeface pairings, three modes (`light`,
+`dark`, `auto`). `--on-accent` is derived from the accent's own luminance rather
+than assumed white, because Livery sets body text on a block of the accent and a
+VA who picks a pale yellow would otherwise publish invisible words.
+
+An accent that is not a hex colour falls back to the design's own. A token file
+is CSS: an unvalidated value there closes a declaration and opens whatever the
+author fancies.
+
+**Blocks.** `GET /site/block/:id` returns one section's markup, for the editor's
+*Insert a section* menu. Every design uses the same class names, so a block
+looks right in any of them. `nav` and `footer` are not offered — a page has one
+of each, and offering them is offering a way to end up with two. The route
+returns HTML rather than writing it: where a section goes in the open file is
+the cursor's business, and a server that inserted it would be guessing.
+
+Each design also ships `site.js`, which does the two things markup cannot —
+mounting the Instagram wall lazily, and removing a `[data-crew-section]` block
+whose list came back empty. `crew-feed.js` deliberately does not remove empty
+lists, because on most pages an empty list still has a fallback row worth
+showing; a block marked `[data-crew-section]` is saying the opposite.
+---
+
+## 8. `crew-feed.js` — the same data on a site we do not host
+
+`https://inflight.info/crew-feed.js` puts a crew centre's public data on any
+website, hosted here or anywhere else. One line, no key, no build step:
+
+```html
+<script src="https://inflight.info/crew-feed.js" data-va="ocean-virtual"></script>
+```
+
+Readers, all of which resolve to `null` rather than throwing — and `null` means
+"leave what is already on the page":
+
+| Call | Endpoint | What |
+|---|---|---|
+| `CrewFeed.routes()` | `/routes` | Published sectors; drafts and switched-off routes dropped |
+| `CrewFeed.network()` | `/route-map` | Airports with coordinates, for a map |
+| `CrewFeed.stats()` | `/stats` | Pilots, hours, PIREPs, destinations… |
+| `CrewFeed.events()` | `/events` | Published events |
+| `CrewFeed.schedule()` | `/schedules` | The bid schedule |
+| `CrewFeed.notices()` | `/announcements` | The noticeboard as the crew centre reads it |
+| `CrewFeed.notices({written:true})` | `/announcements` | Only what a person typed |
+| `CrewFeed.activity()` | `/announcements` | Only what the crew centre recorded — joins, promotions, published events |
+| `CrewFeed.posts()` | `/social` | The Instagram wall |
+| `CrewFeed.handle()` | `/social` | The VA's Instagram handle |
+| `CrewFeed.brand()` | `/api/va-ads/by-slug/<slug>` | Name, callsign, tagline, **logo**, **banner**, accent, callsign prefix, Discord invite |
+| `CrewFeed.ranks()` | same | The **rank ladder**, sorted by the hours each rung asks for |
+| `CrewFeed.fleet()` | same | The declared **aircraft and liveries** |
+| `CrewFeed.roles()` | same | Role definitions (never who holds one) |
+
+The last four read the **directory record**, not a crew endpoint — that is
+deliberate. Everything else here is data the VA's crew centre *produced* and
+lives in the VA's own store; this is what the airline *is* rather than what it
+has been doing. Two different things, so two paths. One fetch serves all four.
+
+Every URL in that record is re-checked for `https:` on the way out. A logo goes
+in an `src`, and an `src` is where a wrong string stops being a broken image and
+starts being somebody else's script. The Supabase block the endpoint also
+carries is dropped by the reader — a public anon key is not a secret, and it is
+still not a marketing page's business.
+
+`notices`, `activity` and the two `/social` readers share one fetch each, so
+asking for both halves of a board costs one request.
+
+Declarative markup, for pages that would rather not write JavaScript:
+
+```html
+<b data-crew-stat="pilots">—</b> pilots
+<div data-crew-figure><b data-crew-stat="hours"></b><span>hours</span></div>
+<section data-crew-when="pireps"> … </section>
+
+<!-- Identity. On an <img> the value becomes the src; on anything else, the
+     text. An element whose field the crew centre does not hold is REMOVED. -->
+<span data-crew-figure hidden><img data-crew-brand="logo" alt=""></span>
+<h1 data-crew-brand="name">Ocean Virtual</h1>
+
+<ul data-crew-list="activity" data-crew-limit="6">
+  <template><li><b>{{title}}</b> <span>{{body}}</span></li></template>
+</ul>
+
+<!-- A template may carry an image field. An <img> whose src never arrived is
+     removed rather than drawn as a broken icon. -->
+<ol data-crew-list="ranks">
+  <template><li><img src="{{image}}" alt=""><b>{{name}}</b> <span>{{from}}</span></li></template>
+</ol>
+```
+
+`data-crew-brand` removes rather than leaving what is on the page, which is the
+opposite of the rule for figures — and deliberately. A figure has a true
+fallback a VA can type; a logo does not. There is no placeholder image that is
+honest about an airline which has not uploaded one, so it arrives or the element
+goes. Wrap it in `[data-crew-figure]` and the wrapper goes with it.
+
+Every `{{field}}` is escaped on the way in: these values come out of a VA's own
+database, and a template that interpolated them raw would make any staff member
+with a notes field an author of the host site's HTML.
+
+A figure that did not arrive is **removed**, along with its `[data-crew-figure]`
+block, rather than printed as `0`. A page that prints a made-up number in big
+numerals next to true ones is worse than one that prints nothing.
+
+### `/api/crew/<slug>/social` — the Instagram wall
+
+Public, CORS-open, 5-minute cache.
+
+```json
+{
+  "handle": "aeromexicovirtual",
+  "posts": [
+    { "kind": "p", "code": "ABC123_-x",
+      "url": "https://www.instagram.com/p/ABC123_-x/",
+      "embedUrl": "https://www.instagram.com/p/ABC123_-x/embed/" }
+  ]
+}
+```
+
+Staff paste share links in the crew centre; what is **stored** is the parsed
+`{kind, code}` and never the URL. Both addresses above are rebuilt from that
+code on the way out, and `crew-feed.js` rebuilds them again on the way in after
+checking `code` against `[A-Za-z0-9_-]`. Nothing a staff member typed ever
+reaches an iframe `src`, at any hop.

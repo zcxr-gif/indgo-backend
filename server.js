@@ -47,11 +47,19 @@ const {
     VaEvent,
     VaWarning,
     requirePortal: requireVaPortalSession,
+    requirePortalOwner: requireVaPortalOwner,
+    logActivity: logVaPortalActivity,
 } = require('./vaPortal');
+
+// Hosting a VA's own public website. Two halves that mount at opposite ends of
+// this file: the host handler goes first, because a request on a VA's address
+// must never reach the platform's routes (or the express.static at the foot of
+// this file), and the authoring API goes in with the rest of the routes.
+const vaSites = require('./vaSites');
 
 // Crew Center sign-in (inflight.info/crew/<slug>) — cascades our existing
 // accounts (VA portal accounts + Inflight staff) and routes to the right view.
-const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps, cleanDiscordInvite } = require('./crewAuth');
+const { registerCrewAuthRoutes, verifyCrewRequest, effectiveCaps, cleanDiscordInvite, publicSocial } = require('./crewAuth');
 
 // VA statistics engine — reach/engagement counters from the tracker plus flight
 // operations derived from the ACARS takeoff/landing feed, summarised per day,
@@ -201,6 +209,13 @@ app.set('trust proxy', 1);
 // Per-request timing for the diagnostics terminal. Mounted before the routes so
 // it observes the full handling time; it only attaches a res 'finish' listener.
 app.use(diagnostics.middleware());
+
+// VA websites, served from their own origin (*.VA_SITES_DOMAIN). FIRST, and it
+// never calls next() once it recognises the host: this file ends with
+// `app.use(express.static(__dirname))`, so a request on a VA's address that
+// fell through to the platform's stack would be answered out of the repository
+// directory. Unset VA_SITES_DOMAIN and this is a no-op.
+vaSites.mountVaSiteHost(app);
 
 // 2. CONNECT TO MONGODB
 mongoose.connect(process.env.MONGO_URI)
@@ -391,6 +406,28 @@ const VirtualAirlineAdSchema = new mongoose.Schema({
     // Owner/staff-chosen accent for the crew center + login. Overrides the accent
     // otherwise derived from the VA's embed config. '' = fall back to that.
     crewAccent: { type: String, trim: true, default: '' },
+
+    // The VA's Instagram wall: a handle, and the posts staff chose to hang on
+    // the crew center (crewSocial.js in the tracker draws it).
+    //
+    // WHY THE SHORTCODES AND NOT THE URLS. What staff paste is a share link
+    // with whatever tracking junk Instagram attached that week. Storing the
+    // parsed `{kind, code}` instead means the embed address is rebuilt from a
+    // closed alphabet everywhere it is used — crew center, public feed, a VA's
+    // own hosted site — and no string a staff member typed ever reaches an
+    // iframe `src`. A stored URL would put that promise at the mercy of every
+    // consumer remembering to re-parse it. See sanitizeSocial in crewAuth.js.
+    //
+    // Public: the wall is something a crew center shows the world, so it goes
+    // out on /api/va-ads/by-slug/:slug and /api/crew/:slug/social.
+    crewSocial: {
+        _id: false,
+        handle: { type: String, trim: true, default: '' },
+        posts: {
+            type: [{ _id: false, kind: String, code: String }],
+            default: [],
+        },
+    },
 
     // Crew structure the VA defines (all optional): a rank ladder + roles, each
     // carrying a badge (colour + icon). These are the DEFINITIONS; per-pilot
@@ -2842,6 +2879,17 @@ registerAuthRoutes(app);
 // only resolves it at request time, when the "send test" button is clicked.
 registerVaPortalRoutes(app, { VirtualAirlineAd, EmbedConfig, VaPilot, s3Client, upload, uploadVaImage, deleteVaImage, isDiscordWebhookUrl, sendVaTestEvent: (ad) => sendVaTestEvent(ad), renderCardPreview: (ad, opts) => renderCardPreview(ad, opts), applyEmbedAppearance: (cfg, body) => applyEmbedAppearance(cfg, body) });
 
+// The VA website editor's API (/api/va-portal/site/*) and Inflight's moderation
+// switch. Gated on the same portal session as everything else in the portal —
+// reads for any account, writes owner-only.
+vaSites.registerVaSiteRoutes(app, {
+    VirtualAirlineAd,
+    requirePortal: requireVaPortalSession,
+    requirePortalOwner: requireVaPortalOwner,
+    requireAuth,
+    logActivity: logVaPortalActivity,
+});
+
 // Crew Center sign-in routes (POST /api/crew/:slug/login, GET /api/crew/:slug/me).
 registerCrewAuthRoutes(app);
 
@@ -3655,6 +3703,39 @@ const publicAnnouncement = (a) => ({
     refId: a.refId || null,
     authorName: a.authorName || '',
     createdAt: a.createdAt,
+});
+
+/* ---------------------------------------------------------------------------
+ * The Instagram wall, on its own public URL.
+ *
+ * WHY A SECOND WAY TO READ SOMETHING /api/va-ads/by-slug ALREADY RETURNS.
+ * That endpoint is the crew center's brand record: thirty fields, a five-minute
+ * cache tuned to branding, and a shape that exists to boot a login screen. A
+ * website that wants the wall and nothing else should not have to fetch the
+ * rank ladder, the join requirements and the VA's Supabase anon key to get it,
+ * and crew-feed.js reads everything else under /api/crew/<slug>/ — a wall that
+ * lived somewhere else would be the one exception a VA had to remember.
+ *
+ * Public and CORS-open, like the noticeboard below it: the wall is chosen
+ * posts on a public profile, which is as far from private as a field gets.
+ * ------------------------------------------------------------------------- */
+app.get('/api/crew/:slug/social', async (req, res) => {
+    try {
+        const raw = String(req.params.slug || '').trim().toLowerCase();
+        if (!raw) return res.status(404).json({ error: 'Unknown crew center.' });
+        let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
+            .select('crewSocial').lean();
+        if (!ad) {
+            ad = await VirtualAirlineAd.findOne({ callsign: raw.toUpperCase(), status: 'approved' })
+                .select('crewSocial').lean();
+        }
+        if (!ad) return res.status(404).json({ error: 'Unknown crew center.' });
+        res.set('Cache-Control', 'public, max-age=300');
+        res.json(publicSocial(ad));
+    } catch (err) {
+        console.error('crew social read error:', err);
+        res.status(500).json({ error: 'Could not load the wall.' });
+    }
 });
 
 // Who may write to the noticeboard.
@@ -12022,7 +12103,7 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
         const raw = String(req.params.slug || '').trim().toLowerCase();
         if (!raw) return res.status(404).json({ message: 'Unknown crew center.' });
 
-        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewTopicMode crewAccent ranks roles crewFleet crewPirepAutoApprove crewSchedule joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
+        const fields = 'name slug callsign tagline logoUrl bannerUrl websiteUrl layout allowedLayouts loginLook crewTopicMode crewAccent crewSocial ranks roles crewFleet crewPirepAutoApprove crewSchedule joinMode minGrade callsignPrefix applicationForm joinRequirements crewEmailConfigured crewDiscordInvite supabaseUrl supabaseAnonKey';
         let ad = await VirtualAirlineAd.findOne({ slug: raw, status: 'approved' })
             .select(fields).lean();
         if (!ad) {
@@ -12065,6 +12146,11 @@ app.get('/api/va-ads/by-slug/:slug', async (req, res) => {
             ranks: Array.isArray(ad.ranks) ? ad.ranks : [],
             roles: Array.isArray(ad.roles) ? ad.roles : [],
             fleet: Array.isArray(ad.crewFleet) ? ad.crewFleet : [],
+            // The Instagram wall. Public because it is the one part of the crew
+            // center whose entire purpose is to be looked at by people who are
+            // not in the crew — and because a VA's own website should be able
+            // to hang the same wall without asking us for a key.
+            social: publicSocial(ad),
             pirepAutoApprove: !!ad.crewPirepAutoApprove,
             // How this VA runs its schedule. Public because the crew center
             // reads it before it has a session — a VA that does not use the
