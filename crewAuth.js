@@ -1115,9 +1115,26 @@ function registerCrewAuthRoutes(app) {
             const VaPortalAccount = mongoose.model('VaPortalAccount');
             const rows = await VaPortalAccount
                 .find({ vaAdId: va._id, role: { $in: ['owner', 'staff'] } })
-                .select('username displayName role active')
+                .select('username displayName role active crewMemberId')
                 .sort({ role: 1, username: 1 })
                 .lean();
+
+            // The roster, so the editor can offer the people the airline
+            // actually has. A store that cannot answer is not an error here:
+            // the staff list above is the part that must render, and a VA
+            // half-way through connecting a project should still see it.
+            const byMember = new Map(rows
+                .filter(a => a.crewMemberId)
+                .map(a => [String(a.crewMemberId), a.username]));
+            let roster = [];
+            try {
+                const store = await crewStore.forVa(va);
+                roster = await store.listMembers({ limit: 2000 });
+            } catch (err) {
+                if (err && err.code !== 'store_not_connected') {
+                    console.warn('crew staff-accounts: roster unavailable —', err.message || err);
+                }
+            }
 
             res.set('Cache-Control', 'no-store');
             res.json({
@@ -1126,11 +1143,192 @@ function registerCrewAuthRoutes(app) {
                     displayName: a.displayName || a.username,
                     role: a.role,
                     active: a.active !== false,
+                    crewMemberId: a.crewMemberId || null,
+                })),
+                // WHO THERE IS TO PROMOTE.
+                //
+                // The list above answers "who already has a staff login", and
+                // for most VAs that is one row: the owner. Which made the team
+                // editor read as broken — an airline with three pilots on the
+                // roster opened a screen full of roles and permissions and had
+                // nobody to give them to, with nothing on the page to say that
+                // staff logins are a separate thing created somewhere else.
+                //
+                // So the roster comes back with it. Nothing here is a secret:
+                // GET /roster is public and returns more than this.
+                roster: roster.map(m => ({
+                    memberId: String(m._id),
+                    name: m.name || '',
+                    callsign: m.callsign || '',
+                    // Already staff — offered as context, not as a candidate.
+                    staffUsername: byMember.get(String(m._id)) || null,
                 })),
             });
         } catch (err) {
             console.error('Crew staff-accounts error:', err);
             res.status(500).json({ error: 'Could not load the staff accounts.' });
+        }
+    });
+
+    // --- Make a roster pilot a staff member (owner or Inflight only) ---
+    //
+    // The step that was missing. Until now "give somebody permissions" meant
+    // leaving the crew center, creating a second login by hand in the VA
+    // portal, and coming back to assign a role to a username typed from memory.
+    // An owner looking at their own roster could not act on it.
+    //
+    // OWNER ONLY, and not delegable to team.manage like the read above. An
+    // unassigned staff account inherits CREW_DEFAULT_STAFF_CAPS — everything
+    // bar the owner-grade set — so being able to mint one is a bigger power
+    // than being able to assign a role, and the no-escalation rule that makes
+    // team.manage safe does not cover it.
+    //
+    // For the same reason a role (or at least one tick) is REQUIRED: the
+    // assignment is written in the same breath as the account, so a person
+    // promoted here can never land on that permissive default.
+    app.post('/api/crew/:slug/staff-accounts', async (req, res) => {
+        const p = verifyCrewRequest(req);
+        if (!p) return res.status(401).json({ error: 'Not authenticated.' });
+
+        const slug = String(req.params.slug || '').toLowerCase();
+        const isInflight = p.kind === 'inflight';
+        if (!(isInflight || p.role === 'owner')) {
+            return res.status(403).json({ error: 'Only the owner can make somebody staff.' });
+        }
+        if (!isInflight && p.slug && p.slug !== slug) {
+            return res.status(403).json({ error: 'Wrong crew center.' });
+        }
+
+        try {
+            const va = await resolveVa(slug);
+            if (!va) return res.status(404).json({ error: 'Crew center not found.' });
+
+            const memberId = clampStr(req.body && req.body.memberId, 80);
+            if (!memberId) return res.status(400).json({ error: 'Pick somebody from the roster.' });
+
+            const VirtualAirlineAd = mongoose.model('VirtualAirlineAd');
+            const ad = await VirtualAirlineAd.findById(va._id);
+            if (!ad) return res.status(404).json({ error: 'Crew center not found.' });
+
+            const roleId = clampStr(req.body && req.body.roleId, 40);
+            const permissions = [...new Set((Array.isArray(req.body && req.body.permissions) ? req.body.permissions : [])
+                .filter(c => CREW_CAP_IDS.includes(c)))];
+            const roles = Array.isArray(ad.staffRoles) ? ad.staffRoles : [];
+            if (roleId && !roles.some(r => r && r.id === roleId)) {
+                return res.status(400).json({ error: 'That role no longer exists — reload and pick again.' });
+            }
+            if (!roleId && !permissions.length) {
+                return res.status(400).json({
+                    error: 'Give them a role, or tick at least one permission. A staff account with neither would get the full staff default.',
+                    code: 'role_required',
+                });
+            }
+
+            const store = await crewStore.forVa(va);
+            const member = await store.getMember(memberId);
+            if (!member) return res.status(404).json({ error: 'That pilot is not on the roster.' });
+
+            const VaPortalAccount = mongoose.model('VaPortalAccount');
+            const already = await VaPortalAccount
+                .findOne({ vaAdId: va._id, crewMemberId: String(member._id) })
+                .select('username').lean();
+            if (already) {
+                return res.status(409).json({ error: `@${already.username} is already staff.` });
+            }
+
+            // THE ONE IDENTITY, WHERE WE CAN HAVE IT.
+            //
+            // The login cascade tries the VA's own pilot store FIRST, so a
+            // staff account minted under a name that pilot already signs in
+            // with would be unreachable behind their pilot row — they would
+            // type the password they know and land back on the pilot page.
+            //
+            // So when they have a pilot login we take it over rather than
+            // sitting behind it: same username, the same bcrypt hash copied
+            // across, and the pilot row deactivated so the cascade falls
+            // through to the staff account. They keep the credentials they
+            // already had and simply become staff. crewMemberId points back at
+            // their roster row, which is what keeps them able to fly (see the
+            // `kind === 'va'` branch of the pilot resolver in server.js).
+            //
+            // Two cases fall back to a fresh login with a generated password:
+            // a pilot with no login at all, and one whose username is already
+            // taken elsewhere in the portal (usernames are globally unique).
+            // The response says which happened rather than leaving the owner to
+            // guess why a password did or did not appear.
+            const pilotAcct = await Promise.resolve()
+                .then(() => (typeof store.getAccountByMember === 'function'
+                    ? store.getAccountByMember(String(member._id)) : null))
+                .catch(() => null);
+
+            let username = '';
+            let passwordHash = '';
+            let issuedPassword = null;
+            let keptTheirLogin = false;
+
+            const pilotName = String((pilotAcct && pilotAcct.username) || '').toLowerCase().trim();
+            if (pilotName && pilotAcct.passwordHash && !(await VaPortalAccount.exists({ username: pilotName }))) {
+                username = pilotName;
+                passwordHash = pilotAcct.passwordHash;
+                keptTheirLogin = true;
+            } else {
+                const base = crewAccounts.baseUsername(member.name || pilotName || 'staff') || 'staff';
+                username = base;
+                for (let n = 2; await VaPortalAccount.exists({ username }); n += 1) {
+                    username = `${base}${n}`;
+                    if (n > 99) { username = `${base}${Date.now().toString(36)}`; break; }
+                }
+                issuedPassword = crewAccounts.generatePassword();
+                passwordHash = await bcrypt.hash(issuedPassword, 12);
+            }
+
+            const account = await VaPortalAccount.create({
+                username,
+                displayName: member.name || username,
+                passwordHash,
+                role: 'staff',
+                vaAdId: va._id,
+                vaName: va.name || '',
+                crewMemberId: String(member._id),
+                createdVia: 'owner',
+                createdByName: p.name || p.uname || '',
+                active: true,
+                // Only when we issued the password. Taking over a login they
+                // already chose a password for must not nag them to change it.
+                mustChangePassword: !!issuedPassword,
+            });
+
+            // Stand the pilot row down only where the staff account actually
+            // replaces it. Deliberately after the account exists: if the create
+            // failed we would otherwise have locked a pilot out of a login and
+            // given them nothing in exchange.
+            if (keptTheirLogin) {
+                await store.updateAccount(pilotAcct._id, { active: false })
+                    .catch(err => console.warn('crew promote: could not stand down the pilot login —', err?.message || err));
+            }
+
+            // The assignment, in the same breath as the account. See above.
+            const asn = Array.isArray(ad.staffAssignments) ? ad.staffAssignments.slice() : [];
+            asn.push({ username, roleId, permissions });
+            ad.staffAssignments = sanitizeAssignments(asn) || asn;
+            await ad.save();
+
+            res.set('Cache-Control', 'no-store');
+            res.status(201).json({
+                account: {
+                    username: account.username,
+                    displayName: account.displayName,
+                    role: account.role,
+                    active: true,
+                    crewMemberId: account.crewMemberId,
+                },
+                // Shown once, and only when there was one to issue.
+                password: issuedPassword,
+                keptTheirLogin,
+            });
+        } catch (err) {
+            console.error('Crew staff promote error:', err);
+            res.status(500).json({ error: 'Could not make them staff.' });
         }
     });
 
