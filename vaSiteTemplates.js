@@ -16,12 +16,12 @@
  * THE ONE INVARIANT ACROSS ALL SIX
  * --------------------------------
  * Every template is a different design and NONE of them is a different data
- * wiring. The `data-crew-*` markup that pulls an airline's real figures out of
+ * wiring. The 'data-crew-*' markup that pulls an airline's real figures out of
  * its crew centre is written ONCE, in BLOCKS below, and every template composes
  * the same blocks. That is the whole reason this file is arranged this way.
  *
  * If each template carried its own copy of the markup, then the day
- * `data-crew-stat` gains a field or `activity` changes shape, five of the six
+ * 'data-crew-stat' gains a field or 'activity' changes shape, five of the six
  * would quietly stop showing a number and nobody would find out until a VA
  * asked why their pilot count was missing. The variety belongs in the CSS,
  * where being wrong is visible; the wiring belongs in one place, where being
@@ -110,7 +110,7 @@ function hex(v, fallback) {
  * The section vocabulary. Every template composes these and no template writes
  * its own version of one, so the data wiring is in exactly one place.
  *
- * Class names are semantic and shared (`.hero`, `.figures`, `.rows`, `.wall`),
+ * Class names are semantic and shared ('.hero', '.figures', '.rows', '.wall'),
  * which is what lets six stylesheets produce six designs over identical markup
  * — and what lets a VA lift a block out of the library and paste it into a page
  * from a different template and have it look right.
@@ -128,7 +128,14 @@ const BLOCKS = {
     nav: (c) => `
 <header class="bar">
   <div class="bar__in">
-    <a class="mark" href="/">${esc(c.name)}</a>
+    <a class="mark" href="/">
+      <!-- The logo the VA already uploaded to their Inflight profile. The
+           wrapper is [data-crew-figure] so that a VA WITHOUT one gets a
+           wordmark rather than a broken-image icon: crew-feed.js removes the
+           whole holder, not just the img. -->
+      <span class="logo" data-crew-figure hidden><img data-crew-brand="logo" alt=""></span>
+      <span data-crew-brand="name">${esc(c.name)}</span>
+    </a>
     <nav>
       <a href="/fleet.html">Fleet</a>
       <a href="${c.crew}">Crew centre</a>
@@ -137,13 +144,36 @@ const BLOCKS = {
   </div>
 </header>`,
 
+    // The banner sits BEHIND the words rather than above them, and is removed
+    // entirely when the VA has not uploaded one — a hero with no photograph is
+    // a design; a hero with a gap where one should be is a fault. The scrim in
+    // style.css is not optional either: white text over an unknown photograph
+    // is unreadable often enough to be a rule.
     hero: (c) => `
   <section class="hero">
-    <p class="eyebrow">${esc(c.callsign || 'Virtual airline')} &middot; Infinite Flight</p>
-    <h1>Fly with ${esc(c.name)}.</h1>
-    <p class="lede">Write the sentence here that says what your airline is for.
-       One sentence, in your own words. The numbers underneath look after themselves.</p>
-    <a class="cta" href="${c.crew}/join">Apply to fly</a>
+    <div class="hero__bg" data-crew-figure hidden>
+      <img data-crew-brand="banner" alt="" loading="eager" decoding="async">
+    </div>
+    <div class="hero__in">
+      <p class="eyebrow">${esc(c.callsign || 'Virtual airline')} &middot; Infinite Flight</p>
+      <h1>Fly with ${esc(c.name)}.</h1>
+      <p class="lede">Write the sentence here that says what your airline is for.
+         One sentence, in your own words. The numbers underneath look after themselves.</p>
+      <a class="cta" href="${c.crew}/join">Apply to fly</a>
+    </div>
+  </section>`,
+
+    // A section of the VA's own words. Nothing in it is fed from anywhere —
+    // that is the point of it. Every other block on this page is the crew
+    // centre talking; this is the airline.
+    text: () => `
+  <section class="block">
+    <h2>A heading you write</h2>
+    <p class="prose">And the words under it. This section is yours — nothing
+       here is filled in from the crew centre, so whatever you type stays
+       exactly as you typed it.</p>
+    <p class="prose">Add as many of these as you like from Insert a section, or
+       just copy this block and change the words.</p>
   </section>`,
 
     figures: () => `
@@ -212,15 +242,16 @@ const BLOCKS = {
     <p class="more" id="wallHandle" hidden></p>
   </section>`,
 
+    // THE FLEET, from the crew centre's own fleet editor. It used to be three
+    // invented aircraft a VA had to overwrite; it is the aircraft and liveries
+    // they actually declared, which is also what the tracker matches their live
+    // flights against — so the website and the flight log cannot disagree.
     fleet: () => `
-  <!-- YOUR FLEET. The one list the crew centre does not publish on a public
-       endpoint, so it stays yours to keep true. -->
   <section class="block">
     <h2>The fleet</h2>
-    <ul class="rows">
-      <li><b>Boeing 737-800</b> <span>Short and medium haul, the backbone</span></li>
-      <li><b>Airbus A350-900</b> <span>Long haul and the flagship routes</span></li>
-      <li><b>Embraer E175</b> <span>Regional and feeder sectors</span></li>
+    <ul class="rows" data-crew-list="fleet" data-crew-limit="16">
+      <template><li><span class="badge"><img src="{{image}}" alt="" loading="lazy" decoding="async"></span><b>{{aircraft}}</b> <span>{{livery}}</span></li></template>
+      <li><b>Add your fleet in the crew centre</b> <span>Aircraft and liveries appear here as soon as they are in the fleet editor.</span></li>
     </ul>
   </section>`,
 
@@ -235,13 +266,16 @@ const BLOCKS = {
        answers it on its homepage.</p>
   </section>`,
 
+    // THE LADDER, from the crew centre. The single most persuasive list on a
+    // virtual airline's website to somebody deciding whether to apply, and the
+    // one nobody remembers to update by hand. Sorted by the hours each rung
+    // asks for, so it reads upward however it happens to be stored.
     ranks: () => `
   <section class="block">
     <h2>How you move up</h2>
-    <ol class="steps">
-      <li><b>Cadet</b> <span>Your first sectors, flown on any route</span></li>
-      <li><b>First Officer</b> <span>Long haul opens up</span></li>
-      <li><b>Captain</b> <span>Every route, and you can lead an event</span></li>
+    <ol class="steps" data-crew-list="ranks" data-crew-limit="10">
+      <template><li><span class="badge"><img src="{{image}}" alt="" loading="lazy" decoding="async"></span><b>{{name}}</b> <span>{{from}}</span></li></template>
+      <li><b>Set your rank ladder</b> <span>Add it in the crew centre and it appears here.</span></li>
     </ol>
   </section>`,
 
@@ -270,9 +304,10 @@ const INSERTABLE = [
     { id: 'notices', label: 'Notices', note: 'What your staff have written on the noticeboard.' },
     { id: 'events', label: 'Events', note: 'The next departures on your calendar.' },
     { id: 'wall', label: 'Instagram wall', note: 'The posts your staff chose in the crew centre.' },
-    { id: 'fleet', label: 'Fleet', note: 'A list you write and keep true yourself.' },
+    { id: 'fleet', label: 'Fleet', note: 'The aircraft and liveries you declared in the crew centre.' },
     { id: 'about', label: 'About', note: 'Two paragraphs about the airline.' },
-    { id: 'ranks', label: 'Ranks', note: 'How a pilot moves up.' },
+    { id: 'ranks', label: 'Ranks', note: 'Your rank ladder, from the crew centre.' },
+    { id: 'text', label: 'Your own words', note: 'A heading and paragraphs. Nothing in it is fed from anywhere.' },
     { id: 'cta', label: 'Apply band', note: 'A full-width band with the apply button.' },
 ];
 
@@ -280,7 +315,7 @@ const INSERTABLE = [
  * THE BASE STYLESHEET
  *
  * Reset, the shared block shapes, and nothing with a personality. Everything
- * that makes a template look like itself is in that template's own `css`, so
+ * that makes a template look like itself is in that template's own 'css', so
  * this file is the same in all six and a VA who edits it is editing plumbing
  * rather than design.
  *
@@ -291,7 +326,19 @@ const INSERTABLE = [
 const BASE_CSS = `/* Base — shared by every template. Colour and type live in theme.css. */
 
 *, *::before, *::after { box-sizing: border-box; }
-html { -webkit-text-size-adjust: 100%; }
+html {
+  -webkit-text-size-adjust: 100%;
+  scroll-behavior: smooth;
+  /* The hero banner bleeds past the measure with a vw-based margin, and vw
+     counts the scrollbar. Clipping swallows the couple of pixels that costs
+     without making the page a scroll container the way overflow:hidden does. */
+  overflow-x: clip;
+}
+/* Anybody who has asked their system for less movement gets none of ours. */
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
 body {
   margin: 0;
   background: var(--bg);
@@ -302,7 +349,12 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 img { max-width: 100%; height: auto; }
-a { color: var(--accent); }
+a { color: var(--accent); transition: color .15s ease, opacity .15s ease; }
+/* A visible focus ring on everything reachable by keyboard. The browser's own
+   is removed by enough resets that it is worth stating rather than assuming. */
+:where(a, button, input, select, textarea):focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px;
+}
 h1, h2, h3 { font-family: var(--font-display); line-height: 1.15; letter-spacing: -.02em; }
 
 /* Header.
@@ -319,14 +371,54 @@ h1, h2, h3 { font-family: var(--font-display); line-height: 1.15; letter-spacing
   display: flex; align-items: center; justify-content: space-between;
   gap: 1rem; padding-block: 1rem;
 }
-.bar .mark { font-family: var(--font-display); font-weight: 700; text-decoration: none; color: var(--ink); }
+.bar .mark {
+  font-family: var(--font-display); font-weight: 700; text-decoration: none;
+  color: var(--ink); display: inline-flex; align-items: center; gap: .6rem;
+}
+/* The VA's uploaded logo. Capped by HEIGHT, never width: a wordmark logo is
+   five times wider than a roundel, and a width cap makes one of the two
+   illegible. */
+.logo img { height: 1.75rem; width: auto; display: block; }
 .bar nav { display: flex; gap: 1.1rem; align-items: center; flex-wrap: wrap; }
 .bar nav a { text-decoration: none; font-size: .9rem; color: var(--muted); }
 .bar nav a:hover { color: var(--ink); }
 
 /* Layout */
 main { max-width: var(--measure); margin: 0 auto; padding: 0 var(--pad); }
-.block, .hero, .figures { padding: var(--gap) 0; }
+.hero, .figures { padding-block: var(--gap); }
+/* Blocks get a little over half, because two of them stacked contribute a
+   bottom AND a top: a full --gap each puts eleven rems between two headings,
+   which reads as a missing section rather than as space. */
+.block { padding-block: calc(var(--gap) * .56); }
+
+/* The hero's banner.
+   Behind the words, not above them, and always under a scrim. White text over
+   an unknown photograph is unreadable often enough that the scrim is a rule
+   rather than a taste: the VA chose the image, and nobody checked it against
+   the text that would sit on it. */
+.hero { position: relative; isolation: isolate; }
+/* Edge to edge. A hero photograph inset to the text measure reads as a picture
+   somebody dropped in the page; the same photograph running to the window
+   reads as the top of a website. The margin pulls each side out to the
+   viewport from whatever box the hero happens to sit in, so it works the same
+   in a centred 'main' and in Livery's full-width one. */
+.hero__bg {
+  position: absolute; inset: 0; z-index: -1; overflow: hidden;
+  margin-inline: calc(50% - 50vw);
+}
+.hero__bg img { width: 100%; height: 100%; object-fit: cover; }
+.hero__bg::after {
+  content: ''; position: absolute; inset: 0;
+  background: linear-gradient(to right, var(--bg) 0%, color-mix(in srgb, var(--bg) 82%, transparent) 45%, color-mix(in srgb, var(--bg) 40%, transparent) 100%);
+}
+/* color-mix is recent. Where it is missing the scrim falls back to a flat wash,
+   which is less pretty and equally legible — the property that matters. */
+@supports not (background: color-mix(in srgb, red 50%, transparent)) {
+  .hero__bg::after { background: var(--bg); opacity: .82; }
+}
+.hero__in { position: relative; }
+/* A hero carrying a photograph needs room the plain one does not. */
+.hero:has(.hero__bg:not([hidden])) { padding-block: clamp(3.5rem, 9vw, 7rem); }
 h1 { font-size: clamp(2.1rem, 6vw, 3.8rem); margin: 0 0 1rem; }
 h2 { font-size: clamp(1.15rem, 2.4vw, 1.5rem); margin: 0 0 1.4rem; }
 .eyebrow {
@@ -342,7 +434,11 @@ h2 { font-size: clamp(1.15rem, 2.4vw, 1.5rem); margin: 0 0 1.4rem; }
   background: var(--accent); color: var(--on-accent);
   border-radius: var(--radius); text-decoration: none; font-weight: 600;
 }
-.cta:hover { filter: brightness(1.08); }
+.cta {
+  transition: filter .15s ease, transform .15s ease;
+}
+.cta:hover { filter: brightness(1.08); transform: translateY(-1px); }
+.cta:active { transform: translateY(0); }
 .bar .cta { margin: 0; padding: .45rem .95rem; font-size: .85rem; color: var(--on-accent); }
 
 /* Figures. The label lives inside the same element as the number so that a
@@ -360,6 +456,31 @@ h2 { font-size: clamp(1.15rem, 2.4vw, 1.5rem); margin: 0 0 1.4rem; }
 }
 .rows li:last-child, .steps li:last-child { border-bottom: 1px solid var(--line); }
 .rows span, .steps span { color: var(--muted); font-size: .92rem; }
+/* Rank badges and aircraft photographs, inside a row. An image that never
+   arrived is removed by crew-feed.js rather than drawn as a broken icon, so
+   this only ever styles one that is really there. */
+/* Rank badges and aircraft photographs.
+
+   crew-feed.js removes an <img> whose src never arrived, because an empty src
+   is a broken-image icon. That leaves the .badge span behind, and the span is
+   why the words in a list stay in one column when only SOME rows have a
+   picture: an empty badge holds the same width as a full one.
+
+   And when no row in the list has a picture at all, the column is pointless —
+   :has(img) is what tells the two cases apart. A browser without :has falls
+   back to a ragged left edge, which is untidy and still legible. */
+.rows .badge, .steps .badge { flex: none; display: none; }
+/* ONE width for the whole column, not per row. Sizing each badge to its own
+   picture staggers the text again — a wide aircraft photo pushes only its own
+   row across, which is the same ragged edge in a different place. The picture
+   fits the column; the column does not fit the picture. */
+.rows:has(img) .badge, .steps:has(img) .badge {
+  display: block; width: 2.5rem; height: 1.8rem;
+}
+.rows .badge img, .steps .badge img {
+  width: 100%; height: 100%; object-fit: contain; object-position: left center;
+  border-radius: 4px; display: block;
+}
 .steps { counter-reset: step; }
 .steps li::before {
   counter-increment: step; content: counter(step);
@@ -666,6 +787,9 @@ h2 { font-size: .95rem; text-transform: uppercase; letter-spacing: .1em; color: 
 .figures span { font-size: .9rem; }
 .rows li, .steps li { padding: .5rem 0; }
 .cta { background: none; color: var(--accent); border: 1px solid currentColor; }
+/* This design is a document. A banner running to the window belongs on a
+   brochure; here it stays inside the measure with the words. */
+.hero__bg { margin-inline: 0; }
 .band { background: none; color: var(--ink); border-top: 2px solid var(--ink); text-align: left; padding-left: 0; padding-right: 0; max-width: var(--measure); margin: var(--gap) auto 0; }
 .band .cta { background: none; color: var(--accent); }
 `,
@@ -949,6 +1073,22 @@ anything marked up with \`data-crew-*\`:
   \`notices\`, \`activity\`, \`posts\`.
 - \`data-crew-limit\` caps the rows. \`data-crew-written="on"\` narrows
   \`notices\` to what a person actually typed.
+- \`<img data-crew-brand="logo">\` — your identity. \`logo\`, \`banner\`,
+  \`name\`, \`tagline\`, \`code\`. On an image it fills the \`src\`; on
+  anything else it fills the text. **A field you have not set removes the
+  element** rather than leaving a broken image, so wrap one in
+  \`data-crew-figure\` when the frame around it should go too.
+
+## What is already yours, without typing it again
+
+Your **logo** and **banner** are the ones on your Inflight VA profile. Your
+**rank ladder** and your **fleet** are the ones in your crew centre. Change any
+of them there and this site follows — there is nothing to re-upload and nothing
+to keep in step by hand.
+
+The lists that read from your crew centre: \`routes\`, \`events\`,
+\`schedule\`, \`notices\`, \`activity\`, \`posts\`, \`ranks\`,
+\`fleet\`, \`roles\`.
 
 **Write a true fallback inside the markup.** If the crew centre is unreachable
 the page keeps what you wrote — it never goes blank because a request timed out.
@@ -992,7 +1132,7 @@ const bytesOf = (s) => Buffer.byteLength(String(s == null ? '' : s), 'utf8');
 /**
  * A whole site, laid out.
  *
- * `theme` is optional — a template's own accent, type and mode are used when it
+ * 'theme' is optional — a template's own accent, type and mode are used when it
  * is absent, which is what makes picking a design a single click.
  */
 function renderTemplate(templateId, va, { feedSrc, crewBase, theme } = {}) {

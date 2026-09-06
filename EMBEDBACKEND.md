@@ -1036,6 +1036,21 @@ Readers, all of which resolve to `null` rather than throwing — and `null` mean
 | `CrewFeed.activity()` | `/announcements` | Only what the crew centre recorded — joins, promotions, published events |
 | `CrewFeed.posts()` | `/social` | The Instagram wall |
 | `CrewFeed.handle()` | `/social` | The VA's Instagram handle |
+| `CrewFeed.brand()` | `/api/va-ads/by-slug/<slug>` | Name, callsign, tagline, **logo**, **banner**, accent, callsign prefix, Discord invite |
+| `CrewFeed.ranks()` | same | The **rank ladder**, sorted by the hours each rung asks for |
+| `CrewFeed.fleet()` | same | The declared **aircraft and liveries** |
+| `CrewFeed.roles()` | same | Role definitions (never who holds one) |
+
+The last four read the **directory record**, not a crew endpoint — that is
+deliberate. Everything else here is data the VA's crew centre *produced* and
+lives in the VA's own store; this is what the airline *is* rather than what it
+has been doing. Two different things, so two paths. One fetch serves all four.
+
+Every URL in that record is re-checked for `https:` on the way out. A logo goes
+in an `src`, and an `src` is where a wrong string stops being a broken image and
+starts being somebody else's script. The Supabase block the endpoint also
+carries is dropped by the reader — a public anon key is not a secret, and it is
+still not a marketing page's business.
 
 `notices`, `activity` and the two `/social` readers share one fetch each, so
 asking for both halves of a board costs one request.
@@ -1047,10 +1062,27 @@ Declarative markup, for pages that would rather not write JavaScript:
 <div data-crew-figure><b data-crew-stat="hours"></b><span>hours</span></div>
 <section data-crew-when="pireps"> … </section>
 
+<!-- Identity. On an <img> the value becomes the src; on anything else, the
+     text. An element whose field the crew centre does not hold is REMOVED. -->
+<span data-crew-figure hidden><img data-crew-brand="logo" alt=""></span>
+<h1 data-crew-brand="name">Ocean Virtual</h1>
+
 <ul data-crew-list="activity" data-crew-limit="6">
   <template><li><b>{{title}}</b> <span>{{body}}</span></li></template>
 </ul>
+
+<!-- A template may carry an image field. An <img> whose src never arrived is
+     removed rather than drawn as a broken icon. -->
+<ol data-crew-list="ranks">
+  <template><li><img src="{{image}}" alt=""><b>{{name}}</b> <span>{{from}}</span></li></template>
+</ol>
 ```
+
+`data-crew-brand` removes rather than leaving what is on the page, which is the
+opposite of the rule for figures — and deliberately. A figure has a true
+fallback a VA can type; a logo does not. There is no placeholder image that is
+honest about an airline which has not uploaded one, so it arrives or the element
+goes. Wrap it in `[data-crew-figure]` and the wrapper goes with it.
 
 Every `{{field}}` is escaped on the way in: these values come out of a VA's own
 database, and a template that interpolated them raw would make any staff member

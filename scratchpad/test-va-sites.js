@@ -197,6 +197,58 @@ cat.templates.forEach((meta) => {
         !!named['style.css'] && named['style.css'].includes(meta.name), true);
 });
 
+// A backtick anywhere in the CSS or the shipped JS ends the template literal it
+// is written in and the whole module stops parsing. It cost two rounds of stale
+// screenshots before it was noticed, so it is a check rather than a habit.
+console.log('\nno stray backticks in anything written inside a template literal');
+T('every design’s CSS', Object.keys(TPL.TEMPLATES).filter(id => TPL.TEMPLATES[id].css.includes('`')), []);
+{
+    const seed = TPL.renderTemplate(TPL.DEFAULT_TEMPLATE, VA, ctx);
+    // style.css carries the shared BASE_CSS and site.js ships verbatim. Both are
+    // written as template literals in the module; either would take it down.
+    T('the shared stylesheet and site.js',
+        seed.filter(f => /\.(css|js)$/.test(f.path) && f.content.includes('`')).map(f => f.path), []);
+}
+
+console.log('\nthe airline’s own identity reaches every design');
+cat.templates.forEach((meta) => {
+    const files = TPL.renderTemplate(meta.id, VA, ctx);
+    const named = Object.fromEntries(files.map(f => [f.path, f.content]));
+    const all = files.filter(f => f.path.endsWith('.html')).map(f => f.content).join('');
+
+    T(`${meta.id}: the logo the VA already uploaded is on the page`,
+        /data-crew-brand="logo"/.test(named['index.html']), true);
+    T(`${meta.id}: …inside a holder, so a VA without one gets a wordmark`,
+        /data-crew-figure[^>]*>\s*<img data-crew-brand="logo"/.test(named['index.html']), true);
+    T(`${meta.id}: the banner is behind the hero, not a gap when absent`,
+        /class="hero__bg" data-crew-figure hidden/.test(named['index.html']), true);
+    // The two lists that used to be three invented aircraft and three invented
+    // ranks. A hard-coded fleet on a hosted site is a website that disagrees
+    // with the airline from the day it is published.
+    if (/data-crew-list="fleet"/.test(all)) {
+        T(`${meta.id}: the fleet is fed, not typed in`,
+            !/Boeing 737-800|Airbus A350-900/.test(all), true);
+    }
+    if (/data-crew-list="ranks"/.test(all)) {
+        T(`${meta.id}: the ladder is fed too`,
+            !/<b>First Officer<\/b> <span>Long haul opens up/.test(all), true);
+    }
+});
+
+console.log('\nthe VA’s own words are the one thing nothing writes over');
+const textBlock = TPL.renderBlock('text', VA, {});
+T('the custom-text block exists', !!textBlock, true);
+T('…and nothing in it is fed from anywhere',
+    /data-crew-/.test(textBlock), false);
+T('…and it is offered in the insert menu',
+    cat.blocks.some(b => b.id === 'text'), true);
+
+console.log('\nan image the crew centre does not hold must not become a broken icon');
+T('a rank template asks for a badge by field, not by a fixed URL',
+    /<img src="\{\{image\}\}"/.test(TPL.renderBlock('ranks', VA, {})), true);
+T('the fleet does the same',
+    /<img src="\{\{image\}\}"/.test(TPL.renderBlock('fleet', VA, {})), true);
+
 console.log('\nthe VA name is content, not markup');
 const hostile = TPL.renderTemplate('flightline', { name: '<script>x</script>', slug: 'x' }, ctx);
 T('a name with a tag in it cannot write HTML into any page',
