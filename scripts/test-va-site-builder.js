@@ -9,7 +9,20 @@
  * No test framework and no database on purpose — it is `node scripts/...`, it
  * exits non-zero on a failure, and it needs nothing running.
  */
-process.env.VA_SITES_DOMAIN = 'inflightva.site';
+const MODE = process.argv[2];
+if (!MODE) {
+    // No argument: run both deployment shapes, each in its own process, because
+    // VA_SITES_DOMAIN is read once when the module loads.
+    const { execFileSync } = require('child_process');
+    let bad = 0;
+    for (const m of ['subdomain', 'path']) {
+        console.log(`\n=== a deployment that serves VA sites by ${m} ===`);
+        try { execFileSync(process.execPath, [__filename, m], { stdio: 'inherit' }); } catch { bad++; }
+    }
+    process.exit(bad ? 1 : 0);
+}
+const SUBDOMAIN = MODE === 'subdomain';
+if (SUBDOMAIN) process.env.VA_SITES_DOMAIN = 'inflightva.site';
 process.env.PUBLIC_SITE_ORIGIN = 'https://inflight.info';
 
 const express = require('express');
@@ -26,12 +39,18 @@ function fakeSite() {
         enabled: true, blocked: false, template: '', theme: {},
         isNew: false,
         async save() { this.saved = (this.saved || 0) + 1; return this; },
-        toObject() { const { save, toObject, ...rest } = this; return rest; },
+        toObject() { const { save, toObject, lean, ...rest } = this; return rest; },
+        // The path route reads lean; the authoring routes want the document.
+        async lean() { const { save, toObject, lean, ...rest } = this; return rest; },
     };
     return doc;
 }
 let SITE = fakeSite();
-vaSites.CrewSite.findOne = () => SITE;
+// Honours the slug so "some other airline" really is a miss; the authoring
+// routes look the row up by vaAdId and get it either way.
+vaSites.CrewSite.findOne = (q) => ((q && q.slug && q.slug !== SITE.slug)
+    ? { lean: async () => null }        // the path route reads lean
+    : SITE);
 
 const VirtualAirlineAd = {
     findById: () => ({ select: () => ({ lean: async () => VA }) }),
@@ -49,6 +68,7 @@ async function requireCap(req, slug, capability) {
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
+vaSites.mountVaSitePath(app);
 vaSites.registerVaSiteRoutes(app, {
     VirtualAirlineAd,
     requirePortal: (req, res) => res.status(401).json({ error: 'portal session required' }),
@@ -85,7 +105,9 @@ const server = app.listen(0, async () => {
     console.log('reading');
     const read = await call('/api/crew/ba/site', { role: 'owner' });
     check('owner reads their site', read.status === 200, read.json);
-    check('the address is their slug on the sites domain', read.json && read.json.url === 'https://ba.inflightva.site', read.json && read.json.url);
+    check('the address is the right one for this deployment',
+        read.json && read.json.url === (SUBDOMAIN ? 'https://ba.inflightva.site' : 'https://inflight.info/va/ba'),
+        read.json && read.json.url);
     check('a fresh site is in design mode', read.json && read.json.mode === 'design');
 
     console.log('picking a design');
@@ -131,14 +153,24 @@ const server = app.listen(0, async () => {
     check('nothing left unpublished', pub.json.hasUnpublishedChanges === false);
 
     console.log('ejecting');
-    const noConfirm = await call('/api/crew/ba/site/eject', { role: 'owner', method: 'POST', body: {} });
-    check('eject asks first', noConfirm.status === 409 && noConfirm.json.code === 'confirm_required', noConfirm.json);
-    const ejected = await call('/api/crew/ba/site/eject', { role: 'owner', method: 'POST', body: { confirm: true } });
-    check('ejected', ejected.status === 200 && ejected.json.mode === 'code', ejected.json);
-    const write2 = await call('/api/crew/ba/site/file', { role: 'owner', method: 'PUT', body: { path: 'index.html', content: '<h1>by hand</h1>' } });
-    check('now files can be written', write2.status === 200, write2.json);
-    const builderAfter = await call('/api/crew/ba/site/builder', { role: 'owner', method: 'PUT', body: { doc } });
-    check('and the builder is refused', builderAfter.status === 409 && builderAfter.json.code === 'ejected', builderAfter.json);
+    if (!SUBDOMAIN) {
+        // A hand-written site contains the VA's own JavaScript, which cannot run
+        // on the platform's origin — and the path address IS that origin.
+        const refused = await call('/api/crew/ba/site/eject', { role: 'owner', method: 'POST', body: { confirm: true } });
+        check('refused, because there is no address to run their code on',
+            refused.status === 409 && refused.json.code === 'needs_subdomain', refused.json);
+        check('and the site is still the builder’s',
+            (await call('/api/crew/ba/site', { role: 'owner' })).json.mode === 'design');
+    } else {
+        const noConfirm = await call('/api/crew/ba/site/eject', { role: 'owner', method: 'POST', body: {} });
+        check('eject asks first', noConfirm.status === 409 && noConfirm.json.code === 'confirm_required', noConfirm.json);
+        const ejected = await call('/api/crew/ba/site/eject', { role: 'owner', method: 'POST', body: { confirm: true } });
+        check('ejected', ejected.status === 200 && ejected.json.mode === 'code', ejected.json);
+        const write2 = await call('/api/crew/ba/site/file', { role: 'owner', method: 'PUT', body: { path: 'index.html', content: '<h1>by hand</h1>' } });
+        check('now files can be written', write2.status === 200, write2.json);
+        const builderAfter = await call('/api/crew/ba/site/builder', { role: 'owner', method: 'PUT', body: { doc } });
+        check('and the builder is refused', builderAfter.status === 409 && builderAfter.json.code === 'ejected', builderAfter.json);
+    }
 
     console.log('the catalogue');
     const cat = await call('/api/crew/ba/site/templates', { role: 'owner' });
@@ -149,8 +181,57 @@ const server = app.listen(0, async () => {
 
     /* VA sites are served under a domain of ours, so a VA slug is one of our
      * hostnames. These are the names that have to stay ours. */
+    /* The address that needs no DNS: inflight.info/va/<slug>/, proxied to this
+     * backend at /va-site. Only ever a site the builder rendered. */
+    console.log('the address that needs no setup');
+    const path = async (p, opts = {}) => {
+        const res = await fetch(base + p, { redirect: 'manual', headers: opts.headers || {} });
+        return { status: res.status, location: res.headers.get('location'), type: res.headers.get('content-type'), csp: res.headers.get('content-security-policy'), body: await res.text() };
+    };
+    // Put the site back into design mode with something published.
+    SITE.mode = 'design';
+    await call('/api/crew/ba/site/design', { role: 'owner', method: 'POST', body: { template: 'flightline' } });
+    await call('/api/crew/ba/site/publish', { role: 'owner', method: 'POST' });
+
+    const home = await path('/va-site/ba/');
+    check('the homepage is served at the path', home.status === 200 && home.body.includes('<!DOCTYPE html>'), home.status);
+    check('as HTML', (home.type || '').includes('text/html'));
+    check('only our own scripts may run on it', (home.csp || '').includes("script-src 'self'"), home.csp);
+    check('and nothing else may', (home.csp || '').includes("default-src 'none'"));
+    check('a missing trailing slash is corrected', (await path('/va-site/ba')).status === 308);
+    check('...to the public address', (await path('/va-site/ba')).location === '/va/ba/');
+    check('its other pages are served', (await path('/va-site/ba/fleet.html')).status === 200);
+    check('its stylesheet is served as CSS', ((await path('/va-site/ba/theme.css')).type || '').includes('text/css'));
+    check('our generated site.js is served', (await path('/va-site/ba/site.js')).status === 200);
+    check('a page that does not exist is a 404', (await path('/va-site/ba/nope.html')).status === 404);
+    check('an unknown airline is a 404', (await path('/va-site/nobody/')).status === 404);
+    check('the pages link relatively, so both addresses work',
+        !/(href|src)="\/[^\/]/.test(home.body) && home.body.includes('href="theme.css"'));
+
+    console.log('what the path address refuses');
+    // A file our renderer never writes, forced into the row.
+    SITE.published.files.push({ path: 'evil.svg', content: '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>', bytes: 90 });
+    check('a file we did not generate is not served, even when it is there',
+        (await path('/va-site/ba/evil.svg')).status === 404);
+    SITE.published.files.pop();
+
+    SITE.enabled = false;
+    check('a site switched off answers as if it were not there', (await path('/va-site/ba/')).status === 404);
+    SITE.enabled = true;
+    SITE.blocked = true;
+    check('a site taken down by staff, the same', (await path('/va-site/ba/')).status === 404);
+    SITE.blocked = false;
+    SITE.mode = 'code';
+    check('a hand-written site is never served here', (await path('/va-site/ba/')).status === 404);
+    check('and neither is its draft', (await path('/va-site/ba/__preview/x'.padEnd(30, 'x') + '/')).status === 404);
+    SITE.mode = 'design';
+
     console.log('labels a VA site may not have');
     const D = process.env.VA_SITES_DOMAIN;
+    if (!SUBDOMAIN) {
+        check('no subdomain configured, so no host is claimed', vaSites.parseSiteHost('ba.anything.example', '') === null);
+        check('and the path address is what a VA is given', vaSites.siteUrlFor('ba') === 'https://inflight.info/va/ba');
+    } else {
     const host = (h) => vaSites.parseSiteHost(h, D);
     check('an airline gets its own label', host(`ba.${D}`) === 'ba');
     check('a port and a case difference change nothing', host(`BA.${D}:443`) === 'ba');
@@ -160,8 +241,12 @@ const server = app.listen(0, async () => {
     check('a nested label is refused', host(`a.b.${D}`) === null);
     check('another domain entirely is not ours to answer', host('ba.example.com') === null);
     check('the apex is ours, not a VA\'s', host(D) === '');
-    check('a reserved slug is given no address', vaSites.siteUrlFor('www') === '');
+    // A reserved name cannot be a HOSTNAME of ours; as a path segment it is
+    // harmless, so such a VA gets the path address rather than nothing.
+    check('a reserved slug gets the path address instead of a subdomain',
+        vaSites.siteUrlFor('www') === 'https://inflight.info/va/www', vaSites.siteUrlFor('www'));
     check('an ordinary slug is', vaSites.siteUrlFor('ba') === `https://ba.${D}`);
+    }
 
     console.log(failures ? `\n${failures} FAILED` : '\nall passed');
     server.close();

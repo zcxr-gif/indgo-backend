@@ -25,8 +25,10 @@
  * sanitiser, not a script allow-list, not a review queue. A separate origin,
  * enforced by the browser.
  *
- * Every VA site is served from `<slug>.<VA_SITES_DOMAIN>` and nothing is served
- * from there but VA sites. On that origin their script has no reach into
+ * A VA site written as FILES is served from `<slug>.<VA_SITES_DOMAIN>` and
+ * nothing is served from there but VA sites. (A site built in the builder is
+ * also served at inflight.info/va/<slug> — see SERVING AT A PATH below, which
+ * explains why that is safe when this is not.) On that origin their script has no reach into
  * inflight.info: it cannot read our localStorage or sessionStorage (where the
  * crew center's session token lives), cannot touch our DOM, cannot call our
  * authenticated endpoints as a signed-in staff member, and cannot be handed a
@@ -166,6 +168,22 @@ const TYPES = {
  * the code reads as two.
  * ======================================================================== */
 const PREVIEW_PREFIX = '__preview';
+
+/* ---------------------------------------------------------------------------
+ * THE TWO ADDRESSES A SITE HAS
+ *
+ * PATH_PREFIX is the one that needs nothing: inflight.info/va/<slug>/, proxied
+ * to this backend the same way inflight.info/pilot/<handle> already is (see
+ * _redirects in the tracker). No DNS record, no certificate, no environment
+ * variable — a VA builds a site and it has an address.
+ *
+ * The subdomain (<slug>.VA_SITES_DOMAIN) is the better address and stays the
+ * preferred one wherever it is configured. It is also the ONLY one that can
+ * serve a site whose owner writes their own JavaScript; see the note on
+ * SERVING AT A PATH below for why.
+ * ------------------------------------------------------------------------ */
+const PATH_PREFIX = '/va';          // what the public sees, on the platform
+const PATH_MOUNT = '/va-site';      // what this backend is proxied at
 const PATH_RE = /^[A-Za-z0-9][A-Za-z0-9._\-/]*$/;
 // `/__preview/<token>/<path>` on a site host. Built once: it is matched on
 // every request to a VA site, preview or not.
@@ -431,11 +449,27 @@ function parseSiteHost(rawHost, domain) {
     return label;
 }
 
-/** The public address of a VA's site, or '' when hosting is not configured. */
+/**
+ * The public address of a VA's site.
+ *
+ * The subdomain when this deployment has one — it is the better address and
+ * the airline's name is the whole of it. The path otherwise, which is always
+ * available and needs nothing set up. Never '' any more: every VA that can
+ * build a site has somewhere to put it.
+ */
 function siteUrlFor(slug) {
     const s = String(slug || '').trim().toLowerCase();
-    if (!DOMAIN || !s || !hostLabelRe.test(s) || reservedLabel(s)) return '';
-    return `https://${s}.${DOMAIN}`;
+    if (!s) return '';
+    if (DOMAIN && hostLabelRe.test(s) && !reservedLabel(s)) return `https://${s}.${DOMAIN}`;
+    return `${CREW_BASE}${PATH_PREFIX}/${encodeURIComponent(s)}`;
+}
+
+/** The path address, whether or not a subdomain also exists — the builder shows
+ *  it as the second way in, and it is what a preview link is built from when
+ *  there is no subdomain. */
+function sitePathUrlFor(slug) {
+    const s = String(slug || '').trim().toLowerCase();
+    return s ? `${CREW_BASE}${PATH_PREFIX}/${encodeURIComponent(s)}` : '';
 }
 
 /* ---------------------------------------------------------------------------
@@ -457,7 +491,11 @@ function registrableGuess(host) {
 
 function announceHostingConfig() {
     if (!DOMAIN) {
-        console.log('ℹ️  VA site hosting is off (VA_SITES_DOMAIN unset).');
+        console.log(
+            `ℹ️  VA sites are served at ${CREW_BASE}${PATH_PREFIX}/<slug> only. Set VA_SITES_DOMAIN `
+            + `(plus a wildcard DNS record and certificate for it) to also give each airline its own `
+            + `address — which is the only way a VA can write their own files.`
+        );
         return;
     }
     let platformHost = '';
@@ -662,15 +700,174 @@ function mountVaSiteHost(app) {
 }
 
 /* ===========================================================================
+ * SERVING AT A PATH — inflight.info/va/<slug>/
+ *
+ * WHY THIS IS ALLOWED WHEN THE WHOLE FILE SAYS IT IS NOT
+ * ------------------------------------------------------
+ * The rule at the top of this file is that a VA'S CODE must not share an origin
+ * with ours, and it still holds. This route does not break it, because a site
+ * built in the builder contains no code of theirs: vaSiteBuilder.js renders
+ * every byte of the markup from a document of fields, with esc() on every value
+ * and linkUrl() on every href. The airline supplies words. We supply the HTML.
+ *
+ * So what is served here is our own markup with somebody's text in it — the
+ * same thing every page of this platform already does with a VA's name, their
+ * notices and their route list. It is not the same thing as running a script
+ * they wrote next to a crew centre session token in localStorage, which is what
+ * the subdomain exists to prevent.
+ *
+ * The line is drawn in code, not in a comment. This route serves ONLY:
+ *
+ *   - a site whose mode is 'design'. Ejecting to files is one-way and refused
+ *     entirely unless a subdomain is configured, so a hand-written site can
+ *     never reach this route;
+ *   - files with an extension we generate — .html and .css, plus the one
+ *     site.js our own renderer writes. Anything else 404s here even if it
+ *     somehow existed in the row.
+ *
+ * And the response carries a Content-Security-Policy with `script-src 'self'`,
+ * where 'self' is the platform: every script that can run on this page is one
+ * we shipped.
+ *
+ * RELATIVE LINKS ARE WHAT MAKE ONE RENDERING SERVE BOTH ADDRESSES. The pages
+ * reference `theme.css` and `fleet.html`, never `/theme.css` — so the same
+ * published bytes work under the subdomain and under this path with nothing
+ * rewritten on the way out. A request without the trailing slash is redirected
+ * to one with it, because that is what those relative links resolve against.
+ * ======================================================================== */
+
+// What our own renderer produces, and therefore all this route will hand back.
+const PATH_SERVABLE = new Set(['.html', '.css']);
+const PATH_SERVABLE_JS = 'site.js';
+
+function pathSecurityHeaders(res, { preview } = {}) {
+    res.set('Content-Security-Policy', [
+        "default-src 'none'",
+        "base-uri 'none'",
+        "object-src 'none'",
+        "form-action 'none'",
+        // The builder frames a preview beside the editor; both are the platform.
+        "frame-ancestors 'self'",
+        // 'self' is inflight.info here, so this is "scripts we shipped" — the
+        // page's own site.js and crew-feed.js, and nothing else.
+        "script-src 'self'",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+        "font-src 'self' https://fonts.gstatic.com data:",
+        "img-src 'self' https: data: blob:",
+        "media-src 'self' https:",
+        `connect-src 'self' ${BACKEND_ORIGIN}`,
+        `frame-src ${FRAME_SRC}`,
+    ].join('; '));
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.set('Permissions-Policy', 'geolocation=(), microphone=(), camera=(), payment=(), usb=(), interest-cohort=()');
+    res.set('Cache-Control', 'no-store');
+    if (preview) res.set('X-Robots-Tag', 'noindex, nofollow');
+}
+
+/** Is this a file this route is willing to hand back? */
+function pathServable(file) {
+    if (!file) return false;
+    if (file.path === PATH_SERVABLE_JS) return true;
+    return PATH_SERVABLE.has(extOf(file.path));
+}
+
+function mountVaSitePath(app) {
+    console.log(`✅ VA sites are reachable at ${CREW_BASE}${PATH_PREFIX}/<slug> with no DNS setup.`);
+
+    app.use(PATH_MOUNT, async (req, res, next) => {
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+            pathSecurityHeaders(res);
+            return res.status(405).type('text/plain').send('This address only serves pages.');
+        }
+        // req.path here is relative to the mount: '/ba', '/ba/', '/ba/fleet.html'.
+        const m = String(req.path || '').match(/^\/([a-z0-9][a-z0-9-]{0,61})(\/.*)?$/i);
+        if (!m) return next();
+
+        const slug = m[1].toLowerCase();
+        const rest = m[2];
+
+        // No trailing slash means every relative link on the page would resolve
+        // one directory too high. Send the browser to the address the page was
+        // written for rather than serving it somewhere it half works.
+        if (rest === undefined) {
+            return res.redirect(308, `${PATH_PREFIX}/${encodeURIComponent(slug)}/`);
+        }
+
+        try {
+            const site = await CrewSite.findOne({ slug }).lean();
+            if (!site) return pathNotFound(res);
+
+            const previewMatch = String(rest).match(PREVIEW_RE);
+            if (previewMatch) {
+                const token = previewMatch[1];
+                const fresh = site.previewToken
+                    && site.previewExpires && new Date(site.previewExpires) > new Date()
+                    && token.length === site.previewToken.length
+                    && crypto.timingSafeEqual(Buffer.from(token), Buffer.from(site.previewToken));
+                if (!fresh) return pathNotFound(res, { preview: true, line: 'Open a fresh preview from your crew centre.' });
+                if (site.mode === 'code') return pathNotFound(res, { preview: true });
+                const file = pickFile((site.draft && site.draft.files) || [], previewMatch[2] || '/');
+                if (!pathServable(file)) return pathNotFound(res, { preview: true });
+                return sendPathFile(res, file, { preview: true });
+            }
+
+            // A hand-written site is not served here at any price — see the note
+            // above. It has an address only where a subdomain is configured.
+            if (site.mode === 'code') return pathNotFound(res);
+            if (!site.enabled || site.blocked) return pathNotFound(res);
+
+            const files = (site.published && site.published.files) || [];
+            if (!files.length) return pathNotFound(res);
+
+            const file = pickFile(files, rest);
+            if (!pathServable(file)) {
+                const own = files.find(f => f.path === '404.html');
+                if (own) {
+                    pathSecurityHeaders(res);
+                    res.status(404).set('Content-Type', TYPES['.html']);
+                    return res.send(own.content || '');
+                }
+                return pathNotFound(res);
+            }
+            return sendPathFile(res, file);
+        } catch (err) {
+            console.error('VA site path serve error:', err && err.message);
+            pathSecurityHeaders(res);
+            return res.status(500).type('html')
+                .send(NOT_FOUND_HTML('Temporarily unavailable', 'This is on our side, not the airline’s. Try again shortly.'));
+        }
+    });
+
+    function sendPathFile(res, file, opts) {
+        pathSecurityHeaders(res, opts);
+        res.set('Content-Type', TYPES[extOf(file.path)] || TYPES['.html']);
+        return res.send(file.content || '');
+    }
+    function pathNotFound(res, opts) {
+        pathSecurityHeaders(res, opts);
+        return res.status(404).type('html')
+            .send(NOT_FOUND_HTML('Page not found', (opts && opts.line) || 'There is no page at this address.'));
+    }
+}
+
+/* ===========================================================================
  * THE AUTHORING API
  *
  * Reads are open to any portal account; every write is owner-only, matching
  * every other mutation in vaPortal.js. A VA's website is the VA's public face
  * and publishing it is not a thing a representative account does by accident.
  * ======================================================================== */
-const notConfigured = (res) => res.status(503).json({
-    error: 'Website hosting is not switched on for this deployment.',
-    code: 'hosting_off',
+/* The one thing a subdomain is still required for.
+ *
+ * A site written as files contains the VA's own JavaScript, and that cannot run
+ * on the platform's origin next to a crew centre session — which is exactly
+ * what the path address is. So where no VA_SITES_DOMAIN is configured, ejecting
+ * is refused rather than quietly producing a site with nowhere to be served. */
+const needsSubdomain = (res) => res.status(409).json({
+    error: 'Writing the files yourself needs your own web address, and this Inflight deployment does not hand those out yet. '
+        + 'Your site keeps working in the builder — ask Inflight if you need the files.',
+    code: 'needs_subdomain',
 });
 
 function publicFile(f) {
@@ -701,6 +898,11 @@ function publicSite(site, va) {
         // has to ask a second time for the thing it exists to edit.
         mode: site.mode === 'code' ? 'code' : 'design',
         builder: site.builder || null,
+        // Where this site can be served from. `pathUrl` always works; `subdomain`
+        // says whether this deployment also hands out an address of the VA's
+        // own, which is the only thing that makes writing the files possible.
+        pathUrl: sitePathUrlFor(site.slug || (va && va.slug)),
+        subdomain: !!DOMAIN,
         enabled: !!site.enabled,
         blocked: !!site.blocked,
         blockedReason: site.blocked ? (site.blockedReason || '') : '',
@@ -778,8 +980,7 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
             const qs = cut < 0 ? '' : String(req.url).slice(cut);
             const m = CREW_SITE_RE.exec(path0);
             if (!m) return next();
-            if (!DOMAIN) return notConfigured(res);
-
+    
             let gate;
             try {
                 gate = await requireCap(req, decodeURIComponent(m[1]), 'site.manage');
@@ -817,15 +1018,6 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
             return {
                 error: 409,
                 message: 'Your crew centre does not have an address yet, and your website is served from it. Ask Inflight to set one.',
-            };
-        }
-        // A website lives at <slug>.<our domain>, so a slug that is one of our
-        // own hostnames cannot have one. Rare, fixable, and far better said here
-        // than discovered as a site that will not load.
-        if (reservedLabel(va.slug)) {
-            return {
-                error: 409,
-                message: `Your crew centre's address is "${va.slug}", which is a name Inflight reserves for its own — so it cannot be a website address. Ask Inflight to change it and your site can go up.`,
             };
         }
         let site = await CrewSite.findOne({ vaAdId: va._id });
@@ -867,7 +1059,6 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
 
     // --- Read ---------------------------------------------------------------
     app.get('/api/va-portal/site', anyEditor, async (req, res) => {
-        if (!DOMAIN) return notConfigured(res);
         try {
             const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
@@ -882,7 +1073,6 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
 
     // --- Write one file -----------------------------------------------------
     app.put('/api/va-portal/site/file', siteOwner, async (req, res) => {
-        if (!DOMAIN) return notConfigured(res);
         const named = cleanPath(req.body && req.body.path);
         if (named.error) return res.status(400).json({ error: named.error });
         const content = String((req.body && req.body.content) || '');
@@ -920,7 +1110,6 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
 
     // --- Delete one file ----------------------------------------------------
     app.delete('/api/va-portal/site/file', siteOwner, async (req, res) => {
-        if (!DOMAIN) return notConfigured(res);
         const named = cleanPath(req.query && req.query.path);
         if (named.error) return res.status(400).json({ error: named.error });
         try {
@@ -949,7 +1138,6 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
      * enumerate our designs from.
      * --------------------------------------------------------------------- */
     app.get('/api/va-portal/site/templates', anyEditor, (req, res) => {
-        if (!DOMAIN) return notConfigured(res);
         res.set('Cache-Control', 'private, max-age=300');
         // The designs AND the block vocabulary in one response: the builder
         // needs both before it can draw anything, and two requests to render
@@ -959,7 +1147,6 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
 
     // --- Lay out a design ---------------------------------------------------
     app.post('/api/va-portal/site/starter', siteOwner, async (req, res) => {
-        if (!DOMAIN) return notConfigured(res);
         const body = req.body || {};
         const wanted = String(body.template || '').trim();
         if (wanted && !templates.TEMPLATES[wanted]) {
@@ -1047,7 +1234,6 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
      * time somebody drags a section while a save is in flight.
      * --------------------------------------------------------------------- */
     app.put('/api/va-portal/site/builder', siteOwner, async (req, res) => {
-        if (!DOMAIN) return notConfigured(res);
         try {
             const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
@@ -1089,7 +1275,6 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
      * airline rather than a blank canvas and an instruction.
      * --------------------------------------------------------------------- */
     app.post('/api/va-portal/site/design', siteOwner, async (req, res) => {
-        if (!DOMAIN) return notConfigured(res);
         const body = req.body || {};
         const wanted = String(body.template || '').trim();
         if (wanted && !templates.TEMPLATES[wanted]) return res.status(400).json({ error: 'No such design.' });
@@ -1142,7 +1327,7 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
      * eject, which is what makes it a safe thing to try.
      * --------------------------------------------------------------------- */
     app.post('/api/va-portal/site/eject', siteOwner, async (req, res) => {
-        if (!DOMAIN) return notConfigured(res);
+        if (!DOMAIN) return needsSubdomain(res);
         try {
             const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
@@ -1188,7 +1373,6 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
      * half-apply.
      * --------------------------------------------------------------------- */
     app.post('/api/va-portal/site/theme', siteOwner, async (req, res) => {
-        if (!DOMAIN) return notConfigured(res);
         try {
             const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
@@ -1226,7 +1410,6 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
      * right in any of them — which is the point of the blocks being shared.
      * --------------------------------------------------------------------- */
     app.get('/api/va-portal/site/block/:id', siteOwner, async (req, res) => {
-        if (!DOMAIN) return notConfigured(res);
         try {
             const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
@@ -1241,7 +1424,6 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
 
     // --- Preview: a token, and the address to open it at ---------------------
     app.post('/api/va-portal/site/preview', siteOwner, async (req, res) => {
-        if (!DOMAIN) return notConfigured(res);
         try {
             const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
@@ -1268,7 +1450,6 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
 
     // --- Publish ------------------------------------------------------------
     app.post('/api/va-portal/site/publish', siteOwner, async (req, res) => {
-        if (!DOMAIN) return notConfigured(res);
         try {
             const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
@@ -1312,7 +1493,6 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
 
     // --- Put the draft back to what is live ---------------------------------
     app.post('/api/va-portal/site/revert', siteOwner, async (req, res) => {
-        if (!DOMAIN) return notConfigured(res);
         try {
             const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
@@ -1332,7 +1512,6 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
 
     // --- Restore an older published version into the draft -------------------
     app.post('/api/va-portal/site/restore', siteOwner, async (req, res) => {
-        if (!DOMAIN) return notConfigured(res);
         const version = Number(req.body && req.body.version);
         if (!isFinite(version)) return res.status(400).json({ error: 'Say which version.' });
         try {
@@ -1357,7 +1536,6 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
 
     // --- The VA's own on/off switch -----------------------------------------
     app.post('/api/va-portal/site/enabled', siteOwner, async (req, res) => {
-        if (!DOMAIN) return notConfigured(res);
         try {
             const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
@@ -1386,14 +1564,6 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
      * The health block exists so nobody has to read a boot log to find out
      * whether this deployment is in a fit state to host somebody's website. */
     app.get('/api/crew-admin/sites', requireAuth, async (req, res) => {
-        if (!DOMAIN) {
-            // Not an error for this screen — "hosting is off" is one of the
-            // things it is here to tell somebody.
-            return res.json({
-                domain: '', sites: [],
-                health: { hosting: false, cookiePrefix: false, sharedDomain: false, reservedSlugs: [] },
-            });
-        }
         try {
             const rows = await CrewSite.find({})
                 .select('vaAdId slug enabled blocked blockedReason published.at published.version draft.updatedAt')
@@ -1418,9 +1588,13 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
             try { platformHost = new URL(CREW_BASE).hostname; } catch { /* leave blank */ }
 
             res.json({
-                domain: DOMAIN,
+                domain: DOMAIN,          // '' where no subdomain is configured
                 health: {
+                    // Always on: every VA site has a path address whether or
+                    // not this deployment hands out subdomains.
                     hosting: true,
+                    pathBase: `${CREW_BASE}${PATH_PREFIX}`,
+                    subdomains: !!DOMAIN,
                     // Mirrors the condition in vaPortal.js / staffAuth.js: the
                     // __Host- prefix needs Secure, and Secure is only set in
                     // production. Reported rather than assumed, because the
@@ -1450,7 +1624,6 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
     });
 
     app.patch('/api/crew-admin/sites/:id', requireAuth, async (req, res) => {
-        if (!DOMAIN) return notConfigured(res);
         try {
             const site = await CrewSite.findById(req.params.id);
             if (!site) return res.status(404).json({ error: 'No such website.' });
@@ -1475,5 +1648,6 @@ module.exports = {
     cleanPath, extOf, bytesOf, layOutTemplate,
     parseSiteHost, siteUrlFor, pickFile, registrableGuess,
     RESERVED_LABELS, reservedLabel,
-    mountVaSiteHost, registerVaSiteRoutes,
+    mountVaSiteHost, mountVaSitePath, registerVaSiteRoutes,
+    PATH_PREFIX, PATH_MOUNT, sitePathUrlFor, pathServable,
 };

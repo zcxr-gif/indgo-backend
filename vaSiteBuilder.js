@@ -98,10 +98,16 @@ function linkUrl(raw, fallback) {
     const s = String(raw == null ? '' : raw).replace(CONTROL, '').trim();
     if (!s) return fallback || '';
     if (s.length > 2000) return fallback || '';
-    // In-site: "/fleet.html", "/", "#wall". Never "//host" — that is the web
-    // with the scheme left off, not a path on this site.
+    // In-site links are kept RELATIVE, never rooted at "/".
+    //
+    // The same rendered file is served at two addresses — the airline's own
+    // subdomain and inflight.info/va/<slug>/ — and a link to "/fleet.html"
+    // means the platform's root at the second one. A relative "fleet.html"
+    // resolves under whichever address the page was opened at, so a VA typing
+    // either form gets the one that works in both places.
     if (/^#[^\s]*$/.test(s)) return s;
-    if (s.startsWith('/') && !s.startsWith('//')) return s;
+    if (s === '/') return './';
+    if (s.startsWith('/') && !s.startsWith('//')) return s.replace(/^\/+/, '');
     let parsed;
     try { parsed = new URL(/^[a-z][a-z0-9+.-]*:/i.test(s) ? s : 'https://' + s); } catch { return fallback || ''; }
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return fallback || '';
@@ -706,13 +712,13 @@ function contextFor(va, { crewBase } = {}) {
 function navHtml(doc, ctx) {
     const links = doc.pages.filter(p => p.nav).map((p) => {
         const label = p.navLabel || p.title || (p.path === 'index.html' ? 'Home' : p.path.replace(/\.html$/, ''));
-        return `      <a href="${p.path === 'index.html' ? '/' : '/' + esc(p.path)}">${esc(label)}</a>`;
+        return `      <a href="${p.path === 'index.html' ? './' : esc(p.path)}">${esc(label)}</a>`;
     });
     if (doc.nav.showCrew) links.push(`      <a href="${esc(ctx.crew)}">${esc(doc.nav.crewLabel)}</a>`);
     const apply = doc.nav.showApply ? `\n      <a class="cta" href="${esc(ctx.join)}">${esc(doc.nav.applyLabel)}</a>` : '';
     return `<header class="bar">
   <div class="bar__in">
-    <a class="mark" href="/">
+    <a class="mark" href="./">
       <span class="logo" data-crew-figure hidden><img data-crew-brand="logo" alt=""></span>
       <span data-crew-brand="name">${esc(ctx.name)}</span>
     </a>
@@ -750,8 +756,8 @@ function pageHtml(doc, page, ctx) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
 <meta name="description" content="${esc(ctx.name)} — a virtual airline on Infinite Flight.">
-<link rel="stylesheet" href="/theme.css">
-<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="theme.css">
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
 ${navHtml(doc, ctx)}
@@ -766,7 +772,7 @@ ${footerHtml(doc, ctx)}
      Instagram wall and clears away a section that turned out to be empty.
      No key in either, and every endpoint they read is public. -->
 <script src="${esc(ctx.feedSrc || '')}" data-va="${esc(ctx.slug)}" data-auto="off"></script>
-<script src="/site.js"></script>
+<script src="site.js"></script>
 </body>
 </html>
 `;

@@ -216,6 +216,11 @@ app.use(diagnostics.middleware());
 // fell through to the platform's stack would be answered out of the repository
 // directory. Unset VA_SITES_DOMAIN and this is a no-op.
 vaSites.mountVaSiteHost(app);
+// And the address that needs no DNS at all: inflight.info/va/<slug>, proxied
+// here from the tracker exactly as /pilot/<handle> already is. Mounted beside
+// the host router and before everything else for the same reason — nothing
+// below may answer for a VA's website.
+vaSites.mountVaSitePath(app);
 
 // 2. CONNECT TO MONGODB
 mongoose.connect(process.env.MONGO_URI)

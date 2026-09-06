@@ -130,7 +130,7 @@ const CLAUSES = [
     {
         heading: '12. Websites We Host For You',
         blocks: [
-            { p: 'Every VA participating in the Program may build a public website in its Crew Center and have us host it, free of charge, at an address under a domain we own that carries your VA’s own name (for example ba.vasites.inflight.info). The site draws your fleet, routes, ranks, events and figures from your Crew Center, so it stays accurate without being maintained separately.' },
+            { p: 'Every VA participating in the Program may build a public website in its Crew Center and have us host it, free of charge, at an address of ours that carries your VA’s own name — either a page on our site (for example inflight.info/va/your-airline) or, where we offer it, a web address of your own. The site draws your fleet, routes, ranks, events and figures from your Crew Center, so it stays accurate without being maintained separately.' },
             { p: 'The content of that website is yours and remains your responsibility. By publishing one you confirm that:' },
             { list: [
                 'You own, or have permission to use, every word, image, video and embedded item on it, and it does not infringe anyone’s rights.',
@@ -139,7 +139,7 @@ const CLAUSES = [
                 'Any code you add behaves honestly toward visitors — no cryptomining, no malware, no advertising or tracking beyond what a visitor would expect of a virtual airline’s homepage.',
             ] },
             { p: 'Because these pages are served from a domain of ours, they carry our name as well as yours. We may therefore review any hosted site at any time and, at our sole discretion, take one down — immediately and without prior notice where the content is unlawful, harmful, or damaging to Inflight, and otherwise after asking you to correct it. A site taken down for cause stays down until the matter is resolved; you keep your draft and can edit it in the meantime.' },
-            { p: 'The address is a courtesy and not a possession: it follows your Crew Center address, we may change or withdraw it, and certain names are reserved for our own use. Hosting is provided “as is”, with no guarantee of availability, and it ends when your participation in the Program ends — so if the site matters to you, keep your own copy of anything you would not want to write again.' },
+            { p: 'The address is a courtesy and not a possession: it follows your Crew Center address, we may change or withdraw it, we may move a site between the forms of address above, and certain names are reserved for our own use. Hosting is provided “as is”, with no guarantee of availability, and it ends when your participation in the Program ends — so if the site matters to you, keep your own copy of anything you would not want to write again.' },
         ],
     },
     {

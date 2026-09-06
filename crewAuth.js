@@ -1443,12 +1443,12 @@ function registerCrewAuthRoutes(app) {
             staffRoles: (canManageTeam && va && va.staffRoles) || [],
             staffAssignments: (canManageTeam && va && va.staffAssignments) || [],
             grantable: canManageTeam ? (isOwner ? CREW_CAP_IDS.slice() : caps.slice()) : [],
-            // Whether this deployment hosts VA websites at all (VA_SITES_DOMAIN
-            // — see vaSites.js). The crew centre hides its Website tile when it
-            // does not: a tile that opens a page reading "hosting is off" is a
-            // tile nobody can act on, and the same reasoning kept the portal's
-            // Website tab hidden before this.
-            siteHosting: !!vaSites.DOMAIN,
+            // Websites are always available: every VA has an address at
+            // inflight.info/va/<slug> whether or not this deployment hands out
+            // subdomains, so the crew centre's Website tile is never hidden.
+            // Kept as a field rather than dropped because the tile reads it and
+            // a deployment could yet turn the feature off.
+            siteHosting: true,
             siteUrl: vaSites.siteUrlFor((va && va.slug) || slug || p.slug || ''),
         });
     });
