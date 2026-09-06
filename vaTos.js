@@ -18,11 +18,11 @@
 
 // Bump this whenever the Terms text or the PDF changes. Previous accepters are
 // re-prompted in their portal (and can be re-notified in Discord) when it moves.
-const TOS_VERSION = 'v4';
+const TOS_VERSION = 'v5';
 
 // Human-readable effective date of the current version (shown on the Terms
 // page, the PDF, and the portal banner).
-const TOS_EFFECTIVE_DATE = '2026-08-11';
+const TOS_EFFECTIVE_DATE = '2026-09-06';
 
 // Where partners find the Terms. The PDF is served statically from the repo
 // root; the page is a public route (see server.js).
@@ -98,6 +98,7 @@ const TOS_SUMMARY = [
     'Partner benefits — every participating VA is entitled to a free live embed (a widget for your own website showing your VA’s live flights and pilot roster) and a Discord flight-events webhook (automatic takeoff/landing cards posted to your own server).',
     'Official tracking provider — by joining, you accept Inflight as your VA’s official flight-tracking provider. This does not require every individual pilot to use Inflight, but whenever you post or run an event, it must be tracked with Inflight and Inflight is credited as the tracker.',
     'Event tracking — any event you announce or run must be tracked using Inflight, evidenced by a screenshot from our tracker. If no picture was taken, the announcement must instead carry, in bold text, an invitation to follow your events on Inflight together with a link to our tracker.',
+    'Hosted website — you may build a public site in your Crew Center and we host it at an address of ours carrying your VA’s name. The content is yours and stays your responsibility; because it sits on our domain we can take one down, and hosting ends with your participation.',
     'Accurate content — listing info, logos and banners must be accurate, owned by you, and not offensive or infringing.',
     'Staff authority — Inflight may review, edit, approve, decline, feature or remove any listing at our discretion.',
     'Enforcement — breaches are handled through a warning ladder (verbal → first → second → final warning) and may end in contract termination.',
@@ -107,6 +108,16 @@ const TOS_SUMMARY = [
 // What changed in the current version, shown on the Terms page + portal banner
 // so partners can see why they are being asked to re-acknowledge.
 const TOS_CHANGELOG = [
+    {
+        version: 'v5',
+        date: TOS_EFFECTIVE_DATE,
+        notes: [
+            'Added: every participating VA may build a public website in its Crew Center and have us host it free of charge, at an address of ours carrying your VA’s own name.',
+            'Added (clause 12): what you are confirming when you publish one — that the content is yours, meets the same standards as your listing, does not impersonate anyone, and does not collect payments or personal information from visitors.',
+            'Added: because these pages are served from a domain of ours, we may review a hosted site and take it down — immediately where content is unlawful or harmful, otherwise after asking you to correct it. Your draft is never deleted.',
+            'Added: the address follows your Crew Center address, some names are reserved for our own use, and hosting ends with your participation in the Program — so keep your own copy of anything you would not want to write again.',
+        ],
+    },
     {
         version: 'v4',
         date: TOS_EFFECTIVE_DATE,

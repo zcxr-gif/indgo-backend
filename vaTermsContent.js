@@ -39,6 +39,7 @@ const CLAUSES = [
             { list: [
                 'A live embed — a widget you can place on your VA’s own website (as a simple iframe) that displays your VA’s live flights map and/or pilot roster in real time, powered by the Inflight tracker and styled to match your branding.',
                 'A flight-events webhook — a Discord webhook that automatically posts takeoff and landing cards for flights flown under your VA’s callsign directly into a channel in your own Discord server, so your community sees your operations live without leaving Discord.',
+                'A hosted website — a public site for your VA, built in your Crew Center and served by us at an address carrying your VA’s name, with your fleet, routes, ranks and figures filled in from your Crew Center. See clause 12.',
             ] },
             { p: 'These benefits are provided on request and configured together with our staff. They remain available for as long as your VA participates in the Program and are withdrawn if your participation ends.' },
         ],
@@ -127,37 +128,52 @@ const CLAUSES = [
         ],
     },
     {
-        heading: '12. Data & Analytics',
+        heading: '12. Websites We Host For You',
+        blocks: [
+            { p: 'Every VA participating in the Program may build a public website in its Crew Center and have us host it, free of charge, at an address of ours that carries your VA’s own name — either a page on our site (for example inflight.info/va/your-airline) or, where we offer it, a web address of your own. The site draws your fleet, routes, ranks, events and figures from your Crew Center, so it stays accurate without being maintained separately.' },
+            { p: 'The content of that website is yours and remains your responsibility. By publishing one you confirm that:' },
+            { list: [
+                'You own, or have permission to use, every word, image, video and embedded item on it, and it does not infringe anyone’s rights.',
+                'It meets the same content standards as your listing (clause 6) — nothing offensive, misleading, adult, hateful, or unlawful, and nothing that impersonates a real-world airline, another VA, or Inflight itself.',
+                'It does not collect payments, passwords, or personal information from visitors, and does not ask visitors for anything they would reasonably believe they were giving to Inflight.',
+                'Any code you add behaves honestly toward visitors — no cryptomining, no malware, no advertising or tracking beyond what a visitor would expect of a virtual airline’s homepage.',
+            ] },
+            { p: 'Because these pages are served from a domain of ours, they carry our name as well as yours. We may therefore review any hosted site at any time and, at our sole discretion, take one down — immediately and without prior notice where the content is unlawful, harmful, or damaging to Inflight, and otherwise after asking you to correct it. A site taken down for cause stays down until the matter is resolved; you keep your draft and can edit it in the meantime.' },
+            { p: 'The address is a courtesy and not a possession: it follows your Crew Center address, we may change or withdraw it, we may move a site between the forms of address above, and certain names are reserved for our own use. Hosting is provided “as is”, with no guarantee of availability, and it ends when your participation in the Program ends — so if the site matters to you, keep your own copy of anything you would not want to write again.' },
+        ],
+    },
+    {
+        heading: '13. Data & Analytics',
         blocks: [
             { p: 'The Program records basic, non-personal engagement metrics for each listing, such as view and click counts, to measure advertisement performance. Any contact details you supply are used solely for administering the Program.' },
         ],
     },
     {
-        heading: '13. No Warranty & Limitation of Liability',
+        heading: '14. No Warranty & Limitation of Liability',
         blocks: [
             { p: 'The Program is provided “as is”, without warranties of any kind. We do not guarantee any level of visibility, traffic, recruitment, or availability. To the fullest extent permitted by law, we are not liable for any loss or damage arising from participation in the Program or from reliance on any listing.' },
         ],
     },
     {
-        heading: '14. Intellectual Property',
+        heading: '15. Intellectual Property',
         blocks: [
             { p: 'You retain ownership of your logos, banners, and brand. By submitting them, you grant us a non-exclusive, royalty-free licence to display and reproduce that content for the purpose of operating and promoting the Program. We will remove your content from active listings upon valid request or termination.' },
         ],
     },
     {
-        heading: '15. Termination',
+        heading: '16. Termination',
         blocks: [
             { p: 'You may withdraw from the Program at any time by requesting removal of your listing. We may end this agreement and remove your listing at any time — for a reason, for no reason, and without justification — including as the final stage of the enforcement process above. On termination, your listing and associated images will be removed from the public directory.' },
         ],
     },
     {
-        heading: '16. Changes to These Terms',
+        heading: '17. Changes to These Terms',
         blocks: [
             { p: 'We may update these Terms from time to time. When we do, we increment the Terms version and notify partners in their portal (and, where appropriate, in their Discord), asking them to acknowledge the new version. Continued participation after a change takes effect constitutes acceptance of the revised Terms.' },
         ],
     },
     {
-        heading: '17. Contact',
+        heading: '18. Contact',
         blocks: [
             { p: `Questions about the Program or these Terms can be directed to ${TOS_CONTACT_EMAIL}.` },
         ],

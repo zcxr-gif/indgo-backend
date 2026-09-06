@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node --expose-gc server.js",
     "build": "node scripts/build-va-terms-pdf.js",
-    "build:terms": "node scripts/build-va-terms-pdf.js"
+    "build:terms": "node scripts/build-va-terms-pdf.js",
+    "test:sites": "node scripts/test-va-site-builder.js && node scripts/test-session-cookies.js"
   },
   "keywords": [],
   "author": "Antony",

@@ -64,7 +64,30 @@ const PORTAL_CALLSIGN_MATCH_MODES = ['exact', 'strict', 'tag', 'broad'];
 //   any     — a rostered pilot counts whatever they are flying.
 const PORTAL_ROSTER_TRUST_MODES = ['off', 'tagged', 'airline', 'any'];
 
-const COOKIE_NAME = 'va_portal_token';
+/* ---------------------------------------------------------------------------
+ * THE COOKIE, AND WHY ITS NAME STARTS WITH __Host-
+ *
+ * Virtual airline websites are served from `<their slug>.<our domain>` (see
+ * vaSites.js), which means a VA's own JavaScript runs on a subdomain of ours.
+ * It cannot read this cookie — httpOnly — but on a shared registrable domain it
+ * CAN write `document.cookie = 'va_portal_token=…; domain=<ours>'` and have that value
+ * sent here on every later request, shadowing the real one. That is cookie
+ * tossing, and it is a session behaving strangely for a signed-in person who
+ * did nothing wrong.
+ *
+ * The `__Host-` prefix closes it in the browser rather than in our code: a
+ * cookie whose name begins `__Host-` is accepted ONLY if it is Secure, has
+ * path=/ and carries NO Domain attribute — and no subdomain can set one that
+ * reaches the parent host at all. It costs a rename.
+ *
+ * The prefix requires Secure, and Secure requires https, so a local http
+ * environment keeps the plain name — the same condition the Secure flag itself
+ * is already under. Sessions issued before the rename stay valid until they
+ * expire: getToken reads the old name too, and the next sign-in replaces it.
+ * ------------------------------------------------------------------------ */
+const SECURE_COOKIES = process.env.NODE_ENV === 'production';
+const LEGACY_COOKIE_NAME = 'va_portal_token';
+const COOKIE_NAME = SECURE_COOKIES ? '__Host-va_portal_token' : LEGACY_COOKIE_NAME;
 const TOKEN_TYPE = 'va_portal';            // distinguishes these tokens from staff tokens
 const TOKEN_TTL = '30d';
 const COOKIE_MAX_AGE = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -528,14 +551,17 @@ function parseCookies(req) {
 function getToken(req) {
     const auth = req.headers && req.headers.authorization;
     if (auth && auth.startsWith('Bearer ')) return auth.slice(7).trim();
-    return parseCookies(req)[COOKIE_NAME] || null;
+    const jar = parseCookies(req);
+    // The prefixed name first: where both exist, the one a subdomain could
+    // not have written is the one to trust.
+    return jar[COOKIE_NAME] || jar[LEGACY_COOKIE_NAME] || null;
 }
 
 function setAuthCookie(res, token) {
     res.cookie(COOKIE_NAME, token, {
         httpOnly: true,
         sameSite: 'lax',
-        secure: process.env.NODE_ENV === 'production',
+        secure: SECURE_COOKIES,
         maxAge: COOKIE_MAX_AGE,
         path: '/',
     });
@@ -543,6 +569,9 @@ function setAuthCookie(res, token) {
 
 function clearAuthCookie(res) {
     res.clearCookie(COOKIE_NAME, { path: '/' });
+    // And the pre-rename one, so signing out ends the session a browser is
+    // still holding under the old name.
+    if (LEGACY_COOKIE_NAME !== COOKIE_NAME) res.clearCookie(LEGACY_COOKIE_NAME, { path: '/' });
 }
 
 // Verify the request's portal token and load the active account.

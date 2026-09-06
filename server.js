@@ -216,6 +216,11 @@ app.use(diagnostics.middleware());
 // fell through to the platform's stack would be answered out of the repository
 // directory. Unset VA_SITES_DOMAIN and this is a no-op.
 vaSites.mountVaSiteHost(app);
+// And the address that needs no DNS at all: inflight.info/va/<slug>, proxied
+// here from the tracker exactly as /pilot/<handle> already is. Mounted beside
+// the host router and before everything else for the same reason — nothing
+// below may answer for a VA's website.
+vaSites.mountVaSitePath(app);
 
 // 2. CONNECT TO MONGODB
 mongoose.connect(process.env.MONGO_URI)
@@ -2887,6 +2892,10 @@ vaSites.registerVaSiteRoutes(app, {
     requirePortal: requireVaPortalSession,
     requirePortalOwner: requireVaPortalOwner,
     requireAuth,
+    // The crew centre's own door onto the same handlers: a crew token holding
+    // site.manage reaches them at /api/crew/:slug/site/*. Hoisted — requireCap
+    // is declared further down this file.
+    requireCap,
     logActivity: logVaPortalActivity,
 });
 
@@ -15401,6 +15410,7 @@ const STAFF_ONLY_PATHS = new Set([
     '/graphic-designer', '/graphic-designer.html',
     '/va-submissions', '/va-submissions.html',
     '/crew-centers', '/crew-centers.html',
+    '/va-sites', '/va-sites.html',
 ]);
 app.use((req, res, next) => {
     if (req.method === 'GET' && STAFF_ONLY_PATHS.has(req.path)) {
@@ -15441,6 +15451,15 @@ app.get('/va-portal', (req, res) => {
 // endpoints (/api/crew-admin/*) are requireAuth.
 app.get('/crew-centers', (req, res) => {
     res.sendFile(path.join(__dirname, 'crew-centers.html'));
+});
+
+// VA Websites (staff hub tool) — every website a VA has built, the switch that
+// takes one down, and whether this deployment is in a fit state to be hosting
+// other people's pages at all. These sites are served from a domain of ours, so
+// the takedown switch is not optional tooling. Staff-only (STAFF_ONLY_PATHS
+// above); its data endpoints (/api/crew-admin/sites) are requireAuth.
+app.get('/va-sites', (req, res) => {
+    res.sendFile(path.join(__dirname, 'va-sites.html'));
 });
 
 // Public Terms & Conditions page (mirrors the signed PDF). Rendered client-side
