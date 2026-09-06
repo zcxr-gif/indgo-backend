@@ -1378,8 +1378,22 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
      * that takes a site down and keeps it down: it outranks the VA's own
      * `enabled`, refuses further publishing, and records why.
      * ------------------------------------------------------------------- */
+    /* Everything staff need to know about VA websites in one response: whether
+     * hosting is on, whether the protections that make hosting-on-our-own-domain
+     * safe are actually in force, which VAs have a slug they cannot have, and
+     * every site with its state.
+     *
+     * The health block exists so nobody has to read a boot log to find out
+     * whether this deployment is in a fit state to host somebody's website. */
     app.get('/api/crew-admin/sites', requireAuth, async (req, res) => {
-        if (!DOMAIN) return notConfigured(res);
+        if (!DOMAIN) {
+            // Not an error for this screen — "hosting is off" is one of the
+            // things it is here to tell somebody.
+            return res.json({
+                domain: '', sites: [],
+                health: { hosting: false, cookiePrefix: false, sharedDomain: false, reservedSlugs: [] },
+            });
+        }
         try {
             const rows = await CrewSite.find({})
                 .select('vaAdId slug enabled blocked blockedReason published.at published.version draft.updatedAt')
@@ -1387,8 +1401,36 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
             const ads = await VirtualAirlineAd.find({ _id: { $in: rows.map(r => r.vaAdId) } })
                 .select('name callsign').lean();
             const named = new Map(ads.map(a => [String(a._id), a]));
+
+            // A VA whose crew centre address is one of our own hostnames cannot
+            // have a website — they are told so in the editor, and staff are
+            // told here, because fixing it means changing the slug and only
+            // staff can do that.
+            let reservedSlugs = [];
+            try {
+                const all = await VirtualAirlineAd.find({ slug: { $exists: true, $ne: '' } })
+                    .select('name callsign slug').lean();
+                reservedSlugs = all.filter(a => reservedLabel(a.slug))
+                    .map(a => ({ id: a._id, name: a.name || '', callsign: a.callsign || '', slug: a.slug }));
+            } catch { /* the list is a courtesy; the sites below are the page */ }
+
+            let platformHost = '';
+            try { platformHost = new URL(CREW_BASE).hostname; } catch { /* leave blank */ }
+
             res.json({
                 domain: DOMAIN,
+                health: {
+                    hosting: true,
+                    // Mirrors the condition in vaPortal.js / staffAuth.js: the
+                    // __Host- prefix needs Secure, and Secure is only set in
+                    // production. Reported rather than assumed, because the
+                    // answer is about the environment this process is running
+                    // in and nobody can see that from the outside.
+                    cookiePrefix: process.env.NODE_ENV === 'production',
+                    sharedDomain: !!platformHost && registrableGuess(platformHost) === registrableGuess(DOMAIN),
+                    platformHost,
+                    reservedSlugs,
+                },
                 sites: rows.map(r => {
                     const a = named.get(String(r.vaAdId)) || {};
                     return {
