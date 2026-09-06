@@ -1201,6 +1201,11 @@ function catalogue() {
 
 module.exports = {
     TEMPLATES, FONTS, MODES, BLOCKS, INSERTABLE, DEFAULT_TEMPLATE,
+    // The two shared assets a builder site needs as much as a hand-written one:
+    // the base stylesheet every design is layered on, and the script that hangs
+    // the Instagram wall. Exported so vaSiteBuilder.js emits the same style.css
+    // and site.js rather than a second copy that drifts.
+    BASE_CSS, SITE_JS,
     renderTemplate, renderBlock, renderThemeCss, normaliseTheme, catalogue,
     luminance, hex,
 };

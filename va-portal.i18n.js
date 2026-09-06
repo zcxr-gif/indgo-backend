@@ -73,6 +73,10 @@
             // English Website tab inside an otherwise Spanish portal instead of
             // a wall of raw keys. Translations drop in additively.
             'ws.heading': 'Your website',
+            'ws.inCrew': 'Your website is built in your crew centre',
+            'ws.inCrewSub': 'Pages, sections and words, with a preview beside them — and your fleet, routes, ranks and figures filled in from the crew centre automatically. It needs the whole screen, so it lives there rather than here.',
+            'ws.openBuilder': 'Open the website builder',
+            'ws.whoCan': 'Signed in as an owner you already have it. An owner can also give the website permission to a staff member under Settings → Team in the crew centre.',
             'ws.sub': 'Write your airline’s public site. We host it, and the numbers on it come from your crew centre — so the website cannot disagree with the airline.',
             'ws.live': 'Live at',
             'ws.notPublished': 'Nothing published yet',

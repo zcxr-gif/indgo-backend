@@ -82,6 +82,12 @@ const crypto = require('crypto');
 // nothing here knows what a template looks like, only how to store one.
 const templates = require('./vaSiteTemplates');
 
+// The block model a VA arranges in the crew centre, and the renderer that turns
+// it into the files below. This file stays the storage: it asks vaSiteBuilder
+// for a file list exactly as it asks vaSiteTemplates for one, and everything
+// downstream — the caps, the preview, the publish, the history — is shared.
+const builder = require('./vaSiteBuilder');
+
 /* ===========================================================================
  * CAPS
  *
@@ -217,6 +223,28 @@ const CrewSiteSchema = new mongoose.Schema({
     blocked: { type: Boolean, default: false },
     blockedReason: { type: String, default: '' },
     blockedAt: Date,
+
+    /* HOW THIS SITE IS AUTHORED.
+     *
+     * 'design' — the VA arranges blocks in the crew centre's builder and we
+     *            render the files from `builder` on every save. The files are
+     *            still the only thing served: the document is an input to them,
+     *            never a second source of truth.
+     * 'code'   — the VA writes the files themselves. `builder` is left where it
+     *            is but nothing reads it.
+     *
+     * A site moves from 'design' to 'code' once, on purpose, through
+     * /site/eject. It does not move back, and that is not a limitation we could
+     * remove by trying harder: once somebody has hand-edited the markup, the
+     * document no longer describes their site, and re-rendering from it would
+     * quietly delete their work. Ejecting says that out loud instead.
+     */
+    mode: { type: String, enum: ['design', 'code'], default: 'design' },
+
+    // The site document — pages, and the ordered blocks on each. Mixed because
+    // its shape is vaSiteBuilder's business and validating it twice, in two
+    // vocabularies, is how the two get to disagree. normaliseDoc is the schema.
+    builder: { type: mongoose.Schema.Types.Mixed, default: null },
 
     // Which design the draft was laid out from, and the theme on top of it.
     //
@@ -392,7 +420,15 @@ function securityHeaders(res, { preview } = {}) {
         "object-src 'none'",
         // 'self' rather than 'none': a VA framing their own pages is ordinary.
         // Nothing of ours can frame them and nothing of theirs can frame us.
-        "frame-ancestors 'self'",
+        //
+        // The exception is a PREVIEW, which the website builder shows in a
+        // panel beside the editor — a VA arranging their homepage has to be
+        // able to see it, and a design you have to open in another tab to look
+        // at is a design nobody looks at while they work. Only the draft is
+        // framed, never the published site: a preview URL carries a token that
+        // expires in half an hour and is only ever handed to the VA who owns it,
+        // whereas the live site stays unframeable by us or anyone.
+        preview ? `frame-ancestors 'self' ${CREW_BASE}` : "frame-ancestors 'self'",
         "form-action 'self' https:",
         `script-src 'self' 'unsafe-inline' ${CREW_BASE} ${BACKEND_ORIGIN} ${SCRIPT_CDNS}`,
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com " + SCRIPT_CDNS,
@@ -568,6 +604,11 @@ function publicSite(site, va) {
         // values actually in force rather than on a design's defaults.
         template: site.template || '',
         theme: templates.normaliseTheme(site.theme, site.template || templates.DEFAULT_TEMPLATE),
+        // How this site is authored, and the document behind it when it is
+        // built rather than written. Sent on every read so the builder never
+        // has to ask a second time for the thing it exists to edit.
+        mode: site.mode === 'code' ? 'code' : 'design',
+        builder: site.builder || null,
         enabled: !!site.enabled,
         blocked: !!site.blocked,
         blockedReason: site.blocked ? (site.blockedReason || '') : '',
@@ -596,7 +637,82 @@ function publicSite(site, va) {
     };
 }
 
-function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePortalOwner, requireAuth, logActivity }) {
+function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePortalOwner, requireAuth, requireCap, logActivity }) {
+
+    /* -----------------------------------------------------------------------
+     * TWO DOORS, ONE IMPLEMENTATION
+     *
+     * A VA's website is edited in their crew centre, which is a different
+     * front end signed in with a different session system: a bearer token from
+     * crewAuth.js rather than the portal's cookie. The obvious way to serve it
+     * is a second set of routes, and the obvious way is wrong — two copies of
+     * publish, revert, restore and the limits is two copies that drift, and the
+     * first thing to drift is a check.
+     *
+     * So there is one set of handlers, and the crew centre reaches them by
+     * having its request REWRITTEN onto them once the crew token has been
+     * checked. `/api/crew/<slug>/site/publish` becomes `/api/va-portal/site/
+     * publish` with `req.siteActor` set, and everything after that point is the
+     * same code answering the same way.
+     *
+     * Two details make it safe rather than clever:
+     *
+     *   - The rewrite happens ONLY after requireCap has passed, and requireCap
+     *     resolves the VA from the slug in the URL and the vaId in the token —
+     *     so the actor cannot be pointed at somebody else's site by editing the
+     *     path.
+     *   - req.siteActor is what the guards below skip on. Nothing else in this
+     *     process sets it, and a request that arrives from the outside cannot:
+     *     it is a property of the request object, not a header.
+     * -------------------------------------------------------------------- */
+    const CREW_SITE_RE = /^\/api\/crew\/([^/]+)\/site(\/.*)?$/;
+
+    /** Whoever is editing: the portal account, or the crew-centre identity. */
+    const actorOf = (req) => req.siteActor || req.portal || {};
+    const actorName = (req) => {
+        const a = actorOf(req);
+        return a.username || a.name || '';
+    };
+
+    // The portal's own guards, skipped for a request that came through the crew
+    // door — it was authenticated before it got here, by the other system.
+    const anyEditor = (req, res, next) => (req.siteActor ? next() : requirePortal(req, res, next));
+    const siteOwner = (req, res, next) => (req.siteActor ? next() : requirePortalOwner(req, res, next));
+
+    if (typeof requireCap === 'function') {
+        app.use(async (req, res, next) => {
+            const cut = String(req.url || '').indexOf('?');
+            const path0 = cut < 0 ? String(req.url || '') : String(req.url).slice(0, cut);
+            const qs = cut < 0 ? '' : String(req.url).slice(cut);
+            const m = CREW_SITE_RE.exec(path0);
+            if (!m) return next();
+            if (!DOMAIN) return notConfigured(res);
+
+            let gate;
+            try {
+                gate = await requireCap(req, decodeURIComponent(m[1]), 'site.manage');
+            } catch (err) {
+                console.error('VA site crew gate error:', err && err.message);
+                return res.status(500).json({ error: 'Could not check your access.' });
+            }
+            if (gate.error) {
+                return res.status(gate.error).json({
+                    error: gate.error === 401
+                        ? 'Sign in to your crew centre.'
+                        : 'Only an owner, or somebody they have given the website permission to, can edit the website.',
+                });
+            }
+            req.siteActor = {
+                vaAdId: gate.p.vaId,
+                username: gate.p.name || gate.p.uname || '',
+                name: gate.p.name || '',
+                role: gate.p.role || 'owner',
+                via: 'crew',
+            };
+            req.url = '/api/va-portal/site' + (m[2] || '') + qs;
+            next();
+        });
+    }
 
     /* The VA behind a portal session, and its site row — created empty on
      * first look rather than by a separate "set up hosting" step nobody would
@@ -629,6 +745,19 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
         return site.draft.files;
     };
 
+    /* A site being built in the crew centre is rendered from its document on
+     * every save, so a file written by hand would live until the next one and
+     * then vanish. Refused rather than accepted-and-lost, and the code says
+     * which route to use instead. */
+    const designedSite = (site, res) => {
+        if (site.mode === 'code') return false;
+        res.status(409).json({
+            error: 'This site is built in the website builder. Edit it there, or eject to files first.',
+            code: 'designed',
+        });
+        return true;
+    };
+
     const touchDraft = (site, account) => {
         site.draft = site.draft || {};
         site.draft.updatedAt = new Date();
@@ -636,10 +765,10 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
     };
 
     // --- Read ---------------------------------------------------------------
-    app.get('/api/va-portal/site', requirePortal, async (req, res) => {
+    app.get('/api/va-portal/site', anyEditor, async (req, res) => {
         if (!DOMAIN) return notConfigured(res);
         try {
-            const r = await siteFor(req.portal);
+            const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
             if (r.site.isNew) await r.site.save();
             res.set('Cache-Control', 'no-store');
@@ -651,7 +780,7 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
     });
 
     // --- Write one file -----------------------------------------------------
-    app.put('/api/va-portal/site/file', requirePortalOwner, async (req, res) => {
+    app.put('/api/va-portal/site/file', siteOwner, async (req, res) => {
         if (!DOMAIN) return notConfigured(res);
         const named = cleanPath(req.body && req.body.path);
         if (named.error) return res.status(400).json({ error: named.error });
@@ -661,9 +790,10 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
             return res.status(413).json({ error: `That file is ${Math.round(bytes / 1024)} KB. The limit is ${Math.round(MAX_FILE_BYTES / 1024)} KB.` });
         }
         try {
-            const r = await siteFor(req.portal);
+            const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
             const site = r.site;
+            if (designedSite(site, res)) return;
             const files = ensureDraft(site);
             const at = files.findIndex(f => f.path === named.path);
 
@@ -678,7 +808,7 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
             const row = { path: named.path, content, bytes, updatedAt: new Date() };
             if (at < 0) files.push(row); else files[at] = row;
             site.draft.files = files;
-            touchDraft(site, req.portal);
+            touchDraft(site, actorOf(req));
             await site.save();
             res.json({ ok: true, file: publicFile(row), usage: { files: files.length, bytes: total } });
         } catch (err) {
@@ -688,17 +818,18 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
     });
 
     // --- Delete one file ----------------------------------------------------
-    app.delete('/api/va-portal/site/file', requirePortalOwner, async (req, res) => {
+    app.delete('/api/va-portal/site/file', siteOwner, async (req, res) => {
         if (!DOMAIN) return notConfigured(res);
         const named = cleanPath(req.query && req.query.path);
         if (named.error) return res.status(400).json({ error: named.error });
         try {
-            const r = await siteFor(req.portal);
+            const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
             const site = r.site;
+            if (designedSite(site, res)) return;
             const files = ensureDraft(site).filter(f => f.path !== named.path);
             site.draft.files = files;
-            touchDraft(site, req.portal);
+            touchDraft(site, actorOf(req));
             await site.save();
             res.json({ ok: true, usage: { files: files.length, bytes: files.reduce((n, f) => n + (f.bytes || 0), 0) } });
         } catch (err) {
@@ -716,14 +847,17 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
      * fact about a VA, and there is no reason for it to be a URL anybody can
      * enumerate our designs from.
      * --------------------------------------------------------------------- */
-    app.get('/api/va-portal/site/templates', requirePortal, (req, res) => {
+    app.get('/api/va-portal/site/templates', anyEditor, (req, res) => {
         if (!DOMAIN) return notConfigured(res);
         res.set('Cache-Control', 'private, max-age=300');
-        res.json(templates.catalogue());
+        // The designs AND the block vocabulary in one response: the builder
+        // needs both before it can draw anything, and two requests to render
+        // one screen is one request too many.
+        res.json({ ...templates.catalogue(), builder: builder.catalogue() });
     });
 
     // --- Lay out a design ---------------------------------------------------
-    app.post('/api/va-portal/site/starter', requirePortalOwner, async (req, res) => {
+    app.post('/api/va-portal/site/starter', siteOwner, async (req, res) => {
         if (!DOMAIN) return notConfigured(res);
         const body = req.body || {};
         const wanted = String(body.template || '').trim();
@@ -732,9 +866,10 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
         }
         const templateId = wanted || templates.DEFAULT_TEMPLATE;
         try {
-            const r = await siteFor(req.portal);
+            const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
             const site = r.site;
+            if (designedSite(site, res)) return;
             const existing = ensureDraft(site);
             // Refuse to overwrite work. The editor asks first and sends
             // `replace` only once somebody has said yes out loud.
@@ -751,12 +886,191 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
             site.draft.files = layOutTemplate(templateId, r.va, theme);
             site.template = templateId;
             site.theme = theme;
-            touchDraft(site, req.portal);
+            touchDraft(site, actorOf(req));
             await site.save();
             res.json(publicSite(site.toObject(), r.va));
         } catch (err) {
             console.error('VA site starter error:', err);
             res.status(500).json({ error: 'Could not lay out that design.' });
+        }
+    });
+
+    /* =====================================================================
+     * THE BUILDER
+     *
+     * Everything above this point treats a site as files, because that is what
+     * it is. These three routes are the other end of the same object: the
+     * document a VA arranges in the crew centre, and the rule that the files
+     * are rendered from it rather than edited alongside it.
+     *
+     * There is one invariant and it is worth stating plainly: IN DESIGN MODE
+     * THE DOCUMENT IS THE SITE. Every save re-renders every page from it. So
+     * nothing else may write to draft.files while a site is in design mode —
+     * the file editor is refused below, not merely hidden in the UI — because a
+     * hand edit that survived one save and vanished on the next is the worst
+     * behaviour this feature could have.
+     * ================================================================== */
+
+    /** Render the document into the draft, with the same caps a hand-written
+     *  site is held to. Returns an error object rather than throwing: a VA who
+     *  has built a site too large for the quota needs to be told which limit,
+     *  not handed a 500. */
+    function applyBuilder(site, va, doc) {
+        const files = builder.renderSite(doc, {
+            va,
+            templateId: site.template || templates.DEFAULT_TEMPLATE,
+            theme: site.theme,
+            feedSrc: `${CREW_BASE}/crew-feed.js`,
+            crewBase: CREW_BASE,
+        });
+        if (files.length > MAX_FILES) {
+            return { error: 413, message: `That is ${files.length} pages and files. A site holds up to ${MAX_FILES}.` };
+        }
+        const total = files.reduce((n, f) => n + f.bytes, 0);
+        if (total > MAX_TOTAL_BYTES) {
+            return { error: 413, message: `That would take the site over ${Math.round(MAX_TOTAL_BYTES / 1024 / 1024)} MB. Shorten a page or use fewer of them.` };
+        }
+        const big = files.find(f => f.bytes > MAX_FILE_BYTES);
+        if (big) {
+            return { error: 413, message: `"${big.path}" is ${Math.round(big.bytes / 1024)} KB. One page can be ${Math.round(MAX_FILE_BYTES / 1024)} KB.` };
+        }
+        site.draft = site.draft || {};
+        site.draft.files = files;
+        return { files };
+    }
+
+    /* --- Save the document -------------------------------------------------
+     * The whole document every time, not a patch. A page of blocks is small
+     * (kilobytes), a VA edits one thing at a time, and the alternative —
+     * per-block PATCH routes — buys nothing and costs an ordering bug the first
+     * time somebody drags a section while a save is in flight.
+     * --------------------------------------------------------------------- */
+    app.put('/api/va-portal/site/builder', siteOwner, async (req, res) => {
+        if (!DOMAIN) return notConfigured(res);
+        try {
+            const r = await siteFor(actorOf(req));
+            if (r.error) return fail(res, r);
+            const site = r.site;
+            if (site.mode === 'code') {
+                return res.status(409).json({
+                    error: 'This site is edited as files now. The builder cannot write over them.',
+                    code: 'ejected',
+                });
+            }
+            ensureDraft(site);
+            const ctx = builder.contextFor(r.va, { crewBase: CREW_BASE });
+            const doc = builder.normaliseDoc(req.body && req.body.doc, ctx);
+            if (!site.template) site.template = templates.DEFAULT_TEMPLATE;
+
+            const applied = applyBuilder(site, r.va, doc);
+            if (applied.error) return res.status(applied.error).json({ error: applied.message });
+
+            site.builder = doc;
+            site.mode = 'design';
+            touchDraft(site, actorOf(req));
+            await site.save();
+            res.json(publicSite(site.toObject(), r.va));
+        } catch (err) {
+            console.error('VA site builder save error:', err);
+            res.status(500).json({ error: 'Could not save your website.' });
+        }
+    });
+
+    /* --- Pick a design -----------------------------------------------------
+     * The reason the document holds no markup. Changing the design changes
+     * style.css and re-renders the pages; every word the VA has written is in
+     * the document and comes through untouched. A VA can try all six in a
+     * minute and lose nothing, which is the difference between a design picker
+     * and a decision.
+     *
+     * A site with no document yet gets the design's own starter content, so
+     * picking one produces a page that already says something about this
+     * airline rather than a blank canvas and an instruction.
+     * --------------------------------------------------------------------- */
+    app.post('/api/va-portal/site/design', siteOwner, async (req, res) => {
+        if (!DOMAIN) return notConfigured(res);
+        const body = req.body || {};
+        const wanted = String(body.template || '').trim();
+        if (wanted && !templates.TEMPLATES[wanted]) return res.status(400).json({ error: 'No such design.' });
+        try {
+            const r = await siteFor(actorOf(req));
+            if (r.error) return fail(res, r);
+            const site = r.site;
+            if (site.mode === 'code') {
+                return res.status(409).json({
+                    error: 'This site is edited as files now. Changing the design here would overwrite them.',
+                    code: 'ejected',
+                });
+            }
+            ensureDraft(site);
+            const templateId = wanted || site.template || templates.DEFAULT_TEMPLATE;
+            site.template = templateId;
+            // A design brings its own accent, type and mode. Sending a theme
+            // with it keeps the VA's — which is what the theme controls do when
+            // somebody changes design after having chosen a colour.
+            site.theme = templates.normaliseTheme(
+                body.keepTheme && site.theme && site.theme.accent ? site.theme : body.theme,
+                templateId,
+            );
+
+            const doc = site.builder && Array.isArray(site.builder.pages) && site.builder.pages.length
+                ? builder.normaliseDoc(site.builder, builder.contextFor(r.va, { crewBase: CREW_BASE }))
+                : builder.starterDoc(templateId, r.va, { crewBase: CREW_BASE });
+
+            const applied = applyBuilder(site, r.va, doc);
+            if (applied.error) return res.status(applied.error).json({ error: applied.message });
+
+            site.builder = doc;
+            site.mode = 'design';
+            touchDraft(site, actorOf(req));
+            await site.save();
+            res.json(publicSite(site.toObject(), r.va));
+        } catch (err) {
+            console.error('VA site design error:', err);
+            res.status(500).json({ error: 'Could not switch to that design.' });
+        }
+    });
+
+    /* --- Eject to the files ------------------------------------------------
+     * One way, and said so before it happens. After this the document is dead
+     * weight — kept, because throwing away the only record of what a VA built
+     * to save a few kilobytes would be indefensible, but never rendered again.
+     *
+     * What a VA gets is exactly what was already live: the rendered files, now
+     * theirs to edit. Nothing about their site changes at the moment they
+     * eject, which is what makes it a safe thing to try.
+     * --------------------------------------------------------------------- */
+    app.post('/api/va-portal/site/eject', siteOwner, async (req, res) => {
+        if (!DOMAIN) return notConfigured(res);
+        try {
+            const r = await siteFor(actorOf(req));
+            if (r.error) return fail(res, r);
+            const site = r.site;
+            if (site.mode === 'code') return res.json(publicSite(site.toObject(), r.va));
+            if (!ensureDraft(site).length) {
+                return res.status(400).json({ error: 'There is nothing to edit yet — pick a design first.' });
+            }
+            if (req.body && req.body.confirm !== true) {
+                return res.status(409).json({
+                    error: 'Ejecting cannot be undone: the builder stops working on this site. Send confirm:true.',
+                    code: 'confirm_required',
+                });
+            }
+            site.mode = 'code';
+            touchDraft(site, actorOf(req));
+            await site.save();
+            if (typeof logActivity === 'function') {
+                logActivity({
+                    vaAdId: r.va._id, vaName: r.va.name,
+                    actorName: actorName(req), actorRole: actorOf(req).role,
+                    action: 'Switched their website to files',
+                    detail: 'The builder no longer writes this site.',
+                });
+            }
+            res.json(publicSite(site.toObject(), r.va));
+        } catch (err) {
+            console.error('VA site eject error:', err);
+            res.status(500).json({ error: 'Could not switch to files.' });
         }
     });
 
@@ -772,10 +1086,10 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
      * before the request is sent — that is the trade for a picker that cannot
      * half-apply.
      * --------------------------------------------------------------------- */
-    app.post('/api/va-portal/site/theme', requirePortalOwner, async (req, res) => {
+    app.post('/api/va-portal/site/theme', siteOwner, async (req, res) => {
         if (!DOMAIN) return notConfigured(res);
         try {
-            const r = await siteFor(req.portal);
+            const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
             const site = r.site;
             const files = ensureDraft(site);
@@ -793,7 +1107,7 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
 
             site.draft.files = files;
             site.theme = theme;
-            touchDraft(site, req.portal);
+            touchDraft(site, actorOf(req));
             await site.save();
             res.json(publicSite(site.toObject(), r.va));
         } catch (err) {
@@ -810,10 +1124,10 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
      * Every design uses the same class names, so a block rendered here looks
      * right in any of them — which is the point of the blocks being shared.
      * --------------------------------------------------------------------- */
-    app.get('/api/va-portal/site/block/:id', requirePortalOwner, async (req, res) => {
+    app.get('/api/va-portal/site/block/:id', siteOwner, async (req, res) => {
         if (!DOMAIN) return notConfigured(res);
         try {
-            const r = await siteFor(req.portal);
+            const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
             const html = templates.renderBlock(req.params.id, r.va, { crewBase: CREW_BASE });
             if (!html) return res.status(404).json({ error: 'No such section.' });
@@ -825,10 +1139,10 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
     });
 
     // --- Preview: a token, and the address to open it at ---------------------
-    app.post('/api/va-portal/site/preview', requirePortalOwner, async (req, res) => {
+    app.post('/api/va-portal/site/preview', siteOwner, async (req, res) => {
         if (!DOMAIN) return notConfigured(res);
         try {
-            const r = await siteFor(req.portal);
+            const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
             const site = r.site;
             if (!ensureDraft(site).length) {
@@ -852,10 +1166,10 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
     });
 
     // --- Publish ------------------------------------------------------------
-    app.post('/api/va-portal/site/publish', requirePortalOwner, async (req, res) => {
+    app.post('/api/va-portal/site/publish', siteOwner, async (req, res) => {
         if (!DOMAIN) return notConfigured(res);
         try {
-            const r = await siteFor(req.portal);
+            const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
             const site = r.site;
             if (site.blocked) {
@@ -871,7 +1185,7 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
             site.published = {
                 files: snapshot,
                 at: new Date(),
-                by: req.portal.username || req.portal.name || '',
+                by: actorName(req),
                 version,
             };
             // Newest first, capped. A VA that publishes daily still has last
@@ -883,7 +1197,7 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
             if (typeof logActivity === 'function') {
                 logActivity({
                     vaAdId: r.va._id, vaName: r.va.name,
-                    actorName: req.portal.username, actorRole: req.portal.role,
+                    actorName: actorName(req), actorRole: actorOf(req).role,
                     action: 'Published website',
                     detail: `${siteUrlFor(site.slug)} — v${version}, ${snapshot.length} file(s)`,
                 });
@@ -896,17 +1210,17 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
     });
 
     // --- Put the draft back to what is live ---------------------------------
-    app.post('/api/va-portal/site/revert', requirePortalOwner, async (req, res) => {
+    app.post('/api/va-portal/site/revert', siteOwner, async (req, res) => {
         if (!DOMAIN) return notConfigured(res);
         try {
-            const r = await siteFor(req.portal);
+            const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
             const site = r.site;
             const live = (site.published && site.published.files) || [];
             if (!live.length) return res.status(400).json({ error: 'Nothing has been published yet, so there is nothing to go back to.' });
             ensureDraft(site);
             site.draft.files = JSON.parse(JSON.stringify(live));
-            touchDraft(site, req.portal);
+            touchDraft(site, actorOf(req));
             await site.save();
             res.json(publicSite(site.toObject(), r.va));
         } catch (err) {
@@ -916,12 +1230,12 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
     });
 
     // --- Restore an older published version into the draft -------------------
-    app.post('/api/va-portal/site/restore', requirePortalOwner, async (req, res) => {
+    app.post('/api/va-portal/site/restore', siteOwner, async (req, res) => {
         if (!DOMAIN) return notConfigured(res);
         const version = Number(req.body && req.body.version);
         if (!isFinite(version)) return res.status(400).json({ error: 'Say which version.' });
         try {
-            const r = await siteFor(req.portal);
+            const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
             const site = r.site;
             const snap = (site.versions || []).find(v => v.version === version);
@@ -931,7 +1245,7 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
             // any other; making it a publish would mean a mis-click changes
             // what the world sees with nothing in between.
             site.draft.files = JSON.parse(JSON.stringify(snap.files || []));
-            touchDraft(site, req.portal);
+            touchDraft(site, actorOf(req));
             await site.save();
             res.json(publicSite(site.toObject(), r.va));
         } catch (err) {
@@ -941,10 +1255,10 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
     });
 
     // --- The VA's own on/off switch -----------------------------------------
-    app.post('/api/va-portal/site/enabled', requirePortalOwner, async (req, res) => {
+    app.post('/api/va-portal/site/enabled', siteOwner, async (req, res) => {
         if (!DOMAIN) return notConfigured(res);
         try {
-            const r = await siteFor(req.portal);
+            const r = await siteFor(actorOf(req));
             if (r.error) return fail(res, r);
             r.site.enabled = !!(req.body && req.body.enabled);
             await r.site.save();

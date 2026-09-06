@@ -22,6 +22,9 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+// Only for the two facts /me reports about websites: whether this deployment
+// hosts them, and what a VA's address would be. No route here touches a site.
+const vaSites = require('./vaSites');
 
 const crewStore = require('./crewStore');
 const crewAccounts = require('./crewAccounts');
@@ -314,6 +317,13 @@ const CREW_CAPABILITIES = [
     { id: 'integrations.manage',    group: 'Owner-level',    label: 'Connect Infinite Flight & the data store' },
     { id: 'team.manage',            group: 'Owner-level',    label: 'Create staff roles & assign the team' },
     { id: 'retention.manage',       group: 'Owner-level',    label: 'Configure & run the roster sweep' },
+    // v14. The public website. Owner-grade for the reason the three above are:
+    // this publishes pages to the world in the airline's name, on an address
+    // that is the airline's. It is also genuinely somebody else's job at most
+    // VAs of any size — the person who writes the website is rarely the person
+    // who runs the roster — so it is a permission an owner can hand over rather
+    // than a power only they have.
+    { id: 'site.manage',            group: 'Owner-level',    label: 'Build & publish the public website' },
 ];
 const CREW_CAP_IDS = CREW_CAPABILITIES.map(c => c.id);
 
@@ -337,7 +347,7 @@ const CREW_CAP_IDS = CREW_CAPABILITIES.map(c => c.id);
  * having read the line — which is exactly the bar the presets note below
  * describes, and the reason there is still no preset with the lot ticked.
  */
-const CREW_OWNER_GRADE_CAPS = ['integrations.manage', 'team.manage', 'retention.manage'];
+const CREW_OWNER_GRADE_CAPS = ['integrations.manage', 'team.manage', 'retention.manage', 'site.manage'];
 
 /** What a staff member with no role assigned gets: everything except the above. */
 const CREW_DEFAULT_STAFF_CAPS = CREW_CAP_IDS.filter(id => !CREW_OWNER_GRADE_CAPS.includes(id));
@@ -1433,6 +1443,13 @@ function registerCrewAuthRoutes(app) {
             staffRoles: (canManageTeam && va && va.staffRoles) || [],
             staffAssignments: (canManageTeam && va && va.staffAssignments) || [],
             grantable: canManageTeam ? (isOwner ? CREW_CAP_IDS.slice() : caps.slice()) : [],
+            // Whether this deployment hosts VA websites at all (VA_SITES_DOMAIN
+            // — see vaSites.js). The crew centre hides its Website tile when it
+            // does not: a tile that opens a page reading "hosting is off" is a
+            // tile nobody can act on, and the same reasoning kept the portal's
+            // Website tab hidden before this.
+            siteHosting: !!vaSites.DOMAIN,
+            siteUrl: vaSites.siteUrlFor((va && va.slug) || slug || p.slug || ''),
         });
     });
 }

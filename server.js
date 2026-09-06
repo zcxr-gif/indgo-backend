@@ -2887,6 +2887,10 @@ vaSites.registerVaSiteRoutes(app, {
     requirePortal: requireVaPortalSession,
     requirePortalOwner: requireVaPortalOwner,
     requireAuth,
+    // The crew centre's own door onto the same handlers: a crew token holding
+    // site.manage reaches them at /api/crew/:slug/site/*. Hoisted — requireCap
+    // is declared further down this file.
+    requireCap,
     logActivity: logVaPortalActivity,
 });
 
