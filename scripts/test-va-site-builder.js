@@ -147,6 +147,22 @@ const server = app.listen(0, async () => {
     console.log('another VA cannot reach this one');
     check('slug mismatch → 403', (await call('/api/crew/other/site', { role: 'owner' })).status === 403);
 
+    /* VA sites are served under a domain of ours, so a VA slug is one of our
+     * hostnames. These are the names that have to stay ours. */
+    console.log('labels a VA site may not have');
+    const D = process.env.VA_SITES_DOMAIN;
+    const host = (h) => vaSites.parseSiteHost(h, D);
+    check('an airline gets its own label', host(`ba.${D}`) === 'ba');
+    check('a port and a case difference change nothing', host(`BA.${D}:443`) === 'ba');
+    ['www', 'api', 'login', 'admin', 'mail', 'ns1', 'postmaster', 'staff', 'crew', 'cdn']
+        .forEach(l => check(`${l} is not a VA site`, host(`${l}.${D}`) === null));
+    check('a punycode label is refused', host(`xn--80ak6aa92e.${D}`) === null);
+    check('a nested label is refused', host(`a.b.${D}`) === null);
+    check('another domain entirely is not ours to answer', host('ba.example.com') === null);
+    check('the apex is ours, not a VA\'s', host(D) === '');
+    check('a reserved slug is given no address', vaSites.siteUrlFor('www') === '');
+    check('an ordinary slug is', vaSites.siteUrlFor('ba') === `https://ba.${D}`);
+
     console.log(failures ? `\n${failures} FAILED` : '\nall passed');
     server.close();
     process.exit(failures ? 1 : 0);

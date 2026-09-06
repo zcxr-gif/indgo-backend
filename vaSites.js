@@ -30,24 +30,47 @@
  * inflight.info: it cannot read our localStorage or sessionStorage (where the
  * crew center's session token lives), cannot touch our DOM, cannot call our
  * authenticated endpoints as a signed-in staff member, and cannot be handed a
- * cookie of ours — every cookie this platform sets is host-only (no `Domain`
- * attribute; see setAuthCookie in vaPortal.js and staffAuth.js), so none of
- * them is sent to a subdomain.
+ * cookie of ours — every session cookie this platform sets is `__Host-`
+ * prefixed (see setAuthCookie in vaPortal.js and staffAuth.js), which the
+ * browser will only accept host-only, so none of them is sent to a subdomain
+ * and none of them can be set FROM one.
  *
- * WHY A SEPARATE DOMAIN WOULD STILL BE BETTER
- * -------------------------------------------
- * `<slug>.vasites.inflight.info` is a separate ORIGIN but not a separate SITE:
- * it shares the registrable domain inflight.info. That leaves one real gap.
- * A VA's script can write `document.cookie = 'x=1; domain=inflight.info'` and
- * have it sent to inflight.info on every subsequent request — cookie tossing.
- * It cannot READ our cookies (they are httpOnly, and a shadowing cookie does
- * not reveal the one it shadows), but it can shadow one and make a session
- * behave oddly.
+ * ON OUR OWN DOMAIN, WITH THEIR NAME IN IT
+ * ----------------------------------------
+ * That is the decision: a VA's site lives at `<their slug>.<our domain>` —
+ * `ba.vasites.inflight.info` — and the airline's name is the part that
+ * identifies it. It is the right product answer (a VA gets an address with
+ * their name on it, on a domain whose certificate and uptime are ours) and it
+ * costs two things, both of which are dealt with HERE rather than left as
+ * warnings.
  *
- * The fix is a VA_SITES_DOMAIN on a registrable domain we own that is NOT the
- * platform's, e.g. `inflightva.site`. Point VA_SITES_DOMAIN at one and nothing
- * in this file changes. Until then announceHostingConfig() says so at
- * boot, once, loudly, because a warning nobody prints is a decision nobody made.
+ * ONE: COOKIE TOSSING. A separate origin is not a separate SITE when the
+ * registrable domain is shared. A VA's own script can write
+ * `document.cookie = 'x=1; domain=inflight.info'` and have it sent to
+ * inflight.info on every later request. It can never READ one of our cookies —
+ * they are httpOnly, and a shadowing cookie does not reveal the one it shadows
+ * — but an unprefixed name is one it can SHADOW, which is enough to make a
+ * session behave strangely.
+ *
+ * The fix is not a second domain, it is the `__Host-` cookie prefix, and the
+ * browser enforces it: a cookie whose name begins `__Host-` is accepted ONLY
+ * when it is Secure, path=/ and carries NO Domain attribute, so no page on any
+ * subdomain of ours can set one that reaches the platform. Both session
+ * cookies this product issues are prefixed — see setAuthCookie in vaPortal.js
+ * and staffAuth.js. That turns "we are careful never to scope a cookie to the
+ * parent domain" into something a VA's JavaScript cannot get around.
+ *
+ * TWO: LABEL COLLISION. On our own domain, a VA slug is a hostname of ours.
+ * `www`, `api`, `login`, `mail` and their kind must never become a VA site, or
+ * the airline whose slug is `login` is handed a page at a name our own users
+ * read as ours. RESERVED_LABELS below refuses them at the host, and the editor
+ * refuses to give such a slug an address at all.
+ *
+ * WHAT IS LEFT. A VA's script still shares a registrable domain with us, so it
+ * can still set NON-prefixed cookies at the parent for anything of ours that
+ * reads one in future. The rule that keeps this closed is simple and it is the
+ * reason this paragraph exists: every session-bearing cookie this platform
+ * issues, now or later, is `__Host-` prefixed.
  *
  * WHAT A HOSTED SITE CAN REACH OF OURS
  * ------------------------------------
@@ -329,6 +352,56 @@ const FRAME_SRC = String(
 
 const hostLabelRe = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
+/* ---------------------------------------------------------------------------
+ * LABELS A VA SITE MAY NOT HAVE
+ *
+ * VA sites are served under a domain of ours, so a VA's slug becomes one of our
+ * hostnames. These are the ones that must stay ours: the names our own services
+ * use or will use, the names mail and DNS use, and the names a person reads as
+ * "this is Inflight" rather than "this is an airline on Inflight". An airline
+ * whose slug is `login` would otherwise be handed `login.<our domain>`, which is
+ * a phishing page we built for them.
+ *
+ * Refused at the HOST, not just at sign-up: a slug can be changed by staff in
+ * the Crew Centers tool long after the site exists, and the check that matters
+ * is the one on the request.
+ *
+ * `xn--` is in here as a prefix rule rather than a name: a punycode label is
+ * how a homograph of one of these gets written, and no VA slug can produce one
+ * (slugs are a-z, 0-9 and dashes), so nothing legitimate is lost.
+ * ------------------------------------------------------------------------ */
+const RESERVED_LABELS = new Set([
+    // Us.
+    'www', 'www2', 'inflight', 'app', 'apps', 'api', 'backend', 'server', 'origin',
+    'admin', 'administrator', 'root', 'staff', 'internal', 'private', 'portal',
+    'crew', 'crews', 'account', 'accounts', 'auth', 'oauth', 'sso', 'login',
+    'signin', 'signup', 'register', 'id', 'my', 'me', 'user', 'users',
+    // The product's own words, so a VA cannot take the name of a feature.
+    'flight', 'flights', 'live', 'map', 'maps', 'track', 'tracker', 'events',
+    'event', 'pilot', 'pilots', 'va', 'vas', 'sites', 'site', 'website',
+    // Infrastructure and the things scanners look for.
+    'cdn', 'static', 'assets', 'media', 'img', 'images', 'files', 'uploads',
+    'download', 'downloads', 'docs', 'doc', 'help', 'support', 'status',
+    'blog', 'news', 'shop', 'store', 'pay', 'billing', 'checkout',
+    'dev', 'test', 'testing', 'stage', 'staging', 'beta', 'preview', 'demo',
+    'git', 'ci', 'build', 'deploy', 'vpn', 'proxy', 'gateway', 'edge',
+    'db', 'sql', 'redis', 'cache', 'queue', 'metrics', 'grafana', 'kibana',
+    'localhost', 'local', 'ipv4', 'ipv6',
+    // Mail and DNS. A label here is not a website, it is a delivery failure.
+    'mail', 'email', 'smtp', 'imap', 'pop', 'pop3', 'mx', 'webmail', 'exchange',
+    'ns', 'ns1', 'ns2', 'ns3', 'ns4', 'dns', 'dmarc', 'dkim', 'spf',
+    'autodiscover', 'autoconfig', 'cpanel', 'whm', 'ftp', 'sftp', 'ssh',
+    // The addresses a certificate authority will mail to prove ownership.
+    'postmaster', 'hostmaster', 'webmaster', 'abuse', 'security', 'noc',
+    'ssl', 'tls', 'secure', 'acme',
+]);
+
+/** Is this label one a VA site may not occupy? */
+function reservedLabel(label) {
+    const l = String(label || '').toLowerCase();
+    return RESERVED_LABELS.has(l) || l.startsWith('xn--');
+}
+
 /**
  * The VA label out of a Host header, or null when the request is not for a VA
  * site at all.
@@ -350,13 +423,18 @@ function parseSiteHost(rawHost, domain) {
     if (!host.endsWith('.' + d)) return null;   // not our domain at all
     const label = host.slice(0, -(d.length + 1));
     if (!hostLabelRe.test(label)) return null;
+    // Reserved reads as "not a VA host" rather than as "no such VA": a request
+    // for www.<our domain> that reached this process is ours to answer, and
+    // 404ing it here would take a platform hostname off the air the moment
+    // somebody pointed it at this backend.
+    if (reservedLabel(label)) return null;
     return label;
 }
 
 /** The public address of a VA's site, or '' when hosting is not configured. */
 function siteUrlFor(slug) {
     const s = String(slug || '').trim().toLowerCase();
-    if (!DOMAIN || !s || !hostLabelRe.test(s)) return '';
+    if (!DOMAIN || !s || !hostLabelRe.test(s) || reservedLabel(s)) return '';
     return `https://${s}.${DOMAIN}`;
 }
 
@@ -386,14 +464,28 @@ function announceHostingConfig() {
     try { platformHost = new URL(CREW_BASE).hostname; } catch { /* leave blank */ }
     const shared = platformHost && registrableGuess(platformHost) === registrableGuess(DOMAIN);
     console.log(`✅ VA site hosting on *.${DOMAIN}`);
-    if (shared) {
+
+    // Sharing a registrable domain with the platform is the intended shape — a
+    // VA gets an address with their own name on it, on a domain we run. What it
+    // requires is that the session cookies carry the `__Host-` prefix, and that
+    // prefix requires Secure, which this process only sets in production. So an
+    // environment hosting VA sites without it is one where a VA's own script
+    // could shadow a platform cookie, and that is worth a line at boot rather
+    // than a paragraph in a file nobody opens.
+    if (shared && process.env.NODE_ENV !== 'production') {
         console.warn(
-            `⚠️  VA_SITES_DOMAIN (${DOMAIN}) shares a registrable domain with the platform `
-            + `(${platformHost}). VA sites are still a separate ORIGIN — their script cannot read `
-            + `our storage, our DOM or our cookies (every cookie here is host-only). But a VA's `
-            + `script CAN set a cookie scoped to ${registrableGuess(DOMAIN)} and have it sent to `
-            + `the platform: cookie tossing. Moving VA_SITES_DOMAIN to a registrable domain we own `
-            + `that is not the platform's closes that, and needs no code change.`
+            `⚠️  VA_SITES_DOMAIN (${DOMAIN}) shares the registrable domain `
+            + `${registrableGuess(DOMAIN)} with the platform (${platformHost}), and NODE_ENV is not `
+            + `"production", so session cookies are not Secure and cannot carry the __Host- prefix `
+            + `that stops a VA's script setting a cookie at the parent domain. Fine on a laptop; `
+            + `not fine anywhere a real VA can publish.`
+        );
+    }
+    if (shared) {
+        console.log(
+            `   VA sites share ${registrableGuess(DOMAIN)} with the platform by design. `
+            + `Cookie tossing is closed by the __Host- prefix on every session cookie, and platform `
+            + `hostnames (www, api, login, mail…) are refused as VA labels.`
         );
     }
 }
@@ -725,6 +817,15 @@ function registerVaSiteRoutes(app, { VirtualAirlineAd, requirePortal, requirePor
             return {
                 error: 409,
                 message: 'Your crew centre does not have an address yet, and your website is served from it. Ask Inflight to set one.',
+            };
+        }
+        // A website lives at <slug>.<our domain>, so a slug that is one of our
+        // own hostnames cannot have one. Rare, fixable, and far better said here
+        // than discovered as a site that will not load.
+        if (reservedLabel(va.slug)) {
+            return {
+                error: 409,
+                message: `Your crew centre's address is "${va.slug}", which is a name Inflight reserves for its own — so it cannot be a website address. Ask Inflight to change it and your site can go up.`,
             };
         }
         let site = await CrewSite.findOne({ vaAdId: va._id });
@@ -1331,5 +1432,6 @@ module.exports = {
     TYPES, PREVIEW_PREFIX, DOMAIN,
     cleanPath, extOf, bytesOf, layOutTemplate,
     parseSiteHost, siteUrlFor, pickFile, registrableGuess,
+    RESERVED_LABELS, reservedLabel,
     mountVaSiteHost, registerVaSiteRoutes,
 };
