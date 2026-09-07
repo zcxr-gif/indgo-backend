@@ -851,15 +851,32 @@ remove, but the page carrying it is.
 
 ### They pick a design, they do not start from a blank file
 
-The Website tab opens on a gallery of six designs — Flightline, Concourse,
-Horizon, Terminal, Cabin, Livery. Picking one lays out a working airline
-homepage with that VA's real figures already wired in, and they change the words
-from there. Accent colour, typeface and light/dark are three controls on top.
+The Website tab opens on a gallery of designs — Flightline, Concourse, Horizon,
+Terminal, Cabin, Livery, Heritage, Skyline. Picking one lays out a working
+airline homepage with that VA's real figures already wired in, and they change
+the words from there. On top of the layout sit five controls: accent colour,
+typeface, light/dark, corner softness, and a **motif** — a pattern drawn in CSS
+that runs behind the hero and the apply band. A VA can change design at any time
+without losing a word they have written, and put the previous one back by name.
 
 Practical consequence for you: **a hosted site being well-made is not evidence
-the VA is well-run.** Every one of them starts from the same six layouts and
-arrives looking deliberate. Judge the listing on §2 activity signals as you
+the VA is well-run.** Every one of them starts from the same handful of layouts
+and arrives looking deliberate. Judge the listing on §2 activity signals as you
 always have; the website tells you nothing about whether anybody is flying.
+
+### Where the pictures on a fleet page come from
+
+Worth knowing before you read one as a §6 copyright problem. A hosted fleet page
+shows one of two things per aircraft:
+
+* **the VA's own uploaded livery image**, linked from wherever they host it —
+  this is theirs and is the usual §6 question;
+* **a silhouette we draw**, generated from the aircraft type as an inline SVG.
+  Ours, no external host, and the card says "Outline by Inflight".
+
+Neither is a third party's photograph, so a fleet grid full of plane pictures is
+not by itself evidence of anything. The credit line under each card says which
+it is — read that before acting.
 
 ### The two switches
 

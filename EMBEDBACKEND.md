@@ -1040,8 +1040,15 @@ Readers, all of which resolve to `null` rather than throwing — and `null` mean
 | `CrewFeed.ranks()` | same | The **rank ladder**, sorted by the hours each rung asks for |
 | `CrewFeed.fleet()` | same | The declared **aircraft and liveries** |
 | `CrewFeed.roles()` | same | Role definitions (never who holds one) |
+| `CrewFeed.hubs()` | `/route-map` | The airports the airline flies most sectors out of |
+| `CrewFeed.partners()` | `/route-map` | The airlines it codeshares with, deduplicated |
 
-The last four read the **directory record**, not a crew endpoint — that is
+`hubs` and `partners` are **worked out, not stored**. A route map already knows
+which airports carry the most sectors and which of those are flown with somebody
+else, so neither is typed anywhere and neither can go stale — which is the whole
+point of this file. Both read the same single `/route-map` fetch as `network()`.
+
+The brand four read the **directory record**, not a crew endpoint — that is
 deliberate. Everything else here is data the VA's crew centre *produced* and
 lives in the VA's own store; this is what the airline *is* rather than what it
 has been doing. Two different things, so two paths. One fetch serves all four.
@@ -1076,7 +1083,31 @@ Declarative markup, for pages that would rather not write JavaScript:
 <ol data-crew-list="ranks">
   <template><li><img src="{{image}}" alt=""><b>{{name}}</b> <span>{{from}}</span></li></template>
 </ol>
+
+<!-- The fleet always has a picture, and always says whose it is. -->
+<ul data-crew-list="fleet">
+  <template><li>
+    <img src="{{image}}" data-fit="{{fit}}" alt="{{aircraft}}">
+    <b>{{aircraft}}</b> <span>{{livery}}</span>
+    <small><a href="{{creditHref}}">{{credit}}</a></small>
+  </li></template>
+</ul>
 ```
+
+### The fleet always has a picture
+
+`fleet()` guarantees an `image` for every aircraft. The VA's own livery upload
+wins where they made one; otherwise the reader **draws** a top-view silhouette
+for the type as an inline SVG data URI — no request, no host, nothing that can
+404, and available synchronously so a fleet page never flickers or reflows.
+`fit` says which it is: `cover` for a photograph, `contain` for a drawn outline,
+because cropping artwork to fill a card cuts the wingtips off.
+
+`credit` and `creditHref` come with it. A picture on a website belongs to
+whoever made it: the VA's own upload is credited to nobody because it is theirs,
+and an outline we drew says so. An `<a>` in a row template whose `href` came
+back empty is **unwrapped** — the words stay, the dead link goes — because an
+attribution deleted for want of a URL is an attribution not paid.
 
 `data-crew-brand` removes rather than leaving what is on the page, which is the
 opposite of the rule for figures — and deliberately. A figure has a true

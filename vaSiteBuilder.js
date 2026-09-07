@@ -267,15 +267,243 @@ ${(p.items || []).map(i => `    <div data-crew-figure><b data-crew-stat="${esc(i
         live: true,
         fields: [
             { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'note', label: 'Under the heading', type: 'line' },
+            { key: 'cards', label: 'Show each aircraft as a picture card', type: 'bool', help: 'Off, it is a compact list. Every card gets an image even where you have not uploaded one.' },
             { key: 'limit', label: 'How many', type: 'number', min: 1, max: 40 },
         ],
-        defaults: () => ({ heading: 'The fleet', limit: 16 }),
-        render: (p) => `
+        defaults: () => ({ heading: 'The fleet', note: '', limit: 16, cards: true }),
+        /* Two shapes, because a fleet of four and a fleet of forty want
+         * different pages. Cards give every airframe a picture — the VA's own
+         * livery shot, or the silhouette crew-feed.js draws for the type, so
+         * there is never a hole in the grid. Rows are the compact form for a
+         * long fleet, and both carry {{credit}}: where a picture is somebody
+         * else's it says whose and links back, and crew-feed.js removes the
+         * line when there is nothing to attribute. */
+        render: (p) => (p.cards ? `
   <section class="block">
-    <h2>${esc(p.heading)}</h2>
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <ul class="cards" data-crew-list="fleet" data-crew-limit="${p.limit}">
+      <template>
+        <li class="card">
+          <span class="card__media"><img src="{{image}}" data-fit="{{fit}}" data-crew-fallback="{{fallback}}" alt="{{aircraft}}" loading="lazy" decoding="async"></span>
+          <span class="card__body">
+            <b>{{aircraft}}</b>
+            <span>{{livery}}</span>
+            <span class="card__credit">{{credit}}</span>
+          </span>
+        </li>
+      </template>
+      <li class="card"><span class="card__body"><b>Add your fleet in the crew centre</b><span>Aircraft and liveries appear here as soon as they are in the fleet editor.</span></span></li>
+    </ul>
+  </section>` : `
+  <section class="block">
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
     <ul class="rows" data-crew-list="fleet" data-crew-limit="${p.limit}">
       <template><li><span class="badge"><img src="{{image}}" alt="" loading="lazy" decoding="async"></span><b>{{aircraft}}</b> <span>{{livery}}</span></li></template>
       <li><b>Add your fleet in the crew centre</b> <span>Aircraft and liveries appear here as soon as they are in the fleet editor.</span></li>
+    </ul>
+  </section>`),
+    },
+
+    /* ---- The airline as an airline, not as a dataset --------------------
+     *
+     * The five blocks below are the ones a VA kept asking for and had to fake
+     * with a paragraph of prose: where we are based, what we are like, who runs
+     * it, who we fly with, and what actually happens when you apply.
+     *
+     * Two of them read from the crew centre and three are the VA's own words,
+     * and the split is deliberate. Hubs and codeshares are FACTS the crew
+     * centre already holds — a route map knows which airports carry the most
+     * sectors and which of them are flown with somebody else, so typing either
+     * by hand is typing something that will be wrong by next month. A culture
+     * is not a fact and there is no field for one, which is exactly why it is
+     * the thing missing from every VA website on the platform.
+     * ------------------------------------------------------------------ */
+
+    hubs: {
+        label: 'Hubs',
+        note: 'The airports you fly most out of, worked out from your route map.',
+        icon: 'building-2',
+        live: true,
+        fields: [
+            { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'note', label: 'Under the heading', type: 'line' },
+            { key: 'limit', label: 'How many', type: 'number', min: 1, max: 12 },
+        ],
+        defaults: () => ({ heading: 'Where we are based', note: 'The airports we fly most of our sectors out of.', limit: 6 }),
+        render: (p) => `
+  <section class="block" data-crew-section>
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <ul class="tiles" data-crew-list="hubs" data-crew-limit="${p.limit}">
+      <template><li class="tile"><b class="code">{{icao}}</b><span>{{routes}} routes &middot; {{departures}} departures</span></li></template>
+    </ul>
+  </section>`,
+    },
+
+    values: {
+        label: 'How we fly',
+        note: 'The three or four things that make your airline itself. Nothing here is fed from anywhere.',
+        icon: 'heart',
+        fields: [
+            { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'note', label: 'Under the heading', type: 'line' },
+            {
+                key: 'items', label: 'Things', type: 'list', max: 8, of: [
+                    { key: 'title', label: 'Called', type: 'line' },
+                    { key: 'body', label: 'One sentence', type: 'line' },
+                ],
+            },
+        ],
+        defaults: () => ({
+            heading: 'How we fly', note: '',
+            items: [
+                { title: 'We fly together', body: 'A group flight every week, on the same day, whoever turns up.' },
+                { title: 'Nobody is chased', body: 'Fly when you want to. There is no monthly minimum and no leaderboard.' },
+                { title: 'Realistic, not strict', body: 'Real routes and real liveries. Nobody is told off for a hard landing.' },
+            ],
+        }),
+        render: (p) => `
+  <section class="block" data-motif>
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <ul class="tiles">
+${(p.items || []).map(i => `      <li class="tile"><b>${esc(i.title)}</b><span>${esc(i.body)}</span></li>`).join('\n')}
+    </ul>
+  </section>`,
+    },
+
+    /* Roles, never names. A staff list on a public page goes out of date the
+     * week somebody steps down, and it puts real people's handles somewhere
+     * anybody can scrape. The departments are the useful half and the half that
+     * stays true. */
+    staff: {
+        label: 'Who runs it',
+        note: 'Your crew centre roles, as a row of labels. Roles only — never who holds one.',
+        icon: 'users',
+        live: true,
+        fields: [
+            { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'note', label: 'Under the heading', type: 'line' },
+            { key: 'limit', label: 'How many', type: 'number', min: 1, max: 20 },
+        ],
+        defaults: () => ({ heading: 'Who runs the airline', note: 'The teams behind the operation.', limit: 14 }),
+        render: (p) => `
+  <section class="block" data-crew-section>
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <ul class="pills" data-crew-list="roles" data-crew-limit="${p.limit}">
+      <template><li class="pill"><span class="dot" style="background:{{color}}"></span>{{name}}</li></template>
+    </ul>
+  </section>`,
+    },
+
+    partners: {
+        label: 'Codeshares',
+        note: 'The airlines you share sectors with, read off your route map.',
+        icon: 'handshake',
+        live: true,
+        fields: [
+            { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'limit', label: 'How many', type: 'number', min: 1, max: 20 },
+        ],
+        defaults: () => ({ heading: 'We fly with', limit: 12 }),
+        render: (p) => `
+  <section class="block" data-crew-section>
+    <div class="block__head"><h2>${esc(p.heading)}</h2></div>
+    <ul class="pills" data-crew-list="partners" data-crew-limit="${p.limit}">
+      <template><li class="pill">{{name}}</li></template>
+    </ul>
+  </section>`,
+    },
+
+    /* The numbers are drawn by a CSS counter rather than typed, so reordering
+     * the steps in the editor cannot leave a 3 above a 2. */
+    joining: {
+        label: 'What happens when you apply',
+        note: 'Numbered steps. The question every applicant has and almost no VA answers.',
+        icon: 'list-ordered',
+        fields: [
+            { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'note', label: 'Under the heading', type: 'line' },
+            {
+                key: 'items', label: 'Steps', type: 'list', max: 8, of: [
+                    { key: 'title', label: 'Called', type: 'line' },
+                    { key: 'body', label: 'One sentence', type: 'line' },
+                ],
+            },
+            { key: 'ctaLabel', label: 'Link under the steps', type: 'line' },
+            { key: 'ctaHref', label: 'That link goes to', type: 'url', help: 'Left empty, it goes to your join page.' },
+        ],
+        defaults: () => ({
+            heading: 'What happens when you apply', note: '',
+            items: [
+                { title: 'You send the form', body: 'A few minutes, in the crew centre. No essay.' },
+                { title: 'A person reads it', body: 'Usually within a day or two. You get a real answer either way.' },
+                { title: 'You get your callsign', body: 'And the crew centre account that goes with it.' },
+                { title: 'You fly', body: 'Pick any sector on the schedule. Nobody minds where you start.' },
+            ],
+            ctaLabel: 'Start an application', ctaHref: '',
+        }),
+        render: (p, ctx) => `
+  <section class="block">
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <ul class="tiles tiles--numbered">
+${(p.items || []).map(i => `      <li class="tile"><b>${esc(i.title)}</b><span>${esc(i.body)}</span></li>`).join('\n')}
+    </ul>${p.ctaLabel ? `\n    <p class="more"><a href="${esc(linkUrl(p.ctaHref, ctx.join))}">${esc(p.ctaLabel)} &rarr;</a></p>` : ''}
+  </section>`,
+    },
+
+    quote: {
+        label: 'A quote',
+        note: 'One line, set large. Worth having once on a site and nothing twice.',
+        icon: 'quote',
+        fields: [
+            { key: 'body', label: 'What was said', type: 'text' },
+            { key: 'by', label: 'Who said it', type: 'line' },
+        ],
+        defaults: () => ({
+            body: 'A line from one of your pilots about their first week is worth more than a paragraph you wrote about yourselves.',
+            by: 'A pilot, somewhere over the Atlantic',
+        }),
+        render: (p) => `
+  <section class="block">
+    <figure class="quote">
+      <p>&ldquo;${esc(p.body)}&rdquo;</p>${p.by ? `\n      <figcaption class="by">${esc(p.by)}</figcaption>` : ''}
+    </figure>
+  </section>`,
+    },
+
+    /* The Discord invite comes from the crew centre rather than from a field
+     * here, so it cannot rot into a dead link the week the server is remade. */
+    contact: {
+        label: 'Talk to us',
+        note: 'Discord, the crew centre and the application, in three tiles.',
+        icon: 'message-circle',
+        fields: [
+            { key: 'heading', label: 'Heading', type: 'line' },
+            { key: 'note', label: 'Under the heading', type: 'line' },
+            { key: 'showDiscord', label: 'Show your Discord invite', type: 'bool', help: 'The one in your crew centre. The tile goes if you have not set one.' },
+        ],
+        defaults: () => ({ heading: 'Talk to us', note: 'Before you apply, or after. Either is fine.', showDiscord: true }),
+        render: (p, ctx) => `
+  <section class="block">
+    <div class="block__head">
+      <h2>${esc(p.heading)}</h2>${p.note ? `\n      <p>${esc(p.note)}</p>` : ''}
+    </div>
+    <ul class="tiles">${p.showDiscord ? `
+      <li class="tile" data-crew-figure><b>Discord</b><span>Where the airline actually lives. <a data-crew-brand="discord" href="#">Join the server</a></span></li>` : ''}
+      <li class="tile"><b>The crew centre</b><span>Schedules, reports and the noticeboard. <a href="${esc(ctx.crew)}">Open it</a></span></li>
+      <li class="tile"><b>Apply</b><span>A few minutes, and a human answer. <a href="${esc(ctx.join)}">Start</a></span></li>
     </ul>
   </section>`,
     },
@@ -716,25 +944,46 @@ function navHtml(doc, ctx) {
     });
     if (doc.nav.showCrew) links.push(`      <a href="${esc(ctx.crew)}">${esc(doc.nav.crewLabel)}</a>`);
     const apply = doc.nav.showApply ? `\n      <a class="cta" href="${esc(ctx.join)}">${esc(doc.nav.applyLabel)}</a>` : '';
-    return `<header class="bar">
+    /* The same header a template renders, down to the attribute names — see
+     * BLOCKS.nav in vaSiteTemplates.js. The burger ships HIDDEN and site.js
+     * reveals it, so a builder page with no JavaScript is a plain wrapping row
+     * of links rather than a button that does nothing over a panel that never
+     * opens. The scrim is a <button> so that tapping outside the open panel is
+     * a real, announced way to close it. */
+    return `<header class="bar" data-bar>
   <div class="bar__in">
     <a class="mark" href="./">
       <span class="logo" data-crew-figure hidden><img data-crew-brand="logo" alt=""></span>
       <span data-crew-brand="name">${esc(ctx.name)}</span>
     </a>
-    <nav>
+    <button class="bar__burger" type="button" aria-expanded="false" aria-controls="siteNav" aria-label="Menu" hidden><i></i></button>
+    <nav class="bar__nav" id="siteNav">
 ${links.join('\n')}${apply}
     </nav>
   </div>
-</header>`;
+</header>
+<button class="bar__scrim" type="button" tabindex="-1" aria-label="Close the menu" hidden></button>`;
 }
 
 function footerHtml(doc, ctx) {
     const note = doc.footer.note
         || `${ctx.name} is a virtual airline on Infinite Flight. Not affiliated with any real-world carrier.`;
+    const links = doc.pages.filter(p => p.nav).map((p) => {
+        const label = p.navLabel || p.title || (p.path === 'index.html' ? 'Home' : p.path.replace(/\.html$/, ''));
+        return `      <a href="${p.path === 'index.html' ? './' : esc(p.path)}">${esc(label)}</a>`;
+    });
+    links.push(`      <a href="${esc(ctx.crew)}">Crew centre</a>`);
+    links.push(`      <a href="${esc(ctx.join)}">Apply</a>`);
     return `<footer>
-  <p>${esc(note)}</p>
-  <p>Crew centre hosted by <a href="${esc(ctx.crewBase)}">Inflight</a>.</p>
+  <div class="foot__in">
+    <div>
+      <p>${esc(note)}</p>
+      <p>Crew centre hosted by <a href="${esc(ctx.crewBase)}">Inflight</a>.</p>
+    </div>
+    <div class="foot__links">
+${links.join('\n')}
+    </div>
+  </div>
 </footer>`;
 }
 
