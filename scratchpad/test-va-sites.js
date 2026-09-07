@@ -269,6 +269,22 @@ T('an unknown design falls back to the default',
 const paleCss = TPL.renderThemeCss({ accent: '#ffe680', font: 'grotesk', mode: 'light' });
 T('a pale accent gets dark text on it, not white on white',
     /--on-accent: #16181d/.test(paleCss), true);
+/* WHAT GOES ON THE ACCENT IS MEASURED, NOT GUESSED.
+ *
+ * A brightness threshold gets the two ends right and the middle wrong: a
+ * mid-tone blue used to fall just under it and be given white text at about
+ * 2.6:1, which is a button whose label you have to lean in to read. Every
+ * design's own accent has to clear the WCAG large-text bar with whichever ink
+ * it was given, or the button that says "Apply to fly" is the least readable
+ * thing on the page. */
+T('every design\'s own accent gets readable text on it',
+    Object.keys(TPL.TEMPLATES).filter((id) => {
+        const a = TPL.TEMPLATES[id].accent;
+        return TPL.contrast(a, TPL.onAccentFor(a)) < 3;
+    }), []);
+T('a mid-tone accent is given the ink that can actually be read on it',
+    TPL.onAccentFor('#4da3ff'), '#16181d');
+T('…and a dark one still gets white', TPL.onAccentFor('#14375e'), '#ffffff');
 const darkCss = TPL.renderThemeCss({ accent: '#14375e', font: 'grotesk', mode: 'light' });
 T('a dark accent gets white', /--on-accent: #ffffff/.test(darkCss), true);
 T('a light-mode theme does not also ship a dark palette',
@@ -284,6 +300,145 @@ T('every offered block actually exists',
     cat.blocks.every(b => !!TPL.renderBlock(b.id, VA, {})), true);
 T('nav and footer are not offered — a page has one of each',
     cat.blocks.some(b => b.id === 'nav' || b.id === 'footer'), false);
+
+
+/* ===========================================================================
+ * THE DESIGN SYSTEM
+ *
+ * Eight designs, one stylesheet, one set of blocks. What is worth testing is
+ * not that any of them looks good — that is not a thing a test can see — but
+ * the invariants that make eight designs cheaper to keep than one:
+ *
+ *   every design's pages are made of blocks that exist;
+ *   every design fits the storage caps a hosted site is held to;
+ *   every asset a page asks for is RELATIVE, because the same bytes are served
+ *     at two addresses and a rooted path is only right at one of them;
+ *   the header works without JavaScript, and the menu works with it;
+ *   and the airline's own motif reaches the stylesheet.
+ * ======================================================================== */
+console.log('\neight designs, one set of parts');
+{
+    const ids = Object.keys(TPL.TEMPLATES);
+    T('there is more than one design to choose from', ids.length >= 6, true);
+    T('every page of every design is made of blocks that exist',
+        ids.every(id => TPL.TEMPLATES[id].pages.every(pg => pg.blocks.every(b => !!TPL.BLOCKS[b]))), true);
+    T('every design has a homepage',
+        ids.every(id => TPL.TEMPLATES[id].pages.some(pg => pg.path === 'index.html')), true);
+    T('every design carries a thumbnail for the picker',
+        ids.every(id => typeof TPL.TEMPLATES[id].thumb === 'string' && TPL.TEMPLATES[id].thumb.length > 40), true);
+
+    // The caps in vaSites.js: 256 KB a file, 2 MB a site, 60 files.
+    const sizes = ids.map(id => TPL.renderTemplate(id, VA, ctx));
+    T('no design writes a file too big to store',
+        sizes.every(fs => fs.every(f => f.bytes <= 256 * 1024)), true);
+    T('no design is too big to store whole',
+        sizes.every(fs => fs.reduce((a, f) => a + f.bytes, 0) <= 2 * 1024 * 1024), true);
+    T('every file a design writes is one the editor would accept',
+        sizes.every(fs => fs.every(f => !!S.cleanPath(f.path).path)), true);
+}
+
+console.log('\nthe same bytes, served at two addresses');
+{
+    // A hosted site is reachable at the airline's own subdomain AND at
+    // inflight.info/va/<slug>/. A stylesheet asked for at "/theme.css" is the
+    // platform's root at the second address, which is a 404 — so nothing a page
+    // asks for may start with a slash.
+    const pages = TPL.renderTemplate('flightline', VA, ctx).filter(f => /\.html$/.test(f.path));
+    const rooted = [];
+    pages.forEach((f) => {
+        const re = /(?:href|src)="(\/[^\/][^"]*)"/g;
+        let m; while ((m = re.exec(f.content))) rooted.push(f.path + ' -> ' + m[1]);
+    });
+    T('no page asks for anything at a rooted path', rooted, []);
+    T('the stylesheet is asked for relatively',
+        /<link rel="stylesheet" href="theme\.css">/.test(pages[0].content), true);
+}
+
+console.log('\nthe header — a menu on a phone, and links without JavaScript');
+{
+    const home = TPL.renderTemplate('horizon', VA, ctx).find(f => f.path === 'index.html').content;
+    T('there is a burger', /class="bar__burger"/.test(home), true);
+    // The whole no-JavaScript story hangs on this one attribute: the button
+    // ships hidden and site.js reveals it, so a page whose script never loads
+    // has a plain row of links rather than a control that does nothing.
+    T('…and it ships hidden, for site.js to reveal', /class="bar__burger"[^>]*\shidden>/.test(home), true);
+    T('it says what it controls', /aria-controls="siteNav"/.test(home) && /id="siteNav"/.test(home), true);
+    T('it says whether it is open', /aria-expanded="false"/.test(home), true);
+    T('the scrim is a button, not an unfocusable div', /<button class="bar__scrim"/.test(home), true);
+    T('…and ships hidden too', /class="bar__scrim"[^>]*\shidden>/.test(home), true);
+
+    // A design that produces a join page must link it, and one that does not
+    // must not — a header naming a page the design never writes is a 404 on
+    // every site using it.
+    const paths = (html) => (html.match(/<nav class="bar__nav"[\s\S]*?<\/nav>/) || [''])[0];
+    const nav = paths(home);
+    const written = TPL.TEMPLATES.horizon.pages.map(p => p.path);
+    T('the header links every page the design writes',
+        written.every(p => nav.includes(p === 'index.html' ? 'href="./"' : 'href="' + p + '"')), true);
+    const terminalNav = paths(TPL.renderTemplate('terminal', VA, ctx).find(f => f.path === 'index.html').content);
+    T('…and links no page it does not', terminalNav.includes('join.html'), false);
+
+    const js = TPL.SITE_JS;
+    T('the script marks the document so CSS knows JavaScript ran',
+        /setAttribute\('data-js'/.test(js), true);
+    T('the menu can be closed with Escape', /key === 'Escape'/.test(js), true);
+    T('…and by the scrim behind it', /scrim\.addEventListener\('click'/.test(js), true);
+    T('…and the page does not scroll behind it', /data-nav-open/.test(js), true);
+    T('…and Tab is held inside it while it is open', /e\.key !== 'Tab'/.test(js), true);
+}
+
+console.log('\nthe motif — the half of a brand a colour picker cannot reach');
+{
+    const withMotif = TPL.renderThemeCss(TPL.normaliseTheme({ pattern: 'chevron' }, 'livery'));
+    T('the motif reaches the stylesheet', /--motif-image: linear-gradient/.test(withMotif), true);
+    // currentColor is what makes ONE declaration correct behind dark text on
+    // the page and light text on a block of the accent. A fixed ink would be
+    // invisible on one of the two.
+    T('…drawn from currentColor, so it works on the page and on the accent',
+        /color-mix\(in srgb, currentColor/.test(withMotif), true);
+    T('none is a real answer, not a broken one',
+        /--motif-image: none/.test(TPL.renderThemeCss(TPL.normaliseTheme({ pattern: 'none' }, 'livery'))), true);
+    T('a motif nobody has heard of falls back to the design\'s own',
+        TPL.normaliseTheme({ pattern: 'tartan' }, 'livery').pattern, TPL.TEMPLATES.livery.pattern);
+
+    T('the corner is one number a VA moves', TPL.normaliseTheme({ radius: 20 }, 'cabin').radius, 20);
+    // A site stored before this field existed reads back null, and Number(null)
+    // is 0 — which would square off every corner on every site that had never
+    // been asked. Absence has to be tested before the number is.
+    T('a corner nobody chose is the design\'s, not zero',
+        TPL.normaliseTheme({ radius: null }, 'cabin').radius, TPL.TEMPLATES.cabin.radius);
+    T('…and a corner somebody chose to be zero stays zero',
+        TPL.normaliseTheme({ radius: 0 }, 'cabin').radius, 0);
+    T('…clamped, so a site cannot be all circles', TPL.normaliseTheme({ radius: 900 }, 'cabin').radius, 28);
+    T('…and a small element is rounded less than a large one',
+        /--radius: 20px;/.test(TPL.renderThemeCss({ radius: 20 })) && /--radius-sm: 11px;/.test(TPL.renderThemeCss({ radius: 20 })), true);
+
+    // This is an export. A stored theme from before motifs existed, or a
+    // caller handing over three fields, must get a stylesheet, not a crash.
+    T('a partial theme still renders a stylesheet',
+        /--accent:/.test(TPL.renderThemeCss({ accent: '#123456' })), true);
+    T('…and an empty one does too', /--accent:/.test(TPL.renderThemeCss({})), true);
+
+    const cat2 = TPL.catalogue();
+    T('the picker is offered every motif', cat2.patterns.length, Object.keys(TPL.PATTERNS).length);
+    T('…each carrying the real CSS, so a swatch is the pattern it offers',
+        cat2.patterns.every(p => typeof p.image === 'string' && p.image.length > 0), true);
+    T('…and every design names one it has', cat2.templates.every(t => !!TPL.PATTERNS[t.pattern]), true);
+}
+
+console.log('\nthe fleet — a picture for every aircraft, and whose it is');
+{
+    const fleetPage = TPL.renderTemplate('skyline', VA, ctx).find(f => f.path === 'fleet.html').content;
+    // A section that fades in when it is scrolled to has never been scrolled to
+    // on paper. Printing must not hand somebody a page of blanks.
+    T('a section waiting to be scrolled to still prints',
+        /@media print[\s\S]*\[data-reveal\][^}]*opacity: 1 !important/.test(TPL.BASE_CSS), true);
+    T('the fleet asks the feed for its rows', /data-crew-list="fleet"/.test(fleetPage), true);
+    T('every card has a picture well', /class="card__media"/.test(fleetPage), true);
+    // The credit is part of the template, not something a VA has to remember.
+    T('…and a credit line under it', /class="card__credit">\{\{credit\}\}/.test(fleetPage), true);
+    T('a drawn outline is contained, not cropped', /data-fit="\{\{fit\}\}"/.test(fleetPage), true);
+}
 
 console.log(failures ? `\n${failures} failing\n` : '\nAll good.\n');
 process.exit(failures ? 1 : 0);

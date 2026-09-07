@@ -301,6 +301,12 @@ const CrewSiteSchema = new mongoose.Schema({
         accent: { type: String, default: '' },
         font: { type: String, default: '' },
         mode: { type: String, default: '' },
+        // The airline's own motif, and how soft its corners are. Both default
+        // to empty/zero-ish rather than to a value, and normaliseTheme fills
+        // them from the design — so a site stored before either existed opens
+        // on its design's own choices instead of on a pattern nobody picked.
+        pattern: { type: String, default: '' },
+        radius: { type: Number, default: null },
     },
 
     // Short-lived preview credential. The site host has no session — that is
